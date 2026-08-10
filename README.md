@@ -46,7 +46,8 @@ with Workspace(destination, identity=b"model request bytes") as workspace:
 
 `Workspace` binds its stable hidden state to the SHA-256 digest of the opaque identity and holds a
 nonblocking writer lock. `Draft.link` only hard-links regular files into a safe relative path. The
-application owns file contents, validation, schemas, and completion meaning.
+application must not mutate a linked source inode after `Draft.link()` returns and before
+publication completes. It owns file contents, validation, schemas, and completion meaning.
 
 ## Guarantees
 

@@ -39,6 +39,7 @@ class Draft:
     def link(self, source: Path, destination: str | PurePosixPath) -> None:
         components = _safe_components(destination)
         source_path = Path(source)
+        _posix.reject_nul_path(source_path)
         try:
             source_entry = source_path.stat(follow_symlinks=False)
         except OSError as error:
@@ -103,6 +104,8 @@ class Draft:
 
 
 def _safe_components(destination: str | PurePosixPath) -> tuple[str, ...]:
+    if "\0" in os.fspath(destination):
+        raise UnsafePublication(f"draft path contains an embedded NUL: {destination!r}")
     path = PurePosixPath(destination)
     if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
         raise UnsafePublication(f"draft path must be safe and relative: {destination}")
@@ -212,24 +215,49 @@ class Workspace:
     def _bind_identity(self) -> None:
         assert self._container_fd >= 0
         try:
+            os.stat(".identity", dir_fd=self._container_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            self._initialize_identity()
+        else:
+            self._verify_identity()
+
+    def _initialize_identity(self) -> None:
+        assert self._container_fd >= 0
+        stage_name = f".identity-{os.urandom(12).hex()}.tmp"
+        descriptor = -1
+        stage_entry: os.stat_result | None = None
+        try:
             descriptor = os.open(
-                ".identity",
+                stage_name,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
                 0o600,
                 dir_fd=self._container_fd,
             )
-        except FileExistsError:
-            self._verify_identity()
-            return
-        try:
+            stage_entry = os.fstat(descriptor)
             view = memoryview(self._identity)
             while view:
                 written = os.write(descriptor, view)
                 view = view[written:]
             _posix.sync_descriptor(descriptor)
-        finally:
             os.close(descriptor)
-        _posix.sync_descriptor(self._container_fd)
+            descriptor = -1
+            try:
+                _posix.commit_noreplace(self._container_fd, stage_name, ".identity")
+            except DestinationExists:
+                self._verify_identity()
+                _posix.remove_file_at(self._container_fd, stage_name, stage_entry)
+                stage_entry = None
+            _posix.sync_descriptor(self._container_fd)
+        except BaseException as error:
+            if stage_entry is not None:
+                try:
+                    _posix.remove_file_at(self._container_fd, stage_name, stage_entry)
+                except Exception as cleanup_error:
+                    error.add_note(f"Servatus could not remove identity stage: {cleanup_error}")
+            raise
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
     def _verify_identity(self) -> None:
         assert self._container_fd >= 0
@@ -243,13 +271,20 @@ class Workspace:
             raise WorkConflict(f"workspace identity is unavailable: {self._destination}") from error
         try:
             identity_entry = os.fstat(descriptor)
-            if not stat.S_ISREG(identity_entry.st_mode):
+            if (
+                not stat.S_ISREG(identity_entry.st_mode)
+                or identity_entry.st_dev != os.fstat(self._container_fd).st_dev
+                or identity_entry.st_size != len(self._identity)
+            ):
                 raise WorkConflict(f"workspace identity is invalid: {self._destination}")
             chunks: list[bytes] = []
-            while chunk := os.read(descriptor, 4096):
+            remaining = len(self._identity) + 1
+            while remaining and (chunk := os.read(descriptor, remaining)):
                 chunks.append(chunk)
+                remaining -= len(chunk)
             if b"".join(chunks) != self._identity:
                 raise WorkConflict(f"workspace belongs to different work: {self._destination}")
+            _posix.ensure_entry(self._container_fd, ".identity", identity_entry)
         finally:
             os.close(descriptor)
 

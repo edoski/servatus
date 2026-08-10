@@ -63,6 +63,94 @@ def test_builder_failure_cleans_disposable_stage_and_propagates(tmp_path: Path) 
     assert hidden_entries(tmp_path) == []
 
 
+def test_failed_attempt_closes_stage_descriptor_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stage_fd = -1
+    stage_closes = 0
+    real_make_stage = _posix.make_unique_stage
+    real_close = os.close
+
+    def track_stage(parent_fd: int, prefix: str) -> tuple[str, int, os.stat_result]:
+        nonlocal stage_fd
+        result = real_make_stage(parent_fd, prefix)
+        stage_fd = result[1]
+        return result
+
+    def track_close(descriptor: int) -> None:
+        nonlocal stage_closes
+        if descriptor == stage_fd:
+            stage_closes += 1
+        real_close(descriptor)
+
+    monkeypatch.setattr(_posix, "make_unique_stage", track_stage)
+    monkeypatch.setattr(_posix.os, "close", track_close)
+
+    def fail(draft: Draft) -> None:
+        raise ValueError("stop")
+
+    with pytest.raises(ValueError, match="stop"):
+        publish(tmp_path / "result", fail)
+
+    assert stage_closes == 1
+
+
+def test_stage_parent_sync_failure_cleans_stage_and_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stage_fd = -1
+    stage_closes = 0
+    failed = False
+    real_open_directory = _posix.open_directory_at
+    real_sync = _posix.sync_descriptor
+    real_close = os.close
+
+    def track_open(parent_fd: int, name: str) -> int:
+        nonlocal stage_fd
+        descriptor = real_open_directory(parent_fd, name)
+        if name.startswith(".servatus-stage-"):
+            stage_fd = descriptor
+        return descriptor
+
+    def fail_first_sync(descriptor: int) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("injected stage-parent sync failure")
+        real_sync(descriptor)
+
+    def track_close(descriptor: int) -> None:
+        nonlocal stage_closes
+        if descriptor == stage_fd:
+            stage_closes += 1
+        real_close(descriptor)
+
+    monkeypatch.setattr(_posix, "open_directory_at", track_open)
+    monkeypatch.setattr(_posix, "sync_descriptor", fail_first_sync)
+    monkeypatch.setattr(_posix.os, "close", track_close)
+
+    with pytest.raises(OSError, match="stage-parent sync failure"):
+        publish(tmp_path / "result", lambda draft: None)
+
+    assert stage_closes == 1
+    assert hidden_entries(tmp_path) == []
+
+
+def test_publish_rejects_nul_destination_before_build(tmp_path: Path) -> None:
+    built = False
+
+    def build(draft: Draft) -> None:
+        nonlocal built
+        built = True
+
+    with pytest.raises(UnsafePublication):
+        publish(tmp_path / "result\0truncated", build)
+
+    assert built is False
+    assert not (tmp_path / "result").exists()
+    assert hidden_entries(tmp_path) == []
+
+
 def test_destination_created_during_build_wins_without_overwrite(tmp_path: Path) -> None:
     destination = tmp_path / "result"
 
@@ -135,13 +223,23 @@ def test_link_creates_regular_file_with_same_inode(tmp_path: Path) -> None:
     assert linked.stat().st_ino == source.stat().st_ino
 
 
-@pytest.mark.parametrize("unsafe", ["", ".", "..", "../escape", "/absolute"])
+@pytest.mark.parametrize("unsafe", ["", ".", "..", "../escape", "/absolute", "safe\0truncated"])
 def test_link_rejects_escaping_paths(tmp_path: Path, unsafe: str) -> None:
     source = tmp_path / "source"
     source.write_text("value")
 
     with pytest.raises(UnsafePublication):
         publish(tmp_path / "result", lambda draft: draft.link(source, unsafe))
+
+    assert not (tmp_path / "result").exists()
+
+
+def test_link_rejects_nul_source_path(tmp_path: Path) -> None:
+    with pytest.raises(UnsafePublication):
+        publish(
+            tmp_path / "result",
+            lambda draft: draft.link(tmp_path / "source\0truncated", "source"),
+        )
 
     assert not (tmp_path / "result").exists()
 
@@ -214,6 +312,67 @@ def test_workspace_rejects_parent_path_substitution(tmp_path: Path) -> None:
     assert not (moved_parent / "result").exists()
 
 
+def test_parent_substitution_during_build_cannot_redirect_commit(tmp_path: Path) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    moved_parent = tmp_path / "moved-parent"
+    destination = parent / "result"
+    replacement_stage: Path | None = None
+
+    def substitute(draft: Draft) -> None:
+        nonlocal replacement_stage
+        (draft.path / "ours").write_text("ours")
+        stage_name = draft.path.name
+        parent.rename(moved_parent)
+        parent.mkdir()
+        replacement_stage = parent / stage_name
+        replacement_stage.mkdir()
+        (replacement_stage / "theirs").write_text("theirs")
+
+    with pytest.raises(UnsafePublication):
+        publish(destination, substitute)
+
+    assert not destination.exists()
+    assert not (moved_parent / "result").exists()
+    assert replacement_stage is not None
+    assert (replacement_stage / "theirs").read_text() == "theirs"
+
+
+def test_descriptor_bound_commit_resists_last_moment_parent_substitution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    moved_parent = tmp_path / "moved-parent"
+    replacement_parent = tmp_path / "replacement-parent"
+    destination = parent / "result"
+    real_commit = _posix.commit_noreplace
+
+    def substitute(parent_fd: int, source: str, destination_name: str) -> None:
+        parent.rename(moved_parent)
+        parent.mkdir()
+        colliding_stage = parent / source
+        colliding_stage.mkdir()
+        (colliding_stage / "theirs").write_text("theirs")
+        try:
+            real_commit(parent_fd, source, destination_name)
+        finally:
+            parent.rename(replacement_parent)
+            moved_parent.rename(parent)
+
+    monkeypatch.setattr(_posix, "commit_noreplace", substitute)
+
+    publication = publish(
+        destination,
+        lambda draft: (draft.path / "ours").write_text("ours"),
+    )
+
+    assert (publication.destination / "ours").read_text() == "ours"
+    colliding_stage = next(replacement_parent.glob(".servatus-stage-*"))
+    assert (colliding_stage / "theirs").read_text() == "theirs"
+    assert not (replacement_parent / "result").exists()
+
+
 def test_syncs_files_before_directories_and_parent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -257,6 +416,53 @@ def test_cleanup_failure_reports_committed_publication(
     assert publication.cleanup_pending is True
     assert (destination / "value").read_text() == "complete"
     assert len(hidden_entries(tmp_path)) == 1
+
+
+def test_identity_initialization_failure_allows_same_identity_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "result"
+    real_sync = _posix.sync_descriptor
+    failed = False
+
+    def fail_first_sync(descriptor: int) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("injected identity sync failure")
+        real_sync(descriptor)
+
+    monkeypatch.setattr(_posix, "sync_descriptor", fail_first_sync)
+    with (
+        pytest.raises(OSError, match="identity sync failure"),
+        Workspace(destination, identity=b"request"),
+    ):
+        pass
+
+    with Workspace(destination, identity=b"request") as workspace:
+        (workspace.path / "checkpoint").write_text("resumed")
+
+    container = hidden_entries(tmp_path)[0]
+    assert (container / ".identity").is_file()
+    assert list(container.glob(".identity-*.tmp")) == []
+
+
+def test_corrupt_identity_is_rejected_without_unbounded_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "result"
+    with Workspace(destination, identity=b"request"):
+        pass
+    identity = hidden_entries(tmp_path)[0] / ".identity"
+    identity.write_bytes(b"x" * 1_000_000)
+
+    def unexpected_read(descriptor: int, size: int) -> bytes:
+        del descriptor, size
+        raise AssertionError("oversized identity must be rejected before reading")
+
+    monkeypatch.setattr(_workspace.os, "read", unexpected_read)
+    with pytest.raises(WorkConflict), Workspace(destination, identity=b"request"):
+        pass
 
 
 def test_nested_workspace_can_feed_parent_publication(tmp_path: Path) -> None:

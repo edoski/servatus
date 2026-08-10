@@ -31,11 +31,12 @@ def require_supported_platform() -> None:
 
 def normalize_destination(destination: Path) -> tuple[Path, str]:
     raw = Path(destination)
+    reject_nul_path(raw)
     if not raw.name or raw.name in {".", ".."}:
         raise UnsafePublication("destination must name a directory inside an existing parent")
     try:
         parent = raw.parent.resolve(strict=True)
-    except OSError as error:
+    except (OSError, ValueError) as error:
         raise UnsafePublication("destination parent does not exist") from error
     if not parent.is_dir():
         raise UnsafePublication("destination parent is not a directory")
@@ -43,6 +44,7 @@ def normalize_destination(destination: Path) -> tuple[Path, str]:
 
 
 def open_directory(path: Path) -> int:
+    reject_nul_path(path)
     try:
         return os.open(path, _DIRECTORY_FLAGS)
     except OSError as error:
@@ -50,6 +52,7 @@ def open_directory(path: Path) -> int:
 
 
 def open_directory_at(parent_fd: int, name: str) -> int:
+    validate_leaf(name)
     try:
         descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
     except OSError as error:
@@ -66,6 +69,7 @@ def same_entry(left: os.stat_result, right: os.stat_result) -> bool:
 
 
 def ensure_entry(parent_fd: int, name: str, expected: os.stat_result) -> None:
+    validate_leaf(name)
     try:
         current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except OSError as error:
@@ -75,6 +79,7 @@ def ensure_entry(parent_fd: int, name: str, expected: os.stat_result) -> None:
 
 
 def ensure_directory_path(path: Path, descriptor: int) -> None:
+    reject_nul_path(path)
     try:
         current = path.stat(follow_symlinks=False)
     except OSError as error:
@@ -84,6 +89,7 @@ def ensure_directory_path(path: Path, descriptor: int) -> None:
 
 
 def make_directory_at(parent_fd: int, name: str) -> tuple[int, os.stat_result]:
+    validate_leaf(name)
     with suppress(FileExistsError):
         os.mkdir(name, mode=0o700, dir_fd=parent_fd)
     descriptor = open_directory_at(parent_fd, name)
@@ -91,15 +97,25 @@ def make_directory_at(parent_fd: int, name: str) -> tuple[int, os.stat_result]:
 
 
 def make_unique_stage(parent_fd: int, prefix: str) -> tuple[str, int, os.stat_result]:
+    validate_leaf(prefix)
     for _ in range(128):
         name = f"{prefix}{os.urandom(12).hex()}"
         try:
             os.mkdir(name, mode=0o700, dir_fd=parent_fd)
         except FileExistsError:
             continue
-        descriptor = open_directory_at(parent_fd, name)
-        sync_descriptor(parent_fd)
-        return name, descriptor, os.fstat(descriptor)
+        entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        descriptor = -1
+        try:
+            descriptor = open_directory_at(parent_fd, name)
+            entry = os.fstat(descriptor)
+            sync_descriptor(parent_fd)
+        except BaseException as error:
+            cleanup_after_failure(parent_fd, name, entry, error)
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
+        return name, descriptor, entry
     raise PublicationError("could not allocate a unique publication stage")
 
 
@@ -149,12 +165,24 @@ def _sync_regular_file(parent_fd: int, name: str, expected: os.stat_result) -> N
         os.close(descriptor)
 
 
-def commit_noreplace(parent_fd: int, parent: Path, source: str, destination: str) -> None:
+def reject_nul_path(path: Path) -> None:
+    if "\0" in os.fspath(path):
+        raise UnsafePublication(f"path contains an embedded NUL: {path!r}")
+
+
+def validate_leaf(name: str) -> None:
+    if not name or name in {".", ".."} or "/" in name or "\0" in name:
+        raise UnsafePublication(f"unsafe filesystem leaf: {name!r}")
+
+
+def commit_noreplace(parent_fd: int, source: str, destination: str) -> None:
     require_supported_platform()
+    validate_leaf(source)
+    validate_leaf(destination)
     if sys.platform.startswith("linux"):
         _linux_rename_noreplace(parent_fd, source, destination)
     else:
-        _macos_rename_noreplace(parent, source, destination)
+        _macos_rename_noreplace(parent_fd, source, destination)
 
 
 def _linux_rename_noreplace(parent_fd: int, source: str, destination: str) -> None:
@@ -182,17 +210,25 @@ def _linux_rename_noreplace(parent_fd: int, source: str, destination: str) -> No
         _raise_rename_error(ctypes.get_errno())
 
 
-def _macos_rename_noreplace(parent: Path, source: str, destination: str) -> None:
+def _macos_rename_noreplace(parent_fd: int, source: str, destination: str) -> None:
     library = ctypes.CDLL(None, use_errno=True)
     try:
-        renamex_np = library.renamex_np
+        renameatx_np = library.renameatx_np
     except AttributeError as error:
-        raise UnsupportedPlatform("libc does not expose renamex_np") from error
-    renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
-    renamex_np.restype = ctypes.c_int
-    result = renamex_np(
-        os.fsencode(parent / source),
-        os.fsencode(parent / destination),
+        raise UnsupportedPlatform("libc does not expose renameatx_np") from error
+    renameatx_np.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameatx_np.restype = ctypes.c_int
+    result = renameatx_np(
+        parent_fd,
+        os.fsencode(source),
+        parent_fd,
+        os.fsencode(destination),
         _RENAME_EXCL,
     )
     if result != 0:
@@ -214,6 +250,14 @@ def remove_tree_at(parent_fd: int, name: str, expected: os.stat_result) -> None:
     if not shutil.rmtree.avoids_symlink_attacks:
         raise UnsupportedPlatform("safe directory removal is unavailable")
     shutil.rmtree(name, dir_fd=parent_fd)
+    sync_descriptor(parent_fd)
+
+
+def remove_file_at(parent_fd: int, name: str, expected: os.stat_result) -> None:
+    ensure_entry(parent_fd, name, expected)
+    if not stat.S_ISREG(expected.st_mode):
+        raise UnsafePublication(f"cleanup target is not a regular file: {name}")
+    os.unlink(name, dir_fd=parent_fd)
     sync_descriptor(parent_fd)
 
 
@@ -258,14 +302,13 @@ def publication_attempt_at(
         ensure_entry(parent_fd, stage_name, stage_entry)
         sync_tree(stage_fd, stage_entry.st_dev)
         ensure_entry(parent_fd, stage_name, stage_entry)
-        commit_noreplace(parent_fd, parent, stage_name, destination_name)
+        ensure_directory_path(parent, parent_fd)
+        commit_noreplace(parent_fd, stage_name, destination_name)
         sync_descriptor(parent_fd)
         return parent / destination_name
     except BaseException as error:
         if stage_name and stage_entry is not None:
             cleanup_after_failure(parent_fd, stage_name, stage_entry, error)
-        if stage_fd >= 0:
-            os.close(stage_fd)
         raise
     finally:
         if stage_fd >= 0:
