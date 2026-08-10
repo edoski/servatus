@@ -221,6 +221,12 @@ same child and parent finalization remain exclusive and nonblocking. A failed ch
 its resumable private work, while a published child becomes immutable input under the parent work.
 Servatus does not track expected children, readiness, dependencies, or application completion.
 
+The owner-only hidden Workspace container is the lifecycle trust root. Within an authentic
+container, Servatus pins the lock and work entries so compliant concurrent opens and cleanup fail
+closed on substitution; an already active handle also rejects replacement of its container path.
+Servatus is not a defense against arbitrary same-account code renaming and recreating that entire
+trust root. Callers must protect its parent directory and run only trusted workers and builders.
+
 ## Guarantees and support boundary
 
 - Campaign files are owner-only, schema-versioned, symlink-safe, atomically replaced, and synced.

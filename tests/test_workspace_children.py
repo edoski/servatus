@@ -310,21 +310,30 @@ def test_completed_child_destination_blocks_stale_duplicate(tmp_path: Path) -> N
         pass
 
 
-@pytest.mark.parametrize("substitution", ["container", "lock", "work"])
+@pytest.mark.parametrize("substitution", ["lock", "work"])
 def test_child_rejects_lifecycle_entry_substitution(tmp_path: Path, substitution: str) -> None:
     parent = Workspace(tmp_path / "study", identity=b"study")
     with parent.child("method-0", identity=b"method-0") as child:
         container = child.path.parent
-        if substitution == "container":
-            container.rename(container.with_name(f"{container.name}-moved"))
-            container.mkdir()
+        entry = container / (".lock" if substitution == "lock" else "work")
+        entry.rename(container / f"{entry.name}-moved")
+        if substitution == "lock":
+            entry.write_text("replacement")
         else:
-            entry = container / (".lock" if substitution == "lock" else "work")
-            entry.rename(container / f"{entry.name}-moved")
-            if substitution == "lock":
-                entry.write_text("replacement")
-            else:
-                entry.mkdir()
+            entry.mkdir()
+        with pytest.raises(UnsafePublication):
+            child.publish(lambda draft: None)
+
+    assert not (tmp_path / "study").exists()
+
+
+def test_active_child_handle_rejects_container_path_replacement(tmp_path: Path) -> None:
+    parent = Workspace(tmp_path / "study", identity=b"study")
+    with parent.child("method-0", identity=b"method-0") as child:
+        container = child.path.parent
+        container.rename(container.with_name(f"{container.name}-moved"))
+        container.mkdir()
+
         with pytest.raises(UnsafePublication):
             child.publish(lambda draft: None)
 

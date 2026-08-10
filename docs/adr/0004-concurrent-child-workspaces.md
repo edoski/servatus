@@ -13,11 +13,17 @@ children may overlap; duplicate children and parent finalization fail immediatel
 
 Open and cleanup take a short exclusive `flock` on the pinned canonical destination-parent
 directory. While coordinated, Servatus checks that the canonical destination is absent, opens or
-creates the private hierarchy, and acquires lifecycle leases without blocking. This prevents a
-removed lock pathname from being recreated as an independently locked inode and avoids waiting on
-a lifecycle lease while holding coordination. Container, lifecycle-lock, and work entries remain
-pinned and are verified before publication and cleanup. The durable identity record binds their
-device and inode identities, so a later opener fails closed if any lifecycle pathname was replaced.
+creates the private hierarchy, and acquires lifecycle leases without blocking. This prevents
+compliant Servatus open and cleanup paths from splitting onto different lock inodes and avoids
+waiting on a lifecycle lease while holding coordination. Within the authentic owner-only container,
+the durable identity record binds the lifecycle-lock and work device/inode identities. An active
+handle also pins the container entry. These entries are verified before application access,
+publication, and cleanup.
+
+The hidden Workspace container is the lifecycle trust root. Arbitrary same-Unix-account code can
+rename and recreate that whole root, which an unprivileged library cannot distinguish from first
+initialization without a separate registry or broader lock. That behavior is outside the threat
+model; Servatus does not add external state or serialize unrelated destinations to claim otherwise.
 
 Child publication atomically retains one immutable result under parent work and removes only that
 child's private workspace. Child or parent failure preserves resumable work; parent success
