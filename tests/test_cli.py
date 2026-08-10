@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -64,7 +65,7 @@ def test_cli_plan_status_and_help(tmp_path: Path, capsys: object) -> None:
 
 
 def test_cli_validate_and_submit_exact_plan(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     tasks, resources, target = write_inputs(tmp_path)
     campaign = tmp_path / "campaign"
@@ -83,6 +84,7 @@ def test_cli_validate_and_submit_exact_plan(
             str(output),
         ]
     )
+    capsys.readouterr()
     calls: list[tuple[str, ...]] = []
 
     def fake(target_value: object, argv: tuple[str, ...], script: bytes) -> _slurm.Result:
@@ -93,6 +95,88 @@ def test_cli_validate_and_submit_exact_plan(
 
     monkeypatch.setattr(_slurm, "_run_ssh", fake)
     assert main(["validate", str(campaign), str(output)]) == 0
+    validation = json.loads(capsys.readouterr().out)
+    assert validation["time_specific"] is True
+    assert len(validation["results"]) == 1
+    result = validation["results"][0]
+    assert result["shape"] == {
+        "task_count": 1,
+        "cpus": 2,
+        "memory_mib": 1024,
+        "gpus": 0,
+        "time_limit": "00:10:00",
+    }
+    assert len(result["shape_digest"]) == 64
+    assert len(result["script_digest"]) == 64
+    assert result["controller_stdout"] == "valid now"
     assert main(["submit", str(campaign), str(output)]) == 0
     assert any(argv[-1] == "--test-only" for argv in calls)
     assert any(argv[-1] != "--test-only" for argv in calls)
+
+
+def test_cli_sensitive_script_diagnostic_is_explicit_and_plan_stays_redacted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    tasks, resources, target = write_inputs(tmp_path)
+    output = tmp_path / "PLAN.json"
+    assert (
+        main(
+            [
+                "plan",
+                str(tasks),
+                "--target",
+                str(target),
+                "--resources",
+                str(resources),
+                "--campaign",
+                str(tmp_path / "campaign"),
+                "--output",
+                str(output),
+                "--show-scripts",
+            ]
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    diagnostic = json.loads(captured.out)
+    assert diagnostic["sensitive"] is True
+    assert "expose task arguments and payloads" in captured.err
+    script = diagnostic["scripts"][0]["script"]
+    assert "run" in script
+    assert base64.b64encode(b"opaque\x00payload").decode() in script
+    persisted = output.read_text()
+    assert "opaque" not in persisted
+    assert "payload" not in persisted
+    assert base64.b64encode(b"opaque\x00payload").decode() not in persisted
+
+
+def test_cli_malformed_plan_is_concise_nonzero_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    tasks, resources, target = write_inputs(tmp_path)
+    campaign = tmp_path / "campaign"
+    output = tmp_path / "PLAN.json"
+    main(
+        [
+            "plan",
+            str(tasks),
+            "--target",
+            str(target),
+            "--resources",
+            str(resources),
+            "--campaign",
+            str(campaign),
+            "--output",
+            str(output),
+        ]
+    )
+    document = json.loads(output.read_text())
+    document["schema_version"] = True
+    output.write_text(json.dumps(document))
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exit_status:
+        main(["submit", str(campaign), str(output)])
+    assert exit_status.value.code == 2
+    error = capsys.readouterr().err
+    assert "plan document schema is unsupported" in error
+    assert "Traceback" not in error

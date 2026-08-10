@@ -81,6 +81,7 @@ def sbatch_argv(
     resources: ResourceRequest,
     task_count: int,
     allocation_id: str,
+    effective_time_limit: str,
 ) -> tuple[str, ...]:
     identity = f"servatus-{allocation_id}"
     argv = [
@@ -91,7 +92,7 @@ def sbatch_argv(
         f"--ntasks={task_count}",
         f"--cpus-per-task={resources.cpus_per_task}",
         f"--mem={task_count * resources.memory_mib_per_task}M",
-        f"--time={resources.time_limit}",
+        f"--time={effective_time_limit}",
         f"--partition={','.join(target.partitions)}",
         f"--chdir={target.work_root}",
         f"--job-name={identity}",

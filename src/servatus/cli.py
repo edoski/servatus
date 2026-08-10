@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from contextlib import suppress
 from pathlib import Path
 from typing import cast
@@ -17,7 +18,9 @@ from ._campaign import (
     Task,
     plan_document,
     restore_plan,
+    sensitive_script_document,
     validate_plan,
+    validation_document,
 )
 from ._errors import ServatusError
 
@@ -33,6 +36,11 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--campaign", type=Path, required=True)
     plan.add_argument("--output", type=Path, required=True)
     plan.add_argument("--tasks-per-allocation", type=int)
+    plan.add_argument(
+        "--show-scripts",
+        action="store_true",
+        help="print sensitive complete scripts, including task arguments and payloads",
+    )
 
     validate = commands.add_parser("validate", help="run bounded Slurm test-only validation")
     validate.add_argument("campaign", type=Path)
@@ -138,11 +146,18 @@ def _run(arguments: argparse.Namespace) -> None:
             tasks_per_allocation=arguments.tasks_per_allocation,
         )
         _write_json(arguments.output, plan_document(plan))
-        print(plan.digest)
+        if arguments.show_scripts:
+            print(
+                "warning: complete scripts expose task arguments and payloads",
+                file=sys.stderr,
+            )
+            print(json.dumps(sensitive_script_document(plan), sort_keys=True))
+        else:
+            print(plan.digest)
     elif command == "validate":
         campaign = Campaign._reopen(arguments.campaign)
         results = validate_plan(restore_plan(campaign, _read_json(arguments.plan)))
-        print(json.dumps({"validated_shapes": len(results), "time_specific": True}))
+        print(json.dumps(validation_document(results), sort_keys=True))
     elif command == "submit":
         campaign = Campaign._reopen(arguments.campaign)
         receipts = campaign.submit(restore_plan(campaign, _read_json(arguments.plan)))

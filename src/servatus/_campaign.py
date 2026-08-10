@@ -31,7 +31,7 @@ _SCHEMA_VERSION = 1
 _PLAN_SCHEMA_VERSION = 1
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
-_GRES = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*(?::[A-Za-z0-9][A-Za-z0-9._-]*)?\Z")
+_GRES = re.compile(r"gpu(?::[A-Za-z0-9][A-Za-z0-9._-]*)?\Z")
 _DURATION = re.compile(r"(?:(0|[1-9][0-9]*)-)?([0-9]{2}):([0-5][0-9]):([0-5][0-9])\Z")
 _HEX_24 = re.compile(r"[0-9a-f]{24}\Z")
 _HEX_32 = re.compile(r"[0-9a-f]{32}\Z")
@@ -63,6 +63,17 @@ def _duration_seconds(value: object, *, name: str) -> int:
     return seconds
 
 
+def _effective_time_limit(value: str) -> str:
+    seconds = _duration_seconds(value, name="time_limit")
+    rounded = ((seconds + 59) // 60) * 60
+    days, remainder = divmod(rounded, 24 * 60 * 60)
+    hours, remainder = divmod(remainder, 60 * 60)
+    minutes = remainder // 60
+    if days:
+        return f"{days}-{hours:02d}:{minutes:02d}:00"
+    return f"{hours:02d}:{minutes:02d}:00"
+
+
 def _safe_token(value: object, *, name: str, optional: bool = False) -> str | None:
     if value is None and optional:
         return None
@@ -72,9 +83,11 @@ def _safe_token(value: object, *, name: str, optional: bool = False) -> str | No
 
 
 def _absolute_path(value: object, *, name: str) -> PurePosixPath:
-    if not isinstance(value, (str, PurePosixPath)):
+    if not isinstance(value, (str, os.PathLike)):
         raise ConfigurationError(f"{name} must be an absolute POSIX path")
-    raw = str(value)
+    raw = cast(str | bytes, os.fspath(value))
+    if not isinstance(raw, str):
+        raise ConfigurationError(f"{name} must be an absolute POSIX path")
     path = PurePosixPath(raw)
     if _CONTROL.search(raw) or not path.is_absolute() or ".." in path.parts or raw != str(path):
         raise ConfigurationError(f"{name} must be a normalized absolute POSIX path")
@@ -187,7 +200,7 @@ class SlurmTarget:
     def __post_init__(self) -> None:
         _safe_token(self.host, name="host")
         for name in ("slurm_bin", "apptainer", "image", "work_root", "log_root"):
-            _absolute_path(getattr(self, name), name=name)
+            object.__setattr__(self, name, _absolute_path(getattr(self, name), name=name))
         _configuration(
             isinstance(self.partitions, tuple) and bool(self.partitions),
             "partitions must be a nonempty tuple",
@@ -345,6 +358,15 @@ class CampaignStatus:
     ambiguous_allocation_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _ValidationResult:
+    shape: dict[str, object]
+    shape_digest: str
+    script_digest: str
+    controller_stdout: str
+    controller_stderr: str
+
+
 def _canonical(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
@@ -417,11 +439,13 @@ def _target_from_dict(value: object) -> SlurmTarget:
     if not isinstance(value, dict):
         raise PlanError("plan target is invalid")
     mapping = cast(dict[str, object], value)
+    if frozenset(mapping) != SlurmTarget._REQUIRED | SlurmTarget._OPTIONAL:
+        raise PlanError("plan target keys are invalid")
     try:
         partitions = mapping["partitions"]
         if not isinstance(partitions, list):
             raise TypeError
-        return SlurmTarget(
+        target = SlurmTarget(
             host=cast(str, mapping["host"]),
             slurm_bin=PurePosixPath(cast(str, mapping["slurm_bin"])),
             apptainer=PurePosixPath(cast(str, mapping["apptainer"])),
@@ -443,14 +467,19 @@ def _target_from_dict(value: object) -> SlurmTarget:
         )
     except (KeyError, TypeError, ConfigurationError) as error:
         raise PlanError("plan target is invalid") from error
+    if _target_dict(target) != mapping:
+        raise PlanError("plan target types are invalid")
+    return target
 
 
 def _resource_from_dict(value: object) -> ResourceRequest:
     if not isinstance(value, dict):
         raise PlanError("plan resources are invalid")
     mapping = cast(dict[str, object], value)
+    if frozenset(mapping) != ResourceRequest._KEYS:
+        raise PlanError("plan resource keys are invalid")
     try:
-        return ResourceRequest(
+        resources = ResourceRequest(
             cpus_per_task=cast(int, mapping["cpus_per_task"]),
             memory_mib_per_task=cast(int, mapping["memory_mib_per_task"]),
             gpus_per_task=cast(int, mapping["gpus_per_task"]),
@@ -458,6 +487,9 @@ def _resource_from_dict(value: object) -> ResourceRequest:
         )
     except (KeyError, ConfigurationError) as error:
         raise PlanError("plan resources are invalid") from error
+    if _resource_dict(resources) != mapping:
+        raise PlanError("plan resource types are invalid")
+    return resources
 
 
 def _allocation_summary(item: _AllocationPlan) -> dict[str, object]:
@@ -469,8 +501,20 @@ def _allocation_summary(item: _AllocationPlan) -> dict[str, object]:
         "memory_mib": allocation.memory_mib,
         "gpus": allocation.gpus,
         "time_limit": allocation.time_limit,
+        "sbatch_argv": list(item.argv),
         "script_digest": item.script_digest,
         "argv_digest": item.argv_digest,
+    }
+
+
+def _lineage(target: SlurmTarget, resources: ResourceRequest) -> dict[str, object]:
+    target_values = _target_dict(target)
+    resource_values = _resource_dict(resources)
+    return {
+        "target": target_values,
+        "resources": resource_values,
+        "target_digest": _digest(target_values),
+        "resource_digest": _digest(resource_values),
     }
 
 
@@ -492,6 +536,20 @@ def plan_document(plan: SubmissionPlan) -> dict[str, object]:
         "schema_version": _PLAN_SCHEMA_VERSION,
         **_plan_semantics(plan),
         "digest": plan.digest,
+    }
+
+
+def sensitive_script_document(plan: SubmissionPlan) -> dict[str, object]:
+    return {
+        "sensitive": True,
+        "plan_digest": plan.digest,
+        "scripts": [
+            {
+                "allocation_id": allocation.allocation_id,
+                "script": allocation.script.decode("utf-8"),
+            }
+            for allocation in plan._allocations
+        ],
     }
 
 
@@ -566,12 +624,7 @@ class Campaign:
         if any(key not in accepted for key in retry_values):
             raise PlanError("retry requires an earlier accepted receipt")
         lineage = state["lineage"]
-        target_digest = _digest(_target_dict(target))
-        resource_digest = _digest(_resource_dict(resources))
-        if lineage is not None and lineage != {
-            "target_digest": target_digest,
-            "resource_digest": resource_digest,
-        }:
+        if lineage is not None and lineage != _lineage(target, resources):
             raise PlanError("campaign is bound to different target or resource semantics")
         capacity = _capacity(target, resources)
         if tasks_per_allocation is not None:
@@ -601,6 +654,7 @@ class Campaign:
             }
         )
         allocations: list[_AllocationPlan] = []
+        effective_time_limit = _effective_time_limit(resources.time_limit)
         for index, group in enumerate(groups):
             allocation_id = hashlib.sha256(f"{seed}:{index}".encode()).hexdigest()[:24]
             script = _slurm.render_script(target, resources, group, allocation_id)
@@ -609,13 +663,19 @@ class Campaign:
                     f"rendered script is {len(script)} bytes; target permits "
                     f"{target.max_script_bytes}"
                 )
-            argv = _slurm.sbatch_argv(target, resources, len(group), allocation_id)
+            argv = _slurm.sbatch_argv(
+                target,
+                resources,
+                len(group),
+                allocation_id,
+                effective_time_limit,
+            )
             public = PlannedAllocation(
                 task_keys=tuple(task.key for task in group),
                 cpus=len(group) * resources.cpus_per_task,
                 memory_mib=len(group) * resources.memory_mib_per_task,
                 gpus=len(group) * resources.gpus_per_task,
-                time_limit=resources.time_limit,
+                time_limit=effective_time_limit,
             )
             allocations.append(
                 _AllocationPlan(
@@ -771,10 +831,7 @@ class Campaign:
         if _ambiguous_ids(state):
             raise AmbiguousSubmission("resolve ambiguous allocation intent before submission")
         lineage = state["lineage"]
-        expected = {
-            "target_digest": _digest(_target_dict(plan._target)),
-            "resource_digest": _digest(_resource_dict(plan._resources)),
-        }
+        expected = _lineage(plan._target, plan._resources)
         if lineage is not None and lineage != expected:
             raise PlanError("campaign is bound to different target or resource semantics")
 
@@ -790,10 +847,7 @@ class Campaign:
             assert state is not None
             if state["revision"] != expected_revision or _ambiguous_ids(state):
                 raise PlanError("campaign changed before submission intent")
-            lineage = {
-                "target_digest": _digest(_target_dict(plan._target)),
-                "resource_digest": _digest(_resource_dict(plan._resources)),
-            }
+            lineage = _lineage(plan._target, plan._resources)
             if state["lineage"] is None:
                 state["lineage"] = lineage
             elif state["lineage"] != lineage:
@@ -807,6 +861,13 @@ class Campaign:
                     "argv_digest": allocation.argv_digest,
                     "target_digest": lineage["target_digest"],
                     "resource_digest": lineage["resource_digest"],
+                    "allocation": {
+                        "cpus": allocation.allocation.cpus,
+                        "memory_mib": allocation.allocation.memory_mib,
+                        "gpus": allocation.allocation.gpus,
+                        "time_limit": allocation.allocation.time_limit,
+                    },
+                    "sbatch_argv": list(allocation.argv),
                     "job_name": f"servatus-{allocation.allocation_id}",
                     "window_start": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S"),
                     "window_end": (now + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S"),
@@ -872,22 +933,29 @@ class Campaign:
         descriptor = self._active_descriptor
         _validate_state(state)
         encoded = _canonical(state) + b"\n"
+        if len(encoded) > _MAX_STATE_BYTES:
+            raise TaskConflict(
+                f"campaign state is {len(encoded)} bytes; maximum is {_MAX_STATE_BYTES}"
+            )
         name = f".campaign-{os.urandom(12).hex()}.tmp"
-        stage = os.open(
-            name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-            0o600,
-            dir_fd=descriptor,
-        )
+        stage = -1
+        installed = False
         try:
+            stage = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=descriptor,
+            )
             view = memoryview(encoded)
             while view:
                 written = os.write(stage, view)
+                if written <= 0:
+                    raise OSError("campaign state write made no progress")
                 view = view[written:]
             os.fsync(stage)
-        finally:
             os.close(stage)
-        try:
+            stage = -1
             try:
                 current = os.stat("campaign.json", dir_fd=descriptor, follow_symlinks=False)
             except FileNotFoundError:
@@ -895,10 +963,15 @@ class Campaign:
             if current is not None:
                 _require_owner_file(current, "campaign.json")
             os.replace(name, "campaign.json", src_dir_fd=descriptor, dst_dir_fd=descriptor)
+            installed = True
             os.fsync(descriptor)
         except BaseException:
-            with suppress(FileNotFoundError):
-                os.unlink(name, dir_fd=descriptor)
+            if stage >= 0:
+                with suppress(OSError):
+                    os.close(stage)
+            if not installed:
+                with suppress(FileNotFoundError):
+                    os.unlink(name, dir_fd=descriptor)
             raise
 
 
@@ -915,8 +988,8 @@ def _ordered_selection(
 
 
 def _capacity(target: SlurmTarget, resources: ResourceRequest) -> int:
-    if _duration_seconds(resources.time_limit, name="time_limit") > _duration_seconds(
-        target.max_time_limit, name="max_time_limit"
+    if _duration_seconds(_effective_time_limit(resources.time_limit), name="time_limit") > (
+        _duration_seconds(_effective_time_limit(target.max_time_limit), name="max_time_limit")
     ):
         raise PlanError("time_limit exceeds target ceiling")
     capacities = [
@@ -990,9 +1063,51 @@ def _open_or_create_directory(path: Path) -> tuple[Path, os.stat_result]:
     if "\0" in raw:
         raise TaskConflict("campaign path contains NUL")
     normalized = Path(os.path.abspath(raw))
-    with suppress(FileExistsError):
-        os.mkdir(normalized, 0o700)
-    return _open_existing_directory(normalized)
+    name = normalized.name
+    if name in {"", ".", ".."}:
+        raise TaskConflict("campaign path must name one directory")
+    try:
+        parent_fd = os.open(
+            normalized.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError as error:
+        raise TaskConflict("campaign parent is unavailable or unsafe") from error
+    child_fd = -1
+    created = False
+    try:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            created = True
+        except FileExistsError:
+            pass
+        try:
+            child_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        except OSError as error:
+            raise TaskConflict("campaign directory is unavailable or unsafe") from error
+        entry = os.fstat(child_fd)
+        _require_owner_directory(entry)
+        if created:
+            os.fsync(parent_fd)
+        return normalized, entry
+    except BaseException as error:
+        if created:
+            try:
+                os.rmdir(name, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            except OSError as cleanup_error:
+                error.add_note(
+                    f"Servatus could not remove unsynced campaign directory: {cleanup_error}"
+                )
+        raise
+    finally:
+        if child_fd >= 0:
+            os.close(child_fd)
+        os.close(parent_fd)
 
 
 def _open_existing_directory(path: Path) -> tuple[Path, os.stat_result]:
@@ -1000,7 +1115,12 @@ def _open_existing_directory(path: Path) -> tuple[Path, os.stat_result]:
     if "\0" in raw:
         raise TaskConflict("campaign path contains NUL")
     normalized = Path(os.path.abspath(raw))
-    descriptor = os.open(normalized, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        descriptor = os.open(
+            normalized, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+    except OSError as error:
+        raise TaskConflict("campaign directory is unavailable or unsafe") from error
     try:
         entry = os.fstat(descriptor)
         _require_owner_directory(entry)
@@ -1095,26 +1215,42 @@ def _validate_state(state: dict[str, object]) -> None:
     )
     if len(set(task_keys)) != len(task_keys):
         raise TaskConflict("campaign task keys are not unique")
-    _validate_lineage(state["lineage"])
-    intents = _validate_intents(cast(list[object], state["intents"]), task_keys)
+    lineage = _validate_lineage(state["lineage"])
+    intents = _validate_intents(cast(list[object], state["intents"]), task_keys, lineage)
     _validate_receipts(cast(list[object], state["receipts"]), intents)
     _validate_resolutions(cast(list[object], state["resolutions"]), intents)
 
 
-def _validate_lineage(value: object) -> None:
+def _validate_lineage(
+    value: object,
+) -> tuple[SlurmTarget, ResourceRequest] | None:
     if value is None:
-        return
+        return None
     if not isinstance(value, dict):
         raise TaskConflict("campaign lineage is invalid")
     lineage = cast(dict[str, object], value)
-    if set(lineage) != {"target_digest", "resource_digest"} or any(
-        not isinstance(digest, str) or _HEX_64.fullmatch(digest) is None
-        for digest in lineage.values()
+    if set(lineage) != {"target", "resources", "target_digest", "resource_digest"}:
+        raise TaskConflict("campaign lineage is invalid")
+    try:
+        target = _target_from_dict(lineage["target"])
+        resources = _resource_from_dict(lineage["resources"])
+    except PlanError as error:
+        raise TaskConflict("campaign lineage is invalid") from error
+    if (
+        lineage["target"] != _target_dict(target)
+        or lineage["resources"] != _resource_dict(resources)
+        or lineage["target_digest"] != _digest(_target_dict(target))
+        or lineage["resource_digest"] != _digest(_resource_dict(resources))
     ):
         raise TaskConflict("campaign lineage is invalid")
+    return target, resources
 
 
-def _validate_intents(value: object, task_keys: tuple[str, ...]) -> dict[str, tuple[str, ...]]:
+def _validate_intents(
+    value: object,
+    task_keys: tuple[str, ...],
+    lineage: tuple[SlurmTarget, ResourceRequest] | None,
+) -> dict[str, tuple[str, ...]]:
     if not isinstance(value, list):
         raise TaskConflict("campaign intents are invalid")
     expected = {
@@ -1125,6 +1261,8 @@ def _validate_intents(value: object, task_keys: tuple[str, ...]) -> dict[str, tu
         "argv_digest",
         "target_digest",
         "resource_digest",
+        "allocation",
+        "sbatch_argv",
         "job_name",
         "window_start",
         "window_end",
@@ -1151,6 +1289,9 @@ def _validate_intents(value: object, task_keys: tuple[str, ...]) -> dict[str, tu
             or len(set(intent_keys)) != len(intent_keys)
         ):
             raise TaskConflict("campaign intent task keys are invalid")
+        if lineage is None:
+            raise TaskConflict("campaign intent has no resource lineage")
+        target, resources = lineage
         for name in (
             "plan_digest",
             "script_digest",
@@ -1161,6 +1302,40 @@ def _validate_intents(value: object, task_keys: tuple[str, ...]) -> dict[str, tu
             digest = intent[name]
             if not isinstance(digest, str) or _HEX_64.fullmatch(digest) is None:
                 raise TaskConflict("campaign intent digest is invalid")
+        if intent["target_digest"] != _digest(_target_dict(target)) or intent[
+            "resource_digest"
+        ] != _digest(_resource_dict(resources)):
+            raise TaskConflict("campaign intent lineage is invalid")
+        allocation = intent["allocation"]
+        argv = intent["sbatch_argv"]
+        if not isinstance(allocation, dict) or not isinstance(argv, list):
+            raise TaskConflict("campaign intent provenance is invalid")
+        totals = cast(dict[str, object], allocation)
+        typed_argv = cast(list[object], argv)
+        task_count = len(intent_keys)
+        expected_totals = {
+            "cpus": task_count * resources.cpus_per_task,
+            "memory_mib": task_count * resources.memory_mib_per_task,
+            "gpus": task_count * resources.gpus_per_task,
+            "time_limit": _effective_time_limit(resources.time_limit),
+        }
+        expected_argv = list(
+            _slurm.sbatch_argv(
+                target,
+                resources,
+                task_count,
+                allocation_id,
+                _effective_time_limit(resources.time_limit),
+            )
+        )
+        if (
+            totals != expected_totals
+            or not typed_argv
+            or any(not isinstance(argument, str) or "\0" in argument for argument in typed_argv)
+            or typed_argv != expected_argv
+            or intent["argv_digest"] != _digest(typed_argv)
+        ):
+            raise TaskConflict("campaign intent provenance is invalid")
         if intent["job_name"] != f"servatus-{allocation_id}" or any(
             not isinstance(intent[name], str) or _CONTROL.search(cast(str, intent[name]))
             for name in ("window_start", "window_end")
@@ -1221,12 +1396,120 @@ def _validate_resolutions(value: object, intents: dict[str, tuple[str, ...]]) ->
         seen.add(allocation_id)
 
 
-def restore_plan(campaign: Campaign, document: object) -> SubmissionPlan:
+def _plan_integer(value: object, *, minimum: int, name: str) -> int:
+    if type(value) is not int or value < minimum:
+        raise PlanError(f"plan {name} must be an integer >= {minimum}")
+    return value
+
+
+def _plan_strings(value: object, *, name: str, nonempty: bool = False) -> list[str]:
+    if not isinstance(value, list):
+        raise PlanError(f"plan {name} must be an array of strings")
+    strings: list[str] = []
+    for item in cast(list[object], value):
+        if not isinstance(item, str) or "\0" in item:
+            raise PlanError(f"plan {name} must be an array of strings")
+        strings.append(item)
+    if nonempty and not strings:
+        raise PlanError(f"plan {name} cannot be empty")
+    return strings
+
+
+def _validate_plan_document(document: object) -> dict[str, object]:
     if not isinstance(document, dict):
         raise PlanError("plan document must be an object")
     mapping = cast(dict[str, object], document)
-    if mapping.get("schema_version") != _PLAN_SCHEMA_VERSION:
+    expected = {
+        "schema_version",
+        "campaign_id",
+        "state_revision",
+        "target",
+        "resources",
+        "completed",
+        "retry",
+        "tasks_per_allocation",
+        "allocations",
+        "digest",
+    }
+    if set(mapping) != expected:
+        raise PlanError("plan document keys are invalid")
+    if (
+        type(mapping["schema_version"]) is not int
+        or mapping["schema_version"] != _PLAN_SCHEMA_VERSION
+    ):
         raise PlanError("plan document schema is unsupported")
+    campaign_id = mapping["campaign_id"]
+    digest = mapping["digest"]
+    if not isinstance(campaign_id, str) or _HEX_32.fullmatch(campaign_id) is None:
+        raise PlanError("plan campaign identity is invalid")
+    _plan_integer(mapping["state_revision"], minimum=0, name="state_revision")
+    _target_from_dict(mapping["target"])
+    _resource_from_dict(mapping["resources"])
+    completed = _plan_strings(mapping["completed"], name="completed")
+    retry = _plan_strings(mapping["retry"], name="retry")
+    if len(set(completed)) != len(completed) or len(set(retry)) != len(retry):
+        raise PlanError("plan selections contain duplicate task keys")
+    tasks_per = mapping["tasks_per_allocation"]
+    if tasks_per is not None:
+        _plan_integer(tasks_per, minimum=1, name="tasks_per_allocation")
+    allocations = mapping["allocations"]
+    if not isinstance(allocations, list):
+        raise PlanError("plan allocations must be an array")
+    for raw in cast(list[object], allocations):
+        _validate_plan_allocation(raw)
+    if not isinstance(digest, str) or _HEX_64.fullmatch(digest) is None:
+        raise PlanError("plan digest is invalid")
+    return mapping
+
+
+def _validate_plan_allocation(value: object) -> None:
+    if not isinstance(value, dict):
+        raise PlanError("plan allocation must be an object")
+    allocation = cast(dict[str, object], value)
+    expected = {
+        "allocation_id",
+        "task_keys",
+        "cpus",
+        "memory_mib",
+        "gpus",
+        "time_limit",
+        "sbatch_argv",
+        "script_digest",
+        "argv_digest",
+    }
+    if set(allocation) != expected:
+        raise PlanError("plan allocation keys are invalid")
+    allocation_id = allocation["allocation_id"]
+    time_limit = allocation["time_limit"]
+    script_digest = allocation["script_digest"]
+    argv_digest = allocation["argv_digest"]
+    if not isinstance(allocation_id, str) or _HEX_24.fullmatch(allocation_id) is None:
+        raise PlanError("plan allocation identity is invalid")
+    task_keys = _plan_strings(allocation["task_keys"], name="task_keys", nonempty=True)
+    if len(set(task_keys)) != len(task_keys):
+        raise PlanError("plan allocation task keys are not unique")
+    _plan_integer(allocation["cpus"], minimum=1, name="allocation cpus")
+    _plan_integer(allocation["memory_mib"], minimum=1, name="allocation memory_mib")
+    _plan_integer(allocation["gpus"], minimum=0, name="allocation gpus")
+    try:
+        effective_seconds = _duration_seconds(time_limit, name="time_limit")
+    except ConfigurationError as error:
+        raise PlanError("plan allocation time_limit is invalid") from error
+    if not isinstance(time_limit, str) or effective_seconds % 60:
+        raise PlanError("plan allocation time_limit must be an effective minute duration")
+    argv = _plan_strings(allocation["sbatch_argv"], name="sbatch_argv", nonempty=True)
+    if not isinstance(script_digest, str) or _HEX_64.fullmatch(script_digest) is None:
+        raise PlanError("plan allocation script digest is invalid")
+    if (
+        not isinstance(argv_digest, str)
+        or _HEX_64.fullmatch(argv_digest) is None
+        or argv_digest != _digest(argv)
+    ):
+        raise PlanError("plan allocation command digest is invalid")
+
+
+def restore_plan(campaign: Campaign, document: object) -> SubmissionPlan:
+    mapping = _validate_plan_document(document)
     try:
         completed = cast(list[str], mapping["completed"])
         retry = cast(list[str], mapping["retry"])
@@ -1247,26 +1530,57 @@ def restore_plan(campaign: Campaign, document: object) -> SubmissionPlan:
     return plan
 
 
-def validate_plan(plan: SubmissionPlan) -> tuple[_slurm.Result, ...]:
+def validate_plan(plan: SubmissionPlan) -> tuple[_ValidationResult, ...]:
     seen: set[tuple[int, int, int, int, str]] = set()
-    results: list[_slurm.Result] = []
+    results: list[_ValidationResult] = []
     for item in plan._allocations:
         allocation = item.allocation
-        shape = (
+        shape_key = (
             len(allocation.task_keys),
             allocation.cpus,
             allocation.memory_mib,
             allocation.gpus,
             allocation.time_limit,
         )
-        if shape in seen:
+        if shape_key in seen:
             continue
-        seen.add(shape)
+        seen.add(shape_key)
         result = _slurm.validate_allocation(plan._target, item.argv, item.script)
         if result.returncode != 0:
             raise SubmissionError(
                 "Slurm rejected a time-specific validation: "
                 + result.stderr.decode("utf-8", "replace").strip()
             )
-        results.append(result)
+        shape: dict[str, object] = {
+            "task_count": len(allocation.task_keys),
+            "cpus": allocation.cpus,
+            "memory_mib": allocation.memory_mib,
+            "gpus": allocation.gpus,
+            "time_limit": allocation.time_limit,
+        }
+        results.append(
+            _ValidationResult(
+                shape,
+                _digest(shape),
+                item.script_digest,
+                result.stdout.decode("utf-8", "replace").rstrip("\n"),
+                result.stderr.decode("utf-8", "replace").rstrip("\n"),
+            )
+        )
     return tuple(results)
+
+
+def validation_document(results: tuple[_ValidationResult, ...]) -> dict[str, object]:
+    return {
+        "time_specific": True,
+        "results": [
+            {
+                "shape": result.shape,
+                "shape_digest": result.shape_digest,
+                "script_digest": result.script_digest,
+                "controller_stdout": result.controller_stdout,
+                "controller_stderr": result.controller_stderr,
+            }
+            for result in results
+        ],
+    }

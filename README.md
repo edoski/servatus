@@ -42,6 +42,10 @@ count, and time uses canonical `[days-]hours:minutes:seconds`. One request appli
 one Campaign. CPU-only, one-GPU, and one-process whole-multi-GPU tasks are supported. A project uses
 separate Campaigns for different resource shapes.
 
+The request retains the authored wall time for provenance. Plans and `sbatch` show Slurm's effective
+limit, rounded upward once to whole minutes. The same rounding is applied before comparing a request
+with the target ceiling; packed task count never multiplies wall time.
+
 `RESOURCES.toml` contains exactly four required values:
 
 ```toml
@@ -101,6 +105,9 @@ The Python interface is authoritative. The CLI task JSONL adapter has exactly `k
 ```sh
 servatus plan TASKS.jsonl --target TARGET.toml --resources RESOURCES.toml \
   --campaign STATE_DIR --output PLAN.json --tasks-per-allocation 4
+# Explicit sensitive diagnostic; prints complete scripts, arguments, and payloads:
+servatus plan TASKS.jsonl --target TARGET.toml --resources RESOURCES.toml \
+  --campaign STATE_DIR --output PLAN.json --show-scripts
 servatus validate STATE_DIR PLAN.json
 servatus submit STATE_DIR PLAN.json
 servatus status STATE_DIR
@@ -109,9 +116,12 @@ servatus resolve STATE_DIR ALLOCATION_ID --job-id 1234 --cluster alpha
 servatus resolve STATE_DIR ALLOCATION_ID --not-submitted
 ```
 
-`PLAN.json` contains task keys, resources, target values, allocation identities, and digests—not
-arguments or stdin. `validate` makes one serial `sbatch --test-only` call per distinct allocation
-shape. Its answer is time-specific and does not submit or mutate campaign state.
+`PLAN.json` contains task keys, requested resources, effective allocation totals, target values,
+exact nonsecret `sbatch` arguments, allocation identities, and digests—not task arguments or stdin.
+Complete scripts are shown only by the warning-bearing `--show-scripts` diagnostic. `validate`
+makes one serial `sbatch --test-only` call per distinct allocation shape and prints each stable
+shape/script digest plus the controller response. Its answer is time-specific and does not submit
+or mutate campaign state.
 
 An intent without a receipt is ambiguous. `reconcile` performs one bounded `squeue`/`sacct` query
 and adopts only one exact Servatus identity. Otherwise an operator must resolve it explicitly as an
@@ -166,6 +176,8 @@ publication completes. It owns contents, validation, schemas, and completion mea
 ## Guarantees and support boundary
 
 - Campaign files are owner-only, schema-versioned, symlink-safe, atomically replaced, and synced.
+- Intent preserves the normalized route, guardrails, requested resources, exact allocation totals,
+  and reviewed nonsecret `sbatch` command before external acceptance.
 - A destination is absent or one complete directory; it is never overwritten.
 - Work, hard-link sources, stages, and destination must share a filesystem.
 - Files and directories are synced before a kernel-exclusive commit; the parent is synced after.

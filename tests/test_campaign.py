@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import copy
 import json
+import os
+import stat
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
@@ -96,6 +99,39 @@ def test_strict_toml_rejects_unknown_and_counted_gres(tmp_path: Path) -> None:
         target(image=PurePosixPath("relative.sif"))
 
 
+@pytest.mark.parametrize(
+    "gres",
+    ["scratch", "gpu:2", "gpu:a100:2", "gpu:a100/bad", "gpu:a100\n"],
+)
+def test_gpu_gres_accepts_only_count_free_gpu_family(gres: str) -> None:
+    with pytest.raises(ConfigurationError):
+        target(gpu_gres=gres)
+
+
+def test_target_toml_rejects_non_gpu_gres_family(tmp_path: Path) -> None:
+    path = tmp_path / "target.toml"
+    path.write_text(
+        'host = "login.example.edu"\nslurm_bin = "/opt/slurm/bin"\n'
+        'apptainer = "/usr/bin/apptainer"\nimage = "/images/work.sif"\n'
+        'work_root = "/work"\nlog_root = "/logs"\npartitions = ["gpu"]\n'
+        'gpu_gres = "scratch"\nmax_tasks_per_allocation = 1\n'
+        "max_cpus_per_allocation = 8\nmax_memory_mib_per_allocation = 8192\n"
+        'max_gpus_per_allocation = 1\nmax_time_limit = "01:00:00"\n'
+        "max_allocations_per_submit = 1\nmax_script_bytes = 1048576\n"
+    )
+    with pytest.raises(ConfigurationError):
+        SlurmTarget.from_toml(path)
+
+
+def test_direct_target_normalizes_pathlike_values_and_rejects_other_types() -> None:
+    direct = target(slurm_bin="/opt/slurm/bin", image=Path("/images/work.sif"))
+    assert direct.slurm_bin == PurePosixPath("/opt/slurm/bin")
+    assert direct.image == PurePosixPath("/images/work.sif")
+    assert isinstance(direct.slurm_bin, PurePosixPath)
+    with pytest.raises(ConfigurationError):
+        target(slurm_bin=7)
+
+
 def test_campaign_freezes_task_order_and_payload(tmp_path: Path) -> None:
     path = tmp_path / "campaign"
     original = tasks(2)
@@ -150,7 +186,7 @@ def test_empty_campaign_has_empty_plan(tmp_path: Path) -> None:
         {"max_cpus_per_allocation": 31},
         {"max_memory_mib_per_allocation": 65535},
         {"max_gpus_per_allocation": 0, "gpu_gres": None},
-        {"max_time_limit": "2-23:59:59"},
+        {"max_time_limit": "2-23:58:59"},
     ],
 )
 def test_every_target_ceiling_can_reject_one_task(
@@ -224,6 +260,36 @@ def test_plan_is_local_stable_and_public_document_redacts_payload(
     assert "value with spaces" not in encoded
 
 
+def test_effective_slurm_time_is_rounded_once_and_requested_time_is_preserved(
+    tmp_path: Path,
+) -> None:
+    campaign = Campaign.open(tmp_path / "campaign", tasks(4))
+    plan = campaign.plan(
+        target(max_time_limit="00:00:01"),
+        resources(time_limit="00:00:30"),
+    )
+    document = _campaign.plan_document(plan)
+    assert document["resources"] == {
+        "cpus_per_task": 32,
+        "memory_mib_per_task": 65536,
+        "gpus_per_task": 1,
+        "time_limit": "00:00:30",
+    }
+    assert plan.allocations[0].time_limit == "00:01:00"
+    assert "--time=00:01:00" in plan._allocations[0].argv
+
+    seconds = Campaign.open(tmp_path / "seconds", tasks(1)).plan(
+        target(), resources(time_limit="01:02:03")
+    )
+    assert seconds.allocations[0].time_limit == "01:03:00"
+    assert "--time=01:03:00" in seconds._allocations[0].argv
+
+    with pytest.raises(PlanError, match="time_limit"):
+        Campaign.open(tmp_path / "too-long", tasks(1)).plan(
+            target(max_time_limit="00:01:00"), resources(time_limit="00:01:01")
+        )
+
+
 def test_script_size_exact_boundary(tmp_path: Path) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(1))
     roomy = campaign.plan(target(), resources())
@@ -245,6 +311,15 @@ def test_submit_records_intent_before_ssh_and_receipt(
         state = json.loads((tmp_path / "campaign" / "campaign.json").read_text())
         assert len(state["intents"]) == 1
         assert state["receipts"] == []
+        assert state["lineage"]["target"] == _campaign._target_dict(target())
+        assert state["lineage"]["resources"] == _campaign._resource_dict(resources())
+        assert state["intents"][0]["allocation"] == {
+            "cpus": 32,
+            "memory_mib": 65536,
+            "gpus": 1,
+            "time_limit": "3-00:00:00",
+        }
+        assert state["intents"][0]["sbatch_argv"] == list(argv)
         assert script == plan._allocations[0].script
         return _slurm.Result(0, b"4242;alpha\n", b"")
 
@@ -253,6 +328,44 @@ def test_submit_records_intent_before_ssh_and_receipt(
 
     assert [(receipt.job_id, receipt.cluster) for receipt in receipts] == [(4242, "alpha")]
     assert campaign.status().pending_task_keys == ()
+    state_path = tmp_path / "campaign" / "campaign.json"
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+    assert list((tmp_path / "campaign").glob(".campaign-*.tmp")) == []
+
+
+def test_intent_file_and_directory_are_synced_before_ssh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
+    plan = campaign.plan(target(), resources())
+    campaign_entry = (tmp_path / "campaign").stat()
+    events: list[str] = []
+    real_fsync = _campaign.os.fsync
+    real_replace = _campaign.os.replace
+
+    def track_fsync(descriptor: int) -> None:
+        entry = os.fstat(descriptor)
+        if stat.S_ISREG(entry.st_mode):
+            events.append("file-fsync")
+        elif (entry.st_dev, entry.st_ino) == (campaign_entry.st_dev, campaign_entry.st_ino):
+            events.append("directory-fsync")
+        real_fsync(descriptor)
+
+    def track_replace(*args: object, **kwargs: object) -> None:
+        events.append("replace")
+        real_replace(*args, **kwargs)  # type: ignore[arg-type]
+
+    def accepted(*args: object, **kwargs: object) -> _slurm.Result:
+        events.append("ssh")
+        assert events.index("file-fsync") < events.index("replace")
+        assert events.index("replace") < events.index("directory-fsync")
+        assert events.index("directory-fsync") < events.index("ssh")
+        return _slurm.Result(0, b"42\n", b"")
+
+    monkeypatch.setattr(_campaign.os, "fsync", track_fsync)
+    monkeypatch.setattr(_campaign.os, "replace", track_replace)
+    monkeypatch.setattr(_slurm, "_run_ssh", accepted)
+    campaign.submit(plan)
 
 
 def test_accepted_without_receipt_is_ambiguous_and_halts(
@@ -384,3 +497,128 @@ def test_reconcile_adopts_only_private_query_result(
 
     assert (receipt.job_id, receipt.cluster) == (909, "alpha")
     assert campaign.status().ambiguous_allocation_ids == ()
+
+
+def test_state_size_boundary_is_symmetric_and_overflow_does_not_mutate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
+    state_path = tmp_path / "campaign" / "campaign.json"
+    with campaign._locked_state() as state:
+        assert state is not None
+        exact = len(_campaign._canonical(state) + b"\n")
+        monkeypatch.setattr(_campaign, "_MAX_STATE_BYTES", exact)
+        campaign._write_state(state)
+        accepted = state_path.read_bytes()
+        monkeypatch.setattr(_campaign, "_MAX_STATE_BYTES", exact - 1)
+        with pytest.raises(TaskConflict, match="maximum"):
+            campaign._write_state(state)
+        assert state_path.read_bytes() == accepted
+        assert list((tmp_path / "campaign").glob(".campaign-*.tmp")) == []
+
+
+@pytest.mark.parametrize("failure", ["write", "fsync"])
+def test_precommit_state_failures_remove_owned_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
+    state_path = tmp_path / "campaign" / "campaign.json"
+    before = state_path.read_bytes()
+    real_write = _campaign.os.write
+    real_fsync = _campaign.os.fsync
+
+    def fail_write(descriptor: int, data: object) -> int:
+        raise OSError("injected state write failure")
+
+    def fail_stage_sync(descriptor: int) -> None:
+        if stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("injected state fsync failure")
+        real_fsync(descriptor)
+
+    with campaign._locked_state() as state:
+        assert state is not None
+        if failure == "write":
+            monkeypatch.setattr(_campaign.os, "write", fail_write)
+        else:
+            monkeypatch.setattr(_campaign.os, "fsync", fail_stage_sync)
+        with pytest.raises(OSError, match="injected state"):
+            campaign._write_state(state)
+    monkeypatch.setattr(_campaign.os, "write", real_write)
+    assert state_path.read_bytes() == before
+    assert list((tmp_path / "campaign").glob(".campaign-*.tmp")) == []
+
+
+def test_campaign_creation_syncs_parent_before_state_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    parent_entry = tmp_path.stat()
+    real_mkdir = _campaign.os.mkdir
+    real_fsync = _campaign.os.fsync
+    real_replace = _campaign.os.replace
+
+    def track_mkdir(*args: object, **kwargs: object) -> None:
+        events.append("mkdir")
+        real_mkdir(*args, **kwargs)  # type: ignore[arg-type]
+
+    def track_fsync(descriptor: int) -> None:
+        entry = os.fstat(descriptor)
+        if (entry.st_dev, entry.st_ino) == (parent_entry.st_dev, parent_entry.st_ino):
+            events.append("parent-fsync")
+        real_fsync(descriptor)
+
+    def track_replace(*args: object, **kwargs: object) -> None:
+        events.append("state-replace")
+        real_replace(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(_campaign.os, "mkdir", track_mkdir)
+    monkeypatch.setattr(_campaign.os, "fsync", track_fsync)
+    monkeypatch.setattr(_campaign.os, "replace", track_replace)
+    Campaign.open(tmp_path / "campaign", tasks(1))
+    assert events.index("mkdir") < events.index("parent-fsync") < events.index("state-replace")
+
+
+def test_campaign_parent_sync_failure_reports_and_removes_unsynced_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent_entry = tmp_path.stat()
+    real_fsync = _campaign.os.fsync
+
+    def fail_parent(descriptor: int) -> None:
+        entry = os.fstat(descriptor)
+        if (entry.st_dev, entry.st_ino) == (parent_entry.st_dev, parent_entry.st_ino):
+            raise OSError("injected parent fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(_campaign.os, "fsync", fail_parent)
+    with pytest.raises(OSError, match="parent fsync failure"):
+        Campaign.open(tmp_path / "campaign", tasks(1))
+    assert not (tmp_path / "campaign").exists()
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("schema_version",), True),
+        (("state_revision",), 0.0),
+        (("resources", "cpus_per_task"), True),
+        (("target", "max_tasks_per_allocation"), True),
+        (("allocations", 0, "cpus"), True),
+        (("allocations", 0, "sbatch_argv"), [True]),
+        (("allocations", 0, "sbatch_argv", 0), "changed"),
+        (("allocations", 0, "argv_digest"), "0" * 64),
+        (("allocations",), {}),
+        (("completed",), 7),
+    ],
+)
+def test_plan_document_rejects_changed_container_and_numeric_types(
+    tmp_path: Path, path: tuple[str | int, ...], value: object
+) -> None:
+    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
+    document = copy.deepcopy(_campaign.plan_document(campaign.plan(target(), resources())))
+    owner: object = document
+    for component in path[:-1]:
+        owner = owner[component]  # type: ignore[index]
+    owner[path[-1]] = value  # type: ignore[index]
+    with pytest.raises(PlanError):
+        _campaign.restore_plan(campaign, document)

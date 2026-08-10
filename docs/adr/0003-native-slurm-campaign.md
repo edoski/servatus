@@ -7,6 +7,12 @@ executables, and one immutable Apptainer image. A Campaign freezes opaque tasks,
 resources, deterministic balanced single-node allocations, complete scripts, and durable intent
 and receipt records. It fails closed when scheduler acceptance is ambiguous.
 
+The durable lineage retains normalized target guardrails and requested resources. Each intent adds
+exact effective allocation totals and the nonsecret `sbatch` argument vector. Public plan files
+redact task arguments and payloads; complete script display is an explicit sensitive diagnostic.
+Authored wall time remains provenance while planned and submitted time reflects Slurm's one-time
+upward minute rounding.
+
 The package invokes stable command-line seams directly. Submitit is prior art, not a dependency:
 its cluster-local Python callable and post-acceptance pickle transport do not fit the workstation
 SSH boundary or the requirement that every accepted job already own its complete payload. There is
