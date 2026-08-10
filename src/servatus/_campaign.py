@@ -1091,8 +1091,7 @@ def _open_or_create_directory(path: Path) -> tuple[Path, os.stat_result]:
             raise TaskConflict("campaign directory is unavailable or unsafe") from error
         entry = os.fstat(child_fd)
         _require_owner_directory(entry)
-        if created:
-            os.fsync(parent_fd)
+        os.fsync(parent_fd)
         return normalized, entry
     except BaseException as error:
         if created:

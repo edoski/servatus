@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import stat
+import threading
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
@@ -593,6 +594,106 @@ def test_campaign_parent_sync_failure_reports_and_removes_unsynced_directory(
     monkeypatch.setattr(_campaign.os, "fsync", fail_parent)
     with pytest.raises(OSError, match="parent fsync failure"):
         Campaign.open(tmp_path / "campaign", tasks(1))
+    assert not (tmp_path / "campaign").exists()
+
+
+def test_concurrent_observer_proves_parent_durability_while_creator_is_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent_entry = tmp_path.stat()
+    creator_at_sync = threading.Event()
+    release_creator = threading.Event()
+    observer_synced = threading.Event()
+    real_fsync = _campaign.os.fsync
+    results: dict[str, Campaign] = {}
+    failures: list[BaseException] = []
+
+    def controlled_fsync(descriptor: int) -> None:
+        entry = os.fstat(descriptor)
+        is_parent = (entry.st_dev, entry.st_ino) == (parent_entry.st_dev, parent_entry.st_ino)
+        if is_parent and threading.current_thread().name == "creator":
+            creator_at_sync.set()
+            assert release_creator.wait(timeout=5)
+        if is_parent and threading.current_thread().name == "observer":
+            observer_synced.set()
+        real_fsync(descriptor)
+
+    def open_campaign(name: str) -> None:
+        try:
+            results[name] = Campaign.open(tmp_path / "campaign", tasks(1))
+        except BaseException as error:
+            failures.append(error)
+
+    monkeypatch.setattr(_campaign.os, "fsync", controlled_fsync)
+    creator = threading.Thread(target=open_campaign, args=("creator",), name="creator")
+    creator.start()
+    assert creator_at_sync.wait(timeout=5)
+    observer = threading.Thread(target=open_campaign, args=("observer",), name="observer")
+    observer.start()
+    observer.join(timeout=5)
+
+    assert not observer.is_alive()
+    assert observer_synced.is_set()
+    assert "observer" in results
+    assert "creator" not in results
+    assert failures == []
+
+    release_creator.set()
+    creator.join(timeout=5)
+    assert not creator.is_alive()
+    assert set(results) == {"creator", "observer"}
+    assert results["creator"].status() == results["observer"].status()
+    assert list((tmp_path / "campaign").glob(".campaign-*.tmp")) == []
+
+
+def test_concurrent_openers_cannot_return_when_all_parent_syncs_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent_entry = tmp_path.stat()
+    creator_at_sync = threading.Event()
+    release_creator = threading.Event()
+    returned: list[str] = []
+    failures: list[tuple[str, BaseException]] = []
+    creator_parent_calls = 0
+    real_fsync = _campaign.os.fsync
+
+    def fail_parent_sync(descriptor: int) -> None:
+        nonlocal creator_parent_calls
+        entry = os.fstat(descriptor)
+        is_parent = (entry.st_dev, entry.st_ino) == (parent_entry.st_dev, parent_entry.st_ino)
+        if not is_parent:
+            real_fsync(descriptor)
+            return
+        if threading.current_thread().name == "creator":
+            creator_parent_calls += 1
+            if creator_parent_calls == 1:
+                creator_at_sync.set()
+                assert release_creator.wait(timeout=5)
+        raise OSError("injected concurrent parent fsync failure")
+
+    def open_campaign(name: str) -> None:
+        try:
+            Campaign.open(tmp_path / "campaign", tasks(1))
+            returned.append(name)
+        except BaseException as error:
+            failures.append((name, error))
+
+    monkeypatch.setattr(_campaign.os, "fsync", fail_parent_sync)
+    creator = threading.Thread(target=open_campaign, args=("creator",), name="creator")
+    creator.start()
+    assert creator_at_sync.wait(timeout=5)
+    observer = threading.Thread(target=open_campaign, args=("observer",), name="observer")
+    observer.start()
+    observer.join(timeout=5)
+    assert not observer.is_alive()
+    assert returned == []
+
+    release_creator.set()
+    creator.join(timeout=5)
+    assert not creator.is_alive()
+    assert returned == []
+    assert {name for name, _ in failures} == {"creator", "observer"}
+    assert all("concurrent parent fsync failure" in str(error) for _, error in failures)
     assert not (tmp_path / "campaign").exists()
 
 
