@@ -16,6 +16,13 @@ handle rejects replacement of its container path. Arbitrary code running as the 
 can rename and recreate the complete trust root and is outside this unprivileged library's threat
 model. Keep destination parents private and treat workers and builders as trusted code.
 
+On Linux filesystems without `renameat2(RENAME_NOREPLACE)`, regular-file publication retains
+kernel-enforced create-if-absent semantics through a same-directory hard link. Directory publication
+instead uses a check-and-rename transaction under an exclusive advisory lock on the pinned parent
+descriptor. Servatus requires that parent to be owned by the effective user and not group- or
+world-writable. The lock coordinates cooperating Servatus publishers; an uncooperative same-account
+process can ignore it and is outside the threat model.
+
 Campaign task arguments and stdin are embedded in the submitted batch script. Redaction from
 ordinary local summaries does not make them secret; do not submit credentials or other secrets.
 Target TOML is an editable user-side guardrail, not an enforcement boundary. Slurm remains

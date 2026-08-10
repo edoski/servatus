@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import fcntl
 import os
 import shutil
 import stat
@@ -23,6 +24,10 @@ _RENAME_EXCL = 0x00000004
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 _FILE_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
 _FILE_STAGE_FLAGS = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+
+
+class _NoreplaceUnavailable(Exception):
+    pass
 
 
 def require_supported_platform() -> None:
@@ -235,14 +240,134 @@ def validate_leaf(name: str) -> None:
         raise UnsafePublication(f"unsafe filesystem leaf: {name!r}")
 
 
-def commit_noreplace(parent_fd: int, source: str, destination: str) -> None:
+def commit_noreplace(
+    parent_fd: int,
+    source: str,
+    destination: str,
+    expected_source: os.stat_result,
+) -> bool:
     require_supported_platform()
     validate_leaf(source)
     validate_leaf(destination)
+    expected_parent = os.fstat(parent_fd)
     if sys.platform.startswith("linux"):
-        _linux_rename_noreplace(parent_fd, source, destination)
-    else:
-        _macos_rename_noreplace(parent_fd, source, destination)
+        try:
+            _linux_rename_noreplace(parent_fd, source, destination)
+        except _NoreplaceUnavailable:
+            _verify_fallback_parent(parent_fd, expected_parent)
+            current_source = _verified_source(parent_fd, source, expected_source)
+            if stat.S_ISREG(current_source.st_mode):
+                return _link_file_noreplace(parent_fd, source, destination, current_source)
+            if stat.S_ISDIR(current_source.st_mode):
+                _locked_directory_noreplace(
+                    parent_fd,
+                    source,
+                    destination,
+                    expected_parent,
+                    current_source,
+                )
+                return False
+            raise UnsafePublication(
+                "publication source is not a regular file or directory"
+            ) from None
+        sync_descriptor(parent_fd)
+        return False
+    _macos_rename_noreplace(parent_fd, source, destination)
+    sync_descriptor(parent_fd)
+    return False
+
+
+def _verified_source(
+    parent_fd: int,
+    source: str,
+    expected: os.stat_result,
+) -> os.stat_result:
+    try:
+        current = os.stat(source, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise UnsafePublication(f"publication source is unavailable: {source}") from error
+    if not same_entry(current, expected):
+        raise UnsafePublication(f"publication source changed during commit: {source}")
+    return current
+
+
+def _verify_fallback_parent(parent_fd: int, expected: os.stat_result) -> os.stat_result:
+    current = os.fstat(parent_fd)
+    if not stat.S_ISDIR(current.st_mode) or not same_entry(current, expected):
+        raise UnsafePublication("publication parent changed before fallback")
+    return current
+
+
+def _verify_owner_controlled_parent(parent_fd: int, expected: os.stat_result) -> None:
+    current = _verify_fallback_parent(parent_fd, expected)
+    if current.st_uid != os.geteuid() or current.st_mode & 0o022:
+        raise UnsafePublication("fallback requires an owner-controlled publication parent")
+
+
+def _link_file_noreplace(
+    parent_fd: int,
+    source: str,
+    destination: str,
+    expected_source: os.stat_result,
+) -> bool:
+    try:
+        os.link(
+            source,
+            destination,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileExistsError as error:
+        raise DestinationExists("publication destination already exists") from error
+    except OSError as error:
+        if error.errno == errno.EXDEV:
+            raise CrossDevicePublication(
+                "publication commit crosses a filesystem boundary"
+            ) from error
+        raise
+    linked = os.stat(destination, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISREG(linked.st_mode) or not same_entry(linked, expected_source):
+        raise UnsafePublication("published file does not match the verified source")
+    sync_descriptor(parent_fd)
+    try:
+        remove_file_at(parent_fd, source, expected_source)
+    except Exception:
+        return True
+    return False
+
+
+def _locked_directory_noreplace(
+    parent_fd: int,
+    source: str,
+    destination: str,
+    expected_parent: os.stat_result,
+    expected_source: os.stat_result,
+) -> None:
+    try:
+        fcntl.flock(parent_fd, fcntl.LOCK_EX)
+    except OSError as error:
+        raise UnsupportedPlatform("publication parent lock is unavailable") from error
+    try:
+        _verify_owner_controlled_parent(parent_fd, expected_parent)
+        current_source = _verified_source(parent_fd, source, expected_source)
+        if not stat.S_ISDIR(current_source.st_mode):
+            raise UnsafePublication("publication source is not a directory")
+        try:
+            os.stat(destination, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise UnsafePublication("publication destination could not be inspected") from error
+        else:
+            raise DestinationExists("publication destination already exists")
+        os.rename(source, destination, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        published = os.stat(destination, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(published.st_mode) or not same_entry(published, expected_source):
+            raise UnsafePublication("published directory does not match the verified source")
+        sync_descriptor(parent_fd)
+    finally:
+        fcntl.flock(parent_fd, fcntl.LOCK_UN)
 
 
 def _linux_rename_noreplace(parent_fd: int, source: str, destination: str) -> None:
@@ -267,7 +392,10 @@ def _linux_rename_noreplace(parent_fd: int, source: str, destination: str) -> No
         _RENAME_NOREPLACE,
     )
     if result != 0:
-        _raise_rename_error(ctypes.get_errno())
+        error_number = ctypes.get_errno()
+        if error_number in {errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP}:
+            raise _NoreplaceUnavailable
+        _raise_rename_error(error_number)
 
 
 def _macos_rename_noreplace(parent_fd: int, source: str, destination: str) -> None:
@@ -346,7 +474,7 @@ def _cleanup_entry_after_failure(
 def publication_attempt(
     destination: Path,
     build: Callable[[Path, int, int], None],
-) -> Path:
+) -> tuple[Path, bool]:
     require_supported_platform()
     parent, destination_name = normalize_destination(destination)
     parent_fd = open_directory(parent)
@@ -361,7 +489,7 @@ def publication_attempt_at(
     parent_fd: int,
     destination_name: str,
     build: Callable[[Path, int, int], None],
-) -> Path:
+) -> tuple[Path, bool]:
     return _publication_transaction_at(
         parent,
         parent_fd,
@@ -376,7 +504,7 @@ def publication_attempt_at(
 def file_publication_attempt(
     destination: Path,
     write: Callable[[Path], None],
-) -> Path:
+) -> tuple[Path, bool]:
     require_supported_platform()
     parent, destination_name = normalize_destination(destination)
     parent_fd = open_directory(parent)
@@ -391,7 +519,7 @@ def file_publication_attempt_at(
     parent_fd: int,
     destination_name: str,
     write: Callable[[Path], None],
-) -> Path:
+) -> tuple[Path, bool]:
     def build(path: Path, descriptor: int, device: int) -> None:
         del descriptor, device
         write(path)
@@ -415,7 +543,7 @@ def _publication_transaction_at(
     make_stage: Callable[[], tuple[str, int, os.stat_result]],
     sync_stage: Callable[[str, int, os.stat_result], None],
     remove_stage: Callable[[int, str, os.stat_result], None],
-) -> Path:
+) -> tuple[Path, bool]:
     ensure_directory_path(parent, parent_fd)
     stage_name = ""
     stage_fd = -1
@@ -426,9 +554,13 @@ def _publication_transaction_at(
         sync_stage(stage_name, stage_fd, stage_entry)
         ensure_entry(parent_fd, stage_name, stage_entry)
         ensure_directory_path(parent, parent_fd)
-        commit_noreplace(parent_fd, stage_name, destination_name)
-        sync_descriptor(parent_fd)
-        return parent / destination_name
+        cleanup_pending = commit_noreplace(
+            parent_fd,
+            stage_name,
+            destination_name,
+            stage_entry,
+        )
+        return parent / destination_name, cleanup_pending
     except BaseException as error:
         if stage_name and stage_entry is not None:
             _cleanup_entry_after_failure(parent_fd, stage_name, stage_entry, error, remove_stage)

@@ -491,14 +491,19 @@ def test_descriptor_bound_commit_resists_last_moment_parent_substitution(
     destination = parent / "result"
     real_commit = _posix.commit_noreplace
 
-    def substitute(parent_fd: int, source: str, destination_name: str) -> None:
+    def substitute(
+        parent_fd: int,
+        source: str,
+        destination_name: str,
+        expected_source: os.stat_result,
+    ) -> bool:
         parent.rename(moved_parent)
         parent.mkdir()
         colliding_stage = parent / source
         colliding_stage.mkdir()
         (colliding_stage / "theirs").write_text("theirs")
         try:
-            real_commit(parent_fd, source, destination_name)
+            return real_commit(parent_fd, source, destination_name, expected_source)
         finally:
             parent.rename(replacement_parent)
             moved_parent.rename(parent)

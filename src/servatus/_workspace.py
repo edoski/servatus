@@ -133,13 +133,13 @@ def _build_draft(build: Callable[[Draft], None]) -> Callable[[Path, int, int], N
 
 
 def publish(destination: Path, build: Callable[[Draft], None]) -> Publication:
-    committed = _posix.publication_attempt(destination, _build_draft(build))
-    return Publication(committed, cleanup_pending=False)
+    committed, cleanup_pending = _posix.publication_attempt(destination, _build_draft(build))
+    return Publication(committed, cleanup_pending=cleanup_pending)
 
 
 def publish_file(destination: Path, write: Callable[[Path], None]) -> Publication:
-    committed = _posix.file_publication_attempt(destination, write)
-    return Publication(committed, cleanup_pending=False)
+    committed, cleanup_pending = _posix.file_publication_attempt(destination, write)
+    return Publication(committed, cleanup_pending=cleanup_pending)
 
 
 class Workspace:
@@ -217,13 +217,13 @@ class Workspace:
             raise RuntimeError("workspace has already published")
         self._verify_live()
         publication_parent_fd = self._publication_parent_fd()
-        committed = _posix.publication_attempt_at(
+        committed, stage_cleanup_pending = _posix.publication_attempt_at(
             self._parent,
             publication_parent_fd,
             self._destination.name,
             _build_draft(build),
         )
-        cleanup_pending = False
+        cleanup_pending = stage_cleanup_pending
         try:
             self._cleanup_published()
         except Exception:
@@ -441,7 +441,7 @@ def _initialize_identity(
         os.close(descriptor)
         descriptor = -1
         try:
-            _posix.commit_noreplace(container_fd, stage_name, ".identity")
+            _posix.commit_noreplace(container_fd, stage_name, ".identity", stage_entry)
         except DestinationExists:
             _verify_identity(container_fd, identity, destination, level)
             _posix.remove_file_at(container_fd, stage_name, stage_entry)

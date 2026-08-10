@@ -2,17 +2,28 @@
 
 Status: accepted
 
-Servatus builds a directory in a unique destination-adjacent stage, rejects unsafe entries,
-recursively syncs its contents, and atomically renames it into an absent destination with the
-platform's no-replace primitive. `publish_file` uses the same transaction for one regular file: it
-creates an empty stage with ordinary umask-controlled permissions, pins its descriptor and inode,
-requires in-place writing, and syncs it before commit. Both operations then sync the destination
-parent.
+Servatus builds a directory in a unique destination-adjacent stage, rejects unsafe entries, and
+recursively syncs its contents before committing it as the destination. `publish_file` uses the same
+transaction for one regular file: it creates an empty stage with ordinary umask-controlled
+permissions, pins its descriptor and inode, requires in-place writing, and syncs it before commit.
+Both operations then sync the destination parent.
 
-Linux uses `renameat2(RENAME_NOREPLACE)` and macOS uses descriptor-relative
-`renameatx_np(RENAME_EXCL)`. Unsupported systems and filesystems fail closed. Work, stages, link
-sources, and destinations must share one filesystem; Servatus never weakens the contract with a
-copy or check-then-rename fallback.
+Linux first uses `renameat2(RENAME_NOREPLACE)` and macOS uses descriptor-relative
+`renameatx_np(RENAME_EXCL)`. Linux falls back only when the native call reports `EINVAL`, `ENOSYS`,
+or `EOPNOTSUPP`, after re-verifying the pinned parent and exact source inode. A regular file is
+installed with a same-parent hard link, which remains kernel-exclusive, then the exact stage is
+removed; both parent-directory changes are synced. Cleanup failure is reported as residue after a
+successful publication.
+
+A directory fallback requires an owner-controlled parent and an exclusive advisory `flock` on its
+pinned descriptor. Under that lock Servatus re-verifies the parent and source, checks the destination
+is absent, performs a descriptor-relative rename, verifies the published inode, and syncs the parent.
+This coordinates cooperating Servatus publishers, not arbitrary same-account code that ignores the
+lock. Locking or verification failure closes the transaction. Cross-device and unexpected native
+errors do not enter the fallback.
+
+Work, stages, link sources, and destinations must share one filesystem. Servatus never copies during
+publication.
 
 Application callbacks own contents and validation. File writers may change the mode but may not
 unlink, replace, or change the type of the stage they receive.

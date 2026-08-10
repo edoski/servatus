@@ -2,7 +2,7 @@
 
 Run resumable work through Slurm and atomically publish validated outputs.
 
-Servatus 0.4.0 combines durable publication with the native Slurm Campaign interface below.
+Servatus 0.4.1 combines durable publication with the native Slurm Campaign interface below.
 
 ```sh
 pip install servatus
@@ -249,15 +249,22 @@ trust root. Callers must protect its parent directory and run only trusted worke
 - Campaign files are owner-only, schema-versioned, symlink-safe, atomically replaced, and synced.
 - Intent preserves the normalized route, guardrails, requested resources, exact allocation totals,
   and reviewed nonsecret `sbatch` command before external acceptance.
-- A destination is absent or one complete regular file or directory; it is never overwritten.
+- A destination is absent or one complete regular file or directory. Native commits and the Linux
+  regular-file fallback never overwrite an existing entry. The Linux directory fallback serializes
+  cooperating Servatus publishers with an exclusive parent-directory lock.
 - Work, hard-link sources, stages, and destination must share a filesystem.
-- Files and directories are synced before a kernel-exclusive commit; the parent is synced after.
+- Files and directories are synced before commit; the parent is synced after publication.
 - Builder failures expose no destination. Resumable work remains; disposable stages are removed.
 - Successful workspace publication removes private state. Cleanup residue is reported separately.
 - Child workspaces share the parent lifecycle lease; parent publication is busy until they close.
 
-Publication supports POSIX filesystems on Linux and macOS. Hardware durability still depends on the
-filesystem and mount. Campaign submission is an unprivileged workstation-side OpenSSH client for
+Publication supports POSIX filesystems on Linux and macOS. Linux first uses
+`renameat2(RENAME_NOREPLACE)`. If the kernel or filesystem reports only `EINVAL`, `ENOSYS`, or
+`EOPNOTSUPP`, regular files use an atomic same-directory hard link followed by stage removal.
+Directories use a descriptor-relative rename while holding an exclusive advisory lock on a pinned,
+owner-controlled parent. That directory fallback assumes all publishers are trusted and honor the
+lock; it is unavailable for group- or world-writable parents. Hardware durability still depends on
+the filesystem and mount. Campaign submission is an unprivileged workstation-side OpenSSH client for
 homogeneous independent processes in one-node Slurm allocations. It invokes the target's absolute
 Slurm and Apptainer paths and uses a minimal sanitized scheduler environment.
 
