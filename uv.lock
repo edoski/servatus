@@ -112,7 +112,7 @@ wheels = [
 
 [[package]]
 name = "servatus"
-version = "0.0.1"
+version = "0.1.0rc1"
 source = { editable = "." }
 
 [package.dev-dependencies]

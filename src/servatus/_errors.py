@@ -28,3 +28,31 @@ class WorkConflict(ServatusError):
 
 class WorkspaceBusy(ServatusError):
     """Another writer currently owns the workspace."""
+
+
+class CampaignError(ServatusError):
+    """A campaign operation could not preserve its lifecycle contract."""
+
+
+class ConfigurationError(CampaignError):
+    """A resource request or target profile is invalid."""
+
+
+class TaskConflict(CampaignError):
+    """A campaign was reopened with changed tasks."""
+
+
+class PlanError(CampaignError):
+    """A submission plan is infeasible, stale, foreign, or changed."""
+
+
+class SubmissionError(CampaignError):
+    """Slurm did not return a valid acceptance receipt."""
+
+
+class AmbiguousSubmission(SubmissionError):
+    """Slurm acceptance cannot be proved safe to replay."""
+
+
+class ReconciliationError(CampaignError):
+    """A bounded scheduler query could not prove one allocation identity."""

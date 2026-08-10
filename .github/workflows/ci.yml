@@ -29,3 +29,5 @@ jobs:
       - run: uv run vulture
       - run: uv build
       - run: uv run --isolated --no-project --with dist/*.whl python -c "import servatus"
+      - run: uv run --isolated --no-project --with dist/*.whl servatus --help
+      - run: uv run --isolated --no-project --with dist/*.whl python -m servatus --help

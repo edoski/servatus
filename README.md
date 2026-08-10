@@ -2,13 +2,127 @@
 
 Run resumable work through Slurm and atomically publish validated outputs.
 
-Servatus 0.0.1 is a publication-only alpha. It provides a small Python interface for keeping
-private resumable work and exposing an application-built directory atomically. Slurm campaigns
-arrive in a later release.
+The released `0.0.1` package contains the publication interface. The repository's `0.1.0rc1`
+candidate adds Slurm campaigns; it remains a release candidate until the documented live-cluster
+acceptance gate passes.
 
 ```sh
 pip install servatus
 ```
+
+## Campaigns
+
+A Campaign freezes an ordered set of opaque tasks. Planning is local and deterministic. Submission
+records durable intent before contacting Slurm, records the acceptance receipt afterward, and stops
+on an ambiguous missing receipt rather than risking duplicate work.
+
+```python
+from pathlib import Path, PurePosixPath
+
+from servatus import Campaign, ResourceRequest, SlurmTarget, Task
+
+campaign = Campaign.open(
+    Path("state/training"),
+    [Task("candidate-0", ("train", "--candidate", "0"), b'{"seed": 7}\n')],
+)
+resources = ResourceRequest(
+    cpus_per_task=8,
+    memory_mib_per_task=32768,
+    gpus_per_task=1,
+    time_limit="1-00:00:00",
+)
+target = SlurmTarget.from_toml(Path("TARGET.toml"))
+plan = campaign.plan(target, resources)
+# Review plan.allocations and plan.digest, then submit explicitly:
+receipts = campaign.submit(plan)
+```
+
+`ResourceRequest` has no defaults. CPU and MiB memory are positive, GPUs are a nonnegative whole
+count, and time uses canonical `[days-]hours:minutes:seconds`. One request applies to every Task in
+one Campaign. CPU-only, one-GPU, and one-process whole-multi-GPU tasks are supported. A project uses
+separate Campaigns for different resource shapes.
+
+`RESOURCES.toml` contains exactly four required values:
+
+```toml
+cpus_per_task = 32
+memory_mib_per_task = 65536
+gpus_per_task = 1
+time_limit = "3-00:00:00"
+```
+
+`TARGET.toml` describes one concrete execution lane and its conservative guardrails:
+
+```toml
+host = "login.example.edu"
+slurm_bin = "/opt/slurm/bin"
+apptainer = "/usr/bin/apptainer"
+image = "/cluster/images/project.sif"
+work_root = "/cluster/work/project"
+log_root = "/cluster/logs/project"
+partitions = ["gpu"]
+account = "research" # optional; qos and constraint are also optional
+gpu_gres = "gpu"     # omit for a CPU-only target
+max_tasks_per_allocation = 4
+max_cpus_per_allocation = 128
+max_memory_mib_per_allocation = 262144
+max_gpus_per_allocation = 4 # use 0 when gpu_gres is omitted
+max_time_limit = "7-00:00:00"
+max_allocations_per_submit = 64
+max_script_bytes = 4194304
+```
+
+Unknown keys, counted GRES, relative remote paths, unsafe site tokens, controls, booleans used as
+integers, unlimited/zero resources, and conflicting GPU settings are rejected. A target profile is
+a user-side mistake guard, not cluster authorization. Every listed partition must fit one truthful
+conservative envelope.
+
+The planner preserves authored order and uses the fewest balanced groups allowed by every declared
+ceiling. An allocation containing `n` Tasks requests exactly `n*C` CPUs, `n*M` MiB, and `n*G` GPUs;
+time remains `T`. A caller may lower packing with `tasks_per_allocation`, but a cap above feasible
+capacity is rejected rather than clamped. Servatus never rounds up to node capacity.
+
+Each allocation runs one concurrent
+`srun --exclusive --exact --nodes=1 --ntasks=1` step per Task. Each step receives its exact CPU,
+MiB, and whole-GPU request and starts the target's immutable Apptainer image from `work_root`.
+CPU-only work emits no GRES or `--nv`. Servatus never emits job-level exclusivity, overlap, all
+memory, manual CUDA indices, ranks, or raw scheduler flags.
+
+Task arguments and byte-exact stdin are embedded in the complete batch script before `sbatch`
+acceptance. They are excluded from ordinary plan and status output, but are not secrets: cluster
+administrators and accounting systems may be able to inspect them. Scheduler names expose only a
+random Servatus allocation identity.
+
+### CLI
+
+The Python interface is authoritative. The CLI task JSONL adapter has exactly `key`, string-array
+`args`, and `stdin_file` per line:
+
+```sh
+servatus plan TASKS.jsonl --target TARGET.toml --resources RESOURCES.toml \
+  --campaign STATE_DIR --output PLAN.json --tasks-per-allocation 4
+servatus validate STATE_DIR PLAN.json
+servatus submit STATE_DIR PLAN.json
+servatus status STATE_DIR
+servatus reconcile STATE_DIR ALLOCATION_ID --target TARGET.toml
+servatus resolve STATE_DIR ALLOCATION_ID --job-id 1234 --cluster alpha
+servatus resolve STATE_DIR ALLOCATION_ID --not-submitted
+```
+
+`PLAN.json` contains task keys, resources, target values, allocation identities, and digests—not
+arguments or stdin. `validate` makes one serial `sbatch --test-only` call per distinct allocation
+shape. Its answer is time-specific and does not submit or mutate campaign state.
+
+An intent without a receipt is ambiguous. `reconcile` performs one bounded `squeue`/`sacct` query
+and adopts only one exact Servatus identity. Otherwise an operator must resolve it explicitly as an
+accepted job or as not submitted. This is fail-closed recovery, not exactly-once execution. Retry is
+explicit through `Campaign.plan(..., retry={...})`; prior receipts remain in history and resources
+cannot change. Scheduler acceptance never means application completion: the caller supplies
+`completed` after its own canonical validation.
+
+Servatus does not cancel jobs in V1. Use the receipt with the site's normal `scancel` command.
+Cancellation applies to the packed allocation, does not prove application completion, and does not
+enable retry automatically.
 
 ## Publication
 
@@ -44,35 +158,38 @@ with Workspace(destination, identity=b"model request bytes") as workspace:
     publication = workspace.publish(assemble)
 ```
 
-`Workspace` binds its stable hidden state to the SHA-256 digest of the opaque identity and holds a
+`Workspace` binds stable hidden state to the SHA-256 digest of opaque identity bytes and holds a
 nonblocking writer lock. `Draft.link` only hard-links regular files into a safe relative path. The
 application must not mutate a linked source inode after `Draft.link()` returns and before
-publication completes. It owns file contents, validation, schemas, and completion meaning.
+publication completes. It owns contents, validation, schemas, and completion meaning.
 
-## Guarantees
+## Guarantees and support boundary
 
+- Campaign files are owner-only, schema-versioned, symlink-safe, atomically replaced, and synced.
 - A destination is absent or one complete directory; it is never overwritten.
 - Work, hard-link sources, stages, and destination must share a filesystem.
-- Files and directories are synced before a kernel-exclusive commit; the destination parent is
-  synced afterward.
-- Builder failures expose no destination. Resumable work remains available, while disposable
-  stages are removed.
-- Successful workspace publication removes private state. A cleanup failure returns
-  `Publication(cleanup_pending=True)` without misreporting the committed destination as failed.
-- Symlinks, special files, escaping link paths, path substitution, and unsupported exclusive-rename
-  primitives fail closed.
+- Files and directories are synced before a kernel-exclusive commit; the parent is synced after.
+- Builder failures expose no destination. Resumable work remains; disposable stages are removed.
+- Successful workspace publication removes private state. Cleanup residue is reported separately.
 
-Servatus supports POSIX filesystems on Linux and macOS. Hardware durability still depends on the
-filesystem and mount. It is not a security boundary against another process that can arbitrarily
-modify the same parent directory.
+Publication supports POSIX filesystems on Linux and macOS. Hardware durability still depends on the
+filesystem and mount. Campaign submission is an unprivileged workstation-side OpenSSH client for
+homogeneous independent processes in one-node Slurm allocations. It invokes the target's absolute
+Slurm and Apptainer paths and uses a minimal sanitized scheduler environment.
 
-## Non-goals in 0.0.1
+No Slurm version window, cluster policy compatibility, GPU isolation, throughput parity, or stable
+`0.1.0` support claim is made until the live administrator gate validates the target executables,
+version, script-size limit, partitions, account/QOS/constraint/GRES names, cgroups, requested versus
+allocated TRES, logs, failure propagation, and CPU/one-GPU/two-GPU/four-packed smokes.
 
-Servatus does not interpret checkpoints or ML artifacts, decide when work is valid, model workflow
-graphs, migrate old outputs, copy across filesystems, overwrite destinations, or provide scheduler
-execution. It has no plugins, callbacks beyond the one build seam, runtime dependencies, daemon,
-database, or global run store.
+## Non-goals
 
-The public API is `Draft`, `Workspace`, `Publication`, `publish`, and the compact errors exported by
-`servatus`. See [the context glossary](docs/CONTEXT.md) and [architecture decisions](docs/adr/README.md)
-for the ownership boundary.
+Servatus is not an ML framework, scheduler plugin, daemon, security boundary, experiment tracker,
+DAG engine, secrets manager, or transfer/image-deployment tool. V1 has no Submitit or runtime Python
+dependency, plugin/backend abstraction, local executor, arrays, heterogeneous tasks, multi-node
+ranks, MPI/torchrun, fractional/shared GPUs, queue-aware packing, automatic retry, background
+polling, cancellation/requeue, raw Slurm/environment passthrough, application completion probes,
+compatibility shims, or cross-filesystem copy fallback.
+
+See the [context glossary](docs/CONTEXT.md) and [architecture decisions](docs/adr/README.md) for the
+ownership boundary.

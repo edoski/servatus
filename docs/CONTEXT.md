@@ -2,6 +2,15 @@
 
 Servatus uses a small generic vocabulary:
 
+- **Task:** one stable opaque key, argument vector, and byte payload.
+- **Campaign:** one immutable ordered task set and its durable submission history.
+- **Resource request:** one homogeneous per-Task CPU, MiB, whole-GPU, and wall-time requirement.
+- **Target:** one concrete SSH/Slurm/Apptainer route with conservative request ceilings.
+- **Plan:** a local immutable selection, grouping, script, command, and digest snapshot.
+- **Allocation:** one single-node Slurm job containing concurrent exact Task steps.
+- **Intent:** the synced record written before possible scheduler acceptance.
+- **Receipt:** a positive Slurm job identity proving scheduler acceptance, not completion.
+- **Ambiguous allocation:** an intent without a receipt or explicit operator resolution.
 - **Destination:** the application-owned canonical path. It is immutable once published.
 - **Workspace:** stable, identity-bound private state retained when resumable work fails.
 - **Identity:** opaque application bytes whose digest binds a workspace to one logical request.
@@ -10,4 +19,4 @@ Servatus uses a small generic vocabulary:
 - **Builder:** the application callback that writes and validates a draft before returning.
 
 Servatus owns lifecycle mechanics, not application meaning. Checkpoints, manifests, schemas,
-validation rules, task topology, and scientific completion remain with the calling project.
+validation rules, task selection, and scientific completion remain with the calling project.

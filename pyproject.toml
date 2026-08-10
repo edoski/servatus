@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "servatus"
-version = "0.0.1"
+version = "0.1.0rc1"
 description = "Run resumable work through Slurm and atomically publish validated outputs."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "Edoardo Galli" }]
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 3 - Alpha",
   "License :: OSI Approved :: MIT License",
   "Operating System :: MacOS",
   "Operating System :: POSIX :: Linux",
@@ -22,6 +22,9 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = []
+
+[project.scripts]
+servatus = "servatus.cli:main"
 
 [project.urls]
 Repository = "https://github.com/edoski/servatus"
