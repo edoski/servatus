@@ -22,3 +22,20 @@ Allocation resources equal the sum of concurrent exact child steps. Servatus nev
 capacity, escalates an explicit request, emits job-level exclusivity, or accepts raw Slurm options.
 Target limits prevent user mistakes but do not replace cluster policy. Application completion and
 the meaning of every task remain with the caller.
+
+## Production acceptance
+
+On 2026-08-10, candidate `0c454bd38da4f3d5b0ba4f0777b708f8a2eb011c` passed the live gate as
+an unprivileged user-side client on Slurm 23.11.4. The site used `select/cons_tres` with
+`CR_CPU_MEMORY`, task cgroup and affinity plugins, `/usr/bin/ssh`, Slurm commands under `/usr/bin`,
+and `/usr/bin/apptainer`. Bounded validation and jobs 44592–44595 proved CPU-only, one-GPU,
+one-process/two-GPU, byte-exact argv/stdin, exact requested and allocated TRES, receipt durability,
+and sibling failure aggregation. Job 44598 proved four packed one-GPU steps with four distinct GPU
+UUIDs beginning within four milliseconds.
+
+The first four-pack also established the topology boundary: on this SMT2 site, one requested Slurm
+CPU represented one logical thread while each exclusive step occupied a physical core, so only two
+one-CPU steps placed simultaneously. The accepted four-pack used `cpus_per_task=2` and requested
+exactly eight CPUs. Callers must describe that topology truthfully. Servatus continues to preserve
+resource arithmetic and binding; it does not auto-inflate CPUs, disable affinity, or add raw Slurm
+options.

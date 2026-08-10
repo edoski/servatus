@@ -2,9 +2,7 @@
 
 Run resumable work through Slurm and atomically publish validated outputs.
 
-The released `0.0.1` package contains the publication interface. The repository's `0.1.0rc1`
-candidate adds Slurm campaigns; it remains a release candidate until the documented live-cluster
-acceptance gate passes.
+Servatus 0.1.0 combines durable publication with the native Slurm Campaign interface below.
 
 ```sh
 pip install servatus
@@ -91,6 +89,13 @@ Each allocation runs one concurrent
 MiB, and whole-GPU request and starts the target's immutable Apptainer image from `work_root`.
 CPU-only work emits no GRES or `--nv`. Servatus never emits job-level exclusivity, overlap, all
 memory, manual CUDA indices, ranks, or raw scheduler flags.
+
+Servatus requests concurrent exact steps; actual simultaneous placement depends on the site's CPU
+and GRES topology and a truthful `ResourceRequest` and target profile. On an SMT2 site, one Slurm
+CPU may represent one logical thread while an exclusive step occupies a physical core, so one
+requested CPU can account for only half the logical capacity needed by that step. The accepted
+four-step production smoke therefore used `cpus_per_task=2`. Servatus does not silently inflate CPU
+requests, disable binding, or expose raw scheduler flags.
 
 Task arguments and byte-exact stdin are embedded in the complete batch script before `sbatch`
 acceptance. They are excluded from ordinary plan and status output, but are not secrets: cluster
@@ -189,10 +194,11 @@ filesystem and mount. Campaign submission is an unprivileged workstation-side Op
 homogeneous independent processes in one-node Slurm allocations. It invokes the target's absolute
 Slurm and Apptainer paths and uses a minimal sanitized scheduler environment.
 
-No Slurm version window, cluster policy compatibility, GPU isolation, throughput parity, or stable
-`0.1.0` support claim is made until the live administrator gate validates the target executables,
-version, script-size limit, partitions, account/QOS/constraint/GRES names, cgroups, requested versus
-allocated TRES, logs, failure propagation, and CPU/one-GPU/two-GPU/four-packed smokes.
+The 0.1.0 client was live-validated on Slurm 23.11.4 with `select/cons_tres` `CR_CPU_MEMORY`, task
+cgroup and affinity plugins, and absolute OpenSSH, Slurm, and Apptainer executables. The accepted
+envelope covered CPU-only, one-GPU, one-process/two-GPU, and four packed one-GPU tasks. This is a
+tested envelope, not a claim that editable target files enforce cluster policy or that other site
+topologies preserve simultaneous placement. See ADR 0003 for the concise acceptance record.
 
 ## Non-goals
 
