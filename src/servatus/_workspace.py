@@ -5,8 +5,8 @@ import fcntl
 import hashlib
 import os
 import stat
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -24,6 +24,16 @@ from ._errors import (
 class Publication:
     destination: Path
     cleanup_pending: bool
+
+
+@dataclass(slots=True)
+class _WorkspaceLevel:
+    container_fd: int = -1
+    lock_fd: int = -1
+    work_fd: int = -1
+    container_entry: os.stat_result | None = None
+    lock_entry: os.stat_result | None = None
+    work_entry: os.stat_result | None = None
 
 
 class Draft:
@@ -132,36 +142,58 @@ def publish_file(destination: Path, write: Callable[[Path], None]) -> Publicatio
 class Workspace:
     def __init__(self, destination: Path, *, identity: bytes) -> None:
         parent, destination_name = _posix.normalize_destination(destination)
-        destination_key = hashlib.sha256(os.fsencode(destination_name)).hexdigest()[:24]
+        self._root_parent = parent
+        self._root_destination_name = destination_name
+        self._root_container_name = _container_name(destination_name)
+        self._root_identity = _identity_digest(identity)
+        self._child_name: str | None = None
         self._destination = parent / destination_name
         self._parent = parent
-        self._parent_fd = -1
-        self._container_fd = -1
-        self._work_fd = -1
-        self._lock_fd = -1
-        self._container_entry: os.stat_result | None = None
-        self._container_name = f".servatus-{destination_key}.work"
-        self._identity = hashlib.sha256(identity).hexdigest().encode("ascii") + b"\n"
+        self._container_name = self._root_container_name
+        self._identity = self._root_identity
+        self._initialize_state()
+
+    def _initialize_state(self) -> None:
+        self._stable_parent_fd = -1
+        self._root_level: _WorkspaceLevel | None = None
+        self._level = _WorkspaceLevel()
         self._entered = False
         self._published = False
+
+    def child(self, name: str, *, identity: bytes) -> Workspace:
+        if self._child_name is not None:
+            raise UnsafePublication("child workspaces cannot contain child workspaces")
+        _posix.validate_leaf(name)
+        child = object.__new__(Workspace)
+        child._root_parent = self._root_parent
+        child._root_destination_name = self._root_destination_name
+        child._root_container_name = self._root_container_name
+        child._root_identity = self._root_identity
+        child._child_name = name
+        child._parent = self.path
+        child._destination = child._parent / name
+        child._container_name = _container_name(name)
+        child._identity = _identity_digest(identity)
+        child._initialize_state()
+        return child
 
     def __enter__(self) -> Workspace:
         if self._entered:
             raise RuntimeError("workspace is already entered")
         _posix.require_supported_platform()
-        self._parent_fd = _posix.open_directory(self._parent)
+        self._stable_parent_fd = _posix.open_directory(self._root_parent)
         try:
-            self._container_fd, self._container_entry = _posix.make_directory_at(
-                self._parent_fd, self._container_name
-            )
-            self._lock_fd = self._open_lock()
-            try:
-                fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise WorkspaceBusy(f"workspace is already locked: {self._destination}") from error
-            self._bind_identity()
-            self._work_fd, _ = _posix.make_directory_at(self._container_fd, "work")
-            _posix.sync_descriptor(self._container_fd)
+            with _coordinate(self._stable_parent_fd):
+                _posix.ensure_directory_path(self._root_parent, self._stable_parent_fd)
+                _ensure_absent(
+                    self._stable_parent_fd,
+                    self._root_destination_name,
+                    self._root_parent / self._root_destination_name,
+                )
+                if self._child_name is None:
+                    self._enter_root()
+                else:
+                    self._enter_child()
         except BaseException:
             self._close()
             raise
@@ -176,131 +208,96 @@ class Workspace:
         return self._parent / self._container_name / "work"
 
     def publish(self, build: Callable[[Draft], None]) -> Publication:
-        if not self._entered or self._parent_fd < 0 or self._container_entry is None:
+        if not self._entered or self._level.container_entry is None:
             raise RuntimeError("workspace must be entered before publication")
         if self._published:
             raise RuntimeError("workspace has already published")
-        _posix.ensure_entry(self._parent_fd, self._container_name, self._container_entry)
-        self._verify_identity()
+        self._verify_live()
+        publication_parent_fd = self._publication_parent_fd()
         committed = _posix.publication_attempt_at(
             self._parent,
-            self._parent_fd,
+            publication_parent_fd,
             self._destination.name,
             _build_draft(build),
         )
         cleanup_pending = False
         try:
-            _cleanup_workspace(
-                self._parent_fd,
-                self._container_name,
-                self._container_entry,
-            )
+            self._cleanup_published()
         except Exception:
             cleanup_pending = True
         self._published = True
         return Publication(committed, cleanup_pending=cleanup_pending)
 
-    def _open_lock(self) -> int:
-        assert self._container_fd >= 0
-        try:
-            descriptor = os.open(
-                ".lock",
-                os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
-                0o600,
-                dir_fd=self._container_fd,
-            )
-        except OSError as error:
-            raise UnsafePublication("workspace lock is unsafe") from error
-        lock_entry = os.fstat(descriptor)
-        if not stat.S_ISREG(lock_entry.st_mode):
-            os.close(descriptor)
-            raise UnsafePublication("workspace lock is not a regular file")
-        return descriptor
+    def _enter_root(self) -> None:
+        self._level = _open_level(
+            self._stable_parent_fd,
+            self._root_container_name,
+            self._identity,
+            self._destination,
+            fcntl.LOCK_EX,
+        )
+        self._verify_live()
 
-    def _bind_identity(self) -> None:
-        assert self._container_fd >= 0
-        try:
-            os.stat(".identity", dir_fd=self._container_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            self._initialize_identity()
+    def _enter_child(self) -> None:
+        assert self._child_name is not None
+        root_destination = self._root_parent / self._root_destination_name
+        self._root_level = _open_level(
+            self._stable_parent_fd,
+            self._root_container_name,
+            self._root_identity,
+            root_destination,
+            fcntl.LOCK_SH,
+        )
+        _ensure_absent(self._root_level.work_fd, self._child_name, self._destination)
+        self._level = _open_level(
+            self._root_level.work_fd,
+            self._container_name,
+            self._identity,
+            self._destination,
+            fcntl.LOCK_EX,
+        )
+        self._verify_live()
+
+    def _publication_parent_fd(self) -> int:
+        if self._child_name is None:
+            return self._stable_parent_fd
+        assert self._root_level is not None
+        return self._root_level.work_fd
+
+    def _verify_live(self) -> None:
+        _posix.ensure_directory_path(self._root_parent, self._stable_parent_fd)
+        if self._child_name is None:
+            _verify_level(self._stable_parent_fd, self._root_container_name, self._level)
         else:
-            self._verify_identity()
-
-    def _initialize_identity(self) -> None:
-        assert self._container_fd >= 0
-        stage_name = f".identity-{os.urandom(12).hex()}.tmp"
-        descriptor = -1
-        stage_entry: os.stat_result | None = None
-        try:
-            descriptor = os.open(
-                stage_name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-                0o600,
-                dir_fd=self._container_fd,
+            assert self._root_level is not None
+            _verify_level(self._stable_parent_fd, self._root_container_name, self._root_level)
+            _verify_identity(
+                self._root_level.container_fd,
+                self._root_identity,
+                self._root_parent / self._root_destination_name,
             )
-            stage_entry = os.fstat(descriptor)
-            view = memoryview(self._identity)
-            while view:
-                written = os.write(descriptor, view)
-                view = view[written:]
-            _posix.sync_descriptor(descriptor)
-            os.close(descriptor)
-            descriptor = -1
-            try:
-                _posix.commit_noreplace(self._container_fd, stage_name, ".identity")
-            except DestinationExists:
-                self._verify_identity()
-                _posix.remove_file_at(self._container_fd, stage_name, stage_entry)
-                stage_entry = None
-            _posix.sync_descriptor(self._container_fd)
-        except BaseException as error:
-            if stage_entry is not None:
-                try:
-                    _posix.remove_file_at(self._container_fd, stage_name, stage_entry)
-                except Exception as cleanup_error:
-                    error.add_note(f"Servatus could not remove identity stage: {cleanup_error}")
-            raise
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
+            _verify_level(self._root_level.work_fd, self._container_name, self._level)
+        _verify_identity(self._level.container_fd, self._identity, self._destination)
 
-    def _verify_identity(self) -> None:
-        assert self._container_fd >= 0
-        try:
-            descriptor = os.open(
-                ".identity",
-                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
-                dir_fd=self._container_fd,
+    def _cleanup_published(self) -> None:
+        assert self._level.container_entry is not None
+        with _coordinate(self._stable_parent_fd):
+            self._verify_live()
+            _cleanup_workspace(
+                self._publication_parent_fd(),
+                self._container_name,
+                self._level.container_entry,
             )
-        except OSError as error:
-            raise WorkConflict(f"workspace identity is unavailable: {self._destination}") from error
-        try:
-            identity_entry = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(identity_entry.st_mode)
-                or identity_entry.st_dev != os.fstat(self._container_fd).st_dev
-                or identity_entry.st_size != len(self._identity)
-            ):
-                raise WorkConflict(f"workspace identity is invalid: {self._destination}")
-            chunks: list[bytes] = []
-            remaining = len(self._identity) + 1
-            while remaining and (chunk := os.read(descriptor, remaining)):
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            if b"".join(chunks) != self._identity:
-                raise WorkConflict(f"workspace belongs to different work: {self._destination}")
-            _posix.ensure_entry(self._container_fd, ".identity", identity_entry)
-        finally:
-            os.close(descriptor)
 
     def _close(self) -> None:
-        for attribute in ("_work_fd", "_lock_fd", "_container_fd", "_parent_fd"):
-            descriptor = getattr(self, attribute)
-            if descriptor >= 0:
-                with suppress(OSError):
-                    os.close(descriptor)
-                setattr(self, attribute, -1)
+        _close_level(self._level)
+        if self._root_level is not None:
+            _close_level(self._root_level)
         self._entered = False
+        if self._stable_parent_fd >= 0:
+            with suppress(OSError):
+                os.close(self._stable_parent_fd)
+            self._stable_parent_fd = -1
 
 
 def _cleanup_workspace(
@@ -309,3 +306,213 @@ def _cleanup_workspace(
     expected: os.stat_result,
 ) -> None:
     _posix.remove_tree_at(parent_fd, name, expected)
+
+
+def _container_name(destination_name: str) -> str:
+    destination_key = hashlib.sha256(os.fsencode(destination_name)).hexdigest()[:24]
+    return f".servatus-{destination_key}.work"
+
+
+def _identity_digest(identity: bytes) -> bytes:
+    return hashlib.sha256(identity).hexdigest().encode("ascii") + b"\n"
+
+
+@contextmanager
+def _coordinate(stable_parent_fd: int) -> Generator[None]:
+    fcntl.flock(stable_parent_fd, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        fcntl.flock(stable_parent_fd, fcntl.LOCK_UN)
+
+
+def _ensure_absent(parent_fd: int, name: str, destination: Path) -> None:
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise UnsafePublication(f"publication destination is unavailable: {destination}") from error
+    raise DestinationExists(f"publication destination already exists: {destination}")
+
+
+def _open_lock(container_fd: int) -> tuple[int, os.stat_result]:
+    try:
+        descriptor = os.open(
+            ".lock",
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=container_fd,
+        )
+    except OSError as error:
+        raise UnsafePublication("workspace lock is unsafe") from error
+    lock_entry = os.fstat(descriptor)
+    if not stat.S_ISREG(lock_entry.st_mode) or lock_entry.st_dev != os.fstat(container_fd).st_dev:
+        os.close(descriptor)
+        raise UnsafePublication("workspace lock is not a regular file")
+    try:
+        _posix.ensure_entry(container_fd, ".lock", lock_entry)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, lock_entry
+
+
+def _open_level(
+    parent_fd: int,
+    container_name: str,
+    identity: bytes,
+    destination: Path,
+    lock_mode: int,
+) -> _WorkspaceLevel:
+    level = _WorkspaceLevel()
+    try:
+        level.container_fd, level.container_entry = _posix.make_directory_at(
+            parent_fd, container_name
+        )
+        level.lock_fd, level.lock_entry = _open_lock(level.container_fd)
+        _acquire_lifecycle(level.lock_fd, lock_mode, destination)
+        _bind_identity(level.container_fd, identity, destination)
+        level.work_fd, level.work_entry = _posix.make_directory_at(level.container_fd, "work")
+        _posix.sync_descriptor(level.container_fd)
+        _verify_level(parent_fd, container_name, level)
+    except BaseException:
+        _close_level(level)
+        raise
+    return level
+
+
+def _acquire_lifecycle(descriptor: int, mode: int, destination: Path) -> None:
+    try:
+        fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
+    except OSError as error:
+        if error.errno in {errno.EACCES, errno.EAGAIN}:
+            raise WorkspaceBusy(f"workspace is already locked: {destination}") from error
+        raise
+
+
+def _bind_identity(container_fd: int, identity: bytes, destination: Path) -> None:
+    try:
+        os.stat(".identity", dir_fd=container_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        _initialize_identity(container_fd, identity, destination)
+    else:
+        _verify_identity(container_fd, identity, destination)
+
+
+def _initialize_identity(container_fd: int, identity: bytes, destination: Path) -> None:
+    stage_name = f".identity-{os.urandom(12).hex()}.tmp"
+    descriptor = -1
+    stage_entry: os.stat_result | None = None
+    try:
+        descriptor = os.open(
+            stage_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=container_fd,
+        )
+        stage_entry = os.fstat(descriptor)
+        view = memoryview(identity)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        _posix.sync_descriptor(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        try:
+            _posix.commit_noreplace(container_fd, stage_name, ".identity")
+        except DestinationExists:
+            _verify_identity(container_fd, identity, destination)
+            _posix.remove_file_at(container_fd, stage_name, stage_entry)
+            stage_entry = None
+        _posix.sync_descriptor(container_fd)
+    except BaseException as error:
+        if stage_entry is not None:
+            try:
+                _posix.remove_file_at(container_fd, stage_name, stage_entry)
+            except Exception as cleanup_error:
+                error.add_note(f"Servatus could not remove identity stage: {cleanup_error}")
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _verify_identity(container_fd: int, identity: bytes, destination: Path) -> None:
+    try:
+        descriptor = os.open(
+            ".identity",
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=container_fd,
+        )
+    except OSError as error:
+        raise WorkConflict(f"workspace identity is unavailable: {destination}") from error
+    try:
+        identity_entry = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(identity_entry.st_mode)
+            or identity_entry.st_dev != os.fstat(container_fd).st_dev
+            or identity_entry.st_size != len(identity)
+        ):
+            raise WorkConflict(f"workspace identity is invalid: {destination}")
+        chunks: list[bytes] = []
+        remaining = len(identity) + 1
+        while remaining and (chunk := os.read(descriptor, remaining)):
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if b"".join(chunks) != identity:
+            raise WorkConflict(f"workspace belongs to different work: {destination}")
+        _posix.ensure_entry(container_fd, ".identity", identity_entry)
+    finally:
+        os.close(descriptor)
+
+
+def _ensure_open_entry(
+    parent_fd: int,
+    name: str,
+    descriptor: int,
+    expected: os.stat_result,
+    *,
+    directory: bool,
+) -> None:
+    opened = os.fstat(descriptor)
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected_type(opened.st_mode) or not _posix.same_entry(opened, expected):
+        raise UnsafePublication(f"workspace entry changed: {name}")
+    _posix.ensure_entry(parent_fd, name, expected)
+
+
+def _verify_level(parent_fd: int, container_name: str, level: _WorkspaceLevel) -> None:
+    assert level.container_entry is not None
+    assert level.lock_entry is not None
+    assert level.work_entry is not None
+    _ensure_open_entry(
+        parent_fd,
+        container_name,
+        level.container_fd,
+        level.container_entry,
+        directory=True,
+    )
+    _ensure_open_entry(
+        level.container_fd,
+        ".lock",
+        level.lock_fd,
+        level.lock_entry,
+        directory=False,
+    )
+    _ensure_open_entry(
+        level.container_fd,
+        "work",
+        level.work_fd,
+        level.work_entry,
+        directory=True,
+    )
+
+
+def _close_level(level: _WorkspaceLevel) -> None:
+    for attribute in ("work_fd", "lock_fd", "container_fd"):
+        descriptor = getattr(level, attribute)
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
+            setattr(level, attribute, -1)

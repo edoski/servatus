@@ -2,7 +2,7 @@
 
 Run resumable work through Slurm and atomically publish validated outputs.
 
-Servatus 0.2.0 combines durable publication with the native Slurm Campaign interface below.
+Servatus 0.3.0 combines durable publication with the native Slurm Campaign interface below.
 
 ```sh
 pip install servatus
@@ -198,6 +198,29 @@ nonblocking writer lock. `Draft.link` only hard-links regular files into a safe 
 application must not mutate a linked source inode after `Draft.link()` returns and before
 publication completes. It owns contents, validation, schemas, and completion meaning.
 
+Independent workers can publish resumable child results beneath one future destination without
+entering the parent:
+
+```python
+parent = Workspace(Path("outputs/study-1"), identity=b"study request bytes")
+
+with parent.child("method-0", identity=b"method request bytes") as child:
+    checkpoint = child.path / "last.ckpt"
+    # Create or resume application work, then retain one immutable child result.
+    child.publish(lambda draft: draft.link(checkpoint, "result.bin"))
+
+# After the application decides all required children are valid:
+with parent as workspace:
+    workspace.publish(
+        lambda draft: draft.link(parent.path / "method-0/result.bin", "method-0/result.bin")
+    )
+```
+
+`child()` accepts one safe leaf and opaque identity. Different children may run concurrently; the
+same child and parent finalization remain exclusive and nonblocking. A failed child retains only
+its resumable private work, while a published child becomes immutable input under the parent work.
+Servatus does not track expected children, readiness, dependencies, or application completion.
+
 ## Guarantees and support boundary
 
 - Campaign files are owner-only, schema-versioned, symlink-safe, atomically replaced, and synced.
@@ -208,6 +231,7 @@ publication completes. It owns contents, validation, schemas, and completion mea
 - Files and directories are synced before a kernel-exclusive commit; the parent is synced after.
 - Builder failures expose no destination. Resumable work remains; disposable stages are removed.
 - Successful workspace publication removes private state. Cleanup residue is reported separately.
+- Child workspaces share the parent lifecycle lease; parent publication is busy until they close.
 
 Publication supports POSIX filesystems on Linux and macOS. Hardware durability still depends on the
 filesystem and mount. Campaign submission is an unprivileged workstation-side OpenSSH client for
