@@ -32,11 +32,11 @@ def render_script(
     target: SlurmTarget,
     resources: ResourceRequest,
     tasks: tuple[Task, ...],
-    allocation_id: str,
 ) -> bytes:
     lines = ["#!/bin/sh", "set -u", "status=0"]
     srun = target.slurm_bin / "srun"
-    for index, task in enumerate(tasks, start=1):
+    for slot, task in enumerate(tasks):
+        process = slot + 1
         payload = base64.b64encode(task.stdin).decode("ascii")
         step = [
             str(srun),
@@ -47,8 +47,8 @@ def render_script(
             f"--cpus-per-task={resources.cpus_per_task}",
             f"--mem={resources.memory_mib_per_task}M",
             f"--chdir={target.work_root}",
-            f"--output={target.log_root}/servatus-{allocation_id}-{index}.out",
-            f"--error={target.log_root}/servatus-{allocation_id}-{index}.err",
+            f"--output={target.log_root}/%j-{slot}.out",
+            f"--error={target.log_root}/%j-{slot}.out",
         ]
         if resources.gpus_per_task:
             assert target.gpu_gres is not None
@@ -69,7 +69,7 @@ def render_script(
             f"printf %s {shlex.quote(payload)} | /usr/bin/base64 -d | "
             f"{shlex.join((*step, *container))} &"
         )
-        lines.append(f"pid_{index}=$!")
+        lines.append(f"pid_{process}=$!")
     for index in range(1, len(tasks) + 1):
         lines.append(f'if ! wait "$pid_{index}"; then status=1; fi')
     lines.extend(('exit "$status"', ""))
@@ -97,8 +97,8 @@ def sbatch_argv(
         f"--chdir={target.work_root}",
         f"--job-name={identity}",
         f"--comment={identity}",
-        f"--output={target.log_root}/{identity}.out",
-        f"--error={target.log_root}/{identity}.err",
+        f"--output={target.log_root}/%j.out",
+        f"--error={target.log_root}/%j.out",
     ]
     if target.account is not None:
         argv.append(f"--account={target.account}")

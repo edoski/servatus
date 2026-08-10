@@ -50,6 +50,23 @@ def test_multitask_script_starts_all_siblings_before_waiting(tmp_path: Path) -> 
     assert 'exit "$status"' in script
 
 
+def test_job_id_logs_preserve_zero_based_combined_allocation_and_slot_shape(
+    tmp_path: Path,
+) -> None:
+    plan = Campaign.open(tmp_path / "campaign", tasks(2)).plan(target(), resources())
+    argv = plan._allocations[0].argv
+    script = plan._allocations[0].script.decode()
+
+    assert "--output=/cluster/logs/project/%j.out" in argv
+    assert "--error=/cluster/logs/project/%j.out" in argv
+    for slot in range(2):
+        path = f"/cluster/logs/project/%j-{slot}.out"
+        assert f"--output={path}" in script
+        assert f"--error={path}" in script
+    assert "%j-2.out" not in script
+    assert ".err" not in script
+
+
 def test_binary_payload_is_embedded_before_acceptance_without_raw_bytes(tmp_path: Path) -> None:
     payload = b"line one\n\x00\xffline two"
     plan = Campaign.open(tmp_path / "campaign", (Task("binary", ("run",), payload),)).plan(

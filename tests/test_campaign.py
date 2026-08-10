@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import os
@@ -133,15 +134,148 @@ def test_direct_target_normalizes_pathlike_values_and_rejects_other_types() -> N
         target(slurm_bin=7)
 
 
-def test_campaign_freezes_task_order_and_payload(tmp_path: Path) -> None:
+def test_campaign_accepts_only_an_exact_append_only_suffix(tmp_path: Path) -> None:
     path = tmp_path / "campaign"
     original = tasks(2)
-    Campaign.open(path, original)
+    campaign = Campaign.open(path, original)
+    stale = campaign.plan(target(), resources())
+    before = json.loads((path / "campaign.json").read_text())
+
+    grown = Campaign.open(path, tasks(4))
+    after = json.loads((path / "campaign.json").read_text())
+
+    assert after["revision"] == before["revision"] + 1
+    assert after["tasks"][:2] == before["tasks"]
+    assert after["tasks"] == [_campaign._task_record(task) for task in tasks(4)]
+    unchanged = (path / "campaign.json").read_bytes()
+    Campaign.open(path, tasks(4))
+    assert (path / "campaign.json").read_bytes() == unchanged
+    with pytest.raises(PlanError, match="stale"):
+        grown.submit(stale)
 
     with pytest.raises(TaskConflict):
-        Campaign.open(path, tuple(reversed(original)))
+        Campaign.open(path, original)
     with pytest.raises(TaskConflict):
-        Campaign.open(path, (replace(original[0], stdin=b"changed"), original[1]))
+        Campaign.open(path, tuple(reversed(tasks(4))))
+    with pytest.raises(TaskConflict):
+        Campaign.open(path, (replace(original[0], stdin=b"changed"), *tasks(4)[1:]))
+
+
+def test_growth_preserves_receipts_and_submits_only_new_suffix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "campaign"
+    campaign = Campaign.open(path, tasks(2))
+    submitted: list[tuple[str, ...]] = []
+
+    def accepted(_target: SlurmTarget, argv: tuple[str, ...], _script: bytes) -> _slurm.Result:
+        submitted.append(argv)
+        return _slurm.Result(0, f"{100 + len(submitted)}\n".encode(), b"")
+
+    monkeypatch.setattr(_slurm, "_run_ssh", accepted)
+    campaign.submit(campaign.plan(target(), resources()))
+    grown = Campaign.open(path, tasks(4))
+    suffix_plan = grown.plan(target(), resources())
+
+    assert [allocation.task_keys for allocation in suffix_plan.allocations] == [
+        ("task-2", "task-3")
+    ]
+    grown.submit(suffix_plan)
+    assert [receipt.task_keys for receipt in grown.status().receipts] == [
+        ("task-0", "task-1"),
+        ("task-2", "task-3"),
+    ]
+    assert grown.status().pending_task_keys == ()
+    retry = grown.plan(target(), resources(), retry={"task-0"})
+    assert [allocation.task_keys for allocation in retry.allocations] == [("task-0",)]
+
+
+def test_growth_preserves_ambiguous_intent_and_resource_lineage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "campaign"
+    campaign = Campaign.open(path, tasks(1))
+
+    def lose_reply(*_args: object, **_kwargs: object) -> _slurm.Result:
+        raise OSError("lost")
+
+    monkeypatch.setattr(_slurm, "_run_ssh", lose_reply)
+    with pytest.raises(AmbiguousSubmission):
+        campaign.submit(campaign.plan(target(), resources()))
+    ambiguous = campaign.status().ambiguous_allocation_ids
+
+    grown = Campaign.open(path, tasks(2))
+
+    assert grown.status().ambiguous_allocation_ids == ambiguous
+    with pytest.raises(AmbiguousSubmission):
+        grown.plan(target(), resources())
+    grown.resolve(ambiguous[0], job_id=None)
+    with pytest.raises(PlanError, match="resource semantics"):
+        grown.plan(target(), resources(cpus_per_task=16))
+    assert tuple(
+        key
+        for allocation in grown.plan(target(), resources()).allocations
+        for key in allocation.task_keys
+    ) == ("task-0", "task-1")
+
+
+def test_growth_precommit_failure_preserves_prior_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "campaign"
+    Campaign.open(path, tasks(1))
+    before = (path / "campaign.json").read_bytes()
+    real_write = _campaign.os.write
+
+    def fail_write(_descriptor: int, _data: object) -> int:
+        raise OSError("injected append write failure")
+
+    monkeypatch.setattr(_campaign.os, "write", fail_write)
+    with pytest.raises(OSError, match="append write failure"):
+        Campaign.open(path, tasks(2))
+    monkeypatch.setattr(_campaign.os, "write", real_write)
+
+    assert (path / "campaign.json").read_bytes() == before
+    Campaign.open(path, tasks(1))
+    assert list(path.glob(".campaign-*.tmp")) == []
+
+
+def test_growth_postcommit_sync_failure_is_recoverable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "campaign"
+    Campaign.open(path, tasks(1))
+    campaign_entry = path.stat()
+    real_fsync = _campaign.os.fsync
+
+    def fail_directory_sync(descriptor: int) -> None:
+        entry = os.fstat(descriptor)
+        if (entry.st_dev, entry.st_ino) == (campaign_entry.st_dev, campaign_entry.st_ino):
+            raise OSError("injected append directory fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(_campaign.os, "fsync", fail_directory_sync)
+    with pytest.raises(OSError, match="append directory fsync failure"):
+        Campaign.open(path, tasks(2))
+    monkeypatch.setattr(_campaign.os, "fsync", real_fsync)
+
+    recovered = Campaign.open(path, tasks(2))
+    state = json.loads((path / "campaign.json").read_text())
+    assert state["revision"] == 1
+    assert recovered.status().pending_task_keys == ("task-0", "task-1")
+    assert list(path.glob(".campaign-*.tmp")) == []
+
+
+def test_growth_task_digest_tampering_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "campaign"
+    Campaign.open(path, tasks(2))
+    state_path = path / "campaign.json"
+    state = json.loads(state_path.read_text())
+    state["tasks"][1]["stdin"] = base64.b64encode(b"changed").decode()
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(TaskConflict, match="digest"):
+        Campaign.open(path, tasks(2))
 
 
 def test_kairos_shape_and_balanced_order(tmp_path: Path) -> None:

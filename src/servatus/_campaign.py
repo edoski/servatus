@@ -27,8 +27,8 @@ from ._errors import (
     TaskConflict,
 )
 
-_SCHEMA_VERSION = 1
-_PLAN_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+_PLAN_SCHEMA_VERSION = 2
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _GRES = re.compile(r"gpu(?::[A-Za-z0-9][A-Za-z0-9._-]*)?\Z")
@@ -587,8 +587,14 @@ class Campaign:
                 stored = tuple(
                     _task_from_record(record) for record in cast(list[object], state["tasks"])
                 )
-                if stored != frozen:
-                    raise TaskConflict("campaign was reopened with changed or reordered tasks")
+                if frozen[: len(stored)] != stored:
+                    raise TaskConflict("campaign tasks may only gain an exact ordered suffix")
+                if len(frozen) > len(stored):
+                    cast(list[object], state["tasks"]).extend(
+                        _task_record(task) for task in frozen[len(stored) :]
+                    )
+                    state["revision"] = cast(int, state["revision"]) + 1
+                    campaign._write_state(state)
         return campaign
 
     @classmethod
@@ -657,7 +663,7 @@ class Campaign:
         effective_time_limit = _effective_time_limit(resources.time_limit)
         for index, group in enumerate(groups):
             allocation_id = hashlib.sha256(f"{seed}:{index}".encode()).hexdigest()[:24]
-            script = _slurm.render_script(target, resources, group, allocation_id)
+            script = _slurm.render_script(target, resources, group)
             if len(script) > target.max_script_bytes:
                 raise PlanError(
                     f"rendered script is {len(script)} bytes; target permits "

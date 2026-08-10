@@ -2,7 +2,7 @@
 
 Run resumable work through Slurm and atomically publish validated outputs.
 
-Servatus 0.3.0 combines durable publication with the native Slurm Campaign interface below.
+Servatus 0.4.0 combines durable publication with the native Slurm Campaign interface below.
 
 ```sh
 pip install servatus
@@ -10,9 +10,11 @@ pip install servatus
 
 ## Campaigns
 
-A Campaign freezes an ordered set of opaque tasks. Planning is local and deterministic. Submission
-records durable intent before contacting Slurm, records the acceptance receipt afterward, and stops
-on an ambiguous missing receipt rather than risking duplicate work.
+A Campaign freezes an ordered prefix of opaque tasks. Reopening with the exact sequence is
+idempotent; reopening with that exact prefix plus a nonempty suffix durably registers the new
+tasks. Removing, reordering, or changing any registered task fails. Planning is local and
+deterministic. Submission records durable intent before contacting Slurm, records the acceptance
+receipt afterward, and stops on an ambiguous missing receipt rather than risking duplicate work.
 
 ```python
 from pathlib import Path, PurePosixPath
@@ -84,11 +86,23 @@ ceiling. An allocation containing `n` Tasks requests exactly `n*C` CPUs, `n*M` M
 time remains `T`. A caller may lower packing with `tasks_per_allocation`, but a cap above feasible
 capacity is rejected rather than clamped. Servatus never rounds up to node capacity.
 
+Append-only growth preserves target/resource lineage, accepted receipts, retry history, and
+ambiguous intents. It increments campaign revision, so a plan made before the append becomes stale.
+Accepted prefix tasks are not selected again unless the caller explicitly requests retry.
+
+Version 0.4 uses Campaign and plan schema 2 because conventional job-ID logs change submitted
+script provenance. Version 0.3 state and plans are rejected rather than interpreted through a
+compatibility path; create a new Campaign when upgrading.
+
 Each allocation runs one concurrent
 `srun --exclusive --exact --nodes=1 --ntasks=1` step per Task. Each step receives its exact CPU,
 MiB, and whole-GPU request and starts the target's immutable Apptainer image from `work_root`.
 CPU-only work emits no GRES or `--nv`. Servatus never emits job-level exclusivity, overlap, all
 memory, manual CUDA indices, ranks, or raw scheduler flags.
+
+Slurm writes combined allocation stdout/stderr to `log_root/%j.out` and each combined task stream
+to `log_root/%j-<zero-based-slot>.out`. `%j` is expanded by Slurm after it assigns the job ID; plans
+and durable intent therefore remain immutable before scheduler acceptance.
 
 Servatus requests concurrent exact steps; actual simultaneous placement depends on the site's CPU
 and GRES topology and a truthful `ResourceRequest` and target profile. On an SMT2 site, one Slurm
@@ -120,6 +134,9 @@ servatus reconcile STATE_DIR ALLOCATION_ID --target TARGET.toml
 servatus resolve STATE_DIR ALLOCATION_ID --job-id 1234 --cluster alpha
 servatus resolve STATE_DIR ALLOCATION_ID --not-submitted
 ```
+
+To extend an existing Campaign through the CLI, pass the complete previously registered JSONL
+prefix followed by the new suffix. Supplying only the suffix or changing the prefix fails closed.
 
 `PLAN.json` contains task keys, requested resources, effective allocation totals, target values,
 exact nonsecret `sbatch` arguments, allocation identities, and digests—not task arguments or stdin.

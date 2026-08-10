@@ -3,7 +3,8 @@
 Servatus uses a small generic vocabulary:
 
 - **Task:** one stable opaque key, argument vector, and byte payload.
-- **Campaign:** one immutable ordered task set and its durable submission history.
+- **Campaign:** one append-only ordered task sequence and its durable submission history; every
+  registered prefix value remains immutable.
 - **Resource request:** one homogeneous per-Task CPU, MiB, whole-GPU, and wall-time requirement.
 - **Target:** one concrete SSH/Slurm/Apptainer route with conservative request ceilings.
 - **Plan:** a local immutable selection, grouping, script, command, and digest snapshot.

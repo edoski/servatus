@@ -3,9 +3,10 @@
 Status: accepted
 
 Servatus V1 supports one concrete lane: an unprivileged workstation invokes OpenSSH, absolute Slurm
-executables, and one immutable Apptainer image. A Campaign freezes opaque tasks, exact homogeneous
-resources, deterministic balanced single-node allocations, complete scripts, and durable intent
-and receipt records. It fails closed when scheduler acceptance is ambiguous.
+executables, and one immutable Apptainer image. A Campaign freezes each registered opaque task and
+permits only an exact append-only suffix, preserving prior order, bytes, resource lineage, intent,
+and receipts. It owns deterministic balanced single-node allocations, complete scripts, and durable
+submission records, and fails closed when scheduler acceptance is ambiguous.
 
 The durable lineage retains normalized target guardrails and requested resources. Each intent adds
 exact effective allocation totals and the nonsecret `sbatch` argument vector. Public plan files
@@ -22,6 +23,10 @@ Allocation resources equal the sum of concurrent exact child steps. Servatus nev
 capacity, escalates an explicit request, emits job-level exclusivity, or accepts raw Slurm options.
 Target limits prevent user mistakes but do not replace cluster policy. Application completion and
 the meaning of every task remain with the caller.
+
+Allocation stdout/stderr share `log_root/%j.out`; each task's stdout/stderr share
+`log_root/%j-<zero-based-slot>.out`. Slurm expands `%j` after acceptance, so conventional job-ID
+logs do not require post-acceptance plan mutation.
 
 ## Production acceptance
 
