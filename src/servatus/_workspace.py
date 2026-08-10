@@ -444,15 +444,13 @@ def _initialize_identity(
         try:
             commit = _posix.commit_noreplace(container_fd, stage_name, ".identity", stage_entry)
             if commit.cleanup_pending:
-                try:  # noqa: SIM105 - warning policy must remain caller-owned
+                with suppress(RuntimeWarning):
                     warnings.warn(
                         "workspace identity was installed, but identity-stage cleanup remains "
                         "pending",
                         RuntimeWarning,
                         stacklevel=3,
                     )
-                except RuntimeWarning:
-                    pass
         except DestinationExists:
             _verify_identity(container_fd, identity, destination, level)
             _posix.remove_file_at(container_fd, stage_name, stage_entry)

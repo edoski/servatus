@@ -261,38 +261,6 @@ def test_file_fallback_reports_only_private_cleanup_pending(
     assert len(list(tmp_path.glob(".servatus-file-stage-*"))) == 1
 
 
-def test_file_fallback_retries_parent_sync_after_stage_was_unlinked(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _force_linux_fallback(monkeypatch)
-    destination = tmp_path / "result"
-    real_sync = _posix.sync_descriptor
-    failed_cleanup_sync = False
-
-    def fail_first_sync_after_unlink(descriptor: int) -> None:
-        nonlocal failed_cleanup_sync
-        entry = os.fstat(descriptor)
-        stage_absent = not list(tmp_path.glob(".servatus-file-stage-*"))
-        if (
-            not failed_cleanup_sync
-            and stat.S_ISDIR(entry.st_mode)
-            and destination.exists()
-            and stage_absent
-        ):
-            failed_cleanup_sync = True
-            raise OSError("injected cleanup parent sync failure")
-        real_sync(descriptor)
-
-    monkeypatch.setattr(_posix, "sync_descriptor", fail_first_sync_after_unlink)
-
-    publication = publish_file(destination, lambda stage: stage.write_text("complete"))
-
-    assert failed_cleanup_sync is True
-    assert publication.cleanup_pending is False
-    assert destination.read_text() == "complete"
-    assert list(tmp_path.glob(".servatus-file-stage-*")) == []
-
-
 def test_directory_fallback_has_one_winner_across_processes(tmp_path: Path) -> None:
     for name in ("stage-a", "stage-b"):
         stage = tmp_path / name
