@@ -331,6 +331,32 @@ def test_child_rejects_lifecycle_entry_substitution(tmp_path: Path, substitution
     assert not (tmp_path / "study").exists()
 
 
+def test_replaced_child_lock_cannot_admit_duplicate(tmp_path: Path) -> None:
+    parent = Workspace(tmp_path / "study", identity=b"study")
+    with parent.child("method-0", identity=b"method-0") as child:
+        lock = child.path.parent / ".lock"
+        lock.rename(lock.with_name(".lock-moved"))
+        lock.write_text("replacement")
+
+        with (
+            pytest.raises(UnsafePublication),
+            parent.child("method-0", identity=b"method-0"),
+        ):
+            pass
+
+
+def test_replaced_parent_lock_cannot_admit_parent_during_child(tmp_path: Path) -> None:
+    destination = tmp_path / "study"
+    parent = Workspace(destination, identity=b"study")
+    with parent.child("method-0", identity=b"method-0"):
+        lock = parent.path.parent / ".lock"
+        lock.rename(lock.with_name(".lock-moved"))
+        lock.write_text("replacement")
+
+        with pytest.raises(UnsafePublication), Workspace(destination, identity=b"study"):
+            pass
+
+
 def test_spawned_parent_finalization_and_child_open_race_is_fail_closed(
     tmp_path: Path,
 ) -> None:

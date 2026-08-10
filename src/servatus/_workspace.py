@@ -19,6 +19,9 @@ from ._errors import (
     WorkspaceBusy,
 )
 
+_WORKSPACE_STATE_HEADER = b"servatus-workspace-v1\n"
+_MAX_WORKSPACE_STATE_BYTES = 512
+
 
 @dataclass(frozen=True, slots=True)
 class Publication:
@@ -275,9 +278,15 @@ class Workspace:
                 self._root_level.container_fd,
                 self._root_identity,
                 self._root_parent / self._root_destination_name,
+                self._root_level,
             )
             _verify_level(self._root_level.work_fd, self._container_name, self._level)
-        _verify_identity(self._level.container_fd, self._identity, self._destination)
+        _verify_identity(
+            self._level.container_fd,
+            self._identity,
+            self._destination,
+            self._level,
+        )
 
     def _cleanup_published(self) -> None:
         assert self._level.container_entry is not None
@@ -372,8 +381,9 @@ def _open_level(
         )
         level.lock_fd, level.lock_entry = _open_lock(level.container_fd)
         _acquire_lifecycle(level.lock_fd, lock_mode, destination)
-        _bind_identity(level.container_fd, identity, destination)
         level.work_fd, level.work_entry = _posix.make_directory_at(level.container_fd, "work")
+        _verify_level(parent_fd, container_name, level)
+        _bind_identity(level.container_fd, identity, destination, level)
         _posix.sync_descriptor(level.container_fd)
         _verify_level(parent_fd, container_name, level)
     except BaseException:
@@ -391,16 +401,27 @@ def _acquire_lifecycle(descriptor: int, mode: int, destination: Path) -> None:
         raise
 
 
-def _bind_identity(container_fd: int, identity: bytes, destination: Path) -> None:
+def _bind_identity(
+    container_fd: int,
+    identity: bytes,
+    destination: Path,
+    level: _WorkspaceLevel,
+) -> None:
     try:
         os.stat(".identity", dir_fd=container_fd, follow_symlinks=False)
     except FileNotFoundError:
-        _initialize_identity(container_fd, identity, destination)
+        _initialize_identity(container_fd, identity, destination, level)
     else:
-        _verify_identity(container_fd, identity, destination)
+        _verify_identity(container_fd, identity, destination, level)
 
 
-def _initialize_identity(container_fd: int, identity: bytes, destination: Path) -> None:
+def _initialize_identity(
+    container_fd: int,
+    identity: bytes,
+    destination: Path,
+    level: _WorkspaceLevel,
+) -> None:
+    state = _workspace_state(identity, level)
     stage_name = f".identity-{os.urandom(12).hex()}.tmp"
     descriptor = -1
     stage_entry: os.stat_result | None = None
@@ -412,7 +433,7 @@ def _initialize_identity(container_fd: int, identity: bytes, destination: Path) 
             dir_fd=container_fd,
         )
         stage_entry = os.fstat(descriptor)
-        view = memoryview(identity)
+        view = memoryview(state)
         while view:
             written = os.write(descriptor, view)
             view = view[written:]
@@ -422,7 +443,7 @@ def _initialize_identity(container_fd: int, identity: bytes, destination: Path) 
         try:
             _posix.commit_noreplace(container_fd, stage_name, ".identity")
         except DestinationExists:
-            _verify_identity(container_fd, identity, destination)
+            _verify_identity(container_fd, identity, destination, level)
             _posix.remove_file_at(container_fd, stage_name, stage_entry)
             stage_entry = None
         _posix.sync_descriptor(container_fd)
@@ -438,7 +459,12 @@ def _initialize_identity(container_fd: int, identity: bytes, destination: Path) 
             os.close(descriptor)
 
 
-def _verify_identity(container_fd: int, identity: bytes, destination: Path) -> None:
+def _verify_identity(
+    container_fd: int,
+    identity: bytes,
+    destination: Path,
+    level: _WorkspaceLevel,
+) -> None:
     try:
         descriptor = os.open(
             ".identity",
@@ -452,16 +478,20 @@ def _verify_identity(container_fd: int, identity: bytes, destination: Path) -> N
         if (
             not stat.S_ISREG(identity_entry.st_mode)
             or identity_entry.st_dev != os.fstat(container_fd).st_dev
-            or identity_entry.st_size != len(identity)
+            or identity_entry.st_size > _MAX_WORKSPACE_STATE_BYTES
         ):
             raise WorkConflict(f"workspace identity is invalid: {destination}")
         chunks: list[bytes] = []
-        remaining = len(identity) + 1
+        remaining = identity_entry.st_size + 1
         while remaining and (chunk := os.read(descriptor, remaining)):
             chunks.append(chunk)
             remaining -= len(chunk)
-        if b"".join(chunks) != identity:
+        actual = b"".join(chunks)
+        identity_prefix = _WORKSPACE_STATE_HEADER + identity
+        if not actual.startswith(identity_prefix):
             raise WorkConflict(f"workspace belongs to different work: {destination}")
+        if actual != _workspace_state(identity, level):
+            raise UnsafePublication(f"workspace lifecycle changed: {destination}")
         _posix.ensure_entry(container_fd, ".identity", identity_entry)
     finally:
         os.close(descriptor)
@@ -480,6 +510,15 @@ def _ensure_open_entry(
     if not expected_type(opened.st_mode) or not _posix.same_entry(opened, expected):
         raise UnsafePublication(f"workspace entry changed: {name}")
     _posix.ensure_entry(parent_fd, name, expected)
+
+
+def _workspace_state(identity: bytes, level: _WorkspaceLevel) -> bytes:
+    assert level.container_entry is not None
+    assert level.lock_entry is not None
+    assert level.work_entry is not None
+    entries = (level.container_entry, level.lock_entry, level.work_entry)
+    pins = b"".join(f"{entry.st_dev}:{entry.st_ino}\n".encode("ascii") for entry in entries)
+    return _WORKSPACE_STATE_HEADER + identity + pins
 
 
 def _verify_level(parent_fd: int, container_name: str, level: _WorkspaceLevel) -> None:

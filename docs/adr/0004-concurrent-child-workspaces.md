@@ -16,7 +16,8 @@ directory. While coordinated, Servatus checks that the canonical destination is 
 creates the private hierarchy, and acquires lifecycle leases without blocking. This prevents a
 removed lock pathname from being recreated as an independently locked inode and avoids waiting on
 a lifecycle lease while holding coordination. Container, lifecycle-lock, and work entries remain
-pinned and are verified before publication and cleanup.
+pinned and are verified before publication and cleanup. The durable identity record binds their
+device and inode identities, so a later opener fails closed if any lifecycle pathname was replaced.
 
 Child publication atomically retains one immutable result under parent work and removes only that
 child's private workspace. Child or parent failure preserves resumable work; parent success
