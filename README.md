@@ -2,7 +2,7 @@
 
 Run resumable work through Slurm and atomically publish validated outputs.
 
-Servatus 0.1.0 combines durable publication with the native Slurm Campaign interface below.
+Servatus 0.2.0 combines durable publication with the native Slurm Campaign interface below.
 
 ```sh
 pip install servatus
@@ -156,6 +156,26 @@ def build(draft: Draft) -> None:
 publication = publish(Path("outputs/run-1"), build)
 ```
 
+Use `publish_file` for one canonical regular file:
+
+```python
+from pathlib import Path
+
+from servatus import publish_file
+
+
+def write(stage: Path) -> None:
+    stage.write_text('{"status":"complete"}\n')
+    # Perform application validation before returning.
+
+
+publication = publish_file(Path("outputs/protocol.json"), write)
+```
+
+The writer receives an existing empty adjacent regular file. It must write and validate that inode
+in place; unlinking, replacing, or changing its file type fails publication. Its initial mode is
+created from `0o666` through the process umask, and an explicit writer `chmod` is preserved.
+
 Use `Workspace` when a worker must retain private checkpoints across restarts:
 
 ```python
@@ -183,7 +203,7 @@ publication completes. It owns contents, validation, schemas, and completion mea
 - Campaign files are owner-only, schema-versioned, symlink-safe, atomically replaced, and synced.
 - Intent preserves the normalized route, guardrails, requested resources, exact allocation totals,
   and reviewed nonsecret `sbatch` command before external acceptance.
-- A destination is absent or one complete directory; it is never overwritten.
+- A destination is absent or one complete regular file or directory; it is never overwritten.
 - Work, hard-link sources, stages, and destination must share a filesystem.
 - Files and directories are synced before a kernel-exclusive commit; the parent is synced after.
 - Builder failures expose no destination. Resumable work remains; disposable stages are removed.

@@ -22,6 +22,7 @@ _RENAME_NOREPLACE = 1
 _RENAME_EXCL = 0x00000004
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 _FILE_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+_FILE_STAGE_FLAGS = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
 
 
 def require_supported_platform() -> None:
@@ -33,7 +34,7 @@ def normalize_destination(destination: Path) -> tuple[Path, str]:
     raw = Path(destination)
     reject_nul_path(raw)
     if not raw.name or raw.name in {".", ".."}:
-        raise UnsafePublication("destination must name a directory inside an existing parent")
+        raise UnsafePublication("destination must name an entry inside an existing parent")
     try:
         parent = raw.parent.resolve(strict=True)
     except (OSError, ValueError) as error:
@@ -119,6 +120,35 @@ def make_unique_stage(parent_fd: int, prefix: str) -> tuple[str, int, os.stat_re
     raise PublicationError("could not allocate a unique publication stage")
 
 
+def make_unique_file_stage(parent_fd: int, prefix: str) -> tuple[str, int, os.stat_result]:
+    validate_leaf(prefix)
+    parent_device = os.fstat(parent_fd).st_dev
+    for _ in range(128):
+        name = f"{prefix}{os.urandom(12).hex()}"
+        try:
+            descriptor = os.open(
+                name,
+                _FILE_STAGE_FLAGS,
+                0o666,
+                dir_fd=parent_fd,
+            )
+        except FileExistsError:
+            continue
+        entry = os.fstat(descriptor)
+        try:
+            if not stat.S_ISREG(entry.st_mode):
+                raise UnsafePublication("publication stage is not a regular file")
+            if entry.st_dev != parent_device:
+                raise CrossDevicePublication("publication stage crosses a filesystem boundary")
+            sync_descriptor(parent_fd)
+        except BaseException as error:
+            _cleanup_entry_after_failure(parent_fd, name, entry, error, remove_file_at)
+            os.close(descriptor)
+            raise
+        return name, descriptor, entry
+    raise PublicationError("could not allocate a unique publication stage")
+
+
 def sync_descriptor(descriptor: int) -> None:
     os.fsync(descriptor)
 
@@ -163,6 +193,36 @@ def _sync_regular_file(parent_fd: int, name: str, expected: os.stat_result) -> N
             raise UnsafePublication(f"draft file was modified during publication: {name}")
     finally:
         os.close(descriptor)
+
+
+def sync_file_stage(
+    parent_fd: int,
+    name: str,
+    descriptor: int,
+    expected: os.stat_result,
+) -> None:
+    opened = os.fstat(descriptor)
+    parent_device = os.fstat(parent_fd).st_dev
+    if opened.st_dev != parent_device or expected.st_dev != parent_device:
+        raise CrossDevicePublication("publication stage crosses a filesystem boundary")
+    if not stat.S_ISREG(opened.st_mode) or not same_entry(opened, expected):
+        raise UnsafePublication("publication stage changed during publication")
+    ensure_entry(parent_fd, name, opened)
+    sync_descriptor(descriptor)
+    synced = os.fstat(descriptor)
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise UnsafePublication("publication stage disappeared") from error
+    if (
+        not stat.S_ISREG(synced.st_mode)
+        or not stat.S_ISREG(current.st_mode)
+        or not same_entry(synced, expected)
+        or not same_entry(synced, current)
+    ):
+        raise UnsafePublication("publication stage changed during publication")
+    if (opened.st_size, opened.st_mtime_ns) != (synced.st_size, synced.st_mtime_ns):
+        raise UnsafePublication("publication stage was modified during publication")
 
 
 def reject_nul_path(path: Path) -> None:
@@ -267,8 +327,18 @@ def cleanup_after_failure(
     expected: os.stat_result,
     error: BaseException,
 ) -> None:
+    _cleanup_entry_after_failure(parent_fd, name, expected, error, remove_tree_at)
+
+
+def _cleanup_entry_after_failure(
+    parent_fd: int,
+    name: str,
+    expected: os.stat_result,
+    error: BaseException,
+    remove: Callable[[int, str, os.stat_result], None],
+) -> None:
     try:
-        remove_tree_at(parent_fd, name, expected)
+        remove(parent_fd, name, expected)
     except Exception as cleanup_error:
         error.add_note(f"Servatus could not remove failed stage: {cleanup_error}")
 
@@ -292,15 +362,68 @@ def publication_attempt_at(
     destination_name: str,
     build: Callable[[Path, int, int], None],
 ) -> Path:
+    return _publication_transaction_at(
+        parent,
+        parent_fd,
+        destination_name,
+        build,
+        lambda: make_unique_stage(parent_fd, ".servatus-stage-"),
+        lambda name, descriptor, entry: sync_tree(descriptor, entry.st_dev),
+        remove_tree_at,
+    )
+
+
+def file_publication_attempt(
+    destination: Path,
+    write: Callable[[Path], None],
+) -> Path:
+    require_supported_platform()
+    parent, destination_name = normalize_destination(destination)
+    parent_fd = open_directory(parent)
+    try:
+        return file_publication_attempt_at(parent, parent_fd, destination_name, write)
+    finally:
+        os.close(parent_fd)
+
+
+def file_publication_attempt_at(
+    parent: Path,
+    parent_fd: int,
+    destination_name: str,
+    write: Callable[[Path], None],
+) -> Path:
+    def build(path: Path, descriptor: int, device: int) -> None:
+        del descriptor, device
+        write(path)
+
+    return _publication_transaction_at(
+        parent,
+        parent_fd,
+        destination_name,
+        build,
+        lambda: make_unique_file_stage(parent_fd, ".servatus-file-stage-"),
+        lambda name, descriptor, entry: sync_file_stage(parent_fd, name, descriptor, entry),
+        remove_file_at,
+    )
+
+
+def _publication_transaction_at(
+    parent: Path,
+    parent_fd: int,
+    destination_name: str,
+    build: Callable[[Path, int, int], None],
+    make_stage: Callable[[], tuple[str, int, os.stat_result]],
+    sync_stage: Callable[[str, int, os.stat_result], None],
+    remove_stage: Callable[[int, str, os.stat_result], None],
+) -> Path:
     ensure_directory_path(parent, parent_fd)
     stage_name = ""
     stage_fd = -1
     stage_entry: os.stat_result | None = None
     try:
-        stage_name, stage_fd, stage_entry = make_unique_stage(parent_fd, ".servatus-stage-")
+        stage_name, stage_fd, stage_entry = make_stage()
         build(parent / stage_name, stage_fd, stage_entry.st_dev)
-        ensure_entry(parent_fd, stage_name, stage_entry)
-        sync_tree(stage_fd, stage_entry.st_dev)
+        sync_stage(stage_name, stage_fd, stage_entry)
         ensure_entry(parent_fd, stage_name, stage_entry)
         ensure_directory_path(parent, parent_fd)
         commit_noreplace(parent_fd, stage_name, destination_name)
@@ -308,7 +431,7 @@ def publication_attempt_at(
         return parent / destination_name
     except BaseException as error:
         if stage_name and stage_entry is not None:
-            cleanup_after_failure(parent_fd, stage_name, stage_entry, error)
+            _cleanup_entry_after_failure(parent_fd, stage_name, stage_entry, error, remove_stage)
         raise
     finally:
         if stage_fd >= 0:

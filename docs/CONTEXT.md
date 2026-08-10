@@ -15,8 +15,10 @@ Servatus uses a small generic vocabulary:
 - **Workspace:** stable, identity-bound private state retained when resumable work fails.
 - **Identity:** opaque application bytes whose digest binds a workspace to one logical request.
 - **Draft:** one unique, disposable directory assembled before publication.
+- **File stage:** one unique, empty regular file written and validated in place before publication.
 - **Publication:** the committed destination plus whether private cleanup remains pending.
 - **Builder:** the application callback that writes and validates a draft before returning.
+- **Writer:** the application callback that writes and validates a file stage before returning.
 
 Servatus owns lifecycle mechanics, not application meaning. Checkpoints, manifests, schemas,
 validation rules, task selection, and scientific completion remain with the calling project.

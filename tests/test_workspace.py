@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -19,6 +20,7 @@ from servatus import (
     _posix,
     _workspace,
     publish,
+    publish_file,
 )
 
 
@@ -61,6 +63,147 @@ def test_builder_failure_cleans_disposable_stage_and_propagates(tmp_path: Path) 
 
     assert not destination.exists()
     assert hidden_entries(tmp_path) == []
+
+
+def test_publish_file_exposes_complete_regular_file_with_ordinary_writer_mode(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "result.json"
+    observed: tuple[int, int, int] | None = None
+
+    def write(stage: Path) -> None:
+        nonlocal observed
+        entry = stage.stat(follow_symlinks=False)
+        observed = (entry.st_size, entry.st_dev, entry.st_ino)
+        stage.write_text('{"status":"complete"}\n')
+
+    previous_umask = os.umask(0o022)
+    try:
+        publication = publish_file(destination, write)
+    finally:
+        os.umask(previous_umask)
+
+    assert observed is not None
+    assert observed[0] == 0
+    assert observed[1] == tmp_path.stat().st_dev
+    assert publication.destination == destination
+    assert publication.cleanup_pending is False
+    assert destination.read_text() == '{"status":"complete"}\n'
+    assert destination.stat().st_ino == observed[2]
+    assert destination.stat().st_mode & 0o777 == 0o644
+    assert hidden_entries(tmp_path) == []
+
+
+def test_publish_file_supports_binary_writers_and_preserves_explicit_mode(tmp_path: Path) -> None:
+    destination = tmp_path / "result.parquet"
+
+    def write(stage: Path) -> None:
+        with stage.open("wb") as stream:
+            stream.write(b"PAR1\x00payload")
+        stage.chmod(0o640)
+
+    publish_file(destination, write)
+
+    assert destination.read_bytes() == b"PAR1\x00payload"
+    assert destination.stat().st_mode & 0o777 == 0o640
+
+
+def test_publish_file_writer_failure_cleans_stage_and_propagates_same_exception(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "result"
+    failure = ValueError("invalid result")
+
+    def fail(stage: Path) -> None:
+        stage.write_text("not canonical")
+        raise failure
+
+    with pytest.raises(ValueError) as raised:
+        publish_file(destination, fail)
+
+    assert raised.value is failure
+    assert not destination.exists()
+    assert hidden_entries(tmp_path) == []
+
+
+@pytest.mark.parametrize("replacement", ["missing", "regular", "directory", "symlink"])
+def test_publish_file_rejects_stage_path_substitution(tmp_path: Path, replacement: str) -> None:
+    destination = tmp_path / "result"
+    symlink_target = tmp_path / "target"
+    symlink_target.write_text("target")
+
+    def substitute(stage: Path) -> None:
+        stage.unlink()
+        if replacement == "regular":
+            stage.write_text("replacement")
+        elif replacement == "directory":
+            stage.mkdir()
+        elif replacement == "symlink":
+            stage.symlink_to(symlink_target)
+
+    with pytest.raises(UnsafePublication):
+        publish_file(destination, substitute)
+
+    assert not destination.exists()
+    replacements = hidden_entries(tmp_path)
+    if replacement == "missing":
+        assert replacements == []
+    else:
+        assert len(replacements) == 1
+
+
+def test_publish_file_destination_race_never_overwrites(tmp_path: Path) -> None:
+    destination = tmp_path / "result"
+
+    def race(stage: Path) -> None:
+        stage.write_text("ours")
+        destination.write_text("theirs")
+
+    with pytest.raises(DestinationExists):
+        publish_file(destination, race)
+
+    assert destination.read_text() == "theirs"
+    assert hidden_entries(tmp_path) == []
+
+
+def test_publish_file_syncs_file_before_committed_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    real_sync = _posix.sync_descriptor
+
+    def record(descriptor: int) -> None:
+        mode = os.fstat(descriptor).st_mode
+        events.append("file" if stat.S_ISREG(mode) else "directory")
+        real_sync(descriptor)
+
+    monkeypatch.setattr(_posix, "sync_descriptor", record)
+
+    publish_file(tmp_path / "result", lambda stage: stage.write_text("complete"))
+
+    assert events[-2:] == ["file", "directory"]
+
+
+def test_publish_file_cleanup_failure_does_not_replace_writer_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    failure = RuntimeError("invalid output")
+
+    def fail_cleanup(parent_fd: int, name: str, expected: os.stat_result) -> None:
+        del parent_fd, name, expected
+        raise OSError("injected cleanup failure")
+
+    def fail(stage: Path) -> None:
+        stage.write_text("partial")
+        raise failure
+
+    monkeypatch.setattr(_posix, "remove_file_at", fail_cleanup)
+
+    with pytest.raises(RuntimeError) as raised:
+        publish_file(tmp_path / "result", fail)
+
+    assert raised.value is failure
+    assert any("injected cleanup failure" in note for note in failure.__notes__)
 
 
 def test_failed_attempt_closes_stage_descriptor_once(

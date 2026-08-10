@@ -124,6 +124,11 @@ def publish(destination: Path, build: Callable[[Draft], None]) -> Publication:
     return Publication(committed, cleanup_pending=False)
 
 
+def publish_file(destination: Path, write: Callable[[Path], None]) -> Publication:
+    committed = _posix.file_publication_attempt(destination, write)
+    return Publication(committed, cleanup_pending=False)
+
+
 class Workspace:
     def __init__(self, destination: Path, *, identity: bytes) -> None:
         parent, destination_name = _posix.normalize_destination(destination)

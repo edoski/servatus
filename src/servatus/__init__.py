@@ -25,7 +25,7 @@ from ._errors import (
     WorkConflict,
     WorkspaceBusy,
 )
-from ._workspace import Draft, Publication, Workspace, publish
+from ._workspace import Draft, Publication, Workspace, publish, publish_file
 
 __all__ = [
     "AmbiguousSubmission",
@@ -55,4 +55,5 @@ __all__ = [
     "Workspace",
     "WorkspaceBusy",
     "publish",
+    "publish_file",
 ]
