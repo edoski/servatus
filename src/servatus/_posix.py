@@ -1,0 +1,273 @@
+from __future__ import annotations
+
+import ctypes
+import errno
+import os
+import shutil
+import stat
+import sys
+from collections.abc import Callable
+from contextlib import suppress
+from pathlib import Path
+
+from ._errors import (
+    CrossDevicePublication,
+    DestinationExists,
+    PublicationError,
+    UnsafePublication,
+    UnsupportedPlatform,
+)
+
+_RENAME_NOREPLACE = 1
+_RENAME_EXCL = 0x00000004
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+_FILE_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+
+
+def require_supported_platform() -> None:
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        raise UnsupportedPlatform(f"unsupported platform: {sys.platform}")
+
+
+def normalize_destination(destination: Path) -> tuple[Path, str]:
+    raw = Path(destination)
+    if not raw.name or raw.name in {".", ".."}:
+        raise UnsafePublication("destination must name a directory inside an existing parent")
+    try:
+        parent = raw.parent.resolve(strict=True)
+    except OSError as error:
+        raise UnsafePublication("destination parent does not exist") from error
+    if not parent.is_dir():
+        raise UnsafePublication("destination parent is not a directory")
+    return parent, raw.name
+
+
+def open_directory(path: Path) -> int:
+    try:
+        return os.open(path, _DIRECTORY_FLAGS)
+    except OSError as error:
+        raise UnsafePublication(f"unsafe directory: {path}") from error
+
+
+def open_directory_at(parent_fd: int, name: str) -> int:
+    try:
+        descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+    except OSError as error:
+        raise UnsafePublication(f"unsafe directory entry: {name}") from error
+    parent_device = os.fstat(parent_fd).st_dev
+    if os.fstat(descriptor).st_dev != parent_device:
+        os.close(descriptor)
+        raise CrossDevicePublication(f"directory crosses a filesystem boundary: {name}")
+    return descriptor
+
+
+def same_entry(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def ensure_entry(parent_fd: int, name: str, expected: os.stat_result) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise UnsafePublication(f"filesystem entry disappeared: {name}") from error
+    if not same_entry(current, expected):
+        raise UnsafePublication(f"filesystem entry changed during publication: {name}")
+
+
+def ensure_directory_path(path: Path, descriptor: int) -> None:
+    try:
+        current = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise UnsafePublication(f"publication parent disappeared: {path}") from error
+    if not stat.S_ISDIR(current.st_mode) or not same_entry(current, os.fstat(descriptor)):
+        raise UnsafePublication(f"publication parent changed: {path}")
+
+
+def make_directory_at(parent_fd: int, name: str) -> tuple[int, os.stat_result]:
+    with suppress(FileExistsError):
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+    descriptor = open_directory_at(parent_fd, name)
+    return descriptor, os.fstat(descriptor)
+
+
+def make_unique_stage(parent_fd: int, prefix: str) -> tuple[str, int, os.stat_result]:
+    for _ in range(128):
+        name = f"{prefix}{os.urandom(12).hex()}"
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        descriptor = open_directory_at(parent_fd, name)
+        sync_descriptor(parent_fd)
+        return name, descriptor, os.fstat(descriptor)
+    raise PublicationError("could not allocate a unique publication stage")
+
+
+def sync_descriptor(descriptor: int) -> None:
+    os.fsync(descriptor)
+
+
+def sync_tree(descriptor: int, device: int) -> None:
+    for name in sorted(os.listdir(descriptor)):
+        try:
+            entry = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        except OSError as error:
+            raise UnsafePublication(f"draft entry disappeared: {name}") from error
+        if entry.st_dev != device:
+            raise CrossDevicePublication(f"draft entry crosses a filesystem boundary: {name}")
+        if stat.S_ISREG(entry.st_mode):
+            _sync_regular_file(descriptor, name, entry)
+        elif stat.S_ISDIR(entry.st_mode):
+            child = open_directory_at(descriptor, name)
+            try:
+                sync_tree(child, device)
+            finally:
+                os.close(child)
+            ensure_entry(descriptor, name, entry)
+        else:
+            raise UnsafePublication(f"draft contains a symlink or special file: {name}")
+    sync_descriptor(descriptor)
+
+
+def _sync_regular_file(parent_fd: int, name: str, expected: os.stat_result) -> None:
+    try:
+        descriptor = os.open(name, _FILE_FLAGS, dir_fd=parent_fd)
+    except OSError as error:
+        raise UnsafePublication(f"unsafe regular file: {name}") from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or not same_entry(opened, expected):
+            raise UnsafePublication(f"draft file changed during publication: {name}")
+        sync_descriptor(descriptor)
+        synced = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not same_entry(synced, current):
+            raise UnsafePublication(f"draft file changed during publication: {name}")
+        if (opened.st_size, opened.st_mtime_ns) != (synced.st_size, synced.st_mtime_ns):
+            raise UnsafePublication(f"draft file was modified during publication: {name}")
+    finally:
+        os.close(descriptor)
+
+
+def commit_noreplace(parent_fd: int, parent: Path, source: str, destination: str) -> None:
+    require_supported_platform()
+    if sys.platform.startswith("linux"):
+        _linux_rename_noreplace(parent_fd, source, destination)
+    else:
+        _macos_rename_noreplace(parent, source, destination)
+
+
+def _linux_rename_noreplace(parent_fd: int, source: str, destination: str) -> None:
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = library.renameat2
+    except AttributeError as error:
+        raise UnsupportedPlatform("libc does not expose renameat2") from error
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        parent_fd,
+        os.fsencode(source),
+        parent_fd,
+        os.fsencode(destination),
+        _RENAME_NOREPLACE,
+    )
+    if result != 0:
+        _raise_rename_error(ctypes.get_errno())
+
+
+def _macos_rename_noreplace(parent: Path, source: str, destination: str) -> None:
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        renamex_np = library.renamex_np
+    except AttributeError as error:
+        raise UnsupportedPlatform("libc does not expose renamex_np") from error
+    renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    renamex_np.restype = ctypes.c_int
+    result = renamex_np(
+        os.fsencode(parent / source),
+        os.fsencode(parent / destination),
+        _RENAME_EXCL,
+    )
+    if result != 0:
+        _raise_rename_error(ctypes.get_errno())
+
+
+def _raise_rename_error(error_number: int) -> None:
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise DestinationExists("publication destination already exists")
+    if error_number == errno.EXDEV:
+        raise CrossDevicePublication("publication commit crosses a filesystem boundary")
+    if error_number in {errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP}:
+        raise UnsupportedPlatform("filesystem does not support atomic no-replace rename")
+    raise OSError(error_number, os.strerror(error_number))
+
+
+def remove_tree_at(parent_fd: int, name: str, expected: os.stat_result) -> None:
+    ensure_entry(parent_fd, name, expected)
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise UnsupportedPlatform("safe directory removal is unavailable")
+    shutil.rmtree(name, dir_fd=parent_fd)
+    sync_descriptor(parent_fd)
+
+
+def cleanup_after_failure(
+    parent_fd: int,
+    name: str,
+    expected: os.stat_result,
+    error: BaseException,
+) -> None:
+    try:
+        remove_tree_at(parent_fd, name, expected)
+    except Exception as cleanup_error:
+        error.add_note(f"Servatus could not remove failed stage: {cleanup_error}")
+
+
+def publication_attempt(
+    destination: Path,
+    build: Callable[[Path, int, int], None],
+) -> Path:
+    require_supported_platform()
+    parent, destination_name = normalize_destination(destination)
+    parent_fd = open_directory(parent)
+    try:
+        return publication_attempt_at(parent, parent_fd, destination_name, build)
+    finally:
+        os.close(parent_fd)
+
+
+def publication_attempt_at(
+    parent: Path,
+    parent_fd: int,
+    destination_name: str,
+    build: Callable[[Path, int, int], None],
+) -> Path:
+    ensure_directory_path(parent, parent_fd)
+    stage_name = ""
+    stage_fd = -1
+    stage_entry: os.stat_result | None = None
+    try:
+        stage_name, stage_fd, stage_entry = make_unique_stage(parent_fd, ".servatus-stage-")
+        build(parent / stage_name, stage_fd, stage_entry.st_dev)
+        ensure_entry(parent_fd, stage_name, stage_entry)
+        sync_tree(stage_fd, stage_entry.st_dev)
+        ensure_entry(parent_fd, stage_name, stage_entry)
+        commit_noreplace(parent_fd, parent, stage_name, destination_name)
+        sync_descriptor(parent_fd)
+        return parent / destination_name
+    except BaseException as error:
+        if stage_name and stage_entry is not None:
+            cleanup_after_failure(parent_fd, stage_name, stage_entry, error)
+        if stage_fd >= 0:
+            os.close(stage_fd)
+        raise
+    finally:
+        if stage_fd >= 0:
+            with suppress(OSError):
+                os.close(stage_fd)

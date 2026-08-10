@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "servatus"
+version = "0.0.1"
+description = "Run resumable work through Slurm and atomically publish validated outputs."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Edoardo Galli" }]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/edoski/servatus"
+Issues = "https://github.com/edoski/servatus/issues"
+
+[dependency-groups]
+dev = [
+  "pyright>=1.1.404",
+  "pytest>=8.4",
+  "ruff>=0.12",
+  "vulture>=2.14",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/servatus"]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "SIM", "UP"]
+
+[tool.vulture]
+min_confidence = 90
+paths = ["src"]
