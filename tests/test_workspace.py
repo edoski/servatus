@@ -496,7 +496,7 @@ def test_descriptor_bound_commit_resists_last_moment_parent_substitution(
         source: str,
         destination_name: str,
         expected_source: os.stat_result,
-    ) -> bool:
+    ) -> _posix._CommitOutcome:
         parent.rename(moved_parent)
         parent.mkdir()
         colliding_stage = parent / source

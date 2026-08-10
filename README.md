@@ -215,6 +215,10 @@ nonblocking writer lock. `Draft.link` only hard-links regular files into a safe 
 application must not mutate a linked source inode after `Draft.link()` returns and before
 publication completes. It owns contents, validation, schemas, and completion meaning.
 
+If Linux installs a Workspace identity through the regular-file fallback but cannot remove its
+private identity stage, the valid identity remains authoritative and Servatus emits a
+`RuntimeWarning` for the cleanup residue.
+
 Independent workers can publish resumable child results beneath one future destination without
 entering the parent:
 
@@ -262,9 +266,11 @@ Publication supports POSIX filesystems on Linux and macOS. Linux first uses
 `renameat2(RENAME_NOREPLACE)`. If the kernel or filesystem reports only `EINVAL`, `ENOSYS`, or
 `EOPNOTSUPP`, regular files use an atomic same-directory hard link followed by stage removal.
 Directories use a descriptor-relative rename while holding an exclusive advisory lock on a pinned,
-owner-controlled parent. That directory fallback assumes all publishers are trusted and honor the
-lock; it is unavailable for group- or world-writable parents. Hardware durability still depends on
-the filesystem and mount. Campaign submission is an unprivileged workstation-side OpenSSH client for
+owner-controlled parent. That fallback requires every same-account publisher on every client to use
+Servatus and the filesystem mount to provide one coherent `flock` domain across those clients.
+Local-only or disabled lock modes and group- or world-writable parents are unsupported. Hardware
+durability still depends on the filesystem and mount. Campaign submission is an unprivileged
+workstation-side OpenSSH client for
 homogeneous independent processes in one-node Slurm allocations. It invokes the target's absolute
 Slurm and Apptainer paths and uses a minimal sanitized scheduler environment.
 

@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import os
 import stat
+import warnings
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -133,13 +134,13 @@ def _build_draft(build: Callable[[Draft], None]) -> Callable[[Path, int, int], N
 
 
 def publish(destination: Path, build: Callable[[Draft], None]) -> Publication:
-    committed, cleanup_pending = _posix.publication_attempt(destination, _build_draft(build))
-    return Publication(committed, cleanup_pending=cleanup_pending)
+    outcome = _posix.publication_attempt(destination, _build_draft(build))
+    return Publication(outcome.destination, cleanup_pending=outcome.cleanup_pending)
 
 
 def publish_file(destination: Path, write: Callable[[Path], None]) -> Publication:
-    committed, cleanup_pending = _posix.file_publication_attempt(destination, write)
-    return Publication(committed, cleanup_pending=cleanup_pending)
+    outcome = _posix.file_publication_attempt(destination, write)
+    return Publication(outcome.destination, cleanup_pending=outcome.cleanup_pending)
 
 
 class Workspace:
@@ -217,19 +218,19 @@ class Workspace:
             raise RuntimeError("workspace has already published")
         self._verify_live()
         publication_parent_fd = self._publication_parent_fd()
-        committed, stage_cleanup_pending = _posix.publication_attempt_at(
+        outcome = _posix.publication_attempt_at(
             self._parent,
             publication_parent_fd,
             self._destination.name,
             _build_draft(build),
         )
-        cleanup_pending = stage_cleanup_pending
+        cleanup_pending = outcome.cleanup_pending
         try:
             self._cleanup_published()
         except Exception:
             cleanup_pending = True
         self._published = True
-        return Publication(committed, cleanup_pending=cleanup_pending)
+        return Publication(outcome.destination, cleanup_pending=cleanup_pending)
 
     def _enter_root(self) -> None:
         self._level = _open_level(
@@ -441,7 +442,16 @@ def _initialize_identity(
         os.close(descriptor)
         descriptor = -1
         try:
-            _posix.commit_noreplace(container_fd, stage_name, ".identity", stage_entry)
+            commit = _posix.commit_noreplace(container_fd, stage_name, ".identity", stage_entry)
+            if commit.cleanup_pending:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("always", RuntimeWarning)
+                    warnings.warn(
+                        "workspace identity was installed, but identity-stage cleanup remains "
+                        "pending",
+                        RuntimeWarning,
+                        stacklevel=3,
+                    )
         except DestinationExists:
             _verify_identity(container_fd, identity, destination, level)
             _posix.remove_file_at(container_fd, stage_name, stage_entry)

@@ -18,9 +18,12 @@ successful publication.
 A directory fallback requires an owner-controlled parent and an exclusive advisory `flock` on its
 pinned descriptor. Under that lock Servatus re-verifies the parent and source, checks the destination
 is absent, performs a descriptor-relative rename, verifies the published inode, and syncs the parent.
-This coordinates cooperating Servatus publishers, not arbitrary same-account code that ignores the
-lock. Locking or verification failure closes the transaction. Cross-device and unexpected native
-errors do not enter the fallback.
+The lock lives on a dedicated handle and is released by closing that handle, so an unlock error cannot
+mask a verified, parent-synced commit. Correctness requires every same-account publisher on every
+client to use Servatus and the filesystem mount to provide one coherent `flock` domain across those
+clients; local-only or disabled lock modes are unsupported. Same-account code that ignores the lock
+is outside the contract. Locking or verification failure closes the transaction. Cross-device and
+unexpected native errors do not enter the fallback.
 
 Work, stages, link sources, and destinations must share one filesystem. Servatus never copies during
 publication.
@@ -29,4 +32,6 @@ Application callbacks own contents and validation. File writers may change the m
 unlink, replace, or change the type of the stage they receive.
 
 An identity-bound workspace is retained after build failure and removed only after a committed,
-parent-synced publication. Cleanup failure is reported separately from publication success.
+parent-synced publication. If fallback identity installation commits before stage removal fails, the
+installed identity remains valid and Servatus warns about the private residue. Cleanup failure is
+reported separately from publication success.

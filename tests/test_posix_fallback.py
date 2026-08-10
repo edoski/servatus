@@ -5,6 +5,7 @@ import multiprocessing
 import os
 import sys
 import threading
+import warnings
 from multiprocessing.connection import Connection
 from pathlib import Path
 
@@ -104,6 +105,31 @@ def test_identity_fallback_installs_workspace_state(
         container = workspace.path.parent
         assert (container / ".identity").is_file()
         assert list(container.glob(".identity-*.tmp")) == []
+
+
+def test_identity_fallback_reports_cleanup_residue_without_failing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _force_linux_fallback(monkeypatch)
+    real_remove = _posix.remove_file_at
+
+    def fail_identity_stage_cleanup(parent_fd: int, name: str, expected: os.stat_result) -> None:
+        if name.startswith(".identity-"):
+            raise OSError("injected identity stage cleanup failure")
+        real_remove(parent_fd, name, expected)
+
+    monkeypatch.setattr(_posix, "remove_file_at", fail_identity_stage_cleanup)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("error")
+        with Workspace(tmp_path / "result", identity=b"request") as workspace:
+            container = workspace.path.parent
+            assert (container / ".identity").is_file()
+            assert len(list(container.glob(".identity-*.tmp"))) == 1
+
+    assert len(caught) == 1
+    assert caught[0].category is RuntimeWarning
+    assert "identity-stage cleanup" in str(caught[0].message)
 
 
 def test_file_fallback_reports_only_private_cleanup_pending(
@@ -228,6 +254,41 @@ def test_directory_fallback_fails_closed_when_flock_is_unavailable(
     assert not (tmp_path / "result").exists()
 
 
+def test_directory_fallback_releases_dedicated_lock_by_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "stage"
+    source.mkdir()
+    parent_fd = _posix.open_directory(tmp_path)
+    operations: list[int] = []
+    lock_descriptors: list[int] = []
+    real_flock = _posix.fcntl.flock
+
+    def reject_explicit_unlock(descriptor: int, operation: int) -> None:
+        lock_descriptors.append(descriptor)
+        operations.append(operation)
+        if operation == _posix.fcntl.LOCK_UN:
+            raise OSError("explicit unlock must not run after commit")
+        real_flock(descriptor, operation)
+
+    monkeypatch.setattr(_posix.fcntl, "flock", reject_explicit_unlock)
+    try:
+        _posix._locked_directory_noreplace(
+            parent_fd,
+            "stage",
+            "result",
+            os.fstat(parent_fd),
+            source.stat(follow_symlinks=False),
+        )
+        os.fstat(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+    assert operations == [_posix.fcntl.LOCK_EX]
+    assert lock_descriptors[0] != parent_fd
+    assert (tmp_path / "result").is_dir()
+
+
 def test_directory_fallback_rejects_source_substitution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -313,7 +374,7 @@ def test_native_noreplace_remains_the_fast_path(
     monkeypatch.setattr(_posix, "_locked_directory_noreplace", unexpected)
     monkeypatch.setattr(_posix, "sync_descriptor", record_sync)
     try:
-        cleanup_pending = _posix.commit_noreplace(
+        outcome = _posix.commit_noreplace(
             parent_fd,
             "stage",
             "result",
@@ -322,7 +383,7 @@ def test_native_noreplace_remains_the_fast_path(
     finally:
         os.close(parent_fd)
 
-    assert cleanup_pending is False
+    assert outcome.cleanup_pending is False
     assert synced is True
     assert (tmp_path / "result").is_dir()
 

@@ -9,6 +9,7 @@ import stat
 import sys
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 
 from ._errors import (
@@ -28,6 +29,17 @@ _FILE_STAGE_FLAGS = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOF
 
 class _NoreplaceUnavailable(Exception):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class _CommitOutcome:
+    cleanup_pending: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _TransactionOutcome:
+    destination: Path
+    cleanup_pending: bool
 
 
 def require_supported_platform() -> None:
@@ -245,7 +257,7 @@ def commit_noreplace(
     source: str,
     destination: str,
     expected_source: os.stat_result,
-) -> bool:
+) -> _CommitOutcome:
     require_supported_platform()
     validate_leaf(source)
     validate_leaf(destination)
@@ -266,15 +278,15 @@ def commit_noreplace(
                     expected_parent,
                     current_source,
                 )
-                return False
+                return _CommitOutcome(cleanup_pending=False)
             raise UnsafePublication(
                 "publication source is not a regular file or directory"
             ) from None
         sync_descriptor(parent_fd)
-        return False
+        return _CommitOutcome(cleanup_pending=False)
     _macos_rename_noreplace(parent_fd, source, destination)
     sync_descriptor(parent_fd)
-    return False
+    return _CommitOutcome(cleanup_pending=False)
 
 
 def _verified_source(
@@ -309,7 +321,7 @@ def _link_file_noreplace(
     source: str,
     destination: str,
     expected_source: os.stat_result,
-) -> bool:
+) -> _CommitOutcome:
     try:
         os.link(
             source,
@@ -333,8 +345,8 @@ def _link_file_noreplace(
     try:
         remove_file_at(parent_fd, source, expected_source)
     except Exception:
-        return True
-    return False
+        return _CommitOutcome(cleanup_pending=True)
+    return _CommitOutcome(cleanup_pending=False)
 
 
 def _locked_directory_noreplace(
@@ -345,10 +357,15 @@ def _locked_directory_noreplace(
     expected_source: os.stat_result,
 ) -> None:
     try:
-        fcntl.flock(parent_fd, fcntl.LOCK_EX)
+        lock_fd = os.open(".", _DIRECTORY_FLAGS, dir_fd=parent_fd)
     except OSError as error:
         raise UnsupportedPlatform("publication parent lock is unavailable") from error
     try:
+        _verify_fallback_parent(lock_fd, expected_parent)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except OSError as error:
+            raise UnsupportedPlatform("publication parent lock is unavailable") from error
         _verify_owner_controlled_parent(parent_fd, expected_parent)
         current_source = _verified_source(parent_fd, source, expected_source)
         if not stat.S_ISDIR(current_source.st_mode):
@@ -367,7 +384,8 @@ def _locked_directory_noreplace(
             raise UnsafePublication("published directory does not match the verified source")
         sync_descriptor(parent_fd)
     finally:
-        fcntl.flock(parent_fd, fcntl.LOCK_UN)
+        with suppress(OSError):
+            os.close(lock_fd)
 
 
 def _linux_rename_noreplace(parent_fd: int, source: str, destination: str) -> None:
@@ -474,7 +492,7 @@ def _cleanup_entry_after_failure(
 def publication_attempt(
     destination: Path,
     build: Callable[[Path, int, int], None],
-) -> tuple[Path, bool]:
+) -> _TransactionOutcome:
     require_supported_platform()
     parent, destination_name = normalize_destination(destination)
     parent_fd = open_directory(parent)
@@ -489,7 +507,7 @@ def publication_attempt_at(
     parent_fd: int,
     destination_name: str,
     build: Callable[[Path, int, int], None],
-) -> tuple[Path, bool]:
+) -> _TransactionOutcome:
     return _publication_transaction_at(
         parent,
         parent_fd,
@@ -504,7 +522,7 @@ def publication_attempt_at(
 def file_publication_attempt(
     destination: Path,
     write: Callable[[Path], None],
-) -> tuple[Path, bool]:
+) -> _TransactionOutcome:
     require_supported_platform()
     parent, destination_name = normalize_destination(destination)
     parent_fd = open_directory(parent)
@@ -519,7 +537,7 @@ def file_publication_attempt_at(
     parent_fd: int,
     destination_name: str,
     write: Callable[[Path], None],
-) -> tuple[Path, bool]:
+) -> _TransactionOutcome:
     def build(path: Path, descriptor: int, device: int) -> None:
         del descriptor, device
         write(path)
@@ -543,7 +561,7 @@ def _publication_transaction_at(
     make_stage: Callable[[], tuple[str, int, os.stat_result]],
     sync_stage: Callable[[str, int, os.stat_result], None],
     remove_stage: Callable[[int, str, os.stat_result], None],
-) -> tuple[Path, bool]:
+) -> _TransactionOutcome:
     ensure_directory_path(parent, parent_fd)
     stage_name = ""
     stage_fd = -1
@@ -554,13 +572,13 @@ def _publication_transaction_at(
         sync_stage(stage_name, stage_fd, stage_entry)
         ensure_entry(parent_fd, stage_name, stage_entry)
         ensure_directory_path(parent, parent_fd)
-        cleanup_pending = commit_noreplace(
+        commit = commit_noreplace(
             parent_fd,
             stage_name,
             destination_name,
             stage_entry,
         )
-        return parent / destination_name, cleanup_pending
+        return _TransactionOutcome(parent / destination_name, commit.cleanup_pending)
     except BaseException as error:
         if stage_name and stage_entry is not None:
             _cleanup_entry_after_failure(parent_fd, stage_name, stage_entry, error, remove_stage)
