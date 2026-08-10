@@ -384,8 +384,8 @@ def _open_level(
         _acquire_lifecycle(level.lock_fd, lock_mode, destination)
         level.work_fd, level.work_entry = _posix.make_directory_at(level.container_fd, "work")
         _verify_level(parent_fd, container_name, level)
-        _bind_identity(level.container_fd, identity, destination, level)
         _posix.sync_descriptor(level.container_fd)
+        _bind_identity(level.container_fd, identity, destination, level)
         _verify_level(parent_fd, container_name, level)
     except BaseException:
         _close_level(level)
@@ -444,19 +444,19 @@ def _initialize_identity(
         try:
             commit = _posix.commit_noreplace(container_fd, stage_name, ".identity", stage_entry)
             if commit.cleanup_pending:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("always", RuntimeWarning)
+                try:  # noqa: SIM105 - warning policy must remain caller-owned
                     warnings.warn(
                         "workspace identity was installed, but identity-stage cleanup remains "
                         "pending",
                         RuntimeWarning,
                         stacklevel=3,
                     )
+                except RuntimeWarning:
+                    pass
         except DestinationExists:
             _verify_identity(container_fd, identity, destination, level)
             _posix.remove_file_at(container_fd, stage_name, stage_entry)
             stage_entry = None
-        _posix.sync_descriptor(container_fd)
     except BaseException as error:
         if stage_entry is not None:
             try:

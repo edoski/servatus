@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import multiprocessing
 import os
+import stat
 import sys
 import threading
 import warnings
@@ -120,16 +121,126 @@ def test_identity_fallback_reports_cleanup_residue_without_failing(
 
     monkeypatch.setattr(_posix, "remove_file_at", fail_identity_stage_cleanup)
 
+    with (
+        pytest.warns(RuntimeWarning, match="identity-stage cleanup"),
+        Workspace(tmp_path / "result", identity=b"request") as workspace,
+    ):
+        container = workspace.path.parent
+        assert (container / ".identity").is_file()
+        assert len(list(container.glob(".identity-*.tmp"))) == 1
+
+
+def test_identity_warning_preserves_other_thread_warning_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _force_linux_fallback(monkeypatch)
+    real_remove = _posix.remove_file_at
+    real_warn = warnings.warn
+    warning_started = threading.Event()
+    continue_warning = threading.Event()
+    failures: list[BaseException] = []
+
+    def fail_identity_stage_cleanup(parent_fd: int, name: str, expected: os.stat_result) -> None:
+        if name.startswith(".identity-"):
+            raise OSError("injected identity stage cleanup failure")
+        real_remove(parent_fd, name, expected)
+
+    def pause_identity_warning(
+        message: str | Warning,
+        category: type[Warning] | None = None,
+        stacklevel: int = 1,
+        source: object | None = None,
+    ) -> None:
+        if "identity-stage cleanup" in str(message):
+            warning_started.set()
+            if not continue_warning.wait(5):
+                raise AssertionError("identity warning did not resume")
+        real_warn(message, category, stacklevel, source)
+
+    def initialize() -> None:
+        try:
+            with Workspace(tmp_path / "result", identity=b"request"):
+                pass
+        except BaseException as error:
+            failures.append(error)
+
+    monkeypatch.setattr(_posix, "remove_file_at", fail_identity_stage_cleanup)
+    monkeypatch.setattr(warnings, "warn", pause_identity_warning)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        worker = threading.Thread(target=initialize)
+        worker.start()
+        try:
+            assert warning_started.wait(5)
+            with pytest.raises(RuntimeWarning, match="unrelated"):
+                real_warn("unrelated", RuntimeWarning)
+        finally:
+            continue_warning.set()
+            worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert failures == []
+
+
+def test_identity_fallback_reconciles_unlinked_stage_without_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _force_linux_fallback(monkeypatch)
+    real_sync = _posix.sync_descriptor
+    failed_cleanup_sync = False
+
+    def fail_first_sync_after_unlink(descriptor: int) -> None:
+        nonlocal failed_cleanup_sync
+        entry = os.fstat(descriptor)
+        if stat.S_ISDIR(entry.st_mode):
+            names = set(os.listdir(descriptor))
+            identity_stage_absent = not any(name.startswith(".identity-") for name in names)
+            if not failed_cleanup_sync and ".identity" in names and identity_stage_absent:
+                failed_cleanup_sync = True
+                raise OSError("injected identity cleanup sync failure")
+        real_sync(descriptor)
+
+    monkeypatch.setattr(_posix, "sync_descriptor", fail_first_sync_after_unlink)
+
     with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("error")
+        warnings.simplefilter("always")
         with Workspace(tmp_path / "result", identity=b"request") as workspace:
             container = workspace.path.parent
             assert (container / ".identity").is_file()
-            assert len(list(container.glob(".identity-*.tmp"))) == 1
+            assert list(container.glob(".identity-*.tmp")) == []
 
-    assert len(caught) == 1
-    assert caught[0].category is RuntimeWarning
-    assert "identity-stage cleanup" in str(caught[0].message)
+    assert failed_cleanup_sync is True
+    assert caught == []
+
+
+def test_identity_fallback_warns_when_cleanup_sync_retry_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _force_linux_fallback(monkeypatch)
+    real_sync = _posix.sync_descriptor
+    failed_cleanup_syncs = 0
+
+    def fail_cleanup_syncs(descriptor: int) -> None:
+        nonlocal failed_cleanup_syncs
+        entry = os.fstat(descriptor)
+        if stat.S_ISDIR(entry.st_mode):
+            names = set(os.listdir(descriptor))
+            if ".identity" in names and not any(name.startswith(".identity-") for name in names):
+                failed_cleanup_syncs += 1
+                raise OSError("injected identity cleanup sync failure")
+        real_sync(descriptor)
+
+    monkeypatch.setattr(_posix, "sync_descriptor", fail_cleanup_syncs)
+
+    with (
+        pytest.warns(RuntimeWarning, match="identity-stage cleanup"),
+        Workspace(tmp_path / "result", identity=b"request") as workspace,
+    ):
+        container = workspace.path.parent
+        assert (container / ".identity").is_file()
+        assert list(container.glob(".identity-*.tmp")) == []
+
+    assert failed_cleanup_syncs == 2
 
 
 def test_file_fallback_reports_only_private_cleanup_pending(
@@ -148,6 +259,38 @@ def test_file_fallback_reports_only_private_cleanup_pending(
     assert publication.cleanup_pending is True
     assert publication.destination.read_text() == "complete"
     assert len(list(tmp_path.glob(".servatus-file-stage-*"))) == 1
+
+
+def test_file_fallback_retries_parent_sync_after_stage_was_unlinked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _force_linux_fallback(monkeypatch)
+    destination = tmp_path / "result"
+    real_sync = _posix.sync_descriptor
+    failed_cleanup_sync = False
+
+    def fail_first_sync_after_unlink(descriptor: int) -> None:
+        nonlocal failed_cleanup_sync
+        entry = os.fstat(descriptor)
+        stage_absent = not list(tmp_path.glob(".servatus-file-stage-*"))
+        if (
+            not failed_cleanup_sync
+            and stat.S_ISDIR(entry.st_mode)
+            and destination.exists()
+            and stage_absent
+        ):
+            failed_cleanup_sync = True
+            raise OSError("injected cleanup parent sync failure")
+        real_sync(descriptor)
+
+    monkeypatch.setattr(_posix, "sync_descriptor", fail_first_sync_after_unlink)
+
+    publication = publish_file(destination, lambda stage: stage.write_text("complete"))
+
+    assert failed_cleanup_sync is True
+    assert publication.cleanup_pending is False
+    assert destination.read_text() == "complete"
+    assert list(tmp_path.glob(".servatus-file-stage-*")) == []
 
 
 def test_directory_fallback_has_one_winner_across_processes(tmp_path: Path) -> None:

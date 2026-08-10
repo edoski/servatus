@@ -345,8 +345,22 @@ def _link_file_noreplace(
     try:
         remove_file_at(parent_fd, source, expected_source)
     except Exception:
-        return _CommitOutcome(cleanup_pending=True)
+        return _reconcile_file_cleanup(parent_fd, source)
     return _CommitOutcome(cleanup_pending=False)
+
+
+def _reconcile_file_cleanup(parent_fd: int, source: str) -> _CommitOutcome:
+    try:
+        os.stat(source, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        try:
+            sync_descriptor(parent_fd)
+        except Exception:
+            return _CommitOutcome(cleanup_pending=True)
+        return _CommitOutcome(cleanup_pending=False)
+    except OSError:
+        pass
+    return _CommitOutcome(cleanup_pending=True)
 
 
 def _locked_directory_noreplace(

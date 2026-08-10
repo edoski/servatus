@@ -215,9 +215,10 @@ nonblocking writer lock. `Draft.link` only hard-links regular files into a safe 
 application must not mutate a linked source inode after `Draft.link()` returns and before
 publication completes. It owns contents, validation, schemas, and completion meaning.
 
-If Linux installs a Workspace identity through the regular-file fallback but cannot remove its
-private identity stage, the valid identity remains authoritative and Servatus emits a
-`RuntimeWarning` for the cleanup residue.
+If Linux installs a Workspace identity through the regular-file fallback but cannot prove both stage
+removal and parent-directory durability, the valid identity remains authoritative and Servatus emits
+a `RuntimeWarning` that identity-stage cleanup remains pending. An absent stage triggers one parent
+sync retry before Servatus reports pending cleanup.
 
 Independent workers can publish resumable child results beneath one future destination without
 entering the parent:

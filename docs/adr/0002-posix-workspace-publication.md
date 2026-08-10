@@ -12,8 +12,9 @@ Linux first uses `renameat2(RENAME_NOREPLACE)` and macOS uses descriptor-relativ
 `renameatx_np(RENAME_EXCL)`. Linux falls back only when the native call reports `EINVAL`, `ENOSYS`,
 or `EOPNOTSUPP`, after re-verifying the pinned parent and exact source inode. A regular file is
 installed with a same-parent hard link, which remains kernel-exclusive, then the exact stage is
-removed; both parent-directory changes are synced. Cleanup failure is reported as residue after a
-successful publication.
+removed; both parent-directory changes are synced. If stage removal reports failure after the source
+name disappeared, Servatus retries the parent sync before reporting cleanup pending. It never removes
+a source found under a substituted inode.
 
 A directory fallback requires an owner-controlled parent and an exclusive advisory `flock` on its
 pinned descriptor. Under that lock Servatus re-verifies the parent and source, checks the destination
@@ -32,6 +33,6 @@ Application callbacks own contents and validation. File writers may change the m
 unlink, replace, or change the type of the stage they receive.
 
 An identity-bound workspace is retained after build failure and removed only after a committed,
-parent-synced publication. If fallback identity installation commits before stage removal fails, the
-installed identity remains valid and Servatus warns about the private residue. Cleanup failure is
-reported separately from publication success.
+parent-synced publication. If fallback identity installation commits but stage removal or its
+durability cannot be proved, the installed identity remains valid and Servatus warns that private
+cleanup remains pending. Cleanup state is reported separately from publication success.

@@ -566,6 +566,45 @@ def test_cleanup_failure_reports_committed_publication(
     assert len(hidden_entries(tmp_path)) == 1
 
 
+def test_workspace_syncs_container_before_identity_commit_without_post_commit_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_commit = _posix.commit_noreplace
+    real_sync = _posix.sync_descriptor
+    synced_entries: set[tuple[int, int]] = set()
+    committed_parent: tuple[int, int] | None = None
+
+    def record_sync(descriptor: int) -> None:
+        entry = os.fstat(descriptor)
+        key = (entry.st_dev, entry.st_ino)
+        if key == committed_parent:
+            raise AssertionError("container sync ran after identity commit")
+        synced_entries.add(key)
+        real_sync(descriptor)
+
+    def record_commit(
+        parent_fd: int,
+        source: str,
+        destination: str,
+        expected_source: os.stat_result,
+    ) -> _posix._CommitOutcome:
+        nonlocal committed_parent
+        parent = os.fstat(parent_fd)
+        key = (parent.st_dev, parent.st_ino)
+        assert key in synced_entries
+        outcome = real_commit(parent_fd, source, destination, expected_source)
+        committed_parent = key
+        return outcome
+
+    monkeypatch.setattr(_posix, "sync_descriptor", record_sync)
+    monkeypatch.setattr(_posix, "commit_noreplace", record_commit)
+
+    with Workspace(tmp_path / "result", identity=b"request"):
+        pass
+
+    assert committed_parent is not None
+
+
 def test_identity_initialization_failure_allows_same_identity_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
