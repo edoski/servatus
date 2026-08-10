@@ -21,10 +21,11 @@ pinned descriptor. Under that lock Servatus re-verifies the parent and source, c
 is absent, performs a descriptor-relative rename, verifies the published inode, and syncs the parent.
 The lock lives on a dedicated handle and is released by closing that handle, so an unlock error cannot
 mask a verified, parent-synced commit. Correctness requires every same-account publisher on every
-client to use Servatus and the filesystem mount to provide one coherent `flock` domain across those
-clients; local-only or disabled lock modes are unsupported. Same-account code that ignores the lock
-is outside the contract. Locking or verification failure closes the transaction. Cross-device and
-unexpected native errors do not enter the fallback.
+client to use Servatus and the filesystem mount to provide one coherent `flock` domain and stable
+inode identities across those clients; local-only or disabled lock modes and unstable cross-client
+inodes are unsupported. Same-account code that ignores the lock is outside the contract. Locking or
+verification failure closes the transaction. Cross-device and unexpected native errors do not enter
+the fallback.
 
 Work, stages, link sources, and destinations must share one filesystem. Servatus never copies during
 publication.

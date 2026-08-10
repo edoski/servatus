@@ -498,7 +498,21 @@ def _verify_identity(
         identity_prefix = _WORKSPACE_STATE_HEADER + identity
         if not actual.startswith(identity_prefix):
             raise WorkConflict(f"workspace belongs to different work: {destination}")
-        if actual != _workspace_state(identity, level):
+        try:
+            persisted_inodes = _parse_workspace_pins(actual[len(identity_prefix) :])
+        except ValueError:
+            raise UnsafePublication(
+                f"workspace lifecycle record is invalid: {destination}"
+            ) from None
+        assert level.container_entry is not None
+        assert level.lock_entry is not None
+        assert level.work_entry is not None
+        current_inodes = (
+            level.container_entry.st_ino,
+            level.lock_entry.st_ino,
+            level.work_entry.st_ino,
+        )
+        if persisted_inodes != current_inodes:
             raise UnsafePublication(f"workspace lifecycle changed: {destination}")
         _posix.ensure_entry(container_fd, ".identity", identity_entry)
     finally:
@@ -527,6 +541,22 @@ def _workspace_state(identity: bytes, level: _WorkspaceLevel) -> bytes:
     entries = (level.container_entry, level.lock_entry, level.work_entry)
     pins = b"".join(f"{entry.st_dev}:{entry.st_ino}\n".encode("ascii") for entry in entries)
     return _WORKSPACE_STATE_HEADER + identity + pins
+
+
+def _parse_workspace_pins(data: bytes) -> tuple[int, int, int]:
+    lines = data.split(b"\n")
+    if len(lines) != 4 or lines[-1]:
+        raise ValueError("workspace lifecycle pin count is invalid")
+    inodes: list[int] = []
+    for line in lines[:-1]:
+        fields = line.split(b":")
+        if len(fields) != 2 or any(not field.isdigit() for field in fields):
+            raise ValueError("workspace lifecycle pin is invalid")
+        device, inode = (int(field) for field in fields)
+        if fields != [str(device).encode("ascii"), str(inode).encode("ascii")]:
+            raise ValueError("workspace lifecycle pin is not canonical")
+        inodes.append(inode)
+    return inodes[0], inodes[1], inodes[2]
 
 
 def _verify_level(parent_fd: int, container_name: str, level: _WorkspaceLevel) -> None:

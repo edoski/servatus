@@ -16,9 +16,12 @@ directory. While coordinated, Servatus checks that the canonical destination is 
 creates the private hierarchy, and acquires lifecycle leases without blocking. This prevents
 compliant Servatus open and cleanup paths from splitting onto different lock inodes and avoids
 waiting on a lifecycle lease while holding coordination. Within the authentic owner-only container,
-the durable identity record binds the lifecycle-lock and work device/inode identities. An active
-handle also pins the container entry. These entries are verified before application access,
-publication, and cleanup.
+the durable identity record binds exact container, lifecycle-lock, and work inode identities. Its
+device values remain in the V1 format but are client-local information. Active handles still require
+matching local device and inode values and enforce entry type and same-filesystem checks. A
+distributed filesystem must expose stable inode identities and one coherent `flock` domain across
+every participating client. These entries are verified before application access, publication, and
+cleanup.
 
 The hidden Workspace container is the lifecycle trust root. Arbitrary same-Unix-account code can
 rename and recreate that whole root, which an unprivileged library cannot distinguish from first

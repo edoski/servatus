@@ -248,6 +248,9 @@ container, Servatus pins the lock and work entries so compliant concurrent opens
 closed on substitution; an already active handle also rejects replacement of its container path.
 Servatus is not a defense against arbitrary same-account code renaming and recreating that entire
 trust root. Callers must protect its parent directory and run only trusted workers and builders.
+Workspace identity records retain device and inode values, but persisted device IDs are
+client-local information. Cross-client reopen requires exact stable inode identities for the
+container, lock, and work entries; live checks still require matching local device and inode values.
 
 ## Guarantees and support boundary
 
@@ -268,10 +271,10 @@ Publication supports POSIX filesystems on Linux and macOS. Linux first uses
 `EOPNOTSUPP`, regular files use an atomic same-directory hard link followed by stage removal.
 Directories use a descriptor-relative rename while holding an exclusive advisory lock on a pinned,
 owner-controlled parent. That fallback requires every same-account publisher on every client to use
-Servatus and the filesystem mount to provide one coherent `flock` domain across those clients.
-Local-only or disabled lock modes and group- or world-writable parents are unsupported. Hardware
-durability still depends on the filesystem and mount. Campaign submission is an unprivileged
-workstation-side OpenSSH client for
+Servatus and the filesystem mount to provide one coherent `flock` domain and stable inode identities
+across those clients. Local-only or disabled lock modes, unstable cross-client inodes, and group- or
+world-writable parents are unsupported. Hardware durability still depends on the filesystem and
+mount. Campaign submission is an unprivileged workstation-side OpenSSH client for
 homogeneous independent processes in one-node Slurm allocations. It invokes the target's absolute
 Slurm and Apptainer paths and uses a minimal sanitized scheduler environment.
 

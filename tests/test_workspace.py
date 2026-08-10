@@ -335,6 +335,60 @@ def test_workspace_preserves_failure_and_reopens_same_identity(tmp_path: Path) -
     assert hidden_entries(tmp_path) == []
 
 
+def test_workspace_reopens_when_persisted_devices_differ(tmp_path: Path) -> None:
+    destination = tmp_path / "result"
+    with Workspace(destination, identity=b"request"):
+        pass
+    identity_path = hidden_entries(tmp_path)[0] / ".identity"
+    header, digest, *pins = identity_path.read_bytes().splitlines()
+    remote_pins = []
+    for pin in pins:
+        device, inode = pin.split(b":", maxsplit=1)
+        remote_pins.append(str(int(device) + 100).encode("ascii") + b":" + inode)
+    identity_path.write_bytes(b"\n".join((header, digest, *remote_pins)) + b"\n")
+
+    with Workspace(destination, identity=b"request") as workspace:
+        (workspace.path / "checkpoint").write_text("resumed")
+
+    assert (hidden_entries(tmp_path)[0] / "work/checkpoint").read_text() == "resumed"
+
+
+@pytest.mark.parametrize("pin_index", [0, 1, 2])
+def test_workspace_rejects_changed_persisted_inode(tmp_path: Path, pin_index: int) -> None:
+    destination = tmp_path / "result"
+    with Workspace(destination, identity=b"request"):
+        pass
+    identity_path = hidden_entries(tmp_path)[0] / ".identity"
+    header, digest, *pins = identity_path.read_bytes().splitlines()
+    device, inode = pins[pin_index].split(b":", maxsplit=1)
+    pins[pin_index] = device + b":" + str(int(inode) + 1).encode("ascii")
+    identity_path.write_bytes(b"\n".join((header, digest, *pins)) + b"\n")
+
+    with pytest.raises(UnsafePublication), Workspace(destination, identity=b"request"):
+        pass
+
+
+@pytest.mark.parametrize(
+    "pins",
+    [
+        b"1:2\n3:4\n",
+        b"device:2\n3:4\n5:6\n",
+        b"1:inode\n3:4\n5:6\n",
+        b"1:2\n3:4\n5:6\nextra\n",
+    ],
+)
+def test_workspace_rejects_malformed_persisted_pins(tmp_path: Path, pins: bytes) -> None:
+    destination = tmp_path / "result"
+    with Workspace(destination, identity=b"request"):
+        pass
+    identity_path = hidden_entries(tmp_path)[0] / ".identity"
+    header, digest, *_ = identity_path.read_bytes().splitlines(keepends=True)
+    identity_path.write_bytes(header + digest + pins)
+
+    with pytest.raises(UnsafePublication), Workspace(destination, identity=b"request"):
+        pass
+
+
 def test_workspace_rejects_different_identity(tmp_path: Path) -> None:
     destination = tmp_path / "result"
     with Workspace(destination, identity=b"request-a") as workspace:

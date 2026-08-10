@@ -21,9 +21,10 @@ kernel-enforced create-if-absent semantics through a same-directory hard link. D
 instead uses a check-and-rename transaction under an exclusive advisory lock on the pinned parent
 descriptor. Servatus requires that parent to be owned by the effective user and not group- or
 world-writable. This contract requires every same-account publisher on every client to use Servatus
-and the filesystem mount to provide coherent `flock` across all those clients. Local-only or disabled
-locking is unsupported. A same-account process that ignores the lock remains outside the threat
-model.
+and the filesystem mount to provide coherent `flock` and stable inode identities across all those
+clients. Persisted device IDs are client-local information; live handles must still agree on local
+device and inode. Local-only or disabled locking and unstable cross-client inodes are unsupported. A
+same-account process that ignores the lock remains outside the threat model.
 
 Campaign task arguments and stdin are embedded in the submitted batch script. Redaction from
 ordinary local summaries does not make them secret; do not submit credentials or other secrets.
