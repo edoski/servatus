@@ -190,6 +190,56 @@ def test_growth_preserves_receipts_and_submits_only_new_suffix(
     assert [allocation.task_keys for allocation in retry.allocations] == [("task-0",)]
 
 
+def test_old_handle_reads_appended_roster_for_status_plan_and_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "campaign"
+    old = Campaign.open(path, tasks(1))
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(0, b"101\n", b""),
+    )
+    old.submit(old.plan(target(), resources()))
+    Campaign.open(path, tasks(3))
+
+    assert old.status().pending_task_keys == ("task-1", "task-2")
+    assert [allocation.task_keys for allocation in old.plan(target(), resources()).allocations] == [
+        ("task-1", "task-2")
+    ]
+    assert [
+        allocation.task_keys
+        for allocation in old.plan(target(), resources(), retry={"task-0"}).allocations
+    ] == [("task-0", "task-1", "task-2")]
+
+
+def test_append_after_submit_verification_blocks_before_ssh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "campaign"
+    old = Campaign.open(path, tasks(1))
+    plan = old.plan(target(), resources())
+    verify = old._verify_plan
+    ssh_calls = 0
+
+    def verify_then_append(value: _campaign.SubmissionPlan) -> None:
+        verify(value)
+        Campaign.open(path, tasks(2))
+
+    def accepted(*_args: object, **_kwargs: object) -> _slurm.Result:
+        nonlocal ssh_calls
+        ssh_calls += 1
+        return _slurm.Result(0, b"101\n", b"")
+
+    monkeypatch.setattr(old, "_verify_plan", verify_then_append)
+    monkeypatch.setattr(_slurm, "_run_ssh", accepted)
+
+    with pytest.raises(PlanError, match="changed before submission intent"):
+        old.submit(plan)
+    assert ssh_calls == 0
+    assert old.status().pending_task_keys == ("task-0", "task-1")
+
+
 def test_growth_preserves_ambiguous_intent_and_resource_lineage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -209,12 +259,12 @@ def test_growth_preserves_ambiguous_intent_and_resource_lineage(
     assert grown.status().ambiguous_allocation_ids == ambiguous
     with pytest.raises(AmbiguousSubmission):
         grown.plan(target(), resources())
-    grown.resolve(ambiguous[0], job_id=None)
+    campaign.resolve(ambiguous[0], job_id=None)
     with pytest.raises(PlanError, match="resource semantics"):
-        grown.plan(target(), resources(cpus_per_task=16))
+        campaign.plan(target(), resources(cpus_per_task=16))
     assert tuple(
         key
-        for allocation in grown.plan(target(), resources()).allocations
+        for allocation in campaign.plan(target(), resources()).allocations
         for key in allocation.task_keys
     ) == ("task-0", "task-1")
 
@@ -612,7 +662,8 @@ def test_validate_deduplicates_shapes_and_never_mutates_state(
 def test_reconcile_adopts_only_private_query_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
+    path = tmp_path / "campaign"
+    campaign = Campaign.open(path, tasks(1))
     plan = campaign.plan(target(), resources())
     monkeypatch.setattr(
         _slurm,
@@ -622,6 +673,7 @@ def test_reconcile_adopts_only_private_query_result(
     with pytest.raises(AmbiguousSubmission):
         campaign.submit(plan)
     allocation_id = campaign.status().ambiguous_allocation_ids[0]
+    Campaign.open(path, tasks(2))
     monkeypatch.setattr(
         _slurm,
         "query_identity",
@@ -632,6 +684,7 @@ def test_reconcile_adopts_only_private_query_result(
 
     assert (receipt.job_id, receipt.cluster) == (909, "alpha")
     assert campaign.status().ambiguous_allocation_ids == ()
+    assert campaign.status().pending_task_keys == ("task-1",)
 
 
 def test_state_size_boundary_is_symmetric_and_overflow_does_not_mutate(

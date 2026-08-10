@@ -403,6 +403,10 @@ def _task_from_record(record: object) -> Task:
     return task
 
 
+def _tasks_from_state(state: dict[str, object]) -> tuple[Task, ...]:
+    return tuple(_task_from_record(record) for record in cast(list[object], state["tasks"]))
+
+
 def _resource_dict(resources: ResourceRequest) -> dict[str, object]:
     return {
         "cpus_per_task": resources.cpus_per_task,
@@ -554,9 +558,8 @@ def sensitive_script_document(plan: SubmissionPlan) -> dict[str, object]:
 
 
 class Campaign:
-    def __init__(self, path: Path, tasks: tuple[Task, ...], entry: os.stat_result) -> None:
+    def __init__(self, path: Path, entry: os.stat_result) -> None:
         self._path = path
-        self._tasks = tasks
         self._entry = entry
 
     @classmethod
@@ -568,7 +571,7 @@ class Campaign:
         if len(set(keys)) != len(keys):
             raise ConfigurationError("Task keys must be unique")
         campaign_path, entry = _open_or_create_directory(path)
-        campaign = cls(campaign_path, frozen, entry)
+        campaign = cls(campaign_path, entry)
         with campaign._locked_state(create=True) as state:
             if state is None:
                 campaign._write_state(
@@ -584,9 +587,7 @@ class Campaign:
                     }
                 )
             else:
-                stored = tuple(
-                    _task_from_record(record) for record in cast(list[object], state["tasks"])
-                )
+                stored = _tasks_from_state(state)
                 if frozen[: len(stored)] != stored:
                     raise TaskConflict("campaign tasks may only gain an exact ordered suffix")
                 if len(frozen) > len(stored):
@@ -600,10 +601,9 @@ class Campaign:
     @classmethod
     def _reopen(cls, path: Path) -> Self:
         campaign_path, entry = _open_existing_directory(path)
-        temporary = cls(campaign_path, (), entry)
-        state = temporary._read_state()
-        tasks = tuple(_task_from_record(record) for record in cast(list[object], state["tasks"]))
-        return cls(campaign_path, tasks, entry)
+        campaign = cls(campaign_path, entry)
+        campaign._read_state()
+        return campaign
 
     def plan(
         self,
@@ -617,10 +617,11 @@ class Campaign:
         if not isinstance(target, SlurmTarget) or not isinstance(resources, ResourceRequest):
             raise ConfigurationError("plan requires a SlurmTarget and ResourceRequest")
         state = self._read_state()
+        tasks = _tasks_from_state(state)
         ambiguous = _ambiguous_ids(state)
         if ambiguous:
             raise AmbiguousSubmission("resolve ambiguous allocation intent before planning")
-        known = tuple(task.key for task in self._tasks)
+        known = tuple(task.key for task in tasks)
         completed_values = _ordered_selection(completed, known, "completed")
         retry_values = _ordered_selection(retry, known, "retry")
         if set(completed_values) & set(retry_values):
@@ -640,7 +641,7 @@ class Campaign:
             capacity = requested
         selected = tuple(
             task
-            for task in self._tasks
+            for task in tasks
             if task.key not in completed_values
             and (task.key not in accepted or task.key in retry_values)
         )
@@ -811,10 +812,11 @@ class Campaign:
 
     def status(self) -> CampaignStatus:
         state = self._read_state()
+        tasks = _tasks_from_state(state)
         receipts = _receipt_values(state)
         accepted = {key for receipt in receipts for key in receipt.task_keys}
         return CampaignStatus(
-            tuple(task.key for task in self._tasks if task.key not in accepted),
+            tuple(task.key for task in tasks if task.key not in accepted),
             receipts,
             tuple(_ambiguous_ids(state)),
         )
@@ -1213,11 +1215,7 @@ def _validate_state(state: dict[str, object]) -> None:
         or not isinstance(state["resolutions"], list)
     ):
         raise TaskConflict("campaign state values are invalid")
-    for record in cast(list[object], state["tasks"]):
-        _task_from_record(record)
-    task_keys = tuple(
-        _task_from_record(record).key for record in cast(list[object], state["tasks"])
-    )
+    task_keys = tuple(task.key for task in _tasks_from_state(state))
     if len(set(task_keys)) != len(task_keys):
         raise TaskConflict("campaign task keys are not unique")
     lineage = _validate_lineage(state["lineage"])
