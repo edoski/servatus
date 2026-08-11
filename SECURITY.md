@@ -7,14 +7,17 @@ Only the latest released version receives security fixes.
 
 Servatus is an unprivileged user library, not an authorization, sandboxing, tenant-isolation, or
 cluster-policy layer. Its publication transaction protects against accidental partial visibility,
-overwrites, and ordinary lifecycle races. Callers remain responsible for directory permissions,
-trusted builders, application validation, filesystem guarantees, and scheduler policy.
+overwrites, and ordinary lifecycle races. Callers remain responsible for destination-parent
+permissions, trusted builders, application validation, filesystem guarantees, and scheduler policy.
 
-The owner-only hidden Workspace container is its lifecycle trust root. Servatus detects compliant
-open/cleanup races and lock or work substitution inside that authentic container, and an active
-handle rejects replacement of its container path. Arbitrary code running as the same Unix account
-can rename and recreate the complete trust root and is outside this unprivileged library's threat
-model. Keep destination parents private and treat workers and builders as trusted code.
+The hidden Workspace container is its lifecycle trust root. Servatus requires the container, its
+work directory, lifecycle lock, and identity file to belong to the effective user with no group or
+world permissions, and reverifies them through pinned descriptors. Initialization syncs the private
+hierarchy before identity becomes authoritative. Cleanup walks only the pinned tree without
+following links, reverifies every name binding, and preserves a moved or substituted root as cleanup
+residue. Arbitrary code running as the same Unix account can rename and recreate the complete trust
+root and is outside this unprivileged library's threat model. Keep destination parents private and
+treat workers and builders as trusted code.
 
 On Linux filesystems without `renameat2(RENAME_NOREPLACE)`, regular-file publication retains
 kernel-enforced create-if-absent semantics through a same-directory hard link. Directory publication

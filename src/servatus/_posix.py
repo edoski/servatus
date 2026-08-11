@@ -4,7 +4,6 @@ import ctypes
 import errno
 import fcntl
 import os
-import shutil
 import stat
 import sys
 from collections.abc import Callable
@@ -108,10 +107,25 @@ def ensure_directory_path(path: Path, descriptor: int) -> None:
 
 def make_directory_at(parent_fd: int, name: str) -> tuple[int, os.stat_result]:
     validate_leaf(name)
-    with suppress(FileExistsError):
+    created: os.stat_result | None = None
+    try:
         os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    else:
+        try:
+            created = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as error:
+            raise UnsafePublication(f"new directory is unavailable: {name}") from error
     descriptor = open_directory_at(parent_fd, name)
-    return descriptor, os.fstat(descriptor)
+    try:
+        opened = os.fstat(descriptor)
+        if created is not None and not same_entry(created, opened):
+            raise UnsafePublication(f"new directory changed before open: {name}")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, opened
 
 
 def make_unique_stage(parent_fd: int, prefix: str) -> tuple[str, int, os.stat_result]:
@@ -466,11 +480,76 @@ def _raise_rename_error(error_number: int) -> None:
 
 
 def remove_tree_at(parent_fd: int, name: str, expected: os.stat_result) -> None:
-    ensure_entry(parent_fd, name, expected)
-    if not shutil.rmtree.avoids_symlink_attacks:
-        raise UnsupportedPlatform("safe directory removal is unavailable")
-    shutil.rmtree(name, dir_fd=parent_fd)
+    if not stat.S_ISDIR(expected.st_mode):
+        raise UnsafePublication(f"cleanup target is not a directory: {name}")
+    descriptor = open_directory_at(parent_fd, name)
+    try:
+        opened = os.fstat(descriptor)
+        if not same_entry(opened, expected):
+            raise UnsafePublication(f"cleanup target changed before open: {name}")
+        ensure_entry(parent_fd, name, expected)
+        _remove_tree_contents(descriptor, expected.st_dev)
+        ensure_entry(parent_fd, name, expected)
+        os.rmdir(name, dir_fd=parent_fd)
+    finally:
+        os.close(descriptor)
     sync_descriptor(parent_fd)
+
+
+def _remove_tree_contents(descriptor: int, device: int) -> None:
+    for name in sorted(os.listdir(descriptor)):
+        try:
+            entry = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        except OSError as error:
+            raise UnsafePublication(f"cleanup entry disappeared: {name}") from error
+        if entry.st_dev != device:
+            raise CrossDevicePublication(f"cleanup entry crosses a filesystem boundary: {name}")
+        if stat.S_ISDIR(entry.st_mode):
+            _remove_directory_entry(descriptor, name, entry, device)
+        else:
+            _remove_nondirectory_entry(descriptor, name, entry)
+
+
+def _remove_directory_entry(
+    parent_fd: int,
+    name: str,
+    expected: os.stat_result,
+    device: int,
+) -> None:
+    descriptor = open_directory_at(parent_fd, name)
+    try:
+        opened = os.fstat(descriptor)
+        if not same_entry(opened, expected):
+            raise UnsafePublication(f"cleanup directory changed before open: {name}")
+        ensure_entry(parent_fd, name, expected)
+        _remove_tree_contents(descriptor, device)
+        ensure_entry(parent_fd, name, expected)
+        os.rmdir(name, dir_fd=parent_fd)
+    finally:
+        os.close(descriptor)
+
+
+def _remove_nondirectory_entry(
+    parent_fd: int,
+    name: str,
+    expected: os.stat_result,
+) -> None:
+    if stat.S_ISREG(expected.st_mode):
+        try:
+            descriptor = os.open(name, _FILE_FLAGS, dir_fd=parent_fd)
+        except OSError as error:
+            raise UnsafePublication(f"unsafe cleanup file: {name}") from error
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or not same_entry(opened, expected):
+                raise UnsafePublication(f"cleanup file changed before open: {name}")
+            ensure_entry(parent_fd, name, expected)
+            os.unlink(name, dir_fd=parent_fd)
+        finally:
+            os.close(descriptor)
+        return
+    ensure_entry(parent_fd, name, expected)
+    os.unlink(name, dir_fd=parent_fd)
 
 
 def remove_file_at(parent_fd: int, name: str, expected: os.stat_result) -> None:

@@ -361,6 +361,7 @@ def _open_lock(container_fd: int) -> tuple[int, os.stat_result]:
         os.close(descriptor)
         raise UnsafePublication("workspace lock is not a regular file")
     try:
+        _require_private_entry(lock_entry, ".lock")
         _posix.ensure_entry(container_fd, ".lock", lock_entry)
     except BaseException:
         os.close(descriptor)
@@ -380,12 +381,12 @@ def _open_level(
         level.container_fd, level.container_entry = _posix.make_directory_at(
             parent_fd, container_name
         )
+        _require_private_entry(level.container_entry, container_name)
         level.lock_fd, level.lock_entry = _open_lock(level.container_fd)
         _acquire_lifecycle(level.lock_fd, lock_mode, destination)
         level.work_fd, level.work_entry = _posix.make_directory_at(level.container_fd, "work")
         _verify_level(parent_fd, container_name, level)
-        _posix.sync_descriptor(level.container_fd)
-        _bind_identity(level.container_fd, identity, destination, level)
+        _bind_identity(parent_fd, level.container_fd, identity, destination, level)
         _verify_level(parent_fd, container_name, level)
     except BaseException:
         _close_level(level)
@@ -403,6 +404,7 @@ def _acquire_lifecycle(descriptor: int, mode: int, destination: Path) -> None:
 
 
 def _bind_identity(
+    parent_fd: int,
     container_fd: int,
     identity: bytes,
     destination: Path,
@@ -411,9 +413,17 @@ def _bind_identity(
     try:
         os.stat(".identity", dir_fd=container_fd, follow_symlinks=False)
     except FileNotFoundError:
+        _sync_workspace_initialization(parent_fd, level)
         _initialize_identity(container_fd, identity, destination, level)
     else:
         _verify_identity(container_fd, identity, destination, level)
+
+
+def _sync_workspace_initialization(parent_fd: int, level: _WorkspaceLevel) -> None:
+    _posix.sync_descriptor(level.lock_fd)
+    _posix.sync_descriptor(level.work_fd)
+    _posix.sync_descriptor(level.container_fd)
+    _posix.sync_descriptor(parent_fd)
 
 
 def _initialize_identity(
@@ -489,6 +499,7 @@ def _verify_identity(
             or identity_entry.st_size > _MAX_WORKSPACE_STATE_BYTES
         ):
             raise WorkConflict(f"workspace identity is invalid: {destination}")
+        _require_private_entry(identity_entry, ".identity")
         chunks: list[bytes] = []
         remaining = identity_entry.st_size + 1
         while remaining and (chunk := os.read(descriptor, remaining)):
@@ -531,7 +542,13 @@ def _ensure_open_entry(
     expected_type = stat.S_ISDIR if directory else stat.S_ISREG
     if not expected_type(opened.st_mode) or not _posix.same_entry(opened, expected):
         raise UnsafePublication(f"workspace entry changed: {name}")
+    _require_private_entry(opened, name)
     _posix.ensure_entry(parent_fd, name, expected)
+
+
+def _require_private_entry(entry: os.stat_result, name: str) -> None:
+    if entry.st_uid != os.geteuid() or stat.S_IMODE(entry.st_mode) & 0o077:
+        raise UnsafePublication(f"workspace entry is not owner-only: {name}")
 
 
 def _workspace_state(identity: bytes, level: _WorkspaceLevel) -> bytes:

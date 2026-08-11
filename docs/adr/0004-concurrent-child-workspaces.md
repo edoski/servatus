@@ -23,10 +23,15 @@ distributed filesystem must expose stable inode identities and one coherent `flo
 every participating client. These entries are verified before application access, publication, and
 cleanup.
 
-The hidden Workspace container is the lifecycle trust root. Arbitrary same-Unix-account code can
-rename and recreate that whole root, which an unprivileged library cannot distinguish from first
-initialization without a separate registry or broader lock. That behavior is outside the threat
-model; Servatus does not add external state or serialize unrelated destinations to claim otherwise.
+The hidden Workspace container is the lifecycle trust root. The root and child containers, work
+directories, locks, and identity files must be owned by the effective user with no group or world
+permissions; live verification checks those properties with the pinned entries. First identity
+commit follows durable initialization of the lock, work directory, container, and its parent.
+Descriptor-rooted cleanup removes only the pinned hierarchy and preserves a moved or substituted
+name. Arbitrary same-Unix-account code can rename and recreate a whole root, which an unprivileged
+library cannot distinguish from first initialization without a separate registry or broader lock.
+That behavior is outside the threat model; Servatus does not add external state or serialize
+unrelated destinations to claim otherwise.
 
 Child publication atomically retains one immutable result under parent work and removes only that
 child's private workspace. Child or parent failure preserves resumable work; parent success

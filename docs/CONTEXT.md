@@ -13,7 +13,8 @@ Servatus uses a small generic vocabulary:
 - **Receipt:** a positive Slurm job identity proving scheduler acceptance, not completion.
 - **Ambiguous allocation:** an intent without a receipt or explicit operator resolution.
 - **Destination:** the application-owned canonical path. It is immutable once published.
-- **Workspace:** stable, identity-bound private state retained when resumable work fails.
+- **Workspace:** stable, identity-bound owner-only private state retained when resumable work fails;
+  Servatus durably initializes and exactly cleans its hidden lifecycle tree.
 - **Child workspace:** one independently locked resumable result beneath a future parent destination.
 - **Identity:** opaque application bytes whose digest binds a workspace to one logical request.
 - **Draft:** one unique, disposable directory assembled before publication.

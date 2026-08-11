@@ -335,6 +335,65 @@ def test_workspace_preserves_failure_and_reopens_same_identity(tmp_path: Path) -
     assert hidden_entries(tmp_path) == []
 
 
+@pytest.mark.parametrize(
+    ("entry_name", "mode"),
+    [
+        ("container", 0o750),
+        ("work", 0o750),
+        ("lock", 0o640),
+        ("identity", 0o640),
+    ],
+)
+def test_workspace_rejects_permissive_private_entries(
+    tmp_path: Path, entry_name: str, mode: int
+) -> None:
+    destination = tmp_path / "result"
+    with Workspace(destination, identity=b"request"):
+        pass
+    container = hidden_entries(tmp_path)[0]
+    entries = {
+        "container": container,
+        "work": container / "work",
+        "lock": container / ".lock",
+        "identity": container / ".identity",
+    }
+    entries[entry_name].chmod(mode)
+
+    with pytest.raises(UnsafePublication), Workspace(destination, identity=b"request"):
+        pass
+
+
+@pytest.mark.parametrize("entry_name", ["container", "work", "lock", "identity"])
+def test_workspace_rejects_foreign_private_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry_name: str
+) -> None:
+    destination = tmp_path / "result"
+    with Workspace(destination, identity=b"request"):
+        pass
+    container = hidden_entries(tmp_path)[0]
+    entries = {
+        "container": container,
+        "work": container / "work",
+        "lock": container / ".lock",
+        "identity": container / ".identity",
+    }
+    target_inode = entries[entry_name].stat(follow_symlinks=False).st_ino
+    real_fstat = os.fstat
+
+    def report_foreign_owner(descriptor: int) -> os.stat_result:
+        entry = real_fstat(descriptor)
+        if entry.st_ino != target_inode:
+            return entry
+        fields = list(entry)
+        fields[4] = entry.st_uid + 1
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(_workspace.os, "fstat", report_foreign_owner)
+
+    with pytest.raises(UnsafePublication), Workspace(destination, identity=b"request"):
+        pass
+
+
 def test_workspace_reopens_when_persisted_devices_differ(tmp_path: Path) -> None:
     destination = tmp_path / "result"
     with Workspace(destination, identity=b"request"):
@@ -509,6 +568,34 @@ def test_workspace_rejects_parent_path_substitution(tmp_path: Path) -> None:
     assert not (moved_parent / "result").exists()
 
 
+def test_workspace_rejects_new_directory_substitution_before_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    moved_container = tmp_path / "moved-container"
+    replacement_container: Path | None = None
+    substituted = False
+    real_open_directory_at = _posix.open_directory_at
+
+    def substitute(parent_fd: int, name: str) -> int:
+        nonlocal replacement_container, substituted
+        if not substituted and name.startswith(".servatus-") and name.endswith(".work"):
+            replacement_container = tmp_path / name
+            replacement_container.rename(moved_container)
+            replacement_container.mkdir(mode=0o700)
+            substituted = True
+        return real_open_directory_at(parent_fd, name)
+
+    monkeypatch.setattr(_posix, "open_directory_at", substitute)
+
+    with pytest.raises(UnsafePublication), Workspace(tmp_path / "result", identity=b"request"):
+        pass
+
+    assert substituted is True
+    assert moved_container.is_dir()
+    assert replacement_container is not None
+    assert replacement_container.is_dir()
+
+
 def test_parent_substitution_during_build_cannot_redirect_commit(tmp_path: Path) -> None:
     parent = tmp_path / "parent"
     parent.mkdir()
@@ -620,12 +707,75 @@ def test_cleanup_failure_reports_committed_publication(
     assert len(hidden_entries(tmp_path)) == 1
 
 
-def test_workspace_syncs_container_before_identity_commit_without_post_commit_sync(
+def test_workspace_cleanup_preserves_substituted_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "result"
+    moved_container = tmp_path / "moved-container"
+    with Workspace(destination, identity=b"request") as workspace:
+        container = workspace.path.parent
+        container_checks = 0
+        real_ensure_entry = _posix.ensure_entry
+
+        def substitute_after_cleanup_check(
+            parent_fd: int, name: str, expected: os.stat_result
+        ) -> None:
+            nonlocal container_checks
+            real_ensure_entry(parent_fd, name, expected)
+            if name != container.name:
+                return
+            container_checks += 1
+            if container_checks == 3:
+                container.rename(moved_container)
+                container.mkdir(mode=0o700)
+                (container / "replacement").write_text("preserve")
+
+        monkeypatch.setattr(_posix, "ensure_entry", substitute_after_cleanup_check)
+        publication = workspace.publish(lambda draft: None)
+
+    assert publication.cleanup_pending is True
+    assert moved_container.is_dir()
+    assert (container / "replacement").read_text() == "preserve"
+
+
+def test_workspace_cleanup_preserves_substituted_nested_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "result"
+    moved_nested = tmp_path / "moved-nested"
+    substituted = False
+    with Workspace(destination, identity=b"request") as workspace:
+        nested = workspace.path / "nested"
+        nested.mkdir()
+        (nested / "checkpoint").write_text("preserve")
+        real_ensure_entry = _posix.ensure_entry
+
+        def substitute_after_cleanup_check(
+            parent_fd: int, name: str, expected: os.stat_result
+        ) -> None:
+            nonlocal substituted
+            real_ensure_entry(parent_fd, name, expected)
+            if name == nested.name and not substituted:
+                nested.rename(moved_nested)
+                nested.mkdir(mode=0o700)
+                (nested / "replacement").write_text("preserve")
+                substituted = True
+
+        monkeypatch.setattr(_posix, "ensure_entry", substitute_after_cleanup_check)
+        publication = workspace.publish(lambda draft: None)
+
+    assert publication.cleanup_pending is True
+    assert substituted is True
+    assert moved_nested.is_dir()
+    assert (nested / "replacement").read_text() == "preserve"
+
+
+def test_workspace_syncs_new_private_hierarchy_before_identity_commit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     real_commit = _posix.commit_noreplace
     real_sync = _posix.sync_descriptor
-    synced_entries: set[tuple[int, int]] = set()
+    synced_entries: list[tuple[int, int]] = []
     committed_parent: tuple[int, int] | None = None
 
     def record_sync(descriptor: int) -> None:
@@ -633,7 +783,7 @@ def test_workspace_syncs_container_before_identity_commit_without_post_commit_sy
         key = (entry.st_dev, entry.st_ino)
         if key == committed_parent:
             raise AssertionError("container sync ran after identity commit")
-        synced_entries.add(key)
+        synced_entries.append(key)
         real_sync(descriptor)
 
     def record_commit(
@@ -644,10 +794,22 @@ def test_workspace_syncs_container_before_identity_commit_without_post_commit_sy
     ) -> _posix._CommitOutcome:
         nonlocal committed_parent
         parent = os.fstat(parent_fd)
-        key = (parent.st_dev, parent.st_ino)
-        assert key in synced_entries
+        container_key = (parent.st_dev, parent.st_ino)
+        container = hidden_entries(tmp_path)[0]
+        lock = (container / ".lock").stat(follow_symlinks=False)
+        work = (container / "work").stat(follow_symlinks=False)
+        parent_key = (tmp_path.stat().st_dev, tmp_path.stat().st_ino)
+        lock_key = (lock.st_dev, lock.st_ino)
+        work_key = (work.st_dev, work.st_ino)
+        assert lock_key in synced_entries
+        assert work_key in synced_entries
+        assert container_key in synced_entries
+        assert parent_key in synced_entries
+        assert synced_entries.index(lock_key) < synced_entries.index(container_key)
+        assert synced_entries.index(work_key) < synced_entries.index(container_key)
+        assert synced_entries.index(container_key) < synced_entries.index(parent_key)
         outcome = real_commit(parent_fd, source, destination, expected_source)
-        committed_parent = key
+        committed_parent = container_key
         return outcome
 
     monkeypatch.setattr(_posix, "sync_descriptor", record_sync)

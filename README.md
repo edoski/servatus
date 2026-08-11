@@ -244,13 +244,18 @@ its resumable private work, while a published child becomes immutable input unde
 Servatus does not track expected children, readiness, dependencies, or application completion.
 
 The owner-only hidden Workspace container is the lifecycle trust root. Within an authentic
-container, Servatus pins the lock and work entries so compliant concurrent opens and cleanup fail
-closed on substitution; an already active handle also rejects replacement of its container path.
-Servatus is not a defense against arbitrary same-account code renaming and recreating that entire
-trust root. Callers must protect its parent directory and run only trusted workers and builders.
-Workspace identity records retain device and inode values, but persisted device IDs are
-client-local information. Cross-client reopen requires exact stable inode identities for the
-container, lock, and work entries; live checks still require matching local device and inode values.
+container, Servatus requires the container, work directory, lifecycle lock, and identity file to
+belong to the effective user with no group or world permissions. It rechecks those properties with
+the pinned entries before application access, publication, and cleanup. First initialization syncs
+the lock and work entries, container, and destination parent before committing identity. Cleanup
+walks the pinned tree descriptor-relatively without following links and removes the root only while
+its name still denotes the pinned inode; a moved or substituted name is preserved and reported as
+pending cleanup. Servatus is not a defense against arbitrary same-account code renaming and
+recreating the entire trust root. Callers must protect its parent directory and run only trusted
+workers and builders. Workspace identity records retain device and inode values, but persisted
+device IDs are client-local information. Cross-client reopen requires exact stable inode identities
+for the container, lock, and work entries; live checks still require matching local device and inode
+values.
 
 ## Guarantees and support boundary
 
@@ -263,7 +268,8 @@ container, lock, and work entries; live checks still require matching local devi
 - Work, hard-link sources, stages, and destination must share a filesystem.
 - Files and directories are synced before commit; the parent is synced after publication.
 - Builder failures expose no destination. Resumable work remains; disposable stages are removed.
-- Successful workspace publication removes private state. Cleanup residue is reported separately.
+- Successful workspace publication exactly removes its pinned private tree. A moved, substituted,
+  or unremovable tree remains visible as cleanup residue and is reported separately.
 - Child workspaces share the parent lifecycle lease; parent publication is busy until they close.
 
 Publication supports POSIX filesystems on Linux and macOS. Linux first uses
