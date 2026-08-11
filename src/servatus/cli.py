@@ -1,5 +1,3 @@
-# pyright: reportPrivateUsage=false
-
 from __future__ import annotations
 
 import argparse
@@ -126,8 +124,8 @@ def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
     def write(stage: Path) -> None:
-        stage.write_bytes(encoded)
         stage.chmod(0o600)
+        stage.write_bytes(encoded)
 
     publish_file(path, write)
 

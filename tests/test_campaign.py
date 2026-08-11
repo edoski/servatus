@@ -8,6 +8,7 @@ import stat
 import threading
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
+from typing import cast
 
 import pytest
 
@@ -18,6 +19,7 @@ from servatus import (
     PlanError,
     ResourceRequest,
     SlurmTarget,
+    SubmissionPlan,
     Task,
     TaskConflict,
     ValidationResult,
@@ -230,8 +232,8 @@ def test_append_after_submit_verification_blocks_before_ssh(
     verify = old._verify_plan
     ssh_calls = 0
 
-    def verify_then_append(value: _campaign.SubmissionPlan) -> None:
-        verify(value)
+    def verify_then_append(value: _campaign.SubmissionPlan, *, operation: str) -> None:
+        verify(value, operation=operation)
         Campaign.open(path, tasks(2))
 
     def accepted(*_args: object, **_kwargs: object) -> _slurm.Result:
@@ -789,9 +791,25 @@ def test_validate_rejects_foreign_plan_before_contacting_slurm(
 
     monkeypatch.setattr(_slurm, "_run_ssh", contacted)
 
-    with pytest.raises(PlanError, match="another campaign"):
+    with pytest.raises(PlanError, match="another campaign") as rejected:
         foreign.validate(plan)
+    assert "validate" in str(rejected.value)
+    assert "submit" not in str(rejected.value)
+    assert "submission" not in str(rejected.value)
     assert called is False
+
+
+def test_plan_type_errors_name_the_requested_operation(tmp_path: Path) -> None:
+    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
+    invalid = cast(SubmissionPlan, object())
+
+    with pytest.raises(PlanError, match="validate requires") as validate_error:
+        campaign.validate(invalid)
+    assert "submit" not in str(validate_error.value)
+    assert "submission" not in str(validate_error.value)
+
+    with pytest.raises(PlanError, match="submit requires"):
+        campaign.submit(invalid)
 
 
 def test_reconcile_adopts_only_private_query_result(

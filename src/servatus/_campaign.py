@@ -684,7 +684,7 @@ class Campaign:
         )
 
     def submit(self, plan: SubmissionPlan) -> tuple[JobReceipt, ...]:
-        self._verify_plan(plan)
+        self._verify_plan(plan, operation="submit")
         expected_revision = plan._state_revision
         receipts: list[JobReceipt] = []
         for allocation in plan._allocations[: plan._target.max_allocations_per_submit]:
@@ -725,7 +725,7 @@ class Campaign:
         return tuple(receipts)
 
     def validate(self, plan: SubmissionPlan) -> tuple[ValidationResult, ...]:
-        self._verify_plan(plan)
+        self._verify_plan(plan, operation="validate")
         return _validate_plan(plan)
 
     def reconcile(self, allocation_id: str) -> JobReceipt:
@@ -790,21 +790,21 @@ class Campaign:
             tuple(_ambiguous_ids(state)),
         )
 
-    def _verify_plan(self, plan: SubmissionPlan) -> None:
+    def _verify_plan(self, plan: SubmissionPlan, *, operation: str) -> None:
         if not isinstance(plan, SubmissionPlan):
-            raise PlanError("submit requires a SubmissionPlan")
+            raise PlanError(f"{operation} requires a SubmissionPlan")
         state = self._read_state()
         if plan._campaign_id != state["campaign_id"]:
-            raise PlanError("submission plan belongs to another campaign")
+            raise PlanError(f"{operation} plan belongs to another campaign")
         if plan._state_revision != state["revision"]:
-            raise PlanError("submission plan is stale")
+            raise PlanError(f"{operation} plan is stale")
         for allocation in plan._allocations:
             if allocation.script_digest != hashlib.sha256(allocation.script).hexdigest():
-                raise PlanError("submission plan script was changed")
+                raise PlanError(f"{operation} plan script was changed")
         if plan.digest != _digest(_plan_semantics(plan)):
-            raise PlanError("submission plan was changed")
+            raise PlanError(f"{operation} plan was changed")
         if _ambiguous_ids(state):
-            raise AmbiguousSubmission("resolve ambiguous allocation intent before submission")
+            raise AmbiguousSubmission(f"resolve ambiguous allocation intent before {operation}")
         lineage = state["lineage"]
         expected = _lineage(plan._target, plan._resources)
         if lineage is not None and lineage != expected:

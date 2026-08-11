@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -83,14 +85,30 @@ def test_cli_plan_status_and_help(tmp_path: Path, capsys: pytest.CaptureFixture[
 
 
 def test_cli_plan_output_is_owner_only_and_immutable(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     tasks, resources, target = write_inputs(tmp_path)
     output = tmp_path / "plans" / "PLAN.json"
     arguments = plan_arguments(tasks, resources, target, tmp_path / "campaign", output)
+    original_write = Path.write_bytes
+    modes_at_write: list[int] = []
 
-    assert main(arguments) == 0
+    def observe_stage_mode(path: Path, data: bytes) -> int:
+        if path.name.startswith(".servatus-file-stage-"):
+            modes_at_write.append(stat.S_IMODE(path.stat().st_mode))
+        return original_write(path, data)
+
+    monkeypatch.setattr(Path, "write_bytes", observe_stage_mode)
+
+    previous_umask = os.umask(0)
+    try:
+        assert main(arguments) == 0
+    finally:
+        os.umask(previous_umask)
     original = output.read_bytes()
+    assert modes_at_write == [0o600]
     assert output.stat().st_mode & 0o777 == 0o600
     capsys.readouterr()
 
