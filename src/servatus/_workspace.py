@@ -361,7 +361,7 @@ def _open_lock(container_fd: int) -> tuple[int, os.stat_result]:
         os.close(descriptor)
         raise UnsafePublication("workspace lock is not a regular file")
     try:
-        _require_private_entry(lock_entry, ".lock")
+        _posix.require_owner_only(lock_entry, "workspace lock .lock")
         _posix.ensure_entry(container_fd, ".lock", lock_entry)
     except BaseException:
         os.close(descriptor)
@@ -381,7 +381,7 @@ def _open_level(
         level.container_fd, level.container_entry = _posix.make_directory_at(
             parent_fd, container_name
         )
-        _require_private_entry(level.container_entry, container_name)
+        _posix.require_owner_only(level.container_entry, f"workspace container {container_name}")
         level.lock_fd, level.lock_entry = _open_lock(level.container_fd)
         _acquire_lifecycle(level.lock_fd, lock_mode, destination)
         level.work_fd, level.work_entry = _posix.make_directory_at(level.container_fd, "work")
@@ -496,7 +496,7 @@ def _verify_identity(
             or identity_entry.st_size > _MAX_WORKSPACE_STATE_BYTES
         ):
             raise WorkConflict(f"workspace identity is invalid: {destination}")
-        _require_private_entry(identity_entry, ".identity")
+        _posix.require_owner_only(identity_entry, "workspace identity .identity")
         chunks: list[bytes] = []
         remaining = identity_entry.st_size + 1
         while remaining and (chunk := os.read(descriptor, remaining)):
@@ -533,13 +533,8 @@ def _ensure_open_entry(
     descriptor: int,
     expected: os.stat_result,
 ) -> None:
-    _require_private_entry(os.fstat(descriptor), name)
+    _posix.require_owner_only(os.fstat(descriptor), f"workspace entry {name}")
     _posix.ensure_entry(parent_fd, name, expected)
-
-
-def _require_private_entry(entry: os.stat_result, name: str) -> None:
-    if entry.st_uid != os.geteuid() or stat.S_IMODE(entry.st_mode) & 0o077:
-        raise UnsafePublication(f"workspace entry is not owner-only: {name}")
 
 
 def _workspace_state(identity: bytes, level: _WorkspaceLevel) -> bytes:

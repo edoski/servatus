@@ -123,6 +123,11 @@ def ensure_absent(parent_fd: int, name: str, destination: Path) -> None:
     raise DestinationExists(f"publication destination already exists: {destination}")
 
 
+def require_owner_only(entry: os.stat_result, description: str) -> None:
+    if entry.st_uid != os.geteuid() or stat.S_IMODE(entry.st_mode) & 0o077:
+        raise UnsafePublication(f"{description} is not owner-only")
+
+
 def make_directory_at(parent_fd: int, name: str) -> tuple[int, os.stat_result]:
     validate_leaf(name)
     created: os.stat_result | None = None
@@ -502,16 +507,6 @@ def remove_tree_at(parent_fd: int, name: str, expected: os.stat_result) -> None:
     sync_descriptor(parent_fd)
 
 
-def remove_pinned_tree_at(
-    parent_fd: int,
-    name: str,
-    descriptor: int,
-    expected: os.stat_result,
-) -> None:
-    _remove_open_directory_entry(parent_fd, name, descriptor, expected, expected.st_dev)
-    sync_descriptor(parent_fd)
-
-
 def _remove_directory_entry(
     parent_fd: int,
     name: str,
@@ -533,10 +528,14 @@ def _remove_open_directory_entry(
     descriptor: int,
     expected: os.stat_result,
     device: int,
+    *,
+    owner_only_description: str | None = None,
 ) -> None:
     opened = os.fstat(descriptor)
     if not stat.S_ISDIR(opened.st_mode) or not same_entry(opened, expected):
         raise UnsafePublication(f"cleanup target changed before open: {name}")
+    if owner_only_description is not None:
+        require_owner_only(opened, owner_only_description)
     ensure_entry(parent_fd, name, expected)
     _remove_tree_contents(descriptor, device)
     ensure_entry(parent_fd, name, expected)
@@ -654,7 +653,6 @@ def publication_attempt(
     parent_fd = open_directory(parent)
     pinned_retirement: _PinnedTree | None = None
     try:
-        ensure_directory_path(parent, parent_fd)
         if retire is not None:
             pinned_retirement = _pin_retirement(
                 parent,
@@ -763,7 +761,15 @@ def _publication_transaction_at(
         cleanup_pending = commit.cleanup_pending
         if retirement is not None:
             try:
-                _retire_pinned_tree(parent_fd, retirement)
+                _remove_open_directory_entry(
+                    parent_fd,
+                    retirement.name,
+                    retirement.descriptor,
+                    retirement.entry,
+                    retirement.entry.st_dev,
+                    owner_only_description="retirement source",
+                )
+                sync_descriptor(parent_fd)
             except Exception:
                 cleanup_pending = True
         return _TransactionOutcome(parent / destination_name, cleanup_pending)
@@ -799,29 +805,10 @@ def _pin_retirement(
         opened = os.fstat(descriptor)
         if not same_entry(opened, entry):
             raise UnsafePublication("retirement source changed before open")
-        _require_owner_only(opened, "retirement source")
+        require_owner_only(opened, "retirement source")
         ensure_entry(parent_fd, retirement_name, opened)
     except BaseException:
         with suppress(OSError):
             os.close(descriptor)
         raise
     return _PinnedTree(retirement_name, descriptor, opened)
-
-
-def _retire_pinned_tree(parent_fd: int, retirement: _PinnedTree) -> None:
-    current = os.fstat(retirement.descriptor)
-    if not stat.S_ISDIR(current.st_mode) or not same_entry(current, retirement.entry):
-        raise UnsafePublication("retirement source changed after publication")
-    _require_owner_only(current, "retirement source")
-    ensure_entry(parent_fd, retirement.name, retirement.entry)
-    remove_pinned_tree_at(
-        parent_fd,
-        retirement.name,
-        retirement.descriptor,
-        retirement.entry,
-    )
-
-
-def _require_owner_only(entry: os.stat_result, description: str) -> None:
-    if entry.st_uid != os.geteuid() or stat.S_IMODE(entry.st_mode) & 0o077:
-        raise UnsafePublication(f"{description} is not owner-only")
