@@ -279,6 +279,37 @@ def test_stage_parent_sync_failure_cleans_stage_and_descriptor(
     assert hidden_entries(tmp_path) == []
 
 
+def test_publish_rejects_new_stage_substitution_before_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "result"
+    moved_stage = tmp_path / "moved-stage"
+    replacement_stage: Path | None = None
+    substituted = False
+    real_open_directory_at = _posix.open_directory_at
+
+    def substitute(parent_fd: int, name: str) -> int:
+        nonlocal replacement_stage, substituted
+        if not substituted and name.startswith(".servatus-stage-"):
+            replacement_stage = tmp_path / name
+            replacement_stage.rename(moved_stage)
+            replacement_stage.mkdir(mode=0o700)
+            (replacement_stage / "injected").write_text("preserve")
+            substituted = True
+        return real_open_directory_at(parent_fd, name)
+
+    monkeypatch.setattr(_posix, "open_directory_at", substitute)
+
+    with pytest.raises(UnsafePublication):
+        publish(destination, lambda draft: None)
+
+    assert substituted is True
+    assert not destination.exists()
+    assert moved_stage.is_dir()
+    assert replacement_stage is not None
+    assert (replacement_stage / "injected").read_text() == "preserve"
+
+
 def test_publish_rejects_nul_destination_before_build(tmp_path: Path) -> None:
     built = False
 
@@ -770,6 +801,19 @@ def test_workspace_cleanup_preserves_substituted_nested_directory(
     assert (nested / "replacement").read_text() == "preserve"
 
 
+def test_workspace_cleanup_removes_unreadable_regular_file(tmp_path: Path) -> None:
+    destination = tmp_path / "result"
+    with Workspace(destination, identity=b"request") as workspace:
+        private_file = workspace.path / "private"
+        private_file.write_text("resumable")
+        private_file.chmod(0o000)
+        publication = workspace.publish(lambda draft: None)
+
+    assert publication.cleanup_pending is False
+    assert destination.is_dir()
+    assert hidden_entries(tmp_path) == []
+
+
 def test_workspace_syncs_new_private_hierarchy_before_identity_commit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -805,9 +849,9 @@ def test_workspace_syncs_new_private_hierarchy_before_identity_commit(
         assert work_key in synced_entries
         assert container_key in synced_entries
         assert parent_key in synced_entries
-        assert synced_entries.index(lock_key) < synced_entries.index(container_key)
-        assert synced_entries.index(work_key) < synced_entries.index(container_key)
-        assert synced_entries.index(container_key) < synced_entries.index(parent_key)
+        internal_sync = max(synced_entries.index(lock_key), synced_entries.index(work_key))
+        hierarchy_sync = synced_entries.index(container_key, internal_sync + 1)
+        assert hierarchy_sync < synced_entries.index(parent_key)
         outcome = real_commit(parent_fd, source, destination, expected_source)
         committed_parent = container_key
         return outcome
@@ -819,6 +863,29 @@ def test_workspace_syncs_new_private_hierarchy_before_identity_commit(
         pass
 
     assert committed_parent is not None
+
+
+def test_workspace_reopen_syncs_container(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    destination = tmp_path / "result"
+    with Workspace(destination, identity=b"request"):
+        pass
+    container = hidden_entries(tmp_path)[0]
+    container_entry = container.stat(follow_symlinks=False)
+    container_key = (container_entry.st_dev, container_entry.st_ino)
+    synced_entries: list[tuple[int, int]] = []
+    real_sync = _posix.sync_descriptor
+
+    def record_sync(descriptor: int) -> None:
+        entry = os.fstat(descriptor)
+        synced_entries.append((entry.st_dev, entry.st_ino))
+        real_sync(descriptor)
+
+    monkeypatch.setattr(_posix, "sync_descriptor", record_sync)
+
+    with Workspace(destination, identity=b"request"):
+        pass
+
+    assert container_key in synced_entries
 
 
 def test_identity_initialization_failure_allows_same_identity_resume(

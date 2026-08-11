@@ -386,6 +386,7 @@ def _open_level(
         _acquire_lifecycle(level.lock_fd, lock_mode, destination)
         level.work_fd, level.work_entry = _posix.make_directory_at(level.container_fd, "work")
         _verify_level(parent_fd, container_name, level)
+        _posix.sync_descriptor(level.container_fd)
         _bind_identity(parent_fd, level.container_fd, identity, destination, level)
         _verify_level(parent_fd, container_name, level)
     except BaseException:

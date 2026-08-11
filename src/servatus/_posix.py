@@ -140,14 +140,16 @@ def make_unique_stage(parent_fd: int, prefix: str) -> tuple[str, int, os.stat_re
         descriptor = -1
         try:
             descriptor = open_directory_at(parent_fd, name)
-            entry = os.fstat(descriptor)
+            opened = os.fstat(descriptor)
+            if not same_entry(entry, opened):
+                raise UnsafePublication(f"new publication stage changed before open: {name}")
             sync_descriptor(parent_fd)
         except BaseException as error:
             cleanup_after_failure(parent_fd, name, entry, error)
             if descriptor >= 0:
                 os.close(descriptor)
             raise
-        return name, descriptor, entry
+        return name, descriptor, opened
     raise PublicationError("could not allocate a unique publication stage")
 
 
@@ -480,6 +482,16 @@ def _raise_rename_error(error_number: int) -> None:
 
 
 def remove_tree_at(parent_fd: int, name: str, expected: os.stat_result) -> None:
+    _remove_directory_entry(parent_fd, name, expected, expected.st_dev)
+    sync_descriptor(parent_fd)
+
+
+def _remove_directory_entry(
+    parent_fd: int,
+    name: str,
+    expected: os.stat_result,
+    device: int,
+) -> None:
     if not stat.S_ISDIR(expected.st_mode):
         raise UnsafePublication(f"cleanup target is not a directory: {name}")
     descriptor = open_directory_at(parent_fd, name)
@@ -493,7 +505,6 @@ def remove_tree_at(parent_fd: int, name: str, expected: os.stat_result) -> None:
         os.rmdir(name, dir_fd=parent_fd)
     finally:
         os.close(descriptor)
-    sync_descriptor(parent_fd)
 
 
 def _remove_tree_contents(descriptor: int, device: int) -> None:
@@ -510,46 +521,60 @@ def _remove_tree_contents(descriptor: int, device: int) -> None:
             _remove_nondirectory_entry(descriptor, name, entry)
 
 
-def _remove_directory_entry(
-    parent_fd: int,
-    name: str,
-    expected: os.stat_result,
-    device: int,
-) -> None:
-    descriptor = open_directory_at(parent_fd, name)
-    try:
-        opened = os.fstat(descriptor)
-        if not same_entry(opened, expected):
-            raise UnsafePublication(f"cleanup directory changed before open: {name}")
-        ensure_entry(parent_fd, name, expected)
-        _remove_tree_contents(descriptor, device)
-        ensure_entry(parent_fd, name, expected)
-        os.rmdir(name, dir_fd=parent_fd)
-    finally:
-        os.close(descriptor)
-
-
 def _remove_nondirectory_entry(
     parent_fd: int,
     name: str,
     expected: os.stat_result,
 ) -> None:
     if stat.S_ISREG(expected.st_mode):
-        try:
-            descriptor = os.open(name, _FILE_FLAGS, dir_fd=parent_fd)
-        except OSError as error:
-            raise UnsafePublication(f"unsafe cleanup file: {name}") from error
-        try:
-            opened = os.fstat(descriptor)
-            if not stat.S_ISREG(opened.st_mode) or not same_entry(opened, expected):
-                raise UnsafePublication(f"cleanup file changed before open: {name}")
-            ensure_entry(parent_fd, name, expected)
-            os.unlink(name, dir_fd=parent_fd)
-        finally:
-            os.close(descriptor)
+        _pin_and_remove_regular_file(parent_fd, name, expected)
         return
     ensure_entry(parent_fd, name, expected)
     os.unlink(name, dir_fd=parent_fd)
+
+
+def _pin_and_remove_regular_file(
+    parent_fd: int,
+    name: str,
+    expected: os.stat_result,
+) -> None:
+    pin = ""
+    for _ in range(128):
+        candidate = f".servatus-cleanup-{os.urandom(12).hex()}"
+        try:
+            os.link(
+                name,
+                candidate,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            continue
+        except OSError as error:
+            raise UnsafePublication(f"cleanup file could not be pinned: {name}") from error
+        pin = candidate
+        break
+    if not pin:
+        raise UnsafePublication("could not allocate a cleanup file pin")
+    try:
+        pinned = os.stat(pin, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise UnsafePublication(f"cleanup file pin is unavailable: {name}") from error
+    try:
+        if not stat.S_ISREG(pinned.st_mode) or not same_entry(pinned, expected):
+            raise UnsafePublication(f"cleanup file changed before pin: {name}")
+        ensure_entry(parent_fd, name, expected)
+        os.unlink(name, dir_fd=parent_fd)
+        ensure_entry(parent_fd, pin, pinned)
+        os.unlink(pin, dir_fd=parent_fd)
+    except BaseException as error:
+        try:
+            ensure_entry(parent_fd, pin, pinned)
+            os.unlink(pin, dir_fd=parent_fd)
+        except Exception as cleanup_error:
+            error.add_note(f"Servatus could not remove cleanup file pin: {cleanup_error}")
+        raise
 
 
 def remove_file_at(parent_fd: int, name: str, expected: os.stat_result) -> None:
