@@ -252,10 +252,9 @@ walks the pinned tree descriptor-relatively without following links and removes 
 its name still denotes the pinned inode; a moved or substituted name is preserved and reported as
 pending cleanup. Servatus is not a defense against arbitrary same-account code renaming and
 recreating the entire trust root. Callers must protect its parent directory and run only trusted
-workers and builders. Workspace identity records retain device and inode values, but persisted
-device IDs are client-local information. Cross-client reopen requires exact stable inode identities
-for the container, lock, and work entries; live checks still require matching local device and inode
-values.
+workers and builders. Workspace identity records store only exact inode pins for the container,
+lock, and work entries. Cross-client reopen requires those inode identities to remain stable; live
+opens still enforce local entry type, same-filesystem placement, and pathname-to-inode identity.
 
 ## Guarantees and support boundary
 
@@ -266,7 +265,8 @@ values.
   regular-file fallback never overwrite an existing entry. The Linux directory fallback serializes
   cooperating Servatus publishers with an exclusive parent-directory lock.
 - Work, hard-link sources, stages, and destination must share a filesystem.
-- Files and directories are synced before commit; the parent is synced after publication.
+- Disposable stage names are not synced merely by creation. Files and directories are synced before
+  commit; the parent is synced after publication.
 - Builder failures expose no destination. Resumable work remains; disposable stages are removed.
 - Successful workspace publication exactly removes its pinned private tree. A moved, substituted,
   or unremovable tree remains visible as cleanup residue and is reported separately.

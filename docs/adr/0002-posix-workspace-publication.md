@@ -6,7 +6,8 @@ Servatus builds a directory in a unique destination-adjacent stage, rejects unsa
 recursively syncs its contents before committing it as the destination. `publish_file` uses the same
 transaction for one regular file: it creates an empty stage with ordinary umask-controlled
 permissions, pins its descriptor and inode, requires in-place writing, and syncs it before commit.
-Both operations then sync the destination parent.
+Creating either disposable stage does not sync its parent; only validated content is made durable
+before commit. Both operations then sync the destination parent.
 
 Linux first uses `renameat2(RENAME_NOREPLACE)` and macOS uses descriptor-relative
 `renameatx_np(RENAME_EXCL)`. Linux falls back only when the native call reports `EINVAL`, `ENOSYS`,
@@ -35,11 +36,13 @@ unlink, replace, or change the type of the stage they receive.
 
 An identity-bound workspace is retained after build failure and removed only after a committed,
 parent-synced publication. Its container, work directory, lifecycle lock, and identity file must be
-owned by the effective user and expose no group or world permissions. Before first identity commit,
-Servatus syncs the lock and work entries, their container, and the container's parent. Cleanup opens
-the expected root, walks and removes entries relative to pinned directory descriptors without
-following links, reverifies each name binding, and removes the root only while it still names the
-expected inode. A moved, substituted, or unremovable tree remains as cleanup residue. If fallback
-identity installation commits but stage removal or its durability cannot be proved, the installed
-identity remains valid and Servatus warns that private cleanup remains pending. Cleanup state is
-reported separately from publication success.
+owned by the effective user and expose no group or world permissions. Its private identity record
+stores the exact container, lock, and work inode pins. Live opens enforce local type, device, and
+pathname identity. Before first identity commit, Servatus syncs the lock and work entries, their
+container, and the container's parent; a durable identity is not synced again merely on reopen.
+Cleanup opens the expected root, walks and removes entries relative to pinned directory descriptors
+without following links, reverifies each name binding, and removes the root only while it still
+names the expected inode. A moved, substituted, or unremovable tree remains as cleanup residue. If
+fallback identity installation commits but stage removal or its durability cannot be proved, the
+installed identity remains valid and Servatus warns that private cleanup remains pending. Cleanup
+state is reported separately from publication success.

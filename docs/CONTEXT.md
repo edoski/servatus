@@ -16,7 +16,8 @@ Servatus uses a small generic vocabulary:
 - **Workspace:** stable, identity-bound owner-only private state retained when resumable work fails;
   Servatus durably initializes and exactly cleans its hidden lifecycle tree.
 - **Child workspace:** one independently locked resumable result beneath a future parent destination.
-- **Identity:** opaque application bytes whose digest binds a workspace to one logical request.
+- **Identity:** opaque application bytes whose digest and three inode pins bind a workspace to one
+  logical request and its container, lock, and work entries.
 - **Draft:** one unique, disposable directory assembled before publication.
 - **File stage:** one unique, empty regular file written and validated in place before publication.
 - **Publication:** the committed destination plus whether private cleanup remains pending.

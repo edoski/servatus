@@ -143,7 +143,6 @@ def make_unique_stage(parent_fd: int, prefix: str) -> tuple[str, int, os.stat_re
             opened = os.fstat(descriptor)
             if not same_entry(entry, opened):
                 raise UnsafePublication(f"new publication stage changed before open: {name}")
-            sync_descriptor(parent_fd)
         except BaseException as error:
             cleanup_after_failure(parent_fd, name, entry, error)
             if descriptor >= 0:
@@ -173,7 +172,6 @@ def make_unique_file_stage(parent_fd: int, prefix: str) -> tuple[str, int, os.st
                 raise UnsafePublication("publication stage is not a regular file")
             if entry.st_dev != parent_device:
                 raise CrossDevicePublication("publication stage crosses a filesystem boundary")
-            sync_descriptor(parent_fd)
         except BaseException as error:
             _cleanup_entry_after_failure(parent_fd, name, entry, error, remove_file_at)
             os.close(descriptor)
@@ -187,7 +185,7 @@ def sync_descriptor(descriptor: int) -> None:
 
 
 def sync_tree(descriptor: int, device: int) -> None:
-    for name in sorted(os.listdir(descriptor)):
+    for name in os.listdir(descriptor):
         try:
             entry = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
         except OSError as error:

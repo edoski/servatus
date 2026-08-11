@@ -20,8 +20,9 @@ from ._errors import (
     WorkspaceBusy,
 )
 
-_WORKSPACE_STATE_HEADER = b"servatus-workspace-v1\n"
-_MAX_WORKSPACE_STATE_BYTES = 512
+_WORKSPACE_STATE_HEADER = b"servatus-workspace-v2\n"
+_MAX_INODE = (1 << 64) - 1
+_MAX_WORKSPACE_STATE_BYTES = len(_WORKSPACE_STATE_HEADER) + 65 + 3 * (len(str(_MAX_INODE)) + 1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,7 +294,7 @@ class Workspace:
         assert self._level.container_entry is not None
         with _coordinate(self._stable_parent_fd):
             self._verify_live()
-            _cleanup_workspace(
+            _posix.remove_tree_at(
                 self._publication_parent_fd(),
                 self._container_name,
                 self._level.container_entry,
@@ -308,14 +309,6 @@ class Workspace:
             with suppress(OSError):
                 os.close(self._stable_parent_fd)
             self._stable_parent_fd = -1
-
-
-def _cleanup_workspace(
-    parent_fd: int,
-    name: str,
-    expected: os.stat_result,
-) -> None:
-    _posix.remove_tree_at(parent_fd, name, expected)
 
 
 def _container_name(destination_name: str) -> str:
@@ -386,7 +379,6 @@ def _open_level(
         _acquire_lifecycle(level.lock_fd, lock_mode, destination)
         level.work_fd, level.work_entry = _posix.make_directory_at(level.container_fd, "work")
         _verify_level(parent_fd, container_name, level)
-        _posix.sync_descriptor(level.container_fd)
         _bind_identity(parent_fd, level.container_fd, identity, destination, level)
         _verify_level(parent_fd, container_name, level)
     except BaseException:
@@ -534,16 +526,9 @@ def _verify_identity(
 def _ensure_open_entry(
     parent_fd: int,
     name: str,
-    descriptor: int,
     expected: os.stat_result,
-    *,
-    directory: bool,
 ) -> None:
-    opened = os.fstat(descriptor)
-    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
-    if not expected_type(opened.st_mode) or not _posix.same_entry(opened, expected):
-        raise UnsafePublication(f"workspace entry changed: {name}")
-    _require_private_entry(opened, name)
+    _require_private_entry(expected, name)
     _posix.ensure_entry(parent_fd, name, expected)
 
 
@@ -557,7 +542,7 @@ def _workspace_state(identity: bytes, level: _WorkspaceLevel) -> bytes:
     assert level.lock_entry is not None
     assert level.work_entry is not None
     entries = (level.container_entry, level.lock_entry, level.work_entry)
-    pins = b"".join(f"{entry.st_dev}:{entry.st_ino}\n".encode("ascii") for entry in entries)
+    pins = b"".join(f"{entry.st_ino}\n".encode("ascii") for entry in entries)
     return _WORKSPACE_STATE_HEADER + identity + pins
 
 
@@ -567,11 +552,10 @@ def _parse_workspace_pins(data: bytes) -> tuple[int, int, int]:
         raise ValueError("workspace lifecycle pin count is invalid")
     inodes: list[int] = []
     for line in lines[:-1]:
-        fields = line.split(b":")
-        if len(fields) != 2 or any(not field.isdigit() for field in fields):
+        if not line.isdigit():
             raise ValueError("workspace lifecycle pin is invalid")
-        device, inode = (int(field) for field in fields)
-        if fields != [str(device).encode("ascii"), str(inode).encode("ascii")]:
+        inode = int(line)
+        if inode > _MAX_INODE or line != str(inode).encode("ascii"):
             raise ValueError("workspace lifecycle pin is not canonical")
         inodes.append(inode)
     return inodes[0], inodes[1], inodes[2]
@@ -584,23 +568,17 @@ def _verify_level(parent_fd: int, container_name: str, level: _WorkspaceLevel) -
     _ensure_open_entry(
         parent_fd,
         container_name,
-        level.container_fd,
         level.container_entry,
-        directory=True,
     )
     _ensure_open_entry(
         level.container_fd,
         ".lock",
-        level.lock_fd,
         level.lock_entry,
-        directory=False,
     )
     _ensure_open_entry(
         level.container_fd,
         "work",
-        level.work_fd,
         level.work_entry,
-        directory=True,
     )
 
 

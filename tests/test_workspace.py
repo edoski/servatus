@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 import sys
@@ -181,7 +182,7 @@ def test_publish_file_syncs_file_before_committed_parent(
 
     publish_file(tmp_path / "result", lambda stage: stage.write_text("complete"))
 
-    assert events[-2:] == ["file", "directory"]
+    assert events == ["file", "directory"]
 
 
 def test_publish_file_cleanup_failure_does_not_replace_writer_exception(
@@ -236,47 +237,6 @@ def test_failed_attempt_closes_stage_descriptor_once(
         publish(tmp_path / "result", fail)
 
     assert stage_closes == 1
-
-
-def test_stage_parent_sync_failure_cleans_stage_and_descriptor(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    stage_fd = -1
-    stage_closes = 0
-    failed = False
-    real_open_directory = _posix.open_directory_at
-    real_sync = _posix.sync_descriptor
-    real_close = os.close
-
-    def track_open(parent_fd: int, name: str) -> int:
-        nonlocal stage_fd
-        descriptor = real_open_directory(parent_fd, name)
-        if name.startswith(".servatus-stage-"):
-            stage_fd = descriptor
-        return descriptor
-
-    def fail_first_sync(descriptor: int) -> None:
-        nonlocal failed
-        if not failed:
-            failed = True
-            raise OSError("injected stage-parent sync failure")
-        real_sync(descriptor)
-
-    def track_close(descriptor: int) -> None:
-        nonlocal stage_closes
-        if descriptor == stage_fd:
-            stage_closes += 1
-        real_close(descriptor)
-
-    monkeypatch.setattr(_posix, "open_directory_at", track_open)
-    monkeypatch.setattr(_posix, "sync_descriptor", fail_first_sync)
-    monkeypatch.setattr(_posix.os, "close", track_close)
-
-    with pytest.raises(OSError, match="stage-parent sync failure"):
-        publish(tmp_path / "result", lambda draft: None)
-
-    assert stage_closes == 1
-    assert hidden_entries(tmp_path) == []
 
 
 def test_publish_rejects_new_stage_substitution_before_open(
@@ -425,22 +385,20 @@ def test_workspace_rejects_foreign_private_entries(
         pass
 
 
-def test_workspace_reopens_when_persisted_devices_differ(tmp_path: Path) -> None:
+def test_workspace_identity_stores_canonical_inode_pins(tmp_path: Path) -> None:
     destination = tmp_path / "result"
     with Workspace(destination, identity=b"request"):
         pass
-    identity_path = hidden_entries(tmp_path)[0] / ".identity"
-    header, digest, *pins = identity_path.read_bytes().splitlines()
-    remote_pins = []
-    for pin in pins:
-        device, inode = pin.split(b":", maxsplit=1)
-        remote_pins.append(str(int(device) + 100).encode("ascii") + b":" + inode)
-    identity_path.write_bytes(b"\n".join((header, digest, *remote_pins)) + b"\n")
+    container = hidden_entries(tmp_path)[0]
+    entries = (container, container / ".lock", container / "work")
+    expected = (
+        b"servatus-workspace-v2\n"
+        + hashlib.sha256(b"request").hexdigest().encode("ascii")
+        + b"\n"
+        + b"".join(f"{entry.stat(follow_symlinks=False).st_ino}\n".encode() for entry in entries)
+    )
 
-    with Workspace(destination, identity=b"request") as workspace:
-        (workspace.path / "checkpoint").write_text("resumed")
-
-    assert (hidden_entries(tmp_path)[0] / "work/checkpoint").read_text() == "resumed"
+    assert (container / ".identity").read_bytes() == expected
 
 
 @pytest.mark.parametrize("pin_index", [0, 1, 2])
@@ -450,8 +408,7 @@ def test_workspace_rejects_changed_persisted_inode(tmp_path: Path, pin_index: in
         pass
     identity_path = hidden_entries(tmp_path)[0] / ".identity"
     header, digest, *pins = identity_path.read_bytes().splitlines()
-    device, inode = pins[pin_index].split(b":", maxsplit=1)
-    pins[pin_index] = device + b":" + str(int(inode) + 1).encode("ascii")
+    pins[pin_index] = str(int(pins[pin_index]) + 1).encode("ascii")
     identity_path.write_bytes(b"\n".join((header, digest, *pins)) + b"\n")
 
     with pytest.raises(UnsafePublication), Workspace(destination, identity=b"request"):
@@ -461,10 +418,11 @@ def test_workspace_rejects_changed_persisted_inode(tmp_path: Path, pin_index: in
 @pytest.mark.parametrize(
     "pins",
     [
-        b"1:2\n3:4\n",
-        b"device:2\n3:4\n5:6\n",
-        b"1:inode\n3:4\n5:6\n",
-        b"1:2\n3:4\n5:6\nextra\n",
+        b"2\n4\n",
+        b"inode\n4\n6\n",
+        b"02\n4\n6\n",
+        b"18446744073709551616\n4\n6\n",
+        b"2\n4\n6\nextra\n",
     ],
 )
 def test_workspace_rejects_malformed_persisted_pins(tmp_path: Path, pins: bytes) -> None:
@@ -713,9 +671,12 @@ def test_syncs_files_before_directories_and_parent(
 
     publish(tmp_path / "result", build)
 
-    file_index = next(index for index, event in enumerate(events) if event[0] == "file")
-    assert all(event[0] == "directory" for event in events[file_index + 1 :])
-    assert len(events[file_index + 1 :]) >= 3
+    assert [kind for kind, _ in events] == [
+        "file",
+        "directory",
+        "directory",
+        "directory",
+    ]
 
 
 def test_cleanup_failure_reports_committed_publication(
@@ -727,7 +688,7 @@ def test_cleanup_failure_reports_committed_publication(
         del parent_fd, name, expected
         raise OSError("injected cleanup failure")
 
-    monkeypatch.setattr(_workspace, "_cleanup_workspace", fail_cleanup)
+    monkeypatch.setattr(_posix, "remove_tree_at", fail_cleanup)
 
     with Workspace(destination, identity=b"request") as workspace:
         publication = workspace.publish(lambda draft: (draft.path / "value").write_text("complete"))
@@ -865,7 +826,9 @@ def test_workspace_syncs_new_private_hierarchy_before_identity_commit(
     assert committed_parent is not None
 
 
-def test_workspace_reopen_syncs_container(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_workspace_reopen_does_not_sync_unchanged_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     destination = tmp_path / "result"
     with Workspace(destination, identity=b"request"):
         pass
@@ -885,7 +848,7 @@ def test_workspace_reopen_syncs_container(tmp_path: Path, monkeypatch: pytest.Mo
     with Workspace(destination, identity=b"request"):
         pass
 
-    assert container_key in synced_entries
+    assert container_key not in synced_entries
 
 
 def test_identity_initialization_failure_allows_same_identity_resume(

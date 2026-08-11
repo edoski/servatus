@@ -16,9 +16,9 @@ directory. While coordinated, Servatus checks that the canonical destination is 
 creates the private hierarchy, and acquires lifecycle leases without blocking. This prevents
 compliant Servatus open and cleanup paths from splitting onto different lock inodes and avoids
 waiting on a lifecycle lease while holding coordination. Within the authentic owner-only container,
-the durable identity record binds exact container, lifecycle-lock, and work inode identities. Its
-device values remain in the V1 format but are client-local information. Active handles still require
-matching local device and inode values and enforce entry type and same-filesystem checks. A
+the durable identity record stores exact container, lifecycle-lock, and work inode identities only.
+Active handles still require matching local device and inode values and enforce entry type and
+same-filesystem checks. A
 distributed filesystem must expose stable inode identities and one coherent `flock` domain across
 every participating client. These entries are verified before application access, publication, and
 cleanup.
