@@ -20,6 +20,7 @@ from servatus import (
     SlurmTarget,
     Task,
     TaskConflict,
+    ValidationResult,
     _campaign,
     _slurm,
 )
@@ -159,6 +160,15 @@ def test_campaign_accepts_only_an_exact_append_only_suffix(tmp_path: Path) -> No
         Campaign.open(path, (replace(original[0], stdin=b"changed"), *tasks(4)[1:]))
 
 
+def test_campaign_loads_an_existing_durable_roster(tmp_path: Path) -> None:
+    path = tmp_path / "campaign"
+    opened = Campaign.open(path, tasks(2))
+
+    loaded = Campaign.load(path)
+
+    assert loaded.status() == opened.status()
+
+
 def test_growth_preserves_receipts_and_submits_only_new_suffix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -183,7 +193,7 @@ def test_growth_preserves_receipts_and_submits_only_new_suffix(
         ("task-0", "task-1"),
         ("task-2", "task-3"),
     ]
-    assert grown.status().pending_task_keys == ()
+    assert grown.status().unaccepted_task_keys == ()
     retry = grown.plan(target(), resources(), retry={"task-0"})
     assert [allocation.task_keys for allocation in retry.allocations] == [("task-0",)]
 
@@ -201,7 +211,7 @@ def test_old_handle_reads_appended_roster_for_status_plan_and_retry(
     old.submit(old.plan(target(), resources()))
     Campaign.open(path, tasks(3))
 
-    assert old.status().pending_task_keys == ("task-1", "task-2")
+    assert old.status().unaccepted_task_keys == ("task-1", "task-2")
     assert [allocation.task_keys for allocation in old.plan(target(), resources()).allocations] == [
         ("task-1", "task-2")
     ]
@@ -235,7 +245,7 @@ def test_append_after_submit_verification_blocks_before_ssh(
     with pytest.raises(PlanError, match="changed before submission intent"):
         old.submit(plan)
     assert ssh_calls == 0
-    assert old.status().pending_task_keys == ("task-0", "task-1")
+    assert old.status().unaccepted_task_keys == ("task-0", "task-1")
 
 
 def test_growth_preserves_ambiguous_intent_and_resource_lineage(
@@ -310,7 +320,7 @@ def test_growth_postcommit_sync_failure_is_recoverable(
     recovered = Campaign.open(path, tasks(2))
     state = json.loads((path / "campaign.json").read_text())
     assert state["revision"] == 1
-    assert recovered.status().pending_task_keys == ("task-0", "task-1")
+    assert recovered.status().unaccepted_task_keys == ("task-0", "task-1")
     assert list(path.glob(".campaign-*.tmp")) == []
 
 
@@ -510,7 +520,7 @@ def test_submit_records_intent_before_ssh_and_receipt(
     receipts = campaign.submit(plan)
 
     assert [(receipt.job_id, receipt.cluster) for receipt in receipts] == [(4242, "alpha")]
-    assert campaign.status().pending_task_keys == ()
+    assert campaign.status().unaccepted_task_keys == ()
     state_path = tmp_path / "campaign" / "campaign.json"
     assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
     assert list((tmp_path / "campaign").glob(".campaign-*.tmp")) == []
@@ -737,7 +747,7 @@ def test_submission_call_cap_leaves_later_groups_pending(
 
     assert len(receipts) == 2
     assert calls == 2
-    assert campaign.status().pending_task_keys == ("task-4",)
+    assert campaign.status().unaccepted_task_keys == ("task-4",)
     with pytest.raises(PlanError, match="stale"):
         campaign.submit(plan)
 
@@ -755,11 +765,33 @@ def test_validate_deduplicates_shapes_and_never_mutates_state(
         return _slurm.Result(0, b"Job 1 to start at 2030-01-01\n", b"")
 
     monkeypatch.setattr(_slurm, "_run_ssh", validated)
-    results = _campaign.validate_plan(plan)
+    results = campaign.validate(plan)
 
     assert len(results) == 2  # group shapes 2 and 1
+    assert all(isinstance(result, ValidationResult) for result in results)
+    assert results[0].task_count == 2
+    assert results[0].cpus == 64
     assert all(argv[-1] == "--test-only" for argv in calls)
     assert before == (tmp_path / "campaign" / "campaign.json").read_bytes()
+
+
+def test_validate_rejects_foreign_plan_before_contacting_slurm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = Campaign.open(tmp_path / "source", tasks(1)).plan(target(), resources())
+    foreign = Campaign.open(tmp_path / "foreign", tasks(1))
+    called = False
+
+    def contacted(*args: object, **kwargs: object) -> _slurm.Result:
+        nonlocal called
+        called = True
+        return _slurm.Result(0, b"valid\n", b"")
+
+    monkeypatch.setattr(_slurm, "_run_ssh", contacted)
+
+    with pytest.raises(PlanError, match="another campaign"):
+        foreign.validate(plan)
+    assert called is False
 
 
 def test_reconcile_adopts_only_private_query_result(
@@ -777,17 +809,20 @@ def test_reconcile_adopts_only_private_query_result(
         campaign.submit(plan)
     allocation_id = campaign.status().ambiguous_allocation_ids[0]
     Campaign.open(path, tasks(2))
-    monkeypatch.setattr(
-        _slurm,
-        "query_identity",
-        lambda *args, **kwargs: _slurm.IdentityMatch(909, "alpha"),
-    )
+    queried_targets: list[SlurmTarget] = []
 
-    receipt = campaign.reconcile(target(), allocation_id)
+    def query(target_value: SlurmTarget, **kwargs: object) -> _slurm.IdentityMatch:
+        queried_targets.append(target_value)
+        return _slurm.IdentityMatch(909, "alpha")
+
+    monkeypatch.setattr(_slurm, "query_identity", query)
+
+    receipt = campaign.reconcile(allocation_id)
 
     assert (receipt.job_id, receipt.cluster) == (909, "alpha")
+    assert queried_targets == [target()]
     assert campaign.status().ambiguous_allocation_ids == ()
-    assert campaign.status().pending_task_keys == ("task-1",)
+    assert campaign.status().unaccepted_task_keys == ("task-1",)
 
 
 def test_state_size_boundary_is_symmetric_and_overflow_does_not_mutate(

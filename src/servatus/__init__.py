@@ -7,6 +7,7 @@ from ._campaign import (
     SlurmTarget,
     SubmissionPlan,
     Task,
+    ValidationResult,
 )
 from ._errors import (
     AmbiguousSubmission,
@@ -51,6 +52,7 @@ __all__ = [
     "TaskConflict",
     "UnsafePublication",
     "UnsupportedPlatform",
+    "ValidationResult",
     "WorkConflict",
     "Workspace",
     "WorkspaceBusy",

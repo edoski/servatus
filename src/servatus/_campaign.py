@@ -323,14 +323,18 @@ class JobReceipt:
 
 @dataclass(frozen=True, slots=True)
 class CampaignStatus:
-    pending_task_keys: tuple[str, ...]
+    unaccepted_task_keys: tuple[str, ...]
     receipts: tuple[JobReceipt, ...]
     ambiguous_allocation_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class _ValidationResult:
-    shape: dict[str, object]
+class ValidationResult:
+    task_count: int
+    cpus: int
+    memory_mib: int
+    gpus: int
+    time_limit: str
     shape_digest: str
     script_digest: str
     controller_stdout: str
@@ -562,7 +566,7 @@ class Campaign:
         return campaign
 
     @classmethod
-    def _reopen(cls, path: Path) -> Self:
+    def load(cls, path: Path) -> Self:
         campaign_path, entry = _open_existing_directory(path)
         campaign = cls(campaign_path, entry)
         campaign._read_state()
@@ -720,12 +724,17 @@ class Campaign:
             receipts.append(receipt)
         return tuple(receipts)
 
-    def reconcile(self, target: SlurmTarget, allocation_id: str) -> JobReceipt:
+    def validate(self, plan: SubmissionPlan) -> tuple[ValidationResult, ...]:
+        self._verify_plan(plan)
+        return _validate_plan(plan)
+
+    def reconcile(self, allocation_id: str) -> JobReceipt:
         state = self._read_state()
         intent = _unresolved_intent(state, allocation_id)
-        lineage = cast(dict[str, object], state["lineage"])
-        if lineage["target"] != _target_dict(target):
-            raise ReconciliationError("reconciliation target does not match allocation intent")
+        lineage = _validate_lineage(state["lineage"])
+        if lineage is None:
+            raise ReconciliationError("allocation intent has no target lineage")
+        target, _ = lineage
         match = _slurm.query_identity(
             target,
             job_name=f"servatus-{allocation_id}",
@@ -1416,9 +1425,9 @@ def restore_plan(campaign: Campaign, document: object) -> SubmissionPlan:
     return plan
 
 
-def validate_plan(plan: SubmissionPlan) -> tuple[_ValidationResult, ...]:
+def _validate_plan(plan: SubmissionPlan) -> tuple[ValidationResult, ...]:
     seen: set[tuple[int, int, int, int, str]] = set()
-    results: list[_ValidationResult] = []
+    results: list[ValidationResult] = []
     for item in plan._allocations:
         allocation = item.allocation
         shape_key = (
@@ -1445,8 +1454,12 @@ def validate_plan(plan: SubmissionPlan) -> tuple[_ValidationResult, ...]:
             "time_limit": allocation.time_limit,
         }
         results.append(
-            _ValidationResult(
-                shape,
+            ValidationResult(
+                len(allocation.task_keys),
+                allocation.cpus,
+                allocation.memory_mib,
+                allocation.gpus,
+                allocation.time_limit,
                 _digest(shape),
                 item.script_digest,
                 result.stdout.decode("utf-8", "replace").rstrip("\n"),
@@ -1456,12 +1469,18 @@ def validate_plan(plan: SubmissionPlan) -> tuple[_ValidationResult, ...]:
     return tuple(results)
 
 
-def validation_document(results: tuple[_ValidationResult, ...]) -> dict[str, object]:
+def validation_document(results: tuple[ValidationResult, ...]) -> dict[str, object]:
     return {
         "time_specific": True,
         "results": [
             {
-                "shape": result.shape,
+                "shape": {
+                    "task_count": result.task_count,
+                    "cpus": result.cpus,
+                    "memory_mib": result.memory_mib,
+                    "gpus": result.gpus,
+                    "time_limit": result.time_limit,
+                },
                 "shape_digest": result.shape_digest,
                 "script_digest": result.script_digest,
                 "controller_stdout": result.controller_stdout,

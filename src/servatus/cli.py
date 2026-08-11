@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
-from contextlib import suppress
 from pathlib import Path
 from typing import cast
 
@@ -19,10 +17,10 @@ from ._campaign import (
     plan_document,
     restore_plan,
     sensitive_script_document,
-    validate_plan,
     validation_document,
 )
 from ._errors import ServatusError
+from ._workspace import publish_file
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -37,6 +35,20 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--output", type=Path, required=True)
     plan.add_argument("--tasks-per-allocation", type=int)
     plan.add_argument(
+        "--completed",
+        action="append",
+        default=[],
+        metavar="TASK_KEY",
+        help="exclude an application-validated task; repeat for multiple tasks",
+    )
+    plan.add_argument(
+        "--retry",
+        action="append",
+        default=[],
+        metavar="TASK_KEY",
+        help="retry a task with a prior scheduler receipt; repeat for multiple tasks",
+    )
+    plan.add_argument(
         "--show-scripts",
         action="store_true",
         help="print sensitive complete scripts, including task arguments and payloads",
@@ -50,13 +62,14 @@ def _parser() -> argparse.ArgumentParser:
     submit.add_argument("campaign", type=Path)
     submit.add_argument("plan", type=Path)
 
-    status = commands.add_parser("status", help="show local campaign provenance")
+    status = commands.add_parser(
+        "status", help="show unaccepted tasks, receipts, and ambiguous allocations"
+    )
     status.add_argument("campaign", type=Path)
 
     reconcile = commands.add_parser("reconcile", help="query one ambiguous allocation once")
     reconcile.add_argument("campaign", type=Path)
     reconcile.add_argument("allocation_id")
-    reconcile.add_argument("--target", type=Path, required=True)
 
     resolve = commands.add_parser("resolve", help="record an operator ambiguity decision")
     resolve.add_argument("campaign", type=Path)
@@ -91,6 +104,8 @@ def _load_tasks(path: Path) -> tuple[Task, ...]:
                     raise ValueError("args must be an array of strings")
                 typed_args.append(value)
             stdin_file = Path(cast(str, mapping["stdin_file"]))
+            if not stdin_file.is_absolute():
+                stdin_file = path.parent / stdin_file
             values.append(
                 Task(cast(str, mapping["key"]), tuple(typed_args), stdin_file.read_bytes())
             )
@@ -109,22 +124,12 @@ def _read_json(path: Path) -> object:
 def _write_json(path: Path, value: object) -> None:
     encoded = json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False).encode() + b"\n"
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}-{os.urandom(8).hex()}.tmp")
-    try:
-        with temporary.open("xb") as destination:
-            os.chmod(temporary, 0o600)
-            destination.write(encoded)
-            destination.flush()
-            os.fsync(destination.fileno())
-        os.replace(temporary, path)
-        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    finally:
-        with suppress(FileNotFoundError):
-            temporary.unlink()
+
+    def write(stage: Path) -> None:
+        stage.write_bytes(encoded)
+        stage.chmod(0o600)
+
+    publish_file(path, write)
 
 
 def _receipt_json(receipt: JobReceipt) -> dict[str, object]:
@@ -143,6 +148,8 @@ def _run(arguments: argparse.Namespace) -> None:
         plan = campaign.plan(
             SlurmTarget.from_toml(arguments.target),
             ResourceRequest.from_toml(arguments.resources),
+            completed=arguments.completed,
+            retry=arguments.retry,
             tasks_per_allocation=arguments.tasks_per_allocation,
         )
         _write_json(arguments.output, plan_document(plan))
@@ -155,19 +162,19 @@ def _run(arguments: argparse.Namespace) -> None:
         else:
             print(plan.digest)
     elif command == "validate":
-        campaign = Campaign._reopen(arguments.campaign)
-        results = validate_plan(restore_plan(campaign, _read_json(arguments.plan)))
+        campaign = Campaign.load(arguments.campaign)
+        results = campaign.validate(restore_plan(campaign, _read_json(arguments.plan)))
         print(json.dumps(validation_document(results), sort_keys=True))
     elif command == "submit":
-        campaign = Campaign._reopen(arguments.campaign)
+        campaign = Campaign.load(arguments.campaign)
         receipts = campaign.submit(restore_plan(campaign, _read_json(arguments.plan)))
         print(json.dumps([_receipt_json(receipt) for receipt in receipts], sort_keys=True))
     elif command == "status":
-        status = Campaign._reopen(arguments.campaign).status()
+        status = Campaign.load(arguments.campaign).status()
         print(
             json.dumps(
                 {
-                    "pending_task_keys": list(status.pending_task_keys),
+                    "unaccepted_task_keys": list(status.unaccepted_task_keys),
                     "receipts": [_receipt_json(receipt) for receipt in status.receipts],
                     "ambiguous_allocation_ids": list(status.ambiguous_allocation_ids),
                 },
@@ -175,13 +182,11 @@ def _run(arguments: argparse.Namespace) -> None:
             )
         )
     elif command == "reconcile":
-        campaign = Campaign._reopen(arguments.campaign)
-        receipt = campaign.reconcile(
-            SlurmTarget.from_toml(arguments.target), arguments.allocation_id
-        )
+        campaign = Campaign.load(arguments.campaign)
+        receipt = campaign.reconcile(arguments.allocation_id)
         print(json.dumps(_receipt_json(receipt), sort_keys=True))
     elif command == "resolve":
-        campaign = Campaign._reopen(arguments.campaign)
+        campaign = Campaign.load(arguments.campaign)
         campaign.resolve(
             arguments.allocation_id,
             job_id=None if arguments.not_submitted else arguments.job_id,

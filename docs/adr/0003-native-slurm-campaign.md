@@ -23,6 +23,12 @@ complete atomic snapshot, including that an allocation cannot have both an accep
 an explicit not-submitted resolution. Internally typed mutations are encoded directly rather than
 decoded again immediately before the atomic write.
 
+`Campaign.open` registers an authored roster; `Campaign.load` reopens an existing one.
+`Campaign.validate` first proves that a plan belongs to the current Campaign revision, then issues
+bounded time-specific `sbatch --test-only` calls. Status reports `unaccepted_task_keys`: receipts
+prove scheduler acceptance, never application completion. Reconciliation reconstructs its target
+from validated immutable lineage, so callers cannot supply a second route.
+
 The package invokes stable command-line seams directly. Submitit is prior art, not a dependency:
 its cluster-local Python callable and post-acceptance pickle transport do not fit the workstation
 SSH boundary or the requirement that every accepted job already own its complete payload. There is

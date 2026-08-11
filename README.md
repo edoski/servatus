@@ -34,7 +34,10 @@ resources = ResourceRequest(
 target = SlurmTarget.from_toml(Path("TARGET.toml"))
 plan = campaign.plan(target, resources)
 # Review plan.allocations and plan.digest, then submit explicitly:
+# validation = campaign.validate(plan)  # Optional, time-specific Slurm --test-only check.
 receipts = campaign.submit(plan)
+# Later processes reopen the durable roster without resupplying Tasks:
+campaign = Campaign.load(Path("state/training"))
 ```
 
 `ResourceRequest` has no defaults. CPU and MiB memory are positive, GPUs are a nonnegative whole
@@ -90,13 +93,9 @@ Append-only growth preserves target/resource lineage, accepted receipts, retry h
 ambiguous intents. It increments campaign revision, so a plan made before the append becomes stale.
 Accepted prefix tasks are not selected again unless the caller explicitly requests retry.
 
-The current development line uses Campaign and plan schema 3. Plans retain typed planning inputs
-and derived allocation summaries; loading regenerates the immutable plan once and requires the
-same canonical bytes. Campaign state stores resource lineage once, exact intent provenance, compact
-acceptance receipts, and allocation IDs explicitly resolved as not submitted. Derivable command
-digests, lineage copies, job names, receipt Task keys, and negative-resolution wrappers are not
-persisted. Schema 2 state and plans are rejected rather than interpreted through a compatibility
-path; create a new Campaign when upgrading.
+The current development line uses Campaign and plan schema 3. Loading a plan regenerates it from
+typed inputs and requires identical canonical bytes. Schema 2 state and plans are rejected; create
+a new Campaign when upgrading.
 
 Each allocation runs one concurrent
 `srun --exclusive --exact --nodes=1 --ntasks=1` step per Task. Each step receives its exact CPU,
@@ -108,12 +107,8 @@ Slurm writes combined allocation stdout/stderr to `log_root/%j.out` and each com
 to `log_root/%j-<zero-based-slot>.out`. `%j` is expanded by Slurm after it assigns the job ID; plans
 and durable intent therefore remain immutable before scheduler acceptance.
 
-Servatus requests concurrent exact steps; actual simultaneous placement depends on the site's CPU
-and GRES topology and a truthful `ResourceRequest` and target profile. On an SMT2 site, one Slurm
-CPU may represent one logical thread while an exclusive step occupies a physical core, so one
-requested CPU can account for only half the logical capacity needed by that step. The accepted
-four-step production smoke therefore used `cpus_per_task=2`. Servatus does not silently inflate CPU
-requests, disable binding, or expose raw scheduler flags.
+Actual simultaneous placement depends on truthful resource requests and site CPU/GRES topology.
+Servatus does not silently inflate CPU requests, disable binding, or expose raw scheduler flags.
 
 Task arguments and byte-exact stdin are embedded in the complete batch script before `sbatch`
 acceptance. They are excluded from ordinary plan and status output, but are not secrets: cluster
@@ -128,33 +123,37 @@ The Python interface is authoritative. The CLI task JSONL adapter has exactly `k
 ```sh
 servatus plan TASKS.jsonl --target TARGET.toml --resources RESOURCES.toml \
   --campaign STATE_DIR --output PLAN.json --tasks-per-allocation 4
+# Exclude caller-validated work or explicitly retry accepted work; both flags are repeatable:
+servatus plan TASKS.jsonl --target TARGET.toml --resources RESOURCES.toml \
+  --campaign STATE_DIR --output RETRY.json --completed task-2 --retry task-0
 # Explicit sensitive diagnostic; prints complete scripts, arguments, and payloads:
 servatus plan TASKS.jsonl --target TARGET.toml --resources RESOURCES.toml \
   --campaign STATE_DIR --output PLAN.json --show-scripts
 servatus validate STATE_DIR PLAN.json
 servatus submit STATE_DIR PLAN.json
 servatus status STATE_DIR
-servatus reconcile STATE_DIR ALLOCATION_ID --target TARGET.toml
+servatus reconcile STATE_DIR ALLOCATION_ID
 servatus resolve STATE_DIR ALLOCATION_ID --job-id 1234 --cluster alpha
 servatus resolve STATE_DIR ALLOCATION_ID --not-submitted
 ```
 
 To extend an existing Campaign through the CLI, pass the complete previously registered JSONL
 prefix followed by the new suffix. Supplying only the suffix or changing the prefix fails closed.
+Relative `stdin_file` paths resolve against `TASKS.jsonl`'s parent.
 
-`PLAN.json` contains task keys, requested resources, effective allocation totals, target values,
+`PLAN.json` is published owner-only and never overwrites an existing path. It contains task keys,
+requested resources, effective allocation totals, target values,
 exact nonsecret `sbatch` arguments, allocation identities, and digests—not task arguments or stdin.
 Complete scripts are shown only by the warning-bearing `--show-scripts` diagnostic. `validate`
 makes one serial `sbatch --test-only` call per distinct allocation shape and prints each stable
 shape/script digest plus the controller response. Its answer is time-specific and does not submit
 or mutate campaign state.
 
-An intent without a receipt is ambiguous. `reconcile` performs one bounded `squeue`/`sacct` query
-and adopts only one exact Servatus identity. Otherwise an operator must resolve it explicitly as an
-accepted job or as not submitted. This is fail-closed recovery, not exactly-once execution. Retry is
-explicit through `Campaign.plan(..., retry={...})`; prior receipts remain in history and resources
-cannot change. Scheduler acceptance never means application completion: the caller supplies
-`completed` after its own canonical validation.
+An intent without a receipt is ambiguous. `reconcile` uses the Campaign's validated target lineage
+for one bounded `squeue`/`sacct` query and adopts only one exact Servatus identity. Otherwise an
+operator must resolve it explicitly as accepted or not submitted. Retry is explicit through
+`Campaign.plan(..., retry={...})`; prior receipts remain in history. Status reports unaccepted
+tasks, not incomplete work: the caller supplies `completed` after its own canonical validation.
 
 Servatus does not cancel jobs in V1. Use the receipt with the site's normal `scancel` command.
 Cancellation applies to the packed allocation, does not prove application completion, and does not
@@ -219,11 +218,6 @@ nonblocking writer lock. `Draft.link` only hard-links regular files into a safe 
 application must not mutate a linked source inode after `Draft.link()` returns and before
 publication completes. It owns contents, validation, schemas, and completion meaning.
 
-If Linux installs a Workspace identity through the regular-file fallback but cannot prove both stage
-removal and parent-directory durability, the valid identity remains authoritative and Servatus emits
-a `RuntimeWarning` that identity-stage cleanup remains pending. An absent stage triggers one parent
-sync retry before Servatus reports pending cleanup.
-
 Independent workers can publish resumable child results beneath one future destination without
 entering the parent:
 
@@ -247,18 +241,10 @@ same child and parent finalization remain exclusive and nonblocking. A failed ch
 its resumable private work, while a published child becomes immutable input under the parent work.
 Servatus does not track expected children, readiness, dependencies, or application completion.
 
-The owner-only hidden Workspace container is the lifecycle trust root. Within an authentic
-container, Servatus requires the container, work directory, lifecycle lock, and identity file to
-belong to the effective user with no group or world permissions. It rechecks those properties with
-the pinned entries before application access, publication, and cleanup. First initialization syncs
-the lock and work entries, container, and destination parent before committing identity. Cleanup
-walks the pinned tree descriptor-relatively without following links and removes the root only while
-its name still denotes the pinned inode; a moved or substituted name is preserved and reported as
-pending cleanup. Servatus is not a defense against arbitrary same-account code renaming and
-recreating the entire trust root. Callers must protect its parent directory and run only trusted
-workers and builders. Workspace identity records store only exact inode pins for the container,
-lock, and work entries. Cross-client reopen requires those inode identities to remain stable; live
-opens still enforce local entry type, same-filesystem placement, and pathname-to-inode identity.
+The owner-only hidden Workspace container is the lifecycle trust root. Servatus pins and rechecks
+its entries without following links; unsafe substitution is preserved and reported as pending
+cleanup. Callers must protect the parent directory, run only trusted same-account code, and use a
+filesystem with stable cross-client inode identities. See [SECURITY.md](SECURITY.md).
 
 ## Guarantees and support boundary
 
@@ -278,23 +264,12 @@ opens still enforce local entry type, same-filesystem placement, and pathname-to
   or unremovable tree remains visible as cleanup residue and is reported separately.
 - Child workspaces share the parent lifecycle lease; parent publication is busy until they close.
 
-Publication supports POSIX filesystems on Linux and macOS. Linux first uses
-`renameat2(RENAME_NOREPLACE)`. If the kernel or filesystem reports only `EINVAL`, `ENOSYS`, or
-`EOPNOTSUPP`, regular files use an atomic same-directory hard link followed by stage removal.
-Directories use a descriptor-relative rename while holding an exclusive advisory lock on a pinned,
-owner-controlled parent. That fallback requires every same-account publisher on every client to use
-Servatus and the filesystem mount to provide one coherent `flock` domain and stable inode identities
-across those clients. Local-only or disabled lock modes, unstable cross-client inodes, and group- or
-world-writable parents are unsupported. Hardware durability still depends on the filesystem and
-mount. Campaign submission is an unprivileged workstation-side OpenSSH client for
-homogeneous independent processes in one-node Slurm allocations. It invokes the target's absolute
-Slurm and Apptainer paths and uses a minimal sanitized scheduler environment.
-
-The 0.1.0 client was live-validated on Slurm 23.11.4 with `select/cons_tres` `CR_CPU_MEMORY`, task
-cgroup and affinity plugins, and absolute OpenSSH, Slurm, and Apptainer executables. The accepted
-envelope covered CPU-only, one-GPU, one-process/two-GPU, and four packed one-GPU tasks. This is a
-tested envelope, not a claim that editable target files enforce cluster policy or that other site
-topologies preserve simultaneous placement. See ADR 0003 for the concise acceptance record.
+Publication supports POSIX filesystems on Linux and macOS. Its Linux fallbacks require cooperating
+Servatus publishers, coherent advisory locks, owner-controlled parents, and stable inode identities;
+hardware durability still depends on the filesystem and mount. Campaign submission is an
+unprivileged workstation-side OpenSSH client for homogeneous independent processes in one-node
+Slurm allocations. See [SECURITY.md](SECURITY.md) and [ADR 0003](docs/adr/0003-native-slurm-campaign.md)
+for the exact fallback and live-acceptance envelope.
 
 ## Non-goals
 

@@ -3,8 +3,8 @@
 Servatus uses a small generic vocabulary:
 
 - **Task:** one stable opaque key, argument vector, and byte payload.
-- **Campaign:** one append-only ordered task sequence and its durable submission history; every
-  registered prefix value remains immutable.
+- **Campaign:** one append-only ordered task sequence and its durable submission history; `open`
+  registers the complete authored roster while `load` reopens existing state without authoring it.
 - **Resource request:** one homogeneous per-Task CPU, MiB, whole-GPU, and wall-time requirement.
 - **Target:** one concrete SSH/Slurm/Apptainer route with conservative request ceilings.
 - **Plan:** a local immutable selection whose exported document is accepted only when regeneration
@@ -14,6 +14,10 @@ Servatus uses a small generic vocabulary:
   Task keys, plan and script digests, exact command, allocation totals, and query window.
 - **Receipt:** a positive Slurm job identity proving scheduler acceptance, not completion; its Task
   keys come from the immutable intent.
+- **Unaccepted task:** one Task without a proven scheduler-acceptance receipt. Application
+  completion is a separate caller-owned decision.
+- **Validation result:** one immutable, time-specific result from bounded Slurm `--test-only`
+  validation of an authoritative Campaign plan.
 - **Ambiguous allocation:** an intent without a receipt or explicit operator resolution.
 - **Destination:** the application-owned canonical path. It is immutable once published.
 - **Workspace:** stable, identity-bound owner-only private state retained when resumable work fails;
