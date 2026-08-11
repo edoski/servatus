@@ -526,9 +526,10 @@ def _verify_identity(
 def _ensure_open_entry(
     parent_fd: int,
     name: str,
+    descriptor: int,
     expected: os.stat_result,
 ) -> None:
-    _require_private_entry(expected, name)
+    _require_private_entry(os.fstat(descriptor), name)
     _posix.ensure_entry(parent_fd, name, expected)
 
 
@@ -568,16 +569,19 @@ def _verify_level(parent_fd: int, container_name: str, level: _WorkspaceLevel) -
     _ensure_open_entry(
         parent_fd,
         container_name,
+        level.container_fd,
         level.container_entry,
     )
     _ensure_open_entry(
         level.container_fd,
         ".lock",
+        level.lock_fd,
         level.lock_entry,
     )
     _ensure_open_entry(
         level.container_fd,
         "work",
+        level.work_fd,
         level.work_entry,
     )
 

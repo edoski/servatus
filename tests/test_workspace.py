@@ -354,6 +354,29 @@ def test_workspace_rejects_permissive_private_entries(
         pass
 
 
+@pytest.mark.parametrize(
+    ("entry_name", "mode"),
+    [("container", 0o770), ("work", 0o770), ("lock", 0o660)],
+)
+def test_workspace_rejects_permissions_changed_after_enter(
+    tmp_path: Path, entry_name: str, mode: int
+) -> None:
+    destination = tmp_path / "result"
+    with Workspace(destination, identity=b"request") as workspace:
+        container = workspace.path.parent
+        entries = {
+            "container": container,
+            "work": workspace.path,
+            "lock": container / ".lock",
+        }
+        entries[entry_name].chmod(mode)
+
+        with pytest.raises(UnsafePublication):
+            workspace.publish(lambda draft: None)
+
+    assert not destination.exists()
+
+
 @pytest.mark.parametrize("entry_name", ["container", "work", "lock", "identity"])
 def test_workspace_rejects_foreign_private_entries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry_name: str
