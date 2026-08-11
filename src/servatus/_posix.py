@@ -41,6 +41,13 @@ class _TransactionOutcome:
     cleanup_pending: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _PinnedTree:
+    name: str
+    descriptor: int
+    entry: os.stat_result
+
+
 def require_supported_platform() -> None:
     if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
         raise UnsupportedPlatform(f"unsupported platform: {sys.platform}")
@@ -103,6 +110,17 @@ def ensure_directory_path(path: Path, descriptor: int) -> None:
         raise UnsafePublication(f"publication parent disappeared: {path}") from error
     if not stat.S_ISDIR(current.st_mode) or not same_entry(current, os.fstat(descriptor)):
         raise UnsafePublication(f"publication parent changed: {path}")
+
+
+def ensure_absent(parent_fd: int, name: str, destination: Path) -> None:
+    validate_leaf(name)
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise UnsafePublication(f"publication destination is unavailable: {destination}") from error
+    raise DestinationExists(f"publication destination already exists: {destination}")
 
 
 def make_directory_at(parent_fd: int, name: str) -> tuple[int, os.stat_result]:
@@ -484,6 +502,16 @@ def remove_tree_at(parent_fd: int, name: str, expected: os.stat_result) -> None:
     sync_descriptor(parent_fd)
 
 
+def remove_pinned_tree_at(
+    parent_fd: int,
+    name: str,
+    descriptor: int,
+    expected: os.stat_result,
+) -> None:
+    _remove_open_directory_entry(parent_fd, name, descriptor, expected, expected.st_dev)
+    sync_descriptor(parent_fd)
+
+
 def _remove_directory_entry(
     parent_fd: int,
     name: str,
@@ -494,15 +522,25 @@ def _remove_directory_entry(
         raise UnsafePublication(f"cleanup target is not a directory: {name}")
     descriptor = open_directory_at(parent_fd, name)
     try:
-        opened = os.fstat(descriptor)
-        if not same_entry(opened, expected):
-            raise UnsafePublication(f"cleanup target changed before open: {name}")
-        ensure_entry(parent_fd, name, expected)
-        _remove_tree_contents(descriptor, device)
-        ensure_entry(parent_fd, name, expected)
-        os.rmdir(name, dir_fd=parent_fd)
+        _remove_open_directory_entry(parent_fd, name, descriptor, expected, device)
     finally:
         os.close(descriptor)
+
+
+def _remove_open_directory_entry(
+    parent_fd: int,
+    name: str,
+    descriptor: int,
+    expected: os.stat_result,
+    device: int,
+) -> None:
+    opened = os.fstat(descriptor)
+    if not stat.S_ISDIR(opened.st_mode) or not same_entry(opened, expected):
+        raise UnsafePublication(f"cleanup target changed before open: {name}")
+    ensure_entry(parent_fd, name, expected)
+    _remove_tree_contents(descriptor, device)
+    ensure_entry(parent_fd, name, expected)
+    os.rmdir(name, dir_fd=parent_fd)
 
 
 def _remove_tree_contents(descriptor: int, device: int) -> None:
@@ -608,14 +646,35 @@ def _cleanup_entry_after_failure(
 def publication_attempt(
     destination: Path,
     build: Callable[[Path, int, int], None],
+    *,
+    retire: Path | None = None,
 ) -> _TransactionOutcome:
     require_supported_platform()
     parent, destination_name = normalize_destination(destination)
     parent_fd = open_directory(parent)
+    pinned_retirement: _PinnedTree | None = None
     try:
-        return publication_attempt_at(parent, parent_fd, destination_name, build)
+        ensure_directory_path(parent, parent_fd)
+        if retire is not None:
+            pinned_retirement = _pin_retirement(
+                parent,
+                parent_fd,
+                destination_name,
+                retire,
+            )
+        return publication_attempt_at(
+            parent,
+            parent_fd,
+            destination_name,
+            build,
+            retirement=pinned_retirement,
+        )
     finally:
-        os.close(parent_fd)
+        if pinned_retirement is not None:
+            with suppress(OSError):
+                os.close(pinned_retirement.descriptor)
+        with suppress(OSError):
+            os.close(parent_fd)
 
 
 def publication_attempt_at(
@@ -623,6 +682,8 @@ def publication_attempt_at(
     parent_fd: int,
     destination_name: str,
     build: Callable[[Path, int, int], None],
+    *,
+    retirement: _PinnedTree | None = None,
 ) -> _TransactionOutcome:
     return _publication_transaction_at(
         parent,
@@ -632,6 +693,7 @@ def publication_attempt_at(
         lambda: make_unique_stage(parent_fd, ".servatus-stage-"),
         lambda name, descriptor, entry: sync_tree(descriptor, entry.st_dev),
         remove_tree_at,
+        retirement=retirement,
     )
 
 
@@ -645,7 +707,8 @@ def file_publication_attempt(
     try:
         return file_publication_attempt_at(parent, parent_fd, destination_name, write)
     finally:
-        os.close(parent_fd)
+        with suppress(OSError):
+            os.close(parent_fd)
 
 
 def file_publication_attempt_at(
@@ -677,8 +740,11 @@ def _publication_transaction_at(
     make_stage: Callable[[], tuple[str, int, os.stat_result]],
     sync_stage: Callable[[str, int, os.stat_result], None],
     remove_stage: Callable[[int, str, os.stat_result], None],
+    *,
+    retirement: _PinnedTree | None = None,
 ) -> _TransactionOutcome:
     ensure_directory_path(parent, parent_fd)
+    ensure_absent(parent_fd, destination_name, parent / destination_name)
     stage_name = ""
     stage_fd = -1
     stage_entry: os.stat_result | None = None
@@ -694,7 +760,13 @@ def _publication_transaction_at(
             destination_name,
             stage_entry,
         )
-        return _TransactionOutcome(parent / destination_name, commit.cleanup_pending)
+        cleanup_pending = commit.cleanup_pending
+        if retirement is not None:
+            try:
+                _retire_pinned_tree(parent_fd, retirement)
+            except Exception:
+                cleanup_pending = True
+        return _TransactionOutcome(parent / destination_name, cleanup_pending)
     except BaseException as error:
         if stage_name and stage_entry is not None:
             _cleanup_entry_after_failure(parent_fd, stage_name, stage_entry, error, remove_stage)
@@ -703,3 +775,53 @@ def _publication_transaction_at(
         if stage_fd >= 0:
             with suppress(OSError):
                 os.close(stage_fd)
+
+
+def _pin_retirement(
+    parent: Path,
+    parent_fd: int,
+    destination_name: str,
+    retire: Path,
+) -> _PinnedTree:
+    retirement_parent, retirement_name = normalize_destination(retire)
+    if retirement_parent != parent:
+        raise UnsafePublication("retirement source must be a destination sibling")
+    if retirement_name == destination_name:
+        raise UnsafePublication("retirement source must differ from the destination")
+    try:
+        entry = os.stat(retirement_name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise UnsafePublication("retirement source is unavailable") from error
+    if not stat.S_ISDIR(entry.st_mode):
+        raise UnsafePublication("retirement source is not a directory")
+    descriptor = open_directory_at(parent_fd, retirement_name)
+    try:
+        opened = os.fstat(descriptor)
+        if not same_entry(opened, entry):
+            raise UnsafePublication("retirement source changed before open")
+        _require_owner_only(opened, "retirement source")
+        ensure_entry(parent_fd, retirement_name, opened)
+    except BaseException:
+        with suppress(OSError):
+            os.close(descriptor)
+        raise
+    return _PinnedTree(retirement_name, descriptor, opened)
+
+
+def _retire_pinned_tree(parent_fd: int, retirement: _PinnedTree) -> None:
+    current = os.fstat(retirement.descriptor)
+    if not stat.S_ISDIR(current.st_mode) or not same_entry(current, retirement.entry):
+        raise UnsafePublication("retirement source changed after publication")
+    _require_owner_only(current, "retirement source")
+    ensure_entry(parent_fd, retirement.name, retirement.entry)
+    remove_pinned_tree_at(
+        parent_fd,
+        retirement.name,
+        retirement.descriptor,
+        retirement.entry,
+    )
+
+
+def _require_owner_only(entry: os.stat_result, description: str) -> None:
+    if entry.st_uid != os.geteuid() or stat.S_IMODE(entry.st_mode) & 0o077:
+        raise UnsafePublication(f"{description} is not owner-only")

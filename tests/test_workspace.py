@@ -5,6 +5,7 @@ import os
 import stat
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 
 import pytest
@@ -50,6 +51,293 @@ def test_publish_exposes_complete_directory_and_never_overwrites(tmp_path: Path)
 
     assert (destination / "value.txt").read_text() == "first"
     assert hidden_entries(tmp_path) == []
+
+
+@pytest.mark.parametrize("publisher", ["directory", "file"])
+def test_existing_destination_is_rejected_before_callback(tmp_path: Path, publisher: str) -> None:
+    destination = tmp_path / "result"
+    destination.write_text("existing")
+    called = False
+
+    def build(draft: Draft) -> None:
+        nonlocal called
+        del draft
+        called = True
+
+    def write(stage: Path) -> None:
+        nonlocal called
+        del stage
+        called = True
+
+    with pytest.raises(DestinationExists):
+        if publisher == "directory":
+            publish(destination, build)
+        else:
+            publish_file(destination, write)
+
+    assert called is False
+    assert destination.read_text() == "existing"
+    assert hidden_entries(tmp_path) == []
+
+
+def test_publish_retires_existing_owner_only_sibling_after_commit(tmp_path: Path) -> None:
+    source = tmp_path / "bundle"
+    source.mkdir(mode=0o700)
+    (source / "private").write_text("authored")
+    destination = tmp_path / "result"
+
+    publication = publish(
+        destination,
+        lambda draft: (draft.path / "complete").write_text("canonical"),
+        retire=source,
+    )
+
+    assert publication.destination == destination
+    assert publication.cleanup_pending is False
+    assert (destination / "complete").read_text() == "canonical"
+    assert not source.exists()
+    assert hidden_entries(tmp_path) == []
+
+
+def test_publish_preserves_retirement_source_when_builder_fails(tmp_path: Path) -> None:
+    source = tmp_path / "bundle"
+    source.mkdir(mode=0o700)
+    (source / "private").write_text("authored")
+
+    def fail(draft: Draft) -> None:
+        (draft.path / "partial").write_text("not canonical")
+        raise ValueError("invalid result")
+
+    with pytest.raises(ValueError, match="invalid result"):
+        publish(tmp_path / "result", fail, retire=source)
+
+    assert (source / "private").read_text() == "authored"
+    assert not (tmp_path / "result").exists()
+
+
+def test_publish_preserves_retirement_source_when_commit_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "bundle"
+    source.mkdir(mode=0o700)
+    (source / "private").write_text("authored")
+    failure = OSError("injected commit failure")
+
+    def fail_commit(*args: object, **kwargs: object) -> _posix._CommitOutcome:
+        del args, kwargs
+        raise failure
+
+    monkeypatch.setattr(_posix, "commit_noreplace", fail_commit)
+
+    with pytest.raises(OSError) as raised:
+        publish(tmp_path / "result", lambda draft: None, retire=source)
+
+    assert raised.value is failure
+    assert (source / "private").read_text() == "authored"
+    assert not (tmp_path / "result").exists()
+
+
+def test_publish_preserves_retirement_source_when_destination_wins_race(tmp_path: Path) -> None:
+    source = tmp_path / "bundle"
+    source.mkdir(mode=0o700)
+    (source / "private").write_text("authored")
+    destination = tmp_path / "result"
+
+    def race(draft: Draft) -> None:
+        (draft.path / "ours").write_text("ours")
+        destination.mkdir()
+        (destination / "theirs").write_text("theirs")
+
+    with pytest.raises(DestinationExists):
+        publish(destination, race, retire=source)
+
+    assert (destination / "theirs").read_text() == "theirs"
+    assert (source / "private").read_text() == "authored"
+
+
+@pytest.mark.parametrize("kind", ["missing", "file", "symlink", "fifo"])
+def test_publish_rejects_unsafe_retirement_source_before_builder(tmp_path: Path, kind: str) -> None:
+    source = tmp_path / "bundle"
+    if kind == "file":
+        source.write_text("not a directory")
+    elif kind == "symlink":
+        target = tmp_path / "target"
+        target.mkdir(mode=0o700)
+        source.symlink_to(target, target_is_directory=True)
+    elif kind == "fifo":
+        os.mkfifo(source)
+    called = False
+
+    def build(draft: Draft) -> None:
+        nonlocal called
+        del draft
+        called = True
+
+    with pytest.raises(UnsafePublication):
+        publish(tmp_path / "result", build, retire=source)
+
+    assert called is False
+    assert not (tmp_path / "result").exists()
+
+
+def test_publish_rejects_nonprivate_or_nonsibling_retirement_before_builder(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "bundle"
+    source.mkdir(mode=0o755)
+    called = False
+
+    def build(draft: Draft) -> None:
+        nonlocal called
+        del draft
+        called = True
+
+    with pytest.raises(UnsafePublication, match="owner-only"):
+        publish(tmp_path / "result", build, retire=source)
+    assert called is False
+
+    source.chmod(0o700)
+    other = tmp_path / "other"
+    other.mkdir()
+    with pytest.raises(UnsafePublication, match="sibling"):
+        publish(other / "result", build, retire=source)
+    assert called is False
+
+    with pytest.raises(UnsafePublication, match="differ"):
+        publish(source, build, retire=source)
+    assert called is False
+
+
+def test_publish_commits_when_retirement_source_is_substituted(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "bundle"
+    source.mkdir(mode=0o700)
+    (source / "private").write_text("authored")
+    moved = tmp_path / "moved-bundle"
+
+    def build(draft: Draft) -> None:
+        (draft.path / "complete").write_text("canonical")
+        source.rename(moved)
+        source.mkdir(mode=0o700)
+        (source / "replacement").write_text("preserve")
+
+    with pytest.warns(RuntimeWarning, match="private cleanup remains pending"):
+        publication = publish(tmp_path / "result", build, retire=source)
+
+    assert publication.cleanup_pending is True
+    assert (tmp_path / "result/complete").read_text() == "canonical"
+    assert (moved / "private").read_text() == "authored"
+    assert (source / "replacement").read_text() == "preserve"
+
+
+def test_publish_commits_when_retirement_permissions_change(tmp_path: Path) -> None:
+    source = tmp_path / "bundle"
+    source.mkdir(mode=0o700)
+
+    def build(draft: Draft) -> None:
+        (draft.path / "complete").write_text("canonical")
+        source.chmod(0o755)
+
+    with pytest.warns(RuntimeWarning, match="private cleanup remains pending"):
+        publication = publish(tmp_path / "result", build, retire=source)
+
+    assert publication.cleanup_pending is True
+    assert source.exists()
+    assert (tmp_path / "result/complete").read_text() == "canonical"
+
+
+def test_retirement_cleanup_failure_is_nonfatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "bundle"
+    source.mkdir(mode=0o700)
+    real_rmdir = os.rmdir
+
+    def fail_cleanup(path: str | bytes, *, dir_fd: int | None = None) -> None:
+        if path == "bundle":
+            raise OSError("injected retirement cleanup failure")
+        real_rmdir(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(_posix.os, "rmdir", fail_cleanup)
+
+    with pytest.warns(RuntimeWarning, match="private cleanup remains pending"):
+        publication = publish(tmp_path / "result", lambda draft: None, retire=source)
+
+    assert publication.cleanup_pending is True
+    assert (tmp_path / "result").is_dir()
+    assert source.is_dir()
+
+
+def test_retirement_parent_sync_failure_is_nonfatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "bundle"
+    source.mkdir(mode=0o700)
+    destination = tmp_path / "result"
+    real_fsync = os.fsync
+    failed = False
+
+    def fail_cleanup_sync(descriptor: int) -> None:
+        nonlocal failed
+        if not failed and destination.exists() and not source.exists():
+            failed = True
+            raise OSError("injected retirement parent sync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(_posix.os, "fsync", fail_cleanup_sync)
+
+    with pytest.warns(RuntimeWarning, match="private cleanup remains pending"):
+        publication = publish(destination, lambda draft: None, retire=source)
+
+    assert failed is True
+    assert publication.cleanup_pending is True
+    assert destination.is_dir()
+    assert not source.exists()
+
+
+def test_cleanup_warning_filter_cannot_mask_committed_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "bundle"
+    source.mkdir(mode=0o700)
+
+    def make_cleanup_pending(draft: Draft) -> None:
+        del draft
+        source.chmod(0o755)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        publication = publish(tmp_path / "result", make_cleanup_pending, retire=source)
+
+    assert publication.cleanup_pending is True
+    assert (tmp_path / "result").is_dir()
+
+
+def test_cleanup_warning_hook_cannot_mask_committed_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "bundle"
+    source.mkdir(mode=0o700)
+    warning_calls = 0
+
+    def make_cleanup_pending(draft: Draft) -> None:
+        del draft
+        source.chmod(0o755)
+
+    def fail_warning(*args: object, **kwargs: object) -> None:
+        nonlocal warning_calls
+        del args, kwargs
+        warning_calls += 1
+        raise RuntimeError("injected warning hook failure")
+
+    monkeypatch.setattr(warnings, "warn", fail_warning)
+
+    publication = publish(tmp_path / "result", make_cleanup_pending, retire=source)
+
+    assert warning_calls == 1
+    assert publication.cleanup_pending is True
+    assert (tmp_path / "result").is_dir()
 
 
 def test_builder_failure_cleans_disposable_stage_and_propagates(tmp_path: Path) -> None:
@@ -713,7 +1001,10 @@ def test_cleanup_failure_reports_committed_publication(
 
     monkeypatch.setattr(_posix, "remove_tree_at", fail_cleanup)
 
-    with Workspace(destination, identity=b"request") as workspace:
+    with (
+        Workspace(destination, identity=b"request") as workspace,
+        pytest.warns(RuntimeWarning, match="private cleanup remains pending"),
+    ):
         publication = workspace.publish(lambda draft: (draft.path / "value").write_text("complete"))
 
     assert publication.destination == destination
@@ -746,7 +1037,8 @@ def test_workspace_cleanup_preserves_substituted_root(
                 (container / "replacement").write_text("preserve")
 
         monkeypatch.setattr(_posix, "ensure_entry", substitute_after_cleanup_check)
-        publication = workspace.publish(lambda draft: None)
+        with pytest.warns(RuntimeWarning, match="private cleanup remains pending"):
+            publication = workspace.publish(lambda draft: None)
 
     assert publication.cleanup_pending is True
     assert moved_container.is_dir()
@@ -777,7 +1069,8 @@ def test_workspace_cleanup_preserves_substituted_nested_directory(
                 substituted = True
 
         monkeypatch.setattr(_posix, "ensure_entry", substitute_after_cleanup_check)
-        publication = workspace.publish(lambda draft: None)
+        with pytest.warns(RuntimeWarning, match="private cleanup remains pending"):
+            publication = workspace.publish(lambda draft: None)
 
     assert publication.cleanup_pending is True
     assert substituted is True

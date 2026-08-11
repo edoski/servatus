@@ -2,7 +2,7 @@
 
 Run resumable work through Slurm and atomically publish validated outputs.
 
-Servatus 0.4.1 combines durable publication with the native Slurm Campaign interface below.
+Servatus 0.5.0 combines durable publication with the native Slurm Campaign interface below.
 
 ```sh
 pip install servatus
@@ -176,6 +176,21 @@ def build(draft: Draft) -> None:
 publication = publish(Path("outputs/run-1"), build)
 ```
 
+When the application has finished authoring an owner-only sibling tree, `publish` can retire that
+tree only after the canonical destination is committed and synced:
+
+```python
+bundle = Path("outputs/.run-1.active")
+publication = publish(Path("outputs/run-1"), build, retire=bundle)
+```
+
+The retained tree must already exist, differ from the destination, share its exact parent, and be
+quiescent before the call. Servatus pins it before entering the builder. Builder, validation,
+collision, and other precommit failures preserve it. After a durable commit, Servatus removes only
+the pinned tree and syncs the parent again. If that exact removal or its durability cannot be
+proved, publication still succeeds, `Publication.cleanup_pending` is true, and one best-effort
+`RuntimeWarning` reports the residue.
+
 Use `publish_file` for one canonical regular file:
 
 ```python
@@ -254,14 +269,19 @@ filesystem with stable cross-client inode identities. See [SECURITY.md](SECURITY
 - Intent preserves the normalized route, guardrails, requested resources, exact allocation totals,
   and reviewed nonsecret `sbatch` command before external acceptance.
 - A destination is absent or one complete regular file or directory. Native commits and the Linux
-  regular-file fallback never overwrite an existing entry. The Linux directory fallback serializes
-  cooperating Servatus publishers with an exclusive parent-directory lock.
+  regular-file fallback never overwrite an existing entry. An already-present destination is
+  rejected before its callback; the commit remains no-replace against later races. The Linux
+  directory fallback serializes cooperating Servatus publishers with an exclusive parent-directory
+  lock.
 - Work, hard-link sources, stages, and destination must share a filesystem.
 - Disposable stage names are not synced merely by creation. Files and directories are synced before
   commit; the parent is synced after publication.
 - Builder failures expose no destination. Resumable work remains; disposable stages are removed.
 - Successful workspace publication exactly removes its pinned private tree. A moved, substituted,
   or unremovable tree remains visible as cleanup residue and is reported separately.
+- Directory publication can retire one exact owner-only sibling after commit. Precommit failure
+  preserves it; unsafe or incomplete post-commit retirement sets `cleanup_pending` without changing
+  publication success.
 - Child workspaces share the parent lifecycle lease; parent publication is busy until they close.
 
 Publication supports POSIX filesystems on Linux and macOS. Its Linux fallbacks require cooperating

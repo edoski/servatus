@@ -7,7 +7,9 @@ recursively syncs its contents before committing it as the destination. `publish
 transaction for one regular file: it creates an empty stage with ordinary umask-controlled
 permissions, pins its descriptor and inode, requires in-place writing, and syncs it before commit.
 Creating either disposable stage does not sync its parent; only validated content is made durable
-before commit. Both operations then sync the destination parent.
+before commit. Both operations inspect the pinned parent and reject an existing destination before
+entering the application callback, then sync the destination parent after commit. The no-replace
+commit remains authoritative against a later race.
 
 Linux first uses `renameat2(RENAME_NOREPLACE)` and macOS uses descriptor-relative
 `renameatx_np(RENAME_EXCL)`. Linux falls back only when the native call reports `EINVAL`, `ENOSYS`,
@@ -34,6 +36,13 @@ publication.
 Application callbacks own contents and validation. File writers may change the mode but may not
 unlink, replace, or change the type of the stage they receive.
 
+Directory publication may also pin one existing, distinct, owner-only destination sibling before
+the builder. Every precommit failure preserves this retained tree. After the destination commit and
+parent sync, Servatus removes only the exact pinned tree through descriptor-relative traversal and
+syncs the parent again. A missing, moved, substituted, newly permissive, or unremovable tree remains
+as cleanup residue. The caller must make the tree quiescent before publication; retirement is not a
+writer lease, callback, token, registry, or application finalizer.
+
 An identity-bound workspace is retained after build failure and removed only after a committed,
 parent-synced publication. Its container, work directory, lifecycle lock, and identity file must be
 owned by the effective user and expose no group or world permissions. Its private identity record
@@ -44,5 +53,8 @@ Cleanup opens the expected root, walks and removes entries relative to pinned di
 without following links, reverifies each name binding, and removes the root only while it still
 names the expected inode. A moved, substituted, or unremovable tree remains as cleanup residue. If
 fallback identity installation commits but stage removal or its durability cannot be proved, the
-installed identity remains valid and Servatus warns that private cleanup remains pending. Cleanup
-state is reported separately from publication success.
+installed identity remains valid and Servatus warns that private cleanup remains pending. Every
+public committed publication with stage, Workspace, or retained-tree residue returns
+`cleanup_pending=True` and makes one best-effort `RuntimeWarning`; warning filters and hooks cannot
+turn that commit into apparent failure. Cleanup state is authoritative and separate from
+publication success.

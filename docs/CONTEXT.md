@@ -28,8 +28,12 @@ Servatus uses a small generic vocabulary:
 - **Draft:** one unique, disposable directory assembled before publication.
 - **File stage:** one unique, empty regular file written and validated in place before publication.
 - **Publication:** the committed destination plus whether private cleanup remains pending.
+- **Retained tree:** one existing owner-only destination sibling pinned before a directory build and
+  removed only after the destination commit is durable.
 - **Builder:** the application callback that writes and validates a draft before returning.
 - **Writer:** the application callback that writes and validates a file stage before returning.
 
 Servatus owns lifecycle mechanics, not application meaning. Checkpoints, manifests, schemas,
 validation rules, task selection, and scientific completion remain with the calling project.
+Retained trees must be quiescent before publication; Servatus provides safe commit-first retirement,
+not a writer lease or application finalizer.

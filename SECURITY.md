@@ -10,6 +10,12 @@ cluster-policy layer. Its publication transaction protects against accidental pa
 overwrites, and ordinary lifecycle races. Callers remain responsible for destination-parent
 permissions, trusted builders, application validation, filesystem guarantees, and scheduler policy.
 
+Optional directory retirement accepts one existing owner-only destination sibling. Servatus pins
+the parent and source before the builder, commits and syncs the destination first, then removes only
+the pinned source tree and syncs the parent again. The caller must stop all source writers before the
+transaction. Missing, moved, substituted, newly permissive, or unremovable sources after commit are
+preserved as cleanup residue and cannot turn committed publication into apparent failure.
+
 The hidden Workspace container is its lifecycle trust root. Servatus requires the container, its
 work directory, lifecycle lock, and identity file to belong to the effective user with no group or
 world permissions, and reverifies them through pinned descriptors. Initialization syncs the private

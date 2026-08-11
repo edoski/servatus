@@ -254,7 +254,8 @@ def test_file_fallback_reports_only_private_cleanup_pending(
 
     monkeypatch.setattr(_posix, "remove_file_at", fail_cleanup)
 
-    publication = publish_file(tmp_path / "result", lambda stage: stage.write_text("complete"))
+    with pytest.warns(RuntimeWarning, match="private cleanup remains pending"):
+        publication = publish_file(tmp_path / "result", lambda stage: stage.write_text("complete"))
 
     assert publication.cleanup_pending is True
     assert publication.destination.read_text() == "complete"

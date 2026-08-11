@@ -31,6 +31,18 @@ class Publication:
     cleanup_pending: bool
 
 
+def _publication_result(destination: Path, *, cleanup_pending: bool) -> Publication:
+    publication = Publication(destination, cleanup_pending=cleanup_pending)
+    if cleanup_pending:
+        _warn_nonfatal("publication committed, but private cleanup remains pending", stacklevel=4)
+    return publication
+
+
+def _warn_nonfatal(message: str, *, stacklevel: int) -> None:
+    with suppress(BaseException):
+        warnings.warn(message, RuntimeWarning, stacklevel=stacklevel)
+
+
 @dataclass(slots=True)
 class _WorkspaceLevel:
     container_fd: int = -1
@@ -134,14 +146,19 @@ def _build_draft(build: Callable[[Draft], None]) -> Callable[[Path, int, int], N
     return run
 
 
-def publish(destination: Path, build: Callable[[Draft], None]) -> Publication:
-    outcome = _posix.publication_attempt(destination, _build_draft(build))
-    return Publication(outcome.destination, cleanup_pending=outcome.cleanup_pending)
+def publish(
+    destination: Path,
+    build: Callable[[Draft], None],
+    *,
+    retire: Path | None = None,
+) -> Publication:
+    outcome = _posix.publication_attempt(destination, _build_draft(build), retire=retire)
+    return _publication_result(outcome.destination, cleanup_pending=outcome.cleanup_pending)
 
 
 def publish_file(destination: Path, write: Callable[[Path], None]) -> Publication:
     outcome = _posix.file_publication_attempt(destination, write)
-    return Publication(outcome.destination, cleanup_pending=outcome.cleanup_pending)
+    return _publication_result(outcome.destination, cleanup_pending=outcome.cleanup_pending)
 
 
 class Workspace:
@@ -190,7 +207,7 @@ class Workspace:
         try:
             with _coordinate(self._stable_parent_fd):
                 _posix.ensure_directory_path(self._root_parent, self._stable_parent_fd)
-                _ensure_absent(
+                _posix.ensure_absent(
                     self._stable_parent_fd,
                     self._root_destination_name,
                     self._root_parent / self._root_destination_name,
@@ -231,7 +248,7 @@ class Workspace:
         except Exception:
             cleanup_pending = True
         self._published = True
-        return Publication(outcome.destination, cleanup_pending=cleanup_pending)
+        return _publication_result(outcome.destination, cleanup_pending=cleanup_pending)
 
     def _enter_root(self) -> None:
         self._level = _open_level(
@@ -253,7 +270,7 @@ class Workspace:
             root_destination,
             fcntl.LOCK_SH,
         )
-        _ensure_absent(self._root_level.work_fd, self._child_name, self._destination)
+        _posix.ensure_absent(self._root_level.work_fd, self._child_name, self._destination)
         self._level = _open_level(
             self._root_level.work_fd,
             self._container_name,
@@ -327,16 +344,6 @@ def _coordinate(stable_parent_fd: int) -> Generator[None]:
         yield
     finally:
         fcntl.flock(stable_parent_fd, fcntl.LOCK_UN)
-
-
-def _ensure_absent(parent_fd: int, name: str, destination: Path) -> None:
-    try:
-        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return
-    except OSError as error:
-        raise UnsafePublication(f"publication destination is unavailable: {destination}") from error
-    raise DestinationExists(f"publication destination already exists: {destination}")
 
 
 def _open_lock(container_fd: int) -> tuple[int, os.stat_result]:
@@ -447,13 +454,10 @@ def _initialize_identity(
         try:
             commit = _posix.commit_noreplace(container_fd, stage_name, ".identity", stage_entry)
             if commit.cleanup_pending:
-                with suppress(RuntimeWarning):
-                    warnings.warn(
-                        "workspace identity was installed, but identity-stage cleanup remains "
-                        "pending",
-                        RuntimeWarning,
-                        stacklevel=3,
-                    )
+                _warn_nonfatal(
+                    "workspace identity was installed, but identity-stage cleanup remains pending",
+                    stacklevel=4,
+                )
         except DestinationExists:
             _verify_identity(container_fd, identity, destination, level)
             _posix.remove_file_at(container_fd, stage_name, stage_entry)
