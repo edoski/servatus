@@ -6,7 +6,6 @@ import re
 import shlex
 import subprocess
 from dataclasses import dataclass
-from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
 from ._errors import ReconciliationError
@@ -144,10 +143,6 @@ def parse_receipt(output: bytes) -> tuple[int, str | None]:
     return job_id, None if cluster_bytes is None else cluster_bytes.decode("ascii")
 
 
-def validate_allocation(target: SlurmTarget, argv: tuple[str, ...], script: bytes) -> Result:
-    return _run_ssh(target, (*argv, "--test-only"), script)
-
-
 def query_identity(
     target: SlurmTarget,
     *,
@@ -214,7 +209,3 @@ def _add_candidate(
     if job_id <= 0:
         return
     candidates.setdefault(job_id, set()).add(cluster)
-
-
-def remote_path(value: PurePosixPath, executable: str) -> str:
-    return str(value / executable)

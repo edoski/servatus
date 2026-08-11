@@ -90,9 +90,13 @@ Append-only growth preserves target/resource lineage, accepted receipts, retry h
 ambiguous intents. It increments campaign revision, so a plan made before the append becomes stale.
 Accepted prefix tasks are not selected again unless the caller explicitly requests retry.
 
-Version 0.4 uses Campaign and plan schema 2 because conventional job-ID logs change submitted
-script provenance. Version 0.3 state and plans are rejected rather than interpreted through a
-compatibility path; create a new Campaign when upgrading.
+The current development line uses Campaign and plan schema 3. Plans retain typed planning inputs
+and derived allocation summaries; loading regenerates the immutable plan once and requires the
+same canonical bytes. Campaign state stores resource lineage once, exact intent provenance, compact
+acceptance receipts, and allocation IDs explicitly resolved as not submitted. Derivable command
+digests, lineage copies, job names, receipt Task keys, and negative-resolution wrappers are not
+persisted. Schema 2 state and plans are rejected rather than interpreted through a compatibility
+path; create a new Campaign when upgrading.
 
 Each allocation runs one concurrent
 `srun --exclusive --exact --nodes=1 --ntasks=1` step per Task. Each step receives its exact CPU,
@@ -258,7 +262,9 @@ opens still enforce local entry type, same-filesystem placement, and pathname-to
 
 ## Guarantees and support boundary
 
-- Campaign files are owner-only, schema-versioned, symlink-safe, atomically replaced, and synced.
+- Campaign files are bounded, owner-only, schema-versioned, symlink-safe, atomically replaced, and
+  synced. Every durable read validates the complete snapshot, including the rule that one
+  allocation cannot be both accepted and resolved as not submitted.
 - Intent preserves the normalized route, guardrails, requested resources, exact allocation totals,
   and reviewed nonsecret `sbatch` command before external acceptance.
 - A destination is absent or one complete regular file or directory. Native commits and the Linux

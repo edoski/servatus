@@ -27,8 +27,8 @@ from ._errors import (
     TaskConflict,
 )
 
-_SCHEMA_VERSION = 2
-_PLAN_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
+_PLAN_SCHEMA_VERSION = 3
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _GRES = re.compile(r"gpu(?::[A-Za-z0-9][A-Za-z0-9._-]*)?\Z")
@@ -147,11 +147,9 @@ class ResourceRequest:
         if missing:
             raise ConfigurationError(f"missing resource keys: {', '.join(sorted(missing))}")
         return cls(
-            cpus_per_task=_integer(values["cpus_per_task"], minimum=1, name="cpus_per_task"),
-            memory_mib_per_task=_integer(
-                values["memory_mib_per_task"], minimum=1, name="memory_mib_per_task"
-            ),
-            gpus_per_task=_integer(values["gpus_per_task"], minimum=0, name="gpus_per_task"),
+            cpus_per_task=cast(int, values["cpus_per_task"]),
+            memory_mib_per_task=cast(int, values["memory_mib_per_task"]),
+            gpus_per_task=cast(int, values["gpus_per_task"]),
             time_limit=cast(str, values["time_limit"]),
         )
 
@@ -250,52 +248,25 @@ class SlurmTarget:
         raw_partitions = values["partitions"]
         if not isinstance(raw_partitions, list):
             raise ConfigurationError("partitions must be an array of strings")
-        partitions: list[str] = []
-        for item in cast(list[object], raw_partitions):
-            if not isinstance(item, str):
-                raise ConfigurationError("partitions must be an array of strings")
-            partitions.append(item)
-        optional: dict[str, str | None] = {}
-        for name in cls._OPTIONAL:
-            value = values.get(name)
-            if value is not None and not isinstance(value, str):
-                raise ConfigurationError(f"{name} must be a string when present")
-            optional[name] = value
         return cls(
             host=cast(str, values["host"]),
-            slurm_bin=_absolute_path(values["slurm_bin"], name="slurm_bin"),
-            apptainer=_absolute_path(values["apptainer"], name="apptainer"),
-            image=_absolute_path(values["image"], name="image"),
-            work_root=_absolute_path(values["work_root"], name="work_root"),
-            log_root=_absolute_path(values["log_root"], name="log_root"),
-            partitions=tuple(partitions),
-            account=optional["account"],
-            qos=optional["qos"],
-            constraint=optional["constraint"],
-            gpu_gres=optional["gpu_gres"],
-            max_tasks_per_allocation=_integer(
-                values["max_tasks_per_allocation"], minimum=1, name="max_tasks_per_allocation"
-            ),
-            max_cpus_per_allocation=_integer(
-                values["max_cpus_per_allocation"], minimum=1, name="max_cpus_per_allocation"
-            ),
-            max_memory_mib_per_allocation=_integer(
-                values["max_memory_mib_per_allocation"],
-                minimum=1,
-                name="max_memory_mib_per_allocation",
-            ),
-            max_gpus_per_allocation=_integer(
-                values["max_gpus_per_allocation"], minimum=0, name="max_gpus_per_allocation"
-            ),
+            slurm_bin=cast(PurePosixPath, values["slurm_bin"]),
+            apptainer=cast(PurePosixPath, values["apptainer"]),
+            image=cast(PurePosixPath, values["image"]),
+            work_root=cast(PurePosixPath, values["work_root"]),
+            log_root=cast(PurePosixPath, values["log_root"]),
+            partitions=tuple(cast(list[str], raw_partitions)),
+            account=cast(str | None, values.get("account")),
+            qos=cast(str | None, values.get("qos")),
+            constraint=cast(str | None, values.get("constraint")),
+            gpu_gres=cast(str | None, values.get("gpu_gres")),
+            max_tasks_per_allocation=cast(int, values["max_tasks_per_allocation"]),
+            max_cpus_per_allocation=cast(int, values["max_cpus_per_allocation"]),
+            max_memory_mib_per_allocation=cast(int, values["max_memory_mib_per_allocation"]),
+            max_gpus_per_allocation=cast(int, values["max_gpus_per_allocation"]),
             max_time_limit=cast(str, values["max_time_limit"]),
-            max_allocations_per_submit=_integer(
-                values["max_allocations_per_submit"],
-                minimum=1,
-                name="max_allocations_per_submit",
-            ),
-            max_script_bytes=_integer(
-                values["max_script_bytes"], minimum=1, name="max_script_bytes"
-            ),
+            max_allocations_per_submit=cast(int, values["max_allocations_per_submit"]),
+            max_script_bytes=cast(int, values["max_script_bytes"]),
         )
 
 
@@ -315,7 +286,6 @@ class _AllocationPlan:
     script: bytes
     argv: tuple[str, ...]
     script_digest: str
-    argv_digest: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -449,13 +419,13 @@ def _target_from_dict(value: object) -> SlurmTarget:
         partitions = mapping["partitions"]
         if not isinstance(partitions, list):
             raise TypeError
-        target = SlurmTarget(
+        return SlurmTarget(
             host=cast(str, mapping["host"]),
-            slurm_bin=PurePosixPath(cast(str, mapping["slurm_bin"])),
-            apptainer=PurePosixPath(cast(str, mapping["apptainer"])),
-            image=PurePosixPath(cast(str, mapping["image"])),
-            work_root=PurePosixPath(cast(str, mapping["work_root"])),
-            log_root=PurePosixPath(cast(str, mapping["log_root"])),
+            slurm_bin=cast(PurePosixPath, mapping["slurm_bin"]),
+            apptainer=cast(PurePosixPath, mapping["apptainer"]),
+            image=cast(PurePosixPath, mapping["image"]),
+            work_root=cast(PurePosixPath, mapping["work_root"]),
+            log_root=cast(PurePosixPath, mapping["log_root"]),
             partitions=tuple(cast(list[str], partitions)),
             account=cast(str | None, mapping["account"]),
             qos=cast(str | None, mapping["qos"]),
@@ -469,11 +439,8 @@ def _target_from_dict(value: object) -> SlurmTarget:
             max_allocations_per_submit=cast(int, mapping["max_allocations_per_submit"]),
             max_script_bytes=cast(int, mapping["max_script_bytes"]),
         )
-    except (KeyError, TypeError, ConfigurationError) as error:
+    except (TypeError, ConfigurationError) as error:
         raise PlanError("plan target is invalid") from error
-    if _target_dict(target) != mapping:
-        raise PlanError("plan target types are invalid")
-    return target
 
 
 def _resource_from_dict(value: object) -> ResourceRequest:
@@ -483,17 +450,14 @@ def _resource_from_dict(value: object) -> ResourceRequest:
     if frozenset(mapping) != ResourceRequest._KEYS:
         raise PlanError("plan resource keys are invalid")
     try:
-        resources = ResourceRequest(
+        return ResourceRequest(
             cpus_per_task=cast(int, mapping["cpus_per_task"]),
             memory_mib_per_task=cast(int, mapping["memory_mib_per_task"]),
             gpus_per_task=cast(int, mapping["gpus_per_task"]),
             time_limit=cast(str, mapping["time_limit"]),
         )
-    except (KeyError, ConfigurationError) as error:
+    except ConfigurationError as error:
         raise PlanError("plan resources are invalid") from error
-    if _resource_dict(resources) != mapping:
-        raise PlanError("plan resource types are invalid")
-    return resources
 
 
 def _allocation_summary(item: _AllocationPlan) -> dict[str, object]:
@@ -507,7 +471,6 @@ def _allocation_summary(item: _AllocationPlan) -> dict[str, object]:
         "time_limit": allocation.time_limit,
         "sbatch_argv": list(item.argv),
         "script_digest": item.script_digest,
-        "argv_digest": item.argv_digest,
     }
 
 
@@ -691,7 +654,6 @@ class Campaign:
                     script,
                     argv,
                     hashlib.sha256(script).hexdigest(),
-                    _digest(list(argv)),
                 )
             )
         partial = SubmissionPlan(
@@ -761,11 +723,12 @@ class Campaign:
     def reconcile(self, target: SlurmTarget, allocation_id: str) -> JobReceipt:
         state = self._read_state()
         intent = _unresolved_intent(state, allocation_id)
-        if intent["target_digest"] != _digest(_target_dict(target)):
+        lineage = cast(dict[str, object], state["lineage"])
+        if lineage["target"] != _target_dict(target):
             raise ReconciliationError("reconciliation target does not match allocation intent")
         match = _slurm.query_identity(
             target,
-            job_name=cast(str, intent["job_name"]),
+            job_name=f"servatus-{allocation_id}",
             window_start=cast(str, intent["window_start"]),
             window_end=cast(str, intent["window_end"]),
         )
@@ -793,18 +756,15 @@ class Campaign:
             raise ConfigurationError("cluster requires a job_id")
         with self._locked_state() as state:
             assert state is not None
-            intent = _unresolved_intent(state, allocation_id)
+            _unresolved_intent(state, allocation_id)
             if job_id is None:
-                cast(list[dict[str, object]], state["resolutions"]).append(
-                    {"allocation_id": allocation_id, "accepted": False}
-                )
+                cast(list[str], state["resolutions"]).append(allocation_id)
             else:
                 cast(list[dict[str, object]], state["receipts"]).append(
                     {
                         "allocation_id": allocation_id,
                         "job_id": job_id,
                         "cluster": cluster,
-                        "task_keys": intent["task_keys"],
                     }
                 )
             state["revision"] = cast(int, state["revision"]) + 1
@@ -832,8 +792,6 @@ class Campaign:
         for allocation in plan._allocations:
             if allocation.script_digest != hashlib.sha256(allocation.script).hexdigest():
                 raise PlanError("submission plan script was changed")
-            if allocation.argv_digest != _digest(list(allocation.argv)):
-                raise PlanError("submission plan command was changed")
         if plan.digest != _digest(_plan_semantics(plan)):
             raise PlanError("submission plan was changed")
         if _ambiguous_ids(state):
@@ -866,9 +824,6 @@ class Campaign:
                     "task_keys": list(allocation.allocation.task_keys),
                     "plan_digest": plan.digest,
                     "script_digest": allocation.script_digest,
-                    "argv_digest": allocation.argv_digest,
-                    "target_digest": lineage["target_digest"],
-                    "resource_digest": lineage["resource_digest"],
                     "allocation": {
                         "cpus": allocation.allocation.cpus,
                         "memory_mib": allocation.allocation.memory_mib,
@@ -876,7 +831,6 @@ class Campaign:
                         "time_limit": allocation.allocation.time_limit,
                     },
                     "sbatch_argv": list(allocation.argv),
-                    "job_name": f"servatus-{allocation.allocation_id}",
                     "window_start": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S"),
                     "window_end": (now + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S"),
                 }
@@ -896,7 +850,6 @@ class Campaign:
                     "allocation_id": receipt.allocation_id,
                     "job_id": receipt.job_id,
                     "cluster": receipt.cluster,
-                    "task_keys": list(receipt.task_keys),
                 }
             )
             state["revision"] = expected_revision + 1
@@ -939,7 +892,6 @@ class Campaign:
 
     def _write_state(self, state: dict[str, object]) -> None:
         descriptor = self._active_descriptor
-        _validate_state(state)
         encoded = _canonical(state) + b"\n"
         if len(encoded) > _MAX_STATE_BYTES:
             raise TaskConflict(
@@ -1031,6 +983,10 @@ def _balanced_groups(tasks: tuple[Task, ...], capacity: int) -> tuple[tuple[Task
 
 
 def _receipt_values(state: dict[str, object]) -> tuple[JobReceipt, ...]:
+    intents = {
+        cast(str, intent["allocation_id"]): tuple(cast(list[str], intent["task_keys"]))
+        for intent in cast(list[dict[str, object]], state["intents"])
+    }
     values: list[JobReceipt] = []
     for raw in cast(list[dict[str, object]], state["receipts"]):
         values.append(
@@ -1038,17 +994,14 @@ def _receipt_values(state: dict[str, object]) -> tuple[JobReceipt, ...]:
                 cast(str, raw["allocation_id"]),
                 cast(int, raw["job_id"]),
                 cast(str | None, raw["cluster"]),
-                tuple(cast(list[str], raw["task_keys"])),
+                intents[cast(str, raw["allocation_id"])],
             )
         )
     return tuple(values)
 
 
 def _ambiguous_ids(state: dict[str, object]) -> list[str]:
-    resolved = {
-        cast(str, value["allocation_id"])
-        for value in cast(list[dict[str, object]], state["resolutions"])
-    }
+    resolved = set(cast(list[str], state["resolutions"]))
     receipted = {receipt.allocation_id for receipt in _receipt_values(state)}
     return [
         cast(str, intent["allocation_id"])
@@ -1220,8 +1173,10 @@ def _validate_state(state: dict[str, object]) -> None:
         raise TaskConflict("campaign task keys are not unique")
     lineage = _validate_lineage(state["lineage"])
     intents = _validate_intents(cast(list[object], state["intents"]), task_keys, lineage)
-    _validate_receipts(cast(list[object], state["receipts"]), intents)
-    _validate_resolutions(cast(list[object], state["resolutions"]), intents)
+    receipted = _validate_receipts(cast(list[object], state["receipts"]), intents)
+    resolved = _validate_resolutions(cast(list[object], state["resolutions"]), intents)
+    if receipted & resolved:
+        raise TaskConflict("campaign allocation cannot be accepted and resolved not submitted")
 
 
 def _validate_lineage(
@@ -1261,12 +1216,8 @@ def _validate_intents(
         "task_keys",
         "plan_digest",
         "script_digest",
-        "argv_digest",
-        "target_digest",
-        "resource_digest",
         "allocation",
         "sbatch_argv",
-        "job_name",
         "window_start",
         "window_end",
     }
@@ -1295,20 +1246,10 @@ def _validate_intents(
         if lineage is None:
             raise TaskConflict("campaign intent has no resource lineage")
         target, resources = lineage
-        for name in (
-            "plan_digest",
-            "script_digest",
-            "argv_digest",
-            "target_digest",
-            "resource_digest",
-        ):
+        for name in ("plan_digest", "script_digest"):
             digest = intent[name]
             if not isinstance(digest, str) or _HEX_64.fullmatch(digest) is None:
                 raise TaskConflict("campaign intent digest is invalid")
-        if intent["target_digest"] != _digest(_target_dict(target)) or intent[
-            "resource_digest"
-        ] != _digest(_resource_dict(resources)):
-            raise TaskConflict("campaign intent lineage is invalid")
         allocation = intent["allocation"]
         argv = intent["sbatch_argv"]
         if not isinstance(allocation, dict) or not isinstance(argv, list):
@@ -1336,10 +1277,9 @@ def _validate_intents(
             or not typed_argv
             or any(not isinstance(argument, str) or "\0" in argument for argument in typed_argv)
             or typed_argv != expected_argv
-            or intent["argv_digest"] != _digest(typed_argv)
         ):
             raise TaskConflict("campaign intent provenance is invalid")
-        if intent["job_name"] != f"servatus-{allocation_id}" or any(
+        if any(
             not isinstance(intent[name], str) or _CONTROL.search(cast(str, intent[name]))
             for name in ("window_start", "window_end")
         ):
@@ -1348,7 +1288,7 @@ def _validate_intents(
     return intents
 
 
-def _validate_receipts(value: object, intents: dict[str, tuple[str, ...]]) -> None:
+def _validate_receipts(value: object, intents: dict[str, tuple[str, ...]]) -> set[str]:
     if not isinstance(value, list):
         raise TaskConflict("campaign receipts are invalid")
     seen: set[str] = set()
@@ -1359,9 +1299,8 @@ def _validate_receipts(value: object, intents: dict[str, tuple[str, ...]]) -> No
         allocation_id = receipt.get("allocation_id")
         job_id = receipt.get("job_id")
         cluster = receipt.get("cluster")
-        task_keys = receipt.get("task_keys")
         if (
-            set(receipt) != {"allocation_id", "job_id", "cluster", "task_keys"}
+            set(receipt) != {"allocation_id", "job_id", "cluster"}
             or not isinstance(allocation_id, str)
             or allocation_id not in intents
             or allocation_id in seen
@@ -1372,40 +1311,28 @@ def _validate_receipts(value: object, intents: dict[str, tuple[str, ...]]) -> No
                 cluster is not None
                 and (not isinstance(cluster, str) or _TOKEN.fullmatch(cluster) is None)
             )
-            or not isinstance(task_keys, list)
-            or tuple(cast(list[object], task_keys)) != intents[allocation_id]
         ):
             raise TaskConflict("campaign receipt is invalid")
         seen.add(allocation_id)
+    return seen
 
 
-def _validate_resolutions(value: object, intents: dict[str, tuple[str, ...]]) -> None:
+def _validate_resolutions(value: object, intents: dict[str, tuple[str, ...]]) -> set[str]:
     if not isinstance(value, list):
         raise TaskConflict("campaign resolutions are invalid")
     seen: set[str] = set()
-    for raw in cast(list[object], value):
-        if not isinstance(raw, dict):
-            raise TaskConflict("campaign resolution is invalid")
-        resolution = cast(dict[str, object], raw)
-        allocation_id = resolution.get("allocation_id")
+    for allocation_id in cast(list[object], value):
         if (
-            set(resolution) != {"allocation_id", "accepted"}
-            or not isinstance(allocation_id, str)
+            not isinstance(allocation_id, str)
             or allocation_id not in intents
             or allocation_id in seen
-            or resolution["accepted"] is not False
         ):
             raise TaskConflict("campaign resolution is invalid")
         seen.add(allocation_id)
+    return seen
 
 
-def _plan_integer(value: object, *, minimum: int, name: str) -> int:
-    if type(value) is not int or value < minimum:
-        raise PlanError(f"plan {name} must be an integer >= {minimum}")
-    return value
-
-
-def _plan_strings(value: object, *, name: str, nonempty: bool = False) -> list[str]:
+def _plan_strings(value: object, *, name: str) -> list[str]:
     if not isinstance(value, list):
         raise PlanError(f"plan {name} must be an array of strings")
     strings: list[str] = []
@@ -1413,12 +1340,19 @@ def _plan_strings(value: object, *, name: str, nonempty: bool = False) -> list[s
         if not isinstance(item, str) or "\0" in item:
             raise PlanError(f"plan {name} must be an array of strings")
         strings.append(item)
-    if nonempty and not strings:
-        raise PlanError(f"plan {name} cannot be empty")
     return strings
 
 
-def _validate_plan_document(document: object) -> dict[str, object]:
+def _plan_inputs(
+    document: object,
+) -> tuple[
+    dict[str, object],
+    SlurmTarget,
+    ResourceRequest,
+    list[str],
+    list[str],
+    int | None,
+]:
     if not isinstance(document, dict):
         raise PlanError("plan document must be an object")
     mapping = cast(dict[str, object], document)
@@ -1441,86 +1375,22 @@ def _validate_plan_document(document: object) -> dict[str, object]:
         or mapping["schema_version"] != _PLAN_SCHEMA_VERSION
     ):
         raise PlanError("plan document schema is unsupported")
-    campaign_id = mapping["campaign_id"]
-    digest = mapping["digest"]
-    if not isinstance(campaign_id, str) or _HEX_32.fullmatch(campaign_id) is None:
-        raise PlanError("plan campaign identity is invalid")
-    _plan_integer(mapping["state_revision"], minimum=0, name="state_revision")
-    _target_from_dict(mapping["target"])
-    _resource_from_dict(mapping["resources"])
+    target = _target_from_dict(mapping["target"])
+    resources = _resource_from_dict(mapping["resources"])
     completed = _plan_strings(mapping["completed"], name="completed")
     retry = _plan_strings(mapping["retry"], name="retry")
     if len(set(completed)) != len(completed) or len(set(retry)) != len(retry):
         raise PlanError("plan selections contain duplicate task keys")
     tasks_per = mapping["tasks_per_allocation"]
-    if tasks_per is not None:
-        _plan_integer(tasks_per, minimum=1, name="tasks_per_allocation")
-    allocations = mapping["allocations"]
-    if not isinstance(allocations, list):
-        raise PlanError("plan allocations must be an array")
-    for raw in cast(list[object], allocations):
-        _validate_plan_allocation(raw)
-    if not isinstance(digest, str) or _HEX_64.fullmatch(digest) is None:
-        raise PlanError("plan digest is invalid")
-    return mapping
-
-
-def _validate_plan_allocation(value: object) -> None:
-    if not isinstance(value, dict):
-        raise PlanError("plan allocation must be an object")
-    allocation = cast(dict[str, object], value)
-    expected = {
-        "allocation_id",
-        "task_keys",
-        "cpus",
-        "memory_mib",
-        "gpus",
-        "time_limit",
-        "sbatch_argv",
-        "script_digest",
-        "argv_digest",
-    }
-    if set(allocation) != expected:
-        raise PlanError("plan allocation keys are invalid")
-    allocation_id = allocation["allocation_id"]
-    time_limit = allocation["time_limit"]
-    script_digest = allocation["script_digest"]
-    argv_digest = allocation["argv_digest"]
-    if not isinstance(allocation_id, str) or _HEX_24.fullmatch(allocation_id) is None:
-        raise PlanError("plan allocation identity is invalid")
-    task_keys = _plan_strings(allocation["task_keys"], name="task_keys", nonempty=True)
-    if len(set(task_keys)) != len(task_keys):
-        raise PlanError("plan allocation task keys are not unique")
-    _plan_integer(allocation["cpus"], minimum=1, name="allocation cpus")
-    _plan_integer(allocation["memory_mib"], minimum=1, name="allocation memory_mib")
-    _plan_integer(allocation["gpus"], minimum=0, name="allocation gpus")
-    try:
-        effective_seconds = _duration_seconds(time_limit, name="time_limit")
-    except ConfigurationError as error:
-        raise PlanError("plan allocation time_limit is invalid") from error
-    if not isinstance(time_limit, str) or effective_seconds % 60:
-        raise PlanError("plan allocation time_limit must be an effective minute duration")
-    argv = _plan_strings(allocation["sbatch_argv"], name="sbatch_argv", nonempty=True)
-    if not isinstance(script_digest, str) or _HEX_64.fullmatch(script_digest) is None:
-        raise PlanError("plan allocation script digest is invalid")
-    if (
-        not isinstance(argv_digest, str)
-        or _HEX_64.fullmatch(argv_digest) is None
-        or argv_digest != _digest(argv)
+    if tasks_per is not None and (
+        isinstance(tasks_per, bool) or not isinstance(tasks_per, int) or tasks_per < 1
     ):
-        raise PlanError("plan allocation command digest is invalid")
+        raise PlanError("plan tasks_per_allocation must be an integer >= 1")
+    return mapping, target, resources, completed, retry, tasks_per
 
 
 def restore_plan(campaign: Campaign, document: object) -> SubmissionPlan:
-    mapping = _validate_plan_document(document)
-    try:
-        completed = cast(list[str], mapping["completed"])
-        retry = cast(list[str], mapping["retry"])
-        tasks_per = cast(int | None, mapping["tasks_per_allocation"])
-        target = _target_from_dict(mapping["target"])
-        resources = _resource_from_dict(mapping["resources"])
-    except KeyError as error:
-        raise PlanError("plan document is incomplete") from error
+    mapping, target, resources, completed, retry, tasks_per = _plan_inputs(document)
     plan = campaign.plan(
         target,
         resources,
@@ -1528,7 +1398,11 @@ def restore_plan(campaign: Campaign, document: object) -> SubmissionPlan:
         retry=retry,
         tasks_per_allocation=tasks_per,
     )
-    if plan_document(plan) != mapping:
+    try:
+        changed = _canonical(plan_document(plan)) != _canonical(mapping)
+    except (TypeError, ValueError) as error:
+        raise PlanError("plan document contains invalid JSON values") from error
+    if changed:
         raise PlanError("plan document is stale, foreign, or changed")
     return plan
 
@@ -1548,7 +1422,7 @@ def validate_plan(plan: SubmissionPlan) -> tuple[_ValidationResult, ...]:
         if shape_key in seen:
             continue
         seen.add(shape_key)
-        result = _slurm.validate_allocation(plan._target, item.argv, item.script)
+        result = _slurm._run_ssh(plan._target, (*item.argv, "--test-only"), item.script)
         if result.returncode != 0:
             raise SubmissionError(
                 "Slurm rejected a time-specific validation: "

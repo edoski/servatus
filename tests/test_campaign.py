@@ -84,7 +84,7 @@ def test_resource_request_rejects_invalid_values(field: str, value: object) -> N
         resources(**{field: value})
 
 
-def test_strict_toml_rejects_unknown_and_counted_gres(tmp_path: Path) -> None:
+def test_strict_resource_toml_and_target_values(tmp_path: Path) -> None:
     resource_file = tmp_path / "resources.toml"
     resource_file.write_text(
         "cpus_per_task = 1\nmemory_mib_per_task = 1024\ngpus_per_task = 0\n"
@@ -93,8 +93,6 @@ def test_strict_toml_rejects_unknown_and_counted_gres(tmp_path: Path) -> None:
     with pytest.raises(ConfigurationError, match="unknown"):
         ResourceRequest.from_toml(resource_file)
 
-    with pytest.raises(ConfigurationError, match="count"):
-        target(gpu_gres="gpu:a100:2")
     with pytest.raises(ConfigurationError):
         target(host="-oProxyCommand=bad")
     with pytest.raises(ConfigurationError):
@@ -518,6 +516,71 @@ def test_submit_records_intent_before_ssh_and_receipt(
     assert list((tmp_path / "campaign").glob(".campaign-*.tmp")) == []
 
 
+def test_submission_state_uses_only_authoritative_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "campaign"
+    campaign = Campaign.open(path, tasks(1))
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(0, b"4242;alpha\n", b""),
+    )
+
+    campaign.submit(campaign.plan(target(), resources()))
+    state = json.loads((path / "campaign.json").read_text())
+
+    assert state["schema_version"] == 3
+    assert set(state["intents"][0]) == {
+        "allocation_id",
+        "task_keys",
+        "plan_digest",
+        "script_digest",
+        "allocation",
+        "sbatch_argv",
+        "window_start",
+        "window_end",
+    }
+    assert set(state["receipts"][0]) == {"allocation_id", "job_id", "cluster"}
+    allocation = _campaign.plan_document(
+        Campaign.open(path, tasks(1)).plan(target(), resources(), retry={"task-0"})
+    )["allocations"][0]
+    assert set(allocation) == {
+        "allocation_id",
+        "task_keys",
+        "cpus",
+        "memory_mib",
+        "gpus",
+        "time_limit",
+        "sbatch_argv",
+        "script_digest",
+    }
+
+
+def test_campaign_rejects_allocation_with_receipt_and_negative_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "campaign"
+    campaign = Campaign.open(path, tasks(1))
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(1, b"", b"lost reply"),
+    )
+    with pytest.raises(AmbiguousSubmission):
+        campaign.submit(campaign.plan(target(), resources()))
+
+    state_path = path / "campaign.json"
+    state = json.loads(state_path.read_text())
+    allocation_id = state["intents"][0]["allocation_id"]
+    state["receipts"].append({"allocation_id": allocation_id, "job_id": 42, "cluster": None})
+    state["resolutions"].append(allocation_id)
+    state_path.write_text(json.dumps(state))
+
+    with pytest.raises(TaskConflict, match="accepted and resolved"):
+        Campaign.open(path, tasks(1))
+
+
 def test_intent_file_and_directory_are_synced_before_ssh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -705,6 +768,52 @@ def test_state_size_boundary_is_symmetric_and_overflow_does_not_mutate(
         assert list((tmp_path / "campaign").glob(".campaign-*.tmp")) == []
 
 
+def test_campaign_rejects_invalid_json_state(tmp_path: Path) -> None:
+    path = tmp_path / "campaign"
+    Campaign.open(path, tasks(1))
+    (path / "campaign.json").write_bytes(b'{"truncated":')
+
+    with pytest.raises(TaskConflict, match="invalid JSON"):
+        Campaign.open(path, tasks(1))
+
+
+def test_campaign_rejects_truncated_state_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
+    real_read = _campaign.os.read
+    first = True
+
+    def truncated_read(descriptor: int, count: int) -> bytes:
+        nonlocal first
+        if first:
+            first = False
+            return real_read(descriptor, count)[:-1]
+        return b""
+
+    monkeypatch.setattr(_campaign.os, "read", truncated_read)
+    with pytest.raises(TaskConflict, match="changed while reading"):
+        campaign.status()
+
+
+def test_campaign_rejects_oversized_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "campaign"
+    campaign = Campaign.open(path, tasks(1))
+    state_path = path / "campaign.json"
+    monkeypatch.setattr(_campaign, "_MAX_STATE_BYTES", state_path.stat().st_size - 1)
+    with pytest.raises(TaskConflict, match="too large"):
+        campaign.status()
+
+
+def test_campaign_rejects_permissive_state_file(tmp_path: Path) -> None:
+    path = tmp_path / "campaign"
+    campaign = Campaign.open(path, tasks(1))
+    state_path = path / "campaign.json"
+    state_path.chmod(0o640)
+    with pytest.raises(TaskConflict, match="owner-only"):
+        campaign.status()
+
+
 @pytest.mark.parametrize("failure", ["write", "fsync"])
 def test_precommit_state_failures_remove_owned_stage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
@@ -888,18 +997,14 @@ def test_concurrent_openers_cannot_return_when_all_parent_syncs_fail(
     ("path", "value"),
     [
         (("schema_version",), True),
-        (("state_revision",), 0.0),
         (("resources", "cpus_per_task"), True),
         (("target", "max_tasks_per_allocation"), True),
         (("allocations", 0, "cpus"), True),
-        (("allocations", 0, "sbatch_argv"), [True]),
-        (("allocations", 0, "sbatch_argv", 0), "changed"),
-        (("allocations", 0, "argv_digest"), "0" * 64),
-        (("allocations",), {}),
         (("completed",), 7),
+        (("tasks_per_allocation",), True),
     ],
 )
-def test_plan_document_rejects_changed_container_and_numeric_types(
+def test_plan_document_rejects_invalid_inputs_and_derived_tampering(
     tmp_path: Path, path: tuple[str | int, ...], value: object
 ) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(1))

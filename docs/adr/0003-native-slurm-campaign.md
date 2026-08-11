@@ -8,11 +8,20 @@ permits only an exact append-only suffix, preserving prior order, bytes, resourc
 and receipts. It owns deterministic balanced single-node allocations, complete scripts, and durable
 submission records, and fails closed when scheduler acceptance is ambiguous.
 
-The durable lineage retains normalized target guardrails and requested resources. Each intent adds
-exact effective allocation totals and the nonsecret `sbatch` argument vector. Public plan files
-redact task arguments and payloads; complete script display is an explicit sensitive diagnostic.
-Authored wall time remains provenance while planned and submitted time reflects Slurm's one-time
-upward minute rounding.
+The durable lineage retains normalized target guardrails and requested resources once. Each intent
+adds ordered Task keys, plan and script digests, exact effective allocation totals, the nonsecret
+`sbatch` argument vector, and its reconciliation window. Job names derive from allocation identity;
+receipts retain only allocation and Slurm identities; negative resolutions are allocation IDs.
+Public plan files redact task arguments and payloads. A loaded plan parses only its typed planning
+inputs, regenerates the immutable plan once, and requires identical canonical bytes, so no second
+derived-field validator is needed. Complete script display remains an explicit sensitive
+diagnostic. Authored wall time remains provenance while planned and submitted time reflects Slurm's
+one-time upward minute rounding.
+
+Campaign and plan schema 3 are a clean break. Every bounded owner-only state read validates the
+complete atomic snapshot, including that an allocation cannot have both an acceptance receipt and
+an explicit not-submitted resolution. Internally typed mutations are encoded directly rather than
+decoded again immediately before the atomic write.
 
 The package invokes stable command-line seams directly. Submitit is prior art, not a dependency:
 its cluster-local Python callable and post-acceptance pickle transport do not fit the workstation

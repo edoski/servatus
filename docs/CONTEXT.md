@@ -7,10 +7,13 @@ Servatus uses a small generic vocabulary:
   registered prefix value remains immutable.
 - **Resource request:** one homogeneous per-Task CPU, MiB, whole-GPU, and wall-time requirement.
 - **Target:** one concrete SSH/Slurm/Apptainer route with conservative request ceilings.
-- **Plan:** a local immutable selection, grouping, script, command, and digest snapshot.
+- **Plan:** a local immutable selection whose exported document is accepted only when regeneration
+  from its typed inputs produces the same canonical bytes.
 - **Allocation:** one single-node Slurm job containing concurrent exact Task steps.
-- **Intent:** the synced record written before possible scheduler acceptance.
-- **Receipt:** a positive Slurm job identity proving scheduler acceptance, not completion.
+- **Intent:** the synced record written before possible scheduler acceptance; it retains ordered
+  Task keys, plan and script digests, exact command, allocation totals, and query window.
+- **Receipt:** a positive Slurm job identity proving scheduler acceptance, not completion; its Task
+  keys come from the immutable intent.
 - **Ambiguous allocation:** an intent without a receipt or explicit operator resolution.
 - **Destination:** the application-owned canonical path. It is immutable once published.
 - **Workspace:** stable, identity-bound owner-only private state retained when resumable work fails;
