@@ -500,7 +500,7 @@ def _remove_directory_entry(
         if not same_entry(opened, expected):
             raise UnsafePublication(f"cleanup target changed before open: {name}")
         ensure_entry(parent_fd, name, expected)
-        _remove_tree_contents(descriptor, expected.st_dev)
+        _remove_tree_contents(descriptor, device)
         ensure_entry(parent_fd, name, expected)
         os.rmdir(name, dir_fd=parent_fd)
     finally:
