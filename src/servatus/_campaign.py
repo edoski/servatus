@@ -1154,7 +1154,11 @@ def _validate_state(state: dict[str, object]) -> None:
         "receipts",
         "resolutions",
     }
-    if set(state) != keys or state.get("schema_version") != _SCHEMA_VERSION:
+    if (
+        set(state) != keys
+        or type(state.get("schema_version")) is not int
+        or state["schema_version"] != _SCHEMA_VERSION
+    ):
         raise TaskConflict("campaign state schema is unsupported")
     if (
         not isinstance(state["campaign_id"], str)
@@ -1272,8 +1276,13 @@ def _validate_intents(
                 _effective_time_limit(resources.time_limit),
             )
         )
+        numeric_totals = {"cpus": 1, "memory_mib": 1, "gpus": 0}
         if (
-            totals != expected_totals
+            any(
+                type(totals.get(name)) is not int or cast(int, totals[name]) < minimum
+                for name, minimum in numeric_totals.items()
+            )
+            or totals != expected_totals
             or not typed_argv
             or any(not isinstance(argument, str) or "\0" in argument for argument in typed_argv)
             or typed_argv != expected_argv

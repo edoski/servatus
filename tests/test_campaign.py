@@ -581,6 +581,46 @@ def test_campaign_rejects_allocation_with_receipt_and_negative_resolution(
         Campaign.open(path, tasks(1))
 
 
+def test_campaign_rejects_float_state_schema(tmp_path: Path) -> None:
+    path = tmp_path / "campaign"
+    Campaign.open(path, tasks(1))
+    state_path = path / "campaign.json"
+    state = json.loads(state_path.read_text())
+    state["schema_version"] = 3.0
+    state_path.write_text(json.dumps(state))
+
+    with pytest.raises(TaskConflict, match="schema"):
+        Campaign.open(path, tasks(1))
+
+
+@pytest.mark.parametrize("field", ["cpus", "memory_mib", "gpus"])
+@pytest.mark.parametrize("value", [True, 1.0])
+def test_campaign_rejects_noninteger_allocation_totals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: bool | float,
+) -> None:
+    path = tmp_path / "campaign"
+    campaign = Campaign.open(path, tasks(1))
+    request = resources(cpus_per_task=1, memory_mib_per_task=1, gpus_per_task=1)
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(1, b"", b"lost reply"),
+    )
+    with pytest.raises(AmbiguousSubmission):
+        campaign.submit(campaign.plan(target(), request))
+
+    state_path = path / "campaign.json"
+    state = json.loads(state_path.read_text())
+    state["intents"][0]["allocation"][field] = value
+    state_path.write_text(json.dumps(state))
+
+    with pytest.raises(TaskConflict, match="provenance"):
+        Campaign.open(path, tasks(1))
+
+
 def test_intent_file_and_directory_are_synced_before_ssh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
