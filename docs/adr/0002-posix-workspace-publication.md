@@ -36,7 +36,9 @@ publication.
 `Draft.link()` selects its source inode at the atomic hard-link operation. It then inspects the
 linked draft entry without following symlinks and accepts only a same-filesystem regular file. A safe
 source-path replacement before the link operation may therefore be selected; there is no preliminary
-source-inode anchor.
+source-inode anchor. The owner-only draft namespace is trusted and must remain quiescent during the
+call; hostile same-account replacement of the destination leaf during `Draft.link()` is outside the
+contract.
 
 Application callbacks own contents and validation and must finish content mutations before
 returning. Servatus verifies pathname/inode identity and syncs contents afterward, but does not use

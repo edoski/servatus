@@ -802,6 +802,35 @@ def test_link_selects_safe_source_at_hard_link_operation(
     assert moved.read_bytes() == b"original"
 
 
+def test_link_inspection_failure_removes_created_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.write_text("value")
+    real_stat = os.stat
+    failed = False
+
+    def fail_inspection(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        nonlocal failed
+        if not failed and path == "failed" and isinstance(kwargs.get("dir_fd"), int):
+            failed = True
+            raise OSError("injected inspection failure")
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(_workspace.os, "stat", fail_inspection)
+
+    def build(draft: Draft) -> None:
+        with pytest.raises(UnsafePublication, match="destination is unavailable"):
+            draft.link(source, "failed")
+        assert not os.path.lexists(draft.path / "failed")
+        (draft.path / "safe").write_text("complete")
+
+    publish(tmp_path / "result", build)
+
+    assert source.read_text() == "value"
+    assert [entry.name for entry in (tmp_path / "result").iterdir()] == ["safe"]
+
+
 @pytest.mark.parametrize("unsafe", ["", ".", "..", "../escape", "/absolute", "safe\0truncated"])
 def test_link_rejects_escaping_paths(tmp_path: Path, unsafe: str) -> None:
     source = tmp_path / "source"

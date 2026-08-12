@@ -14,7 +14,9 @@ Builders and file writers must finish mutating draft contents before returning. 
 selects its source inode at the atomic hard-link operation, so a safe replacement of the source path
 before that operation may be selected. Servatus then checks the linked entry without following
 symlinks, verifies pathname/inode identity, and syncs content. It does not detect or exclude
-concurrent content writers; same-account mutation after the callback returns is outside the contract.
+concurrent content writers. The owner-only draft namespace must remain quiescent during each
+`Draft.link()`; hostile same-account replacement of its destination leaf during that call and
+content mutation after the callback returns are outside the contract.
 
 Optional directory retirement accepts one existing owner-only destination sibling. Servatus pins
 the parent and source before the builder, commits and syncs the destination first, then removes only

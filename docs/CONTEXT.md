@@ -25,8 +25,8 @@ Servatus uses a small generic vocabulary:
 - **Child workspace:** one independently locked resumable result beneath a future parent destination.
 - **Identity:** opaque application bytes whose digest and three inode pins bind a workspace to one
   logical request and its container, lock, and work entries.
-- **Draft:** one unique, disposable directory assembled before publication; a hard link selects its
-  safe regular source inode at the kernel link operation.
+- **Draft:** one unique, disposable, owner-only directory assembled before publication; its trusted
+  namespace remains quiescent while a hard link selects and validates one regular source inode.
 - **File stage:** one unique, empty regular file written and validated in place before publication.
 - **Publication:** the committed destination plus whether private cleanup remains pending.
 - **Retained tree:** one existing owner-only destination sibling pinned before a directory build and

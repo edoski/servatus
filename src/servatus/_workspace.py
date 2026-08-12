@@ -54,10 +54,9 @@ class _WorkspaceLevel:
 
 
 class Draft:
-    def __init__(self, path: Path, descriptor: int, device: int) -> None:
+    def __init__(self, path: Path, descriptor: int) -> None:
         self._path = path
         self._descriptor = descriptor
-        self._device = device
 
     @property
     def path(self) -> Path:
@@ -91,17 +90,24 @@ class Draft:
             try:
                 linked = os.stat(leaf, dir_fd=current_fd, follow_symlinks=False)
             except OSError as error:
+                try:
+                    os.unlink(leaf, dir_fd=current_fd)
+                except OSError as cleanup_error:
+                    cleanup_error.add_note(f"Inspection failed: {error}")
+                    raise UnsafePublication(
+                        f"hard-link destination could not be inspected or removed: {destination}"
+                    ) from cleanup_error
                 raise UnsafePublication(
                     f"hard-link destination is unavailable: {destination}"
                 ) from error
-            if stat.S_ISREG(linked.st_mode) and linked.st_dev == self._device:
+            if stat.S_ISREG(linked.st_mode):
                 return
-            _posix.ensure_entry(current_fd, leaf, linked)
-            os.unlink(leaf, dir_fd=current_fd)
-            if linked.st_dev != self._device:
-                raise CrossDevicePublication(
-                    f"hard-link source is on another filesystem: {source_path}"
-                )
+            try:
+                os.unlink(leaf, dir_fd=current_fd)
+            except OSError as error:
+                raise UnsafePublication(
+                    f"unsafe hard-link source could not be removed: {source_path}"
+                ) from error
             raise UnsafePublication(f"hard-link source is not a regular file: {source_path}")
         finally:
             os.close(current_fd)
@@ -118,7 +124,8 @@ def _safe_components(destination: str | PurePosixPath) -> tuple[str, ...]:
 
 def _build_draft(build: Callable[[Draft], None]) -> Callable[[Path, int, int], None]:
     def run(path: Path, descriptor: int, device: int) -> None:
-        build(Draft(path, descriptor, device))
+        del device
+        build(Draft(path, descriptor))
 
     return run
 

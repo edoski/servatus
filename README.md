@@ -237,7 +237,8 @@ nonblocking writer lock. `Draft.link` atomically hard-links the source path into
 path, then accepts only a same-filesystem regular file. The hard-link operation selects the source
 inode, so a safe source-path replacement before that operation may be selected. The builder owns
 contents, validation, schemas, and completion meaning and must finish mutating linked contents
-before returning.
+before returning. The owner-only draft namespace must remain quiescent during each `Draft.link()`;
+hostile same-account replacement of its destination leaf during that call is outside the contract.
 
 Independent workers can publish resumable child results beneath one future destination without
 entering the parent:
