@@ -191,8 +191,6 @@ def _run(arguments: argparse.Namespace) -> None:
             cluster=arguments.cluster,
         )
         print(json.dumps({"allocation_id": arguments.allocation_id, "resolved": True}))
-    else:
-        raise AssertionError(f"unhandled command: {command}")
 
 
 def main(argv: list[str] | None = None) -> int:

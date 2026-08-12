@@ -532,8 +532,6 @@ class Campaign:
     @classmethod
     def open(cls, path: Path, tasks: Sequence[Task]) -> Self:
         frozen = tuple(tasks)
-        if any(not isinstance(task, Task) for task in frozen):
-            raise ConfigurationError("tasks must contain only Task values")
         keys = [task.key for task in frozen]
         if len(set(keys)) != len(keys):
             raise ConfigurationError("Task keys must be unique")
@@ -581,8 +579,6 @@ class Campaign:
         retry: Collection[str] = (),
         tasks_per_allocation: int | None = None,
     ) -> SubmissionPlan:
-        if not isinstance(target, SlurmTarget) or not isinstance(resources, ResourceRequest):
-            raise ConfigurationError("plan requires a SlurmTarget and ResourceRequest")
         state = self._read_state()
         tasks = _tasks_from_state(state)
         ambiguous = _ambiguous_ids(state)
@@ -791,8 +787,6 @@ class Campaign:
         )
 
     def _verify_plan(self, plan: SubmissionPlan, *, operation: str) -> None:
-        if not isinstance(plan, SubmissionPlan):
-            raise PlanError(f"{operation} requires a SubmissionPlan")
         state = self._read_state()
         if plan._campaign_id != state["campaign_id"]:
             raise PlanError(f"{operation} plan belongs to another campaign")
@@ -1218,12 +1212,10 @@ def _validate_lineage(
 
 
 def _validate_intents(
-    value: object,
+    value: list[object],
     task_keys: tuple[str, ...],
     lineage: tuple[SlurmTarget, ResourceRequest] | None,
 ) -> dict[str, tuple[str, ...]]:
-    if not isinstance(value, list):
-        raise TaskConflict("campaign intents are invalid")
     expected = {
         "allocation_id",
         "task_keys",
@@ -1235,7 +1227,7 @@ def _validate_intents(
         "window_end",
     }
     intents: dict[str, tuple[str, ...]] = {}
-    for raw in cast(list[object], value):
+    for raw in value:
         if not isinstance(raw, dict):
             raise TaskConflict("campaign intent is invalid")
         intent = cast(dict[str, object], raw)
@@ -1292,8 +1284,6 @@ def _validate_intents(
                 for name, minimum in numeric_totals.items()
             )
             or totals != expected_totals
-            or not typed_argv
-            or any(not isinstance(argument, str) or "\0" in argument for argument in typed_argv)
             or typed_argv != expected_argv
         ):
             raise TaskConflict("campaign intent provenance is invalid")
@@ -1306,11 +1296,9 @@ def _validate_intents(
     return intents
 
 
-def _validate_receipts(value: object, intents: dict[str, tuple[str, ...]]) -> set[str]:
-    if not isinstance(value, list):
-        raise TaskConflict("campaign receipts are invalid")
+def _validate_receipts(value: list[object], intents: dict[str, tuple[str, ...]]) -> set[str]:
     seen: set[str] = set()
-    for raw in cast(list[object], value):
+    for raw in value:
         if not isinstance(raw, dict):
             raise TaskConflict("campaign receipt is invalid")
         receipt = cast(dict[str, object], raw)
@@ -1335,11 +1323,9 @@ def _validate_receipts(value: object, intents: dict[str, tuple[str, ...]]) -> se
     return seen
 
 
-def _validate_resolutions(value: object, intents: dict[str, tuple[str, ...]]) -> set[str]:
-    if not isinstance(value, list):
-        raise TaskConflict("campaign resolutions are invalid")
+def _validate_resolutions(value: list[object], intents: dict[str, tuple[str, ...]]) -> set[str]:
     seen: set[str] = set()
-    for allocation_id in cast(list[object], value):
+    for allocation_id in value:
         if (
             not isinstance(allocation_id, str)
             or allocation_id not in intents

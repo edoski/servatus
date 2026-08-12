@@ -108,7 +108,7 @@ def ensure_directory_path(path: Path, descriptor: int) -> None:
         current = path.stat(follow_symlinks=False)
     except OSError as error:
         raise UnsafePublication(f"publication parent disappeared: {path}") from error
-    if not stat.S_ISDIR(current.st_mode) or not same_entry(current, os.fstat(descriptor)):
+    if not same_entry(current, os.fstat(descriptor)):
         raise UnsafePublication(f"publication parent changed: {path}")
 
 
@@ -177,7 +177,6 @@ def make_unique_stage(parent_fd: int, prefix: str) -> tuple[str, int, os.stat_re
 
 def make_unique_file_stage(parent_fd: int, prefix: str) -> tuple[str, int, os.stat_result]:
     validate_leaf(prefix)
-    parent_device = os.fstat(parent_fd).st_dev
     for _ in range(128):
         name = f"{prefix}{os.urandom(12).hex()}"
         try:
@@ -190,15 +189,6 @@ def make_unique_file_stage(parent_fd: int, prefix: str) -> tuple[str, int, os.st
         except FileExistsError:
             continue
         entry = os.fstat(descriptor)
-        try:
-            if not stat.S_ISREG(entry.st_mode):
-                raise UnsafePublication("publication stage is not a regular file")
-            if entry.st_dev != parent_device:
-                raise CrossDevicePublication("publication stage crosses a filesystem boundary")
-        except BaseException as error:
-            _cleanup_entry_after_failure(parent_fd, name, entry, error, remove_file_at)
-            os.close(descriptor)
-            raise
         return name, descriptor, entry
     raise PublicationError("could not allocate a unique publication stage")
 
@@ -236,7 +226,7 @@ def _sync_regular_file(parent_fd: int, name: str, expected: os.stat_result) -> N
         raise UnsafePublication(f"unsafe regular file: {name}") from error
     try:
         opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or not same_entry(opened, expected):
+        if not same_entry(opened, expected):
             raise UnsafePublication(f"draft file changed during publication: {name}")
         sync_descriptor(descriptor)
         synced = os.fstat(descriptor)
@@ -256,25 +246,10 @@ def sync_file_stage(
     expected: os.stat_result,
 ) -> None:
     opened = os.fstat(descriptor)
-    parent_device = os.fstat(parent_fd).st_dev
-    if opened.st_dev != parent_device or expected.st_dev != parent_device:
-        raise CrossDevicePublication("publication stage crosses a filesystem boundary")
-    if not stat.S_ISREG(opened.st_mode) or not same_entry(opened, expected):
-        raise UnsafePublication("publication stage changed during publication")
-    ensure_entry(parent_fd, name, opened)
+    ensure_entry(parent_fd, name, expected)
     sync_descriptor(descriptor)
     synced = os.fstat(descriptor)
-    try:
-        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    except OSError as error:
-        raise UnsafePublication("publication stage disappeared") from error
-    if (
-        not stat.S_ISREG(synced.st_mode)
-        or not stat.S_ISREG(current.st_mode)
-        or not same_entry(synced, expected)
-        or not same_entry(synced, current)
-    ):
-        raise UnsafePublication("publication stage changed during publication")
+    ensure_entry(parent_fd, name, expected)
     if (opened.st_size, opened.st_mtime_ns) != (synced.st_size, synced.st_mtime_ns):
         raise UnsafePublication("publication stage was modified during publication")
 
@@ -295,9 +270,6 @@ def commit_noreplace(
     destination: str,
     expected_source: os.stat_result,
 ) -> _CommitOutcome:
-    require_supported_platform()
-    validate_leaf(source)
-    validate_leaf(destination)
     expected_parent = os.fstat(parent_fd)
     if sys.platform.startswith("linux"):
         try:
@@ -342,7 +314,7 @@ def _verified_source(
 
 def _verify_fallback_parent(parent_fd: int, expected: os.stat_result) -> os.stat_result:
     current = os.fstat(parent_fd)
-    if not stat.S_ISDIR(current.st_mode) or not same_entry(current, expected):
+    if not same_entry(current, expected):
         raise UnsafePublication("publication parent changed before fallback")
     return current
 
@@ -376,7 +348,7 @@ def _link_file_noreplace(
             ) from error
         raise
     linked = os.stat(destination, dir_fd=parent_fd, follow_symlinks=False)
-    if not stat.S_ISREG(linked.st_mode) or not same_entry(linked, expected_source):
+    if not same_entry(linked, expected_source):
         raise UnsafePublication("published file does not match the verified source")
     sync_descriptor(parent_fd)
     try:
@@ -418,9 +390,7 @@ def _locked_directory_noreplace(
         except OSError as error:
             raise UnsupportedPlatform("publication parent lock is unavailable") from error
         _verify_owner_controlled_parent(parent_fd, expected_parent)
-        current_source = _verified_source(parent_fd, source, expected_source)
-        if not stat.S_ISDIR(current_source.st_mode):
-            raise UnsafePublication("publication source is not a directory")
+        _verified_source(parent_fd, source, expected_source)
         try:
             os.stat(destination, dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError:
@@ -431,7 +401,7 @@ def _locked_directory_noreplace(
             raise DestinationExists("publication destination already exists")
         os.rename(source, destination, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         published = os.stat(destination, dir_fd=parent_fd, follow_symlinks=False)
-        if not stat.S_ISDIR(published.st_mode) or not same_entry(published, expected_source):
+        if not same_entry(published, expected_source):
             raise UnsafePublication("published directory does not match the verified source")
         sync_descriptor(parent_fd)
     finally:
@@ -513,8 +483,6 @@ def _remove_directory_entry(
     expected: os.stat_result,
     device: int,
 ) -> None:
-    if not stat.S_ISDIR(expected.st_mode):
-        raise UnsafePublication(f"cleanup target is not a directory: {name}")
     descriptor = open_directory_at(parent_fd, name)
     try:
         _remove_open_directory_entry(parent_fd, name, descriptor, expected, device)
@@ -532,7 +500,7 @@ def _remove_open_directory_entry(
     owner_only_description: str | None = None,
 ) -> None:
     opened = os.fstat(descriptor)
-    if not stat.S_ISDIR(opened.st_mode) or not same_entry(opened, expected):
+    if not same_entry(opened, expected):
         raise UnsafePublication(f"cleanup target changed before open: {name}")
     if owner_only_description is not None:
         require_owner_only(opened, owner_only_description)
@@ -597,7 +565,7 @@ def _pin_and_remove_regular_file(
     except OSError as error:
         raise UnsafePublication(f"cleanup file pin is unavailable: {name}") from error
     try:
-        if not stat.S_ISREG(pinned.st_mode) or not same_entry(pinned, expected):
+        if not same_entry(pinned, expected):
             raise UnsafePublication(f"cleanup file changed before pin: {name}")
         ensure_entry(parent_fd, name, expected)
         os.unlink(name, dir_fd=parent_fd)
@@ -614,8 +582,6 @@ def _pin_and_remove_regular_file(
 
 def remove_file_at(parent_fd: int, name: str, expected: os.stat_result) -> None:
     ensure_entry(parent_fd, name, expected)
-    if not stat.S_ISREG(expected.st_mode):
-        raise UnsafePublication(f"cleanup target is not a regular file: {name}")
     os.unlink(name, dir_fd=parent_fd)
     sync_descriptor(parent_fd)
 
@@ -794,17 +760,9 @@ def _pin_retirement(
         raise UnsafePublication("retirement source must be a destination sibling")
     if retirement_name == destination_name:
         raise UnsafePublication("retirement source must differ from the destination")
-    try:
-        entry = os.stat(retirement_name, dir_fd=parent_fd, follow_symlinks=False)
-    except OSError as error:
-        raise UnsafePublication("retirement source is unavailable") from error
-    if not stat.S_ISDIR(entry.st_mode):
-        raise UnsafePublication("retirement source is not a directory")
     descriptor = open_directory_at(parent_fd, retirement_name)
     try:
         opened = os.fstat(descriptor)
-        if not same_entry(opened, entry):
-            raise UnsafePublication("retirement source changed before open")
         require_owner_only(opened, "retirement source")
         ensure_entry(parent_fd, retirement_name, opened)
     except BaseException:

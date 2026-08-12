@@ -8,7 +8,6 @@ import stat
 import threading
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
-from typing import cast
 
 import pytest
 
@@ -19,7 +18,6 @@ from servatus import (
     PlanError,
     ResourceRequest,
     SlurmTarget,
-    SubmissionPlan,
     Task,
     TaskConflict,
     ValidationResult,
@@ -797,19 +795,6 @@ def test_validate_rejects_foreign_plan_before_contacting_slurm(
     assert "submit" not in str(rejected.value)
     assert "submission" not in str(rejected.value)
     assert called is False
-
-
-def test_plan_type_errors_name_the_requested_operation(tmp_path: Path) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    invalid = cast(SubmissionPlan, object())
-
-    with pytest.raises(PlanError, match="validate requires") as validate_error:
-        campaign.validate(invalid)
-    assert "submit" not in str(validate_error.value)
-    assert "submission" not in str(validate_error.value)
-
-    with pytest.raises(PlanError, match="submit requires"):
-        campaign.submit(invalid)
 
 
 def test_reconcile_adopts_only_private_query_result(
