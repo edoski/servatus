@@ -57,6 +57,7 @@ class Draft:
     def __init__(self, path: Path, descriptor: int) -> None:
         self._path = path
         self._descriptor = descriptor
+        self._failure: UnsafePublication | None = None
 
     @property
     def path(self) -> Path:
@@ -94,9 +95,11 @@ class Draft:
                     os.unlink(leaf, dir_fd=current_fd)
                 except OSError as cleanup_error:
                     cleanup_error.add_note(f"Inspection failed: {error}")
-                    raise UnsafePublication(
+                    failure = UnsafePublication(
                         f"hard-link destination could not be inspected or removed: {destination}"
-                    ) from cleanup_error
+                    )
+                    self._failure = failure
+                    raise failure from cleanup_error
                 raise UnsafePublication(
                     f"hard-link destination is unavailable: {destination}"
                 ) from error
@@ -105,9 +108,11 @@ class Draft:
             try:
                 os.unlink(leaf, dir_fd=current_fd)
             except OSError as error:
-                raise UnsafePublication(
+                failure = UnsafePublication(
                     f"unsafe hard-link source could not be removed: {source_path}"
-                ) from error
+                )
+                self._failure = failure
+                raise failure from error
             raise UnsafePublication(f"hard-link source is not a regular file: {source_path}")
         finally:
             os.close(current_fd)
@@ -122,10 +127,12 @@ def _safe_components(destination: str | PurePosixPath) -> tuple[str, ...]:
     return path.parts
 
 
-def _build_draft(build: Callable[[Draft], None]) -> Callable[[Path, int, int], None]:
-    def run(path: Path, descriptor: int, device: int) -> None:
-        del device
-        build(Draft(path, descriptor))
+def _build_draft(build: Callable[[Draft], None]) -> Callable[[Path, int], None]:
+    def run(path: Path, descriptor: int) -> None:
+        draft = Draft(path, descriptor)
+        build(draft)
+        if failure := draft._failure:  # pyright: ignore[reportPrivateUsage]
+            raise failure
 
     return run
 

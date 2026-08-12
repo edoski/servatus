@@ -802,12 +802,13 @@ def test_link_selects_safe_source_at_hard_link_operation(
     assert moved.read_bytes() == b"original"
 
 
-def test_link_inspection_failure_removes_created_entry(
+def test_link_uncertain_cleanup_aborts_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "source"
     source.write_text("value")
     real_stat = os.stat
+    real_unlink = os.unlink
     failed = False
 
     def fail_inspection(path: object, *args: object, **kwargs: object) -> os.stat_result:
@@ -817,18 +818,24 @@ def test_link_inspection_failure_removes_created_entry(
             raise OSError("injected inspection failure")
         return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
 
+    def fail_cleanup(path: object, *args: object, **kwargs: object) -> None:
+        if path == "failed" and isinstance(kwargs.get("dir_fd"), int):
+            raise OSError("injected cleanup failure")
+        real_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
     monkeypatch.setattr(_workspace.os, "stat", fail_inspection)
+    monkeypatch.setattr(_workspace.os, "unlink", fail_cleanup)
 
     def build(draft: Draft) -> None:
-        with pytest.raises(UnsafePublication, match="destination is unavailable"):
+        with pytest.raises(UnsafePublication, match="could not be inspected or removed"):
             draft.link(source, "failed")
-        assert not os.path.lexists(draft.path / "failed")
         (draft.path / "safe").write_text("complete")
 
-    publish(tmp_path / "result", build)
+    with pytest.raises(UnsafePublication, match="could not be inspected or removed"):
+        publish(tmp_path / "result", build)
 
     assert source.read_text() == "value"
-    assert [entry.name for entry in (tmp_path / "result").iterdir()] == ["safe"]
+    assert not (tmp_path / "result").exists()
 
 
 @pytest.mark.parametrize("unsafe", ["", ".", "..", "../escape", "/absolute", "safe\0truncated"])

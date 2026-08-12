@@ -601,7 +601,7 @@ def _cleanup_entry_after_failure(
 
 def publication_attempt(
     destination: Path,
-    build: Callable[[Path, int, int], None],
+    build: Callable[[Path, int], None],
     *,
     retire: Path | None = None,
 ) -> _TransactionOutcome:
@@ -636,7 +636,7 @@ def publication_attempt_at(
     parent: Path,
     parent_fd: int,
     destination_name: str,
-    build: Callable[[Path, int, int], None],
+    build: Callable[[Path, int], None],
     *,
     retirement: _PinnedTree | None = None,
 ) -> _TransactionOutcome:
@@ -672,8 +672,8 @@ def file_publication_attempt_at(
     destination_name: str,
     write: Callable[[Path], None],
 ) -> _TransactionOutcome:
-    def build(path: Path, descriptor: int, device: int) -> None:
-        del descriptor, device
+    def build(path: Path, descriptor: int) -> None:
+        del descriptor
         write(path)
 
     return _publication_transaction_at(
@@ -691,7 +691,7 @@ def _publication_transaction_at(
     parent: Path,
     parent_fd: int,
     destination_name: str,
-    build: Callable[[Path, int, int], None],
+    build: Callable[[Path, int], None],
     make_stage: Callable[[], tuple[str, int, os.stat_result]],
     sync_stage: Callable[[str, int, os.stat_result], None],
     remove_stage: Callable[[int, str, os.stat_result], None],
@@ -705,7 +705,7 @@ def _publication_transaction_at(
     stage_entry: os.stat_result | None = None
     try:
         stage_name, stage_fd, stage_entry = make_stage()
-        build(parent / stage_name, stage_fd, stage_entry.st_dev)
+        build(parent / stage_name, stage_fd)
         sync_stage(stage_name, stage_fd, stage_entry)
         ensure_entry(parent_fd, stage_name, stage_entry)
         ensure_directory_path(parent, parent_fd)
