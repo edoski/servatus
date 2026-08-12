@@ -33,8 +33,15 @@ the fallback.
 Work, stages, link sources, and destinations must share one filesystem. Servatus never copies during
 publication.
 
-Application callbacks own contents and validation. File writers may change the mode but may not
-unlink, replace, or change the type of the stage they receive.
+`Draft.link()` selects its source inode at the atomic hard-link operation. It then inspects the
+linked draft entry without following symlinks and accepts only a same-filesystem regular file. A safe
+source-path replacement before the link operation may therefore be selected; there is no preliminary
+source-inode anchor.
+
+Application callbacks own contents and validation and must finish content mutations before
+returning. Servatus verifies pathname/inode identity and syncs contents afterward, but does not use
+size or modification-time comparisons to claim concurrent-writer exclusion. File writers may change
+the mode but may not unlink, replace, or change the type of the stage they receive.
 
 Directory publication may also pin one existing, distinct, owner-only destination sibling before
 the builder. Every precommit failure preserves this retained tree. After the destination commit and

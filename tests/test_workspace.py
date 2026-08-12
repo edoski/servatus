@@ -779,6 +779,29 @@ def test_link_creates_regular_file_with_same_inode(tmp_path: Path) -> None:
     assert linked.stat().st_ino == source.stat().st_ino
 
 
+def test_link_selects_safe_source_at_hard_link_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"original")
+    moved = tmp_path / "moved.bin"
+    real_link = os.link
+
+    def select_replacement(*args: object, **kwargs: object) -> None:
+        source.rename(moved)
+        source.write_bytes(b"replacement")
+        real_link(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(_workspace.os, "link", select_replacement)
+
+    publish(tmp_path / "result", lambda draft: draft.link(source, "value.bin"))
+
+    linked = tmp_path / "result/value.bin"
+    assert linked.read_bytes() == b"replacement"
+    assert linked.stat().st_ino == source.stat().st_ino
+    assert moved.read_bytes() == b"original"
+
+
 @pytest.mark.parametrize("unsafe", ["", ".", "..", "../escape", "/absolute", "safe\0truncated"])
 def test_link_rejects_escaping_paths(tmp_path: Path, unsafe: str) -> None:
     source = tmp_path / "source"
@@ -810,6 +833,29 @@ def test_link_rejects_occupied_draft_path(tmp_path: Path) -> None:
 
     with pytest.raises(DestinationExists):
         publish(tmp_path / "result", build)
+
+
+@pytest.mark.parametrize("kind", ["missing", "symlink", "fifo"])
+def test_link_rejects_unsafe_source_without_leaving_a_draft_entry(
+    tmp_path: Path, kind: str
+) -> None:
+    source = tmp_path / "source"
+    if kind == "symlink":
+        target = tmp_path / "target"
+        target.write_text("value")
+        source.symlink_to(target)
+    elif kind == "fifo":
+        os.mkfifo(source)
+
+    def build(draft: Draft) -> None:
+        with pytest.raises(UnsafePublication):
+            draft.link(source, "unsafe")
+        assert not os.path.lexists(draft.path / "unsafe")
+        (draft.path / "safe").write_text("value")
+
+    publish(tmp_path / "result", build)
+
+    assert (tmp_path / "result/safe").read_text() == "value"
 
 
 @pytest.mark.parametrize("kind", ["symlink", "fifo"])

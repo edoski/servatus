@@ -229,12 +229,7 @@ def _sync_regular_file(parent_fd: int, name: str, expected: os.stat_result) -> N
         if not same_entry(opened, expected):
             raise UnsafePublication(f"draft file changed during publication: {name}")
         sync_descriptor(descriptor)
-        synced = os.fstat(descriptor)
-        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if not same_entry(synced, current):
-            raise UnsafePublication(f"draft file changed during publication: {name}")
-        if (opened.st_size, opened.st_mtime_ns) != (synced.st_size, synced.st_mtime_ns):
-            raise UnsafePublication(f"draft file was modified during publication: {name}")
+        ensure_entry(parent_fd, name, opened)
     finally:
         os.close(descriptor)
 
@@ -245,13 +240,9 @@ def sync_file_stage(
     descriptor: int,
     expected: os.stat_result,
 ) -> None:
-    opened = os.fstat(descriptor)
     ensure_entry(parent_fd, name, expected)
     sync_descriptor(descriptor)
-    synced = os.fstat(descriptor)
     ensure_entry(parent_fd, name, expected)
-    if (opened.st_size, opened.st_mtime_ns) != (synced.st_size, synced.st_mtime_ns):
-        raise UnsafePublication("publication stage was modified during publication")
 
 
 def reject_nul_path(path: Path) -> None:

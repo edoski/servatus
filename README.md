@@ -2,7 +2,7 @@
 
 Run resumable work through Slurm and atomically publish validated outputs.
 
-Servatus 0.5.0 combines durable publication with the native Slurm Campaign interface below.
+Servatus 0.6.0 combines durable publication with the native Slurm Campaign interface below.
 
 ```sh
 pip install servatus
@@ -176,6 +176,9 @@ def build(draft: Draft) -> None:
 publication = publish(Path("outputs/run-1"), build)
 ```
 
+The builder owns draft contents and validation. It must finish all content mutations before
+returning; Servatus syncs the quiescent draft afterward.
+
 When the application has finished authoring an owner-only sibling tree, `publish` can retire that
 tree only after the canonical destination is committed and synced:
 
@@ -209,7 +212,8 @@ publication = publish_file(Path("outputs/protocol.json"), write)
 
 The writer receives an existing empty adjacent regular file. It must write and validate that inode
 in place; unlinking, replacing, or changing its file type fails publication. Its initial mode is
-created from `0o666` through the process umask, and an explicit writer `chmod` is preserved.
+created from `0o666` through the process umask, and an explicit writer `chmod` is preserved. The
+writer must finish all content mutations before returning.
 
 Use `Workspace` when a worker must retain private checkpoints across restarts:
 
@@ -229,9 +233,11 @@ with Workspace(destination, identity=b"model request bytes") as workspace:
 ```
 
 `Workspace` binds stable hidden state to the SHA-256 digest of opaque identity bytes and holds a
-nonblocking writer lock. `Draft.link` only hard-links regular files into a safe relative path. The
-application must not mutate a linked source inode after `Draft.link()` returns and before
-publication completes. It owns contents, validation, schemas, and completion meaning.
+nonblocking writer lock. `Draft.link` atomically hard-links the source path into a safe relative
+path, then accepts only a same-filesystem regular file. The hard-link operation selects the source
+inode, so a safe source-path replacement before that operation may be selected. The builder owns
+contents, validation, schemas, and completion meaning and must finish mutating linked contents
+before returning.
 
 Independent workers can publish resumable child results beneath one future destination without
 entering the parent:
@@ -276,6 +282,8 @@ filesystem with stable cross-client inode identities. See [SECURITY.md](SECURITY
 - Work, hard-link sources, stages, and destination must share a filesystem.
 - Disposable stage names are not synced merely by creation. Files and directories are synced before
   commit; the parent is synced after publication.
+- Builders and writers must be quiescent when they return. Servatus verifies pathname/inode
+  identity and syncs content, but does not detect or exclude concurrent content writers.
 - Builder failures expose no destination. Resumable work remains; disposable stages are removed.
 - Successful workspace publication exactly removes its pinned private tree. A moved, substituted,
   or unremovable tree remains visible as cleanup residue and is reported separately.

@@ -67,39 +67,6 @@ class Draft:
         components = _safe_components(destination)
         source_path = Path(source)
         _posix.reject_nul_path(source_path)
-        try:
-            source_entry = source_path.stat(follow_symlinks=False)
-        except OSError as error:
-            raise UnsafePublication(f"hard-link source is unavailable: {source_path}") from error
-        if not stat.S_ISREG(source_entry.st_mode):
-            raise UnsafePublication(f"hard-link source is not a regular file: {source_path}")
-        try:
-            source_fd = os.open(
-                source_path,
-                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
-            )
-        except OSError as error:
-            raise UnsafePublication(f"unsafe hard-link source: {source_path}") from error
-        try:
-            opened_source = os.fstat(source_fd)
-            if not stat.S_ISREG(opened_source.st_mode) or not _posix.same_entry(
-                opened_source, source_entry
-            ):
-                raise UnsafePublication(f"hard-link source changed: {source_path}")
-            if opened_source.st_dev != self._device:
-                raise CrossDevicePublication(
-                    f"hard-link source is on another filesystem: {source_path}"
-                )
-            self._link_open_source(source_path, opened_source, components)
-        finally:
-            os.close(source_fd)
-
-    def _link_open_source(
-        self,
-        source: Path,
-        source_entry: os.stat_result,
-        components: tuple[str, ...],
-    ) -> None:
         current_fd = os.dup(self._descriptor)
         try:
             for component in components[:-1]:
@@ -118,14 +85,24 @@ class Draft:
             except OSError as error:
                 if error.errno == errno.EXDEV:
                     raise CrossDevicePublication(
-                        f"hard-link source is on another filesystem: {source}"
+                        f"hard-link source is on another filesystem: {source_path}"
                     ) from error
-                raise
-            linked = os.stat(leaf, dir_fd=current_fd, follow_symlinks=False)
-            if not stat.S_ISREG(linked.st_mode) or not _posix.same_entry(linked, source_entry):
-                with suppress(OSError):
-                    os.unlink(leaf, dir_fd=current_fd)
-                raise UnsafePublication(f"hard-link source changed: {source}")
+                raise UnsafePublication(f"unsafe hard-link source: {source_path}") from error
+            try:
+                linked = os.stat(leaf, dir_fd=current_fd, follow_symlinks=False)
+            except OSError as error:
+                raise UnsafePublication(
+                    f"hard-link destination is unavailable: {destination}"
+                ) from error
+            if stat.S_ISREG(linked.st_mode) and linked.st_dev == self._device:
+                return
+            _posix.ensure_entry(current_fd, leaf, linked)
+            os.unlink(leaf, dir_fd=current_fd)
+            if linked.st_dev != self._device:
+                raise CrossDevicePublication(
+                    f"hard-link source is on another filesystem: {source_path}"
+                )
+            raise UnsafePublication(f"hard-link source is not a regular file: {source_path}")
         finally:
             os.close(current_fd)
 

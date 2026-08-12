@@ -25,15 +25,19 @@ Servatus uses a small generic vocabulary:
 - **Child workspace:** one independently locked resumable result beneath a future parent destination.
 - **Identity:** opaque application bytes whose digest and three inode pins bind a workspace to one
   logical request and its container, lock, and work entries.
-- **Draft:** one unique, disposable directory assembled before publication.
+- **Draft:** one unique, disposable directory assembled before publication; a hard link selects its
+  safe regular source inode at the kernel link operation.
 - **File stage:** one unique, empty regular file written and validated in place before publication.
 - **Publication:** the committed destination plus whether private cleanup remains pending.
 - **Retained tree:** one existing owner-only destination sibling pinned before a directory build and
   removed only after the destination commit is durable.
-- **Builder:** the application callback that writes and validates a draft before returning.
-- **Writer:** the application callback that writes and validates a file stage before returning.
+- **Builder:** the application callback that writes and validates a draft, then stops mutating it
+  before returning.
+- **Writer:** the application callback that writes and validates a file stage, then stops mutating it
+  before returning.
 
 Servatus owns lifecycle mechanics, not application meaning. Checkpoints, manifests, schemas,
 validation rules, task selection, and scientific completion remain with the calling project.
-Retained trees must be quiescent before publication; Servatus provides safe commit-first retirement,
-not a writer lease or application finalizer.
+Builders, writers, and retained trees must be quiescent at their documented handoff points;
+Servatus provides durable publication and safe commit-first retirement, not a writer lease or
+application finalizer.

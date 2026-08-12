@@ -10,6 +10,12 @@ cluster-policy layer. Its publication transaction protects against accidental pa
 overwrites, and ordinary lifecycle races. Callers remain responsible for destination-parent
 permissions, trusted builders, application validation, filesystem guarantees, and scheduler policy.
 
+Builders and file writers must finish mutating draft contents before returning. `Draft.link()`
+selects its source inode at the atomic hard-link operation, so a safe replacement of the source path
+before that operation may be selected. Servatus then checks the linked entry without following
+symlinks, verifies pathname/inode identity, and syncs content. It does not detect or exclude
+concurrent content writers; same-account mutation after the callback returns is outside the contract.
+
 Optional directory retirement accepts one existing owner-only destination sibling. Servatus pins
 the parent and source before the builder, commits and syncs the destination first, then removes only
 the pinned source tree and syncs the parent again. The caller must stop all source writers before the
