@@ -379,7 +379,8 @@ def _query_active(
     if not rows:
         return None
     fields = _decoded_fields(rows[0], 8)
-    job_id_raw, name, comment, submitted, state, reason, started, ended = fields
+    job_id_raw, name, comment = fields[:3]
+    submitted, state, reason, started, ended = _normalized_fields(*fields[3:])
     _validate_job_evidence(job_id_raw, state, attempt)
     if not _active_identity_matches(name, comment, attempt.identity):
         raise ObservationError("scheduler query returned unrelated evidence")
@@ -475,22 +476,29 @@ def _decoded_fields(line: bytes, expected: int) -> tuple[str, ...]:
         raise ObservationError("scheduler query row is malformed") from error
     if any(_CONTROL.search(value) for value in decoded):
         raise ObservationError("scheduler query row is malformed")
-    return tuple(value.strip(" ") for value in decoded)
+    return decoded
+
+
+def _normalized_fields(*values: str) -> tuple[str, ...]:
+    return tuple(value.strip(" ") for value in values)
 
 
 def _parse_accounting_row(line: bytes, attempt: _AttemptQuery) -> _AccountingJob:
+    fields = _decoded_fields(line, 10)
     (
         job_id,
         cluster_raw,
         name,
         comment,
+    ) = fields[:4]
+    (
         submitted,
         state,
         exit_code,
         reason,
         started,
         ended,
-    ) = _decoded_fields(line, 10)
+    ) = _normalized_fields(*fields[4:])
     _validate_job_evidence(job_id, state, attempt)
     if not _accounting_identity_matches(name, comment, attempt.identity):
         raise ObservationError("scheduler query returned unrelated evidence")
@@ -700,20 +708,14 @@ def query_identity(
         raise ReconciliationError("scheduler identity query was unavailable")
 
     candidates: dict[int, set[str | None]] = {}
-    for raw in squeue.stdout.decode("utf-8", "strict").splitlines():
-        fields = raw.split("|")
-        if len(fields) != 3 or fields[1] != job_name:
-            continue
-        if not _active_identity_matches(fields[1], fields[2], job_name):
+    for job_id, name, comment in _identity_rows(squeue.stdout, 3):
+        if not _active_identity_matches(name, comment, job_name):
             raise ReconciliationError("scheduler query returned unrelated allocation identity")
-        _add_candidate(candidates, fields[0], None)
-    for raw in sacct.stdout.decode("utf-8", "strict").splitlines():
-        fields = raw.split("|")
-        if len(fields) != 4 or fields[1] != job_name:
-            continue
-        if not _accounting_identity_matches(fields[1], fields[2], job_name):
+        _add_candidate(candidates, job_id, None)
+    for job_id, name, comment, cluster_raw in _identity_rows(sacct.stdout, 4):
+        if not _accounting_identity_matches(name, comment, job_name):
             raise ReconciliationError("scheduler query returned unrelated allocation identity")
-        _add_candidate(candidates, fields[0], fields[3] or None)
+        _add_candidate(candidates, job_id, cluster_raw or None)
 
     if len(candidates) != 1:
         raise ReconciliationError("scheduler query did not prove one exact allocation identity")
@@ -727,9 +729,19 @@ def query_identity(
 def _add_candidate(
     candidates: dict[int, set[str | None]], raw_job_id: str, cluster: str | None
 ) -> None:
-    if not raw_job_id.isascii() or not raw_job_id.isdecimal():
-        return
+    if (
+        not raw_job_id.isascii()
+        or not raw_job_id.isdecimal()
+        or int(raw_job_id) <= 0
+        or (cluster is not None and _SITE_TOKEN.fullmatch(cluster) is None)
+    ):
+        raise ReconciliationError("scheduler query returned unrelated allocation identity")
     job_id = int(raw_job_id)
-    if job_id <= 0:
-        return
     candidates.setdefault(job_id, set()).add(cluster)
+
+
+def _identity_rows(output: bytes, expected: int) -> tuple[tuple[str, ...], ...]:
+    try:
+        return tuple(_decoded_fields(line, expected) for line in _output_lines(output))
+    except ObservationError as error:
+        raise ReconciliationError("scheduler identity query returned malformed evidence") from error

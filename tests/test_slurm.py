@@ -159,6 +159,21 @@ def test_identity_query_accepts_absent_accounting_comment(
             b"42|servatus-abc|servatus-abc\n",
             b"42|servatus-abc|wrong-identity|alpha\n",
         ),
+        (b"42|servatus-abc|servatus-abc\n43|wrong|wrong\n", b""),
+        (b"42|servatus-abc|servatus-abc\nmalformed\n", b""),
+        (b"42|servatus-abc|servatus-abc\n0|servatus-abc|servatus-abc\n", b""),
+        (
+            b"42|servatus-abc|servatus-abc\n",
+            b"42|servatus-abc||alpha\n43|wrong||alpha\n",
+        ),
+        (
+            b"42|servatus-abc|servatus-abc\n",
+            b"42|servatus-abc||alpha\nmalformed\n",
+        ),
+        (b"42| servatus-abc |servatus-abc\n", b""),
+        (b"42|servatus-abc| servatus-abc \n", b""),
+        (b"", b"42|servatus-abc| N/A |alpha\n"),
+        (b"42|servatus-abc|servatus-abc\n", b"42|servatus-abc||bad cluster\n"),
     ],
 )
 def test_identity_query_leaves_unproved_results_ambiguous(

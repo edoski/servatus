@@ -151,21 +151,28 @@ def active_row(
 
 
 @pytest.mark.parametrize(
-    ("active_comment", "accounting_comment", "expected"),
+    ("active_name", "active_comment", "accounting_name", "accounting_comment", "expected"),
     [
-        (None, "", AllocationState.QUEUED),
-        (None, "None", AllocationState.QUEUED),
-        (None, "Unknown", AllocationState.QUEUED),
-        (None, "N/A", AllocationState.QUEUED),
-        ("", "", None),
-        ("wrong-identity", "", None),
-        (None, "wrong-identity", None),
+        ("exact", "exact", "exact", "", AllocationState.QUEUED),
+        ("exact", "exact", "exact", "None", AllocationState.QUEUED),
+        ("exact", "exact", "exact", "Unknown", AllocationState.QUEUED),
+        ("exact", "exact", "exact", "N/A", AllocationState.QUEUED),
+        ("exact", "", "exact", "", None),
+        ("exact", "wrong-identity", "exact", "", None),
+        ("exact", "exact", "exact", "wrong-identity", None),
+        ("padded", "exact", "exact", "", None),
+        ("exact", "padded", "exact", "", None),
+        ("exact", "exact", "padded", "", None),
+        ("exact", "exact", "exact", " N/A ", None),
+        ("exact", "exact", "exact", " ", None),
     ],
 )
 def test_inspection_applies_source_specific_comment_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    active_comment: str | None,
+    active_name: str,
+    active_comment: str,
+    accounting_name: str,
     accounting_comment: str,
     expected: AllocationState | None,
 ) -> None:
@@ -180,6 +187,9 @@ def test_inspection_applies_source_specific_comment_identity(
     receipt = campaign.inspect(scheduler=False).attempts[0].receipt
     identity = f"servatus-{receipt.allocation_id}"
 
+    def identity_field(value: str) -> str:
+        return identity if value == "exact" else f" {identity} " if value == "padded" else value
+
     def query(_target: SlurmTarget, argv: tuple[str, ...]) -> _slurm.Result:
         if argv[0].endswith("squeue"):
             return _slurm.Result(
@@ -192,7 +202,8 @@ def test_inspection_applies_source_specific_comment_identity(
                     "N/A",
                     "N/A",
                     job_id=45291,
-                    comment=active_comment,
+                    name=identity_field(active_name),
+                    comment=identity_field(active_comment),
                 ),
                 b"",
             )
@@ -208,6 +219,7 @@ def test_inspection_applies_source_specific_comment_identity(
                 "Unknown",
                 job_id=45291,
                 cluster="sling",
+                name=identity_field(accounting_name),
                 comment=accounting_comment,
             ),
             b"",
