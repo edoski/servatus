@@ -219,10 +219,11 @@ Adding a second equivalent path is not allowed.
 
 One public immutable `Profile` groups one complete execution lane: its opaque label, one
 `SlurmTarget`, and one homogeneous `ResourceRequest`. `Campaign.plan()` consumes the Profile rather
-than a separate target/resource pair. Campaign lineage records the selected label plus the exact
-resolved target and resource values; the label is explanatory, while the values remain authority.
-A later edit to the same label cannot silently change an existing Campaign because ordinary lineage
-comparison fails.
+than a separate target/resource pair. Campaign compatibility binds only to the exact resolved target
+and resource values. The selected label is retained as nonbinding plan, attempt, and operational
+provenance so humans can identify the authored lane. Two labels resolving to identical values are
+compatible; changing the resolved values behind one label fails ordinary Campaign lineage
+comparison.
 
 Profiles live in one client-owned, version-controlled `SERVATUS.toml` at the repository root:
 
@@ -240,8 +241,12 @@ gpus_per_task = 1
 time_limit = "3-00:00:00"
 ```
 
-The document may contain multiple complete profiles. Profiles do not inherit, merge, reference one
-another, or split target and resource ownership. Selection is exactly:
+The document root allows exactly `profiles` plus optional `default_profile`. `profiles` is a
+nonempty table. Every declared label must be a nonempty string key and every declared profile must
+contain exactly one complete `target` table and one complete `resources` table. Loading validates the
+whole document once, including unselected profiles; one malformed profile invalidates the document.
+Profiles do not inherit, merge, reference one another, or split target and resource ownership.
+Selection is exactly:
 
 1. an explicit profile name supplied by the caller;
 2. otherwise the document's optional `default_profile`;
@@ -253,13 +258,13 @@ the nested raw values exactly once. There is no environment fallback, repository
 parent-directory search, global store, path-to-project registry, per-profile default boolean, or
 implicit single-profile selection.
 
-The library interface loads an explicit path once at the client composition root. Servatus's CLI may
-default its config path to the exact current-working-directory name `SERVATUS.toml` and may accept a
-`--profile` override; it never searches for that file. KAIROS uses the same exact repository-root
-file, permits `--profile NAME`, and otherwise uses the file's declared default. Git owns creation,
-editing, review, and history. Servatus adds no profile install/remove/list/show commands. A separate
-`profile check` command is also excluded until real use proves that normal load/plan errors are
-insufficient.
+The library interface loads one explicit path supplied by its caller. Both Servatus and KAIROS CLIs
+read exactly `Path.cwd() / "SERVATUS.toml"`; there is no config-path option and no parent-directory
+search. They permit `--profile NAME` and otherwise use the file's declared default. Invocation from
+another directory therefore fails on the missing exact file rather than guessing a project root.
+Git owns creation, editing, review, and history. Servatus adds no profile
+install/remove/list/show commands. A separate `profile check` command is also excluded until real
+use proves that normal load/plan errors are insufficient.
 
 Repository placement provides discoverability and Git provenance, but it does not replace durable
 Campaign lineage: a dirty file or another checkout can differ. No extra revision store or profile
@@ -290,6 +295,7 @@ must still preserve every accepted safety fact:
 - attempt/allocation identity;
 - ordered Task keys;
 - Campaign revision;
+- selected nonbinding profile label;
 - target and resource lineage digests;
 - plan and script digests;
 - exact effective allocation totals;
@@ -484,6 +490,7 @@ view. It contains only generic execution evidence:
 - record schema and observation time;
 - Campaign identity, revision, sealed state, and roster digest;
 - ordered Task keys;
+- selected nonbinding profile label;
 - target/resource lineage digests and allocation shapes;
 - attempt, retry, plan, and script digests;
 - Slurm job/cluster identities and normalized current scheduler observations;
@@ -843,10 +850,13 @@ Scope:
 
 - add the immutable public `Profile` and strict one-pass loading of one repository-local
   `SERVATUS.toml` containing one or more complete named target/resource profiles;
+- require the exact root shape, validate every declared profile including unselected ones, and let
+  library callers supply the explicit file path while both CLIs read only
+  `Path.cwd() / "SERVATUS.toml"`;
 - let an explicit name override the optional top-level `default_profile`, and fail directly when no
   selection or selected profile exists;
-- make `Campaign.plan()` consume one Profile and retain its label plus exact resolved execution
-  values in immutable lineage;
+- make `Campaign.plan()` consume one Profile, bind compatibility to exact resolved execution values,
+  and retain its label as nonbinding plan/attempt provenance;
 - remove paired target/resource TOML loading paths and direct planning parameters where the Profile
   replaces them without weakening programmatic construction or durable validation;
 - make planning consume one exact current Campaign view and implement the approved selection matrix;
@@ -878,8 +888,10 @@ Required public tests:
 - one or multiple complete profiles load exact typed target/resource values;
 - absent document, absent selection, absent selected/default label, malformed profile, and unknown
   raw keys fail once at configuration ingress;
-- Campaign lineage retains the selected label and exact values, and rejects a changed profile on an
-  existing Campaign;
+- same-value aliases remain compatible, the selected label remains visible provenance, and changed
+  resolved values are rejected on an existing Campaign;
+- malformed unselected profiles invalidate the whole document;
+- CLI invocation outside the directory containing the exact `SERVATUS.toml` fails without search;
 - no filesystem search, environment lookup, management command, or second target/resource planning
   path remains;
 - every row of the result/acceptance/execution selection matrix;
@@ -912,6 +924,8 @@ Baseline: exact accepted S3 head.
 Scope:
 
 - add canonical redacted operational-record bytes from one Campaign view;
+- include the selected nonbinding profile label while keeping resolved sensitive target values
+  redacted;
 - exclude payloads, scripts, Task digests, raw reasons, nodes, target secrets, and environment;
 - document that Task keys/job IDs remain identifying and Campaign state remains private;
 - audit source/tests/docs for duplicate decoding, dead paths, repeated fields, and premature types;
@@ -1225,24 +1239,11 @@ Expected outcome: two exact local candidates—main containing current main plus
 and compact containing that main behavior plus only the accepted CUDA delta. One independent review
 covers both fixed merge ranges and returns Standards 0 / Spec 0 for each before E4.
 
-## External gate E4 — publish KAIROS refs
+## External gate E4 — combined image and isolated acceptance
 
-Blocked until both phases of I1 are independently GREEN and the user authorizes the exact pushes.
-
-Required sequence:
-
-- fetch and pin `origin` and `research` refs immediately before mutation;
-- stop on unexpected remote movement;
-- push only accepted main and compact refs by normal fast-forward or reviewed ancestry merge;
-- verify both remotes at exact SHAs;
-- report exact main, compact, Servatus tag/head/hashes, Blockweaver version, and protected current
-  image/config state to the coordinating Runner task.
-
-No image or production config change belongs to this gate.
-
-## External gate E5 — combined image and isolated acceptance
-
-Requires separate authorization after E4. Follow KAIROS `AGENTS.md` exactly:
+Requires separate authorization after both local I1 candidates are independently GREEN. No KAIROS
+ref is published first. Transfer the exact accepted compact commit into one run-owned remote build
+checkout without publishing a branch, assert its full SHA, and follow KAIROS `AGENTS.md` exactly:
 
 - isolated checkout at `/scratch.hpc/edoardo.galli3/build/kairos-cuda-<short-sha>`;
 - exact full compact SHA assertion;
@@ -1252,7 +1253,9 @@ Requires separate authorization after E4. Follow KAIROS `AGENTS.md` exactly:
 - `apptainer build` followed by `apptainer test`;
 - preserve the preceding accepted image.
 
-Acceptance uses only isolated synthetic data and new Campaign state. Minimum evidence:
+Acceptance uses only isolated synthetic data, new Campaign state, and a run-owned
+`SERVATUS.toml` whose resolved `KAIROS` values equal the accepted I1 profile except for selecting the
+new immutable image. Minimum evidence:
 
 - Campaign seal/reopen;
 - scheduler observation for queued/running/terminal state;
@@ -1263,22 +1266,38 @@ Acceptance uses only isolated synthetic data and new Campaign state. Minimum evi
 - redacted Campaign record contains no request bytes or secrets;
 - no production output or current scientific Campaign is touched.
 
-Any failure stops before `SERVATUS.toml` changes.
+Any failure stops before the tracked `profiles.KAIROS.target.image` field changes. No accepted ref
+is pushed.
 
-## External gate E6 — production configuration cutover
+## External gate E5 — reviewed image selection
 
-Requires a separately reviewed KAIROS config-only slice after the exact new image passes E5:
+Requires a separately reviewed KAIROS config-only slice after the exact new image passes E4:
 
 - change only `profiles.KAIROS.target.image` in `SERVATUS.toml` unless another reviewed operational
   fact requires a narrow change;
 - independently review the fixed range;
 - rerun focused profile parsing and full proportionate static/test gates;
-- integrate/push main and compact as separately authorized;
-- verify future submissions read Servatus `0.7.0` and the accepted image;
+- integrate the reviewed config commit into both local main and compact candidates without push;
+- prove the resolved selected profile is byte-for-byte the one used by isolated E4 acceptance;
 - do not alter already-submitted jobs or old Campaign state.
 
+## External gate E6 — publish coherent KAIROS refs
+
+Blocked until E4 and E5 are GREEN and the user authorizes the exact pushes. Code, envelope, worker,
+profile, and accepted image selection therefore first become public together.
+
+Required sequence:
+
+- fetch and pin `origin` and `research` refs immediately before mutation;
+- stop on unexpected remote movement;
+- push only the final accepted main and compact refs by normal fast-forward or reviewed ancestry
+  merge;
+- verify both remotes at exact SHAs and verify their `SERVATUS.toml` selects the accepted image;
+- report exact main, compact, Servatus tag/head/hashes, Blockweaver version, profile label, and image
+  SHA-256 to the coordinating Runner task.
+
 The preceding image, Servatus `0.6.0`, schema-3 Campaign evidence, and old accepted refs remain until
-the new path is proven. Cleanup is a separate final approval.
+the coherent refs are verified. Cleanup is a separate final approval.
 
 ## Final cleanup
 
@@ -1356,3 +1375,9 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
   user-owned untracked App-planning document, preserved untouched; a separate task owns App work in
   an isolated worktree. This program begins with Servatus S1-S4 and re-pins KAIROS only after the
   separate task and E1/E3 gates complete. No product or external state changed by this ledger update.
+- 2026-08-13: profile-revision adversarial rereview rejected the first revision until it made label
+  provenance explicitly nonbinding, required whole-document validation and exact cwd-only CLI
+  resolution, and removed a publication window in which new KAIROS worker payloads could target the
+  old image. E4 now builds and accepts the exact local candidate, E5 reviews the sole image-field
+  selection, and E6 publishes code plus compatible image configuration together. Common-path review
+  was already GREEN; the correction returns to the same adversarial reviewer before S1 starts.
