@@ -36,13 +36,15 @@ Campaign lineage compatibility; labels remain plan and Attempt provenance.
 optional synchronous boolean result probe exactly once per Task and queries only exact accepted
 Attempt identities through bounded native `squeue` and `sacct` calls. Each Attempt receives one
 server-side single-job queue request plus duplicate-preserving accounting selected and verified by
-its allocation-derived job name/comment. One original accounting record inside the reconciliation
-window anchors the accepted Attempt; strictly later records with that exact immutable identity are
-requeue incarnations, and the unique latest incarnation owns accounting evidence. Slurm Job-ID and
-cluster reuse therefore cannot collapse Attempt evidence. An active row is attributable only with
-that accounting anchor. The exact native invalid-job response means no active row and does not
-suppress accounting; unrelated, multiply plausible, or noncanonical accounting history fails
-closed. Scheduler and reconciliation commands use a fixed C locale and UTC timezone.
+its allocation-derived job name. Queue evidence must also carry the exact allocation comment;
+accounting may carry that exact comment or an absent site value, while any different nonempty
+comment fails closed. One original accounting record inside the reconciliation window anchors the
+accepted Attempt; strictly later records with that exact immutable identity are requeue
+incarnations, and the unique latest incarnation owns accounting evidence. Slurm Job-ID and cluster
+reuse therefore cannot collapse Attempt evidence. An active row is attributable only with that
+accounting anchor. The exact native invalid-job response means no active row and does not suppress
+accounting; unrelated, multiply plausible, or noncanonical accounting history fails closed.
+Scheduler and reconciliation commands use a fixed C locale and UTC timezone.
 Probe and scheduler operations run outside the Campaign lock. Inspection then rejects any Campaign
 revision change. Their answers are transient, time-stamped, redacted, and never stored. Receipt
 identity exists once on Attempt evidence rather than being copied into allocation evidence.

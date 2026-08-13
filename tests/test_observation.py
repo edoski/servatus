@@ -51,6 +51,7 @@ def accept(
     *,
     task_count: int = 1,
     retry: bool = False,
+    cluster: str = "alpha",
 ) -> None:
     replies = iter(job_ids)
     remaining = len(job_ids)
@@ -58,7 +59,9 @@ def accept(
         context.setattr(
             _slurm,
             "_run_ssh",
-            lambda *_args, **_kwargs: _slurm.Result(0, f"{next(replies)};alpha\n".encode(), b""),
+            lambda *_args, **_kwargs: _slurm.Result(
+                0, f"{next(replies)};{cluster}\n".encode(), b""
+            ),
         )
         context.setattr(
             _slurm,
@@ -122,7 +125,8 @@ def accounting_row(
     comment: str | None = None,
 ) -> bytes:
     return (
-        f"{job_id}|{cluster}|{name or identity}|{comment or identity}|{submitted_at}|{state}|"
+        f"{job_id}|{cluster}|{name or identity}|"
+        f"{identity if comment is None else comment}|{submitted_at}|{state}|"
         f"{exit_code}|{reason}|{started_at}|{ended_at}\n"
     ).encode()
 
@@ -137,11 +141,87 @@ def active_row(
     *,
     name: str | None = None,
     comment: str | None = None,
+    job_id: int = 42,
 ) -> bytes:
     return (
-        f"42|{name or identity}|{comment or identity}|{submitted_at}|{state}|{reason}|"
+        f"{job_id}|{name or identity}|{identity if comment is None else comment}|"
+        f"{submitted_at}|{state}|{reason}|"
         f"{started_at}|{ended_at}\n"
     ).encode()
+
+
+@pytest.mark.parametrize(
+    ("active_comment", "accounting_comment", "expected"),
+    [
+        (None, "", AllocationState.QUEUED),
+        (None, "None", AllocationState.QUEUED),
+        (None, "Unknown", AllocationState.QUEUED),
+        (None, "N/A", AllocationState.QUEUED),
+        ("", "", None),
+        ("wrong-identity", "", None),
+        (None, "wrong-identity", None),
+    ],
+)
+def test_inspection_applies_source_specific_comment_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    active_comment: str | None,
+    accounting_comment: str,
+    expected: AllocationState | None,
+) -> None:
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return datetime(2026, 8, 13, 15, 42, 25, tzinfo=UTC)
+
+    monkeypatch.setattr(_campaign, "datetime", Clock)
+    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
+    accept(monkeypatch, campaign, [45291], cluster="sling")
+    receipt = campaign.inspect(scheduler=False).attempts[0].receipt
+    identity = f"servatus-{receipt.allocation_id}"
+
+    def query(_target: SlurmTarget, argv: tuple[str, ...]) -> _slurm.Result:
+        if argv[0].endswith("squeue"):
+            return _slurm.Result(
+                0,
+                active_row(
+                    identity,
+                    "2026-08-13T15:42:25",
+                    "PENDING",
+                    "QOSMaxJobsPerUserLimit",
+                    "N/A",
+                    "N/A",
+                    job_id=45291,
+                    comment=active_comment,
+                ),
+                b"",
+            )
+        return _slurm.Result(
+            0,
+            accounting_row(
+                identity,
+                "2026-08-13T15:42:25",
+                "PENDING",
+                "0:0",
+                "QOSMaxJobsPerUserLimit",
+                "Unknown",
+                "Unknown",
+                job_id=45291,
+                cluster="sling",
+                comment=accounting_comment,
+            ),
+            b"",
+        )
+
+    monkeypatch.setattr(_slurm, "_run_bounded_ssh", query)
+    if expected is None:
+        with pytest.raises(ObservationError, match="unrelated"):
+            campaign.inspect()
+        return
+    allocation = campaign.inspect().attempts[0].allocation
+    assert allocation is not None
+    assert allocation.state is expected
+    assert allocation.raw_state == "PENDING"
 
 
 def test_native_missing_active_job_still_uses_exact_terminal_accounting(

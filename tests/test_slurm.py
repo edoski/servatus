@@ -123,7 +123,7 @@ def test_parse_receipt_rejects_unproved_identity(output: bytes) -> None:
         _slurm.parse_receipt(output)
 
 
-def test_identity_query_deduplicates_squeue_and_sacct(
+def test_identity_query_accepts_absent_accounting_comment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = 0
@@ -133,7 +133,7 @@ def test_identity_query_deduplicates_squeue_and_sacct(
         calls += 1
         if calls == 1:
             return _slurm.Result(0, b"42|servatus-abc|servatus-abc\n", b"")
-        return _slurm.Result(0, b"42|servatus-abc|servatus-abc|alpha\n", b"")
+        return _slurm.Result(0, b"42|servatus-abc||alpha\n", b"")
 
     monkeypatch.setattr(_slurm, "_run_ssh", query)
     match = _slurm.query_identity(
@@ -155,6 +155,10 @@ def test_identity_query_deduplicates_squeue_and_sacct(
             b"43|servatus-abc|servatus-abc|alpha\n",
         ),
         (b"42|wrong|wrong\n", b""),
+        (
+            b"42|servatus-abc|servatus-abc\n",
+            b"42|servatus-abc|wrong-identity|alpha\n",
+        ),
     ],
 )
 def test_identity_query_leaves_unproved_results_ambiguous(

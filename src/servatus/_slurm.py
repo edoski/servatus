@@ -380,7 +380,9 @@ def _query_active(
         return None
     fields = _decoded_fields(rows[0], 8)
     job_id_raw, name, comment, submitted, state, reason, started, ended = fields
-    _validate_job_identity(job_id_raw, name, comment, state, attempt)
+    _validate_job_evidence(job_id_raw, state, attempt)
+    if not _active_identity_matches(name, comment, attempt.identity):
+        raise ObservationError("scheduler query returned unrelated evidence")
     submitted_at = _required_timestamp(submitted)
     return _ActiveJob(
         submitted_at,
@@ -489,7 +491,9 @@ def _parse_accounting_row(line: bytes, attempt: _AttemptQuery) -> _AccountingJob
         started,
         ended,
     ) = _decoded_fields(line, 10)
-    _validate_job_identity(job_id, name, comment, state, attempt)
+    _validate_job_evidence(job_id, state, attempt)
+    if not _accounting_identity_matches(name, comment, attempt.identity):
+        raise ObservationError("scheduler query returned unrelated evidence")
     cluster = _optional_field(cluster_raw)
     if (attempt.cluster is not None and cluster != attempt.cluster) or (
         cluster is not None and _SITE_TOKEN.fullmatch(cluster) is None
@@ -506,10 +510,8 @@ def _parse_accounting_row(line: bytes, attempt: _AttemptQuery) -> _AccountingJob
     )
 
 
-def _validate_job_identity(
+def _validate_job_evidence(
     job_id: str,
-    name: str,
-    comment: str,
     state: str,
     attempt: _AttemptQuery,
 ) -> None:
@@ -517,11 +519,17 @@ def _validate_job_identity(
         not job_id.isascii()
         or not job_id.isdecimal()
         or int(job_id) != attempt.job_id
-        or name != attempt.identity
-        or comment != attempt.identity
         or _state_base(state) is None
     ):
         raise ObservationError("scheduler query returned unrelated evidence")
+
+
+def _active_identity_matches(name: str, comment: str, identity: str) -> bool:
+    return name == identity and comment == identity
+
+
+def _accounting_identity_matches(name: str, comment: str, identity: str) -> bool:
+    return name == identity and (comment == identity or _optional_field(comment) is None)
 
 
 def _required_timestamp(value: str) -> str:
@@ -694,12 +702,18 @@ def query_identity(
     candidates: dict[int, set[str | None]] = {}
     for raw in squeue.stdout.decode("utf-8", "strict").splitlines():
         fields = raw.split("|")
-        if len(fields) == 3 and fields[1] == job_name and fields[2] == job_name:
-            _add_candidate(candidates, fields[0], None)
+        if len(fields) != 3 or fields[1] != job_name:
+            continue
+        if not _active_identity_matches(fields[1], fields[2], job_name):
+            raise ReconciliationError("scheduler query returned unrelated allocation identity")
+        _add_candidate(candidates, fields[0], None)
     for raw in sacct.stdout.decode("utf-8", "strict").splitlines():
         fields = raw.split("|")
-        if len(fields) == 4 and fields[1] == job_name and fields[2] == job_name:
-            _add_candidate(candidates, fields[0], fields[3] or None)
+        if len(fields) != 4 or fields[1] != job_name:
+            continue
+        if not _accounting_identity_matches(fields[1], fields[2], job_name):
+            raise ReconciliationError("scheduler query returned unrelated allocation identity")
+        _add_candidate(candidates, fields[0], fields[3] or None)
 
     if len(candidates) != 1:
         raise ReconciliationError("scheduler query did not prove one exact allocation identity")
