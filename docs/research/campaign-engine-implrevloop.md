@@ -1,7 +1,8 @@
 # Campaign Engine Implementation and Review Ledger
 
-Status: architecture and complete ledger independently reviewed GREEN; implementation authorized.
-This is the active plan.
+Status: bounded-log amendment rereview active; S2 product work paused before commit.
+This remains the active plan, but the amended S2/S3/E0 contract is not accepted until both ledger
+review axes return GREEN.
 
 Date: 2026-08-13
 
@@ -13,6 +14,7 @@ Slurm. Servatus will own the generic execution facts shared by KAIROS and simila
 - one ordered immutable Task roster with append-only authoring and an irreversible seal;
 - every submission attempt, scheduler acceptance, ambiguity, and explicit retry;
 - read-only observation of accepted Slurm allocations;
+- bounded diagnostic access to exact accepted allocation and packed-Task logs;
 - one caller-supplied, in-memory result probe over opaque Tasks;
 - result-aware planning and derived readiness without application schemas;
 - one repository-local named execution-profile document that replaces paired client target/resource
@@ -436,8 +438,15 @@ snapshot = campaign.read_log(
 `allocation_id` must name one exact accepted Attempt owned by the Campaign. A supplied `task_key`
 must belong to that Attempt; its immutable Attempt-local order determines the zero-based packed
 slot. Omitting it selects the allocation wrapper log. Servatus privately derives the stored target,
-receipt Job ID, and exact remote path. Callers cannot supply a host, path, Job ID, shell fragment, or
-arbitrary remote command.
+receipt Job ID, and exact remote path. Future rendered filenames bind both immutable Servatus
+allocation identity and the scheduler identity:
+
+- allocation wrapper: `<allocation_id>-%j.out`;
+- packed Task: `<allocation_id>-%j-<slot>.out`.
+
+The allocation ID is derived from Campaign identity, exact plan facts, and allocation position, so
+reused Slurm Job IDs and same-number jobs in different clusters cannot redirect one Attempt's log
+address. Callers cannot supply a host, path, Job ID, shell fragment, or arbitrary remote command.
 
 One call returns only the latest suffix, defaults to 64 KiB, and accepts an exact positive byte
 limit no greater than 1 MiB. The implementation may read one extra byte solely to determine
@@ -454,14 +463,27 @@ stdout/stderr, and no public transport adapter. The path comes only from validat
 Campaign lineage. Log files may append concurrently; a snapshot claims only the returned bounded
 suffix at `observed_at`, not a stable file or immutable provenance. The existing same-account remote
 log-namespace trust model remains explicit; Servatus does not add a nonportable remote inode
-transaction merely to defend against an out-of-contract hostile replacement.
+transaction merely to defend against an out-of-contract hostile replacement. The implementation
+reads and validates one immutable accepted Attempt, receipt, target, slot, and derived path under
+the existing bounded Campaign-state lock, releases the lock, then performs SSH. It never holds the
+Campaign lock across remote I/O. Accepted Attempt and lineage facts are immutable, so no revision
+retry or post-read state check is needed. Append, seal, plan, and submit remain available while a
+log read is blocked remotely.
 
-Log bytes are sensitive diagnostic data. They are never placed in Campaign state, a Campaign view,
+Log bytes are sensitive, untrusted diagnostic data and may contain terminal control sequences.
+They are never placed in Campaign state, a Campaign view,
 plan documents, operational records, exceptions, `repr`, or automatic CLI JSON. Log presence,
 absence, silence, text, or failure never affects result state, scheduler state, readiness,
 quiescence, planning, retry, reconciliation, or scientific validity. There is no decoder, line
 model, parser registry, progress/epoch concept, search, offset/range protocol, follow mode, stream,
 poller, cache, persistence, multi-log read, or arbitrary-path escape hatch.
+
+README and SECURITY must document arbitrary binary content, the owner-account remote namespace
+trust model, lack of remote inode/authenticity guarantees after Slurm writes the path, and the need
+to redirect CLI output to a file or safe viewer. `ObservationError` messages, explicit notes, and
+visible chained causes must never contain log bytes, derived remote paths, host secrets, remote
+stderr, or commands; unsafe transport and remote exceptions are raised through one sanitized cause
+or suppressed chain.
 
 ### Campaign view and readiness
 
@@ -852,10 +874,13 @@ Scope:
 - add the optional plain synchronous result probe to the same `inspect()` path;
 - add one explicit bounded `Campaign.read_log()` diagnostic snapshot over exact accepted Attempt
   and optional packed Task identity, keeping raw bytes outside `CampaignView`;
-- run probes and scheduler queries outside the Campaign lock and reject revision changes;
+- change future Slurm allocation and packed-Task log templates to include immutable
+  `allocation_id` plus `%j`, so Job-ID reuse cannot redirect an Attempt's diagnostic address;
+- run probes, scheduler queries, and remote log I/O outside the Campaign lock; inspection rejects
+  revision changes, while log reads snapshot immutable accepted Attempt facts before releasing it;
 - derive result readiness and execution quiescence independently;
 - keep observations transient, time-stamped, read-only, and redacted;
-- update context, README, and the Campaign-engine ADR.
+- update context, README, SECURITY, ADR 0003's rendered log identity, and the Campaign-engine ADR.
 
 Non-goals:
 
@@ -887,9 +912,12 @@ Required public tests:
 - inspection never mutates Campaign bytes or revision.
 - accepted allocation and packed-Task log reads derive exact private paths from durable receipt and
   Attempt order; foreign/unaccepted identity and unrelated Task input fail before SSH;
+- allocation and Task log filenames contain exact `allocation_id` plus Job ID; retries and equal Job
+  IDs across distinct Attempts/clusters cannot alias one another;
 - bounded binary tail snapshots prove exact limit/truncation behavior for empty, small, exact-limit,
   and over-limit content without decoding;
 - timeout, stderr, nonzero status, output overflow, and unavailable log fail without partial bytes;
+- a blocked remote read does not hold the Campaign lock or prevent append/seal/plan/submit;
 - log content is absent from view/state/plan/record/exception/`repr` and never changes readiness,
   quiescence, planning, retry, or Campaign bytes/revision.
 
@@ -937,6 +965,8 @@ Scope:
 - remove obsolete acceptance-only status and manual completed-key paths;
 - keep validate/submit/reconcile/resolve thin over public Campaign methods;
 - update README, context, ADR 0003, Campaign-engine ADR, and CLI help.
+- make CLI help and README/SECURITY identify `log` output as sensitive untrusted binary data that
+  may contain terminal control sequences and recommend redirecting it to a file or safe viewer;
 
 Non-goals:
 
@@ -977,6 +1007,8 @@ Required public tests:
 - CLI `log` addresses one exact accepted allocation and optional member Task, preserves arbitrary
   bytes without adding a newline, honors the public byte bound, and reports unavailable logs only
   through the existing error path;
+- CLI help contains the raw-byte/redirection warning; errors and chained causes contain no log
+  content, remote path, command, host secret, or remote stderr;
 - no parallel status, completed-set, or plan implementation remains.
 
 Expected outcome:
@@ -1045,7 +1077,8 @@ Slurm contact. This gate precedes public release because scheduler observation m
 real controller after publication. It runs against the exact final S4 head after every correction
 caused by E2; any later product correction invalidates E0 and requires a rerun.
 
-Use one run-owned CPU-only Campaign and allocation on an administrator-approved CPU partition. It
+Use the exact installed wheel built from the final accepted S4 head for one run-owned CPU-only
+Campaign and allocation on an administrator-approved CPU partition. It
 must not use, inspect, or compete with the protected K-study beyond ordinary shared cluster policy.
 Evidence must prove:
 
@@ -1056,6 +1089,8 @@ Evidence must prove:
 - one exact Task log containing a known synthetic stdout/stderr sentinel and one allocation-level
   log snapshot read through the public bounded interface;
 - exact packed-slot selection where the isolated allocation contains multiple synthetic Tasks;
+- redirect the installed `servatus log` CLI stdout to a run-owned file, byte-compare the sentinel
+  and no-added-newline behavior, and never render arbitrary log bytes directly to the terminal;
 - missing/expired-row handling through a synthetic unit test remains authoritative if the live site
   retains the accounting row;
 - Campaign state is unchanged by observation;
@@ -1119,8 +1154,9 @@ Required sequence:
 6. publish through the repository's trusted PyPI workflow;
 7. record public wheel and sdist SHA-256 values and provenance;
 8. fresh no-cache install from the public index;
-9. verify metadata version, zero runtime dependencies, public API, CLI, seal/view/planning behavior,
-   and publication smoke;
+9. verify metadata version, zero runtime dependencies, exported `LogSnapshot`, public
+   `Campaign.read_log`, CLI `log` command presence, seal/view/planning behavior, and publication
+   smoke without new scheduler or log contact;
 10. preserve `0.6.0` and its tag/package plus the protected schema-3 Campaign evidence.
 
 Failure at any step stops before accepted KAIROS implementation. Do not delete local build/review
@@ -1418,9 +1454,9 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
 | Historical extraction/consolidation/deployment ledger | Complete; archived authority |
 | New Campaign-engine architecture | User-approved |
 | Repository-local Profile revision | User-approved; independent rereview GREEN |
-| New ledger | GREEN; implementation-ready |
+| New ledger | Prior architecture GREEN; bounded-log amendment rereview active |
 | S1 Campaign roster and attempt state | Complete; Standards 0 / Spec 0 at `313b4d32` |
-| S2-S4 Servatus implementation | Authorized; S2 next |
+| S2-S4 Servatus implementation | S2 paused uncommitted during ledger amendment rereview |
 | Servatus `0.7.0` external release | Not authorized |
 | Active K-study | Running under separate Runner; protected |
 | K1-K2 KAIROS adoption | Blocked by public `0.7.0` and K-study closure |
@@ -1493,3 +1529,9 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
   raw-byte `servatus log` command to S3, and exact isolated live evidence to E0. It adds no slice,
   KAIROS wrapper, log parser, progress model, completion authority, or persistent log state. S2
   remains paused before commit until this ledger correction receives independent rereview.
+- 2026-08-13: the first bounded-log ledger rereview rejected the amendment until future rendered
+  filenames bound immutable `allocation_id` as well as reusable Slurm Job ID, remote reads were
+  explicitly outside the Campaign lock, S2 owned its SECURITY and ADR 0003 changes, CLI help warned
+  about untrusted binary terminal output, and E0/E3 proved the installed wheel and CLI surface.
+  Those planning corrections are active; the paused S2 product delta remains uncommitted and must
+  not resume until both original ledger reviewers return GREEN.
