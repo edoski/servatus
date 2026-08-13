@@ -427,6 +427,7 @@ class LogSnapshot:
     truncated: bool
     observed_at: datetime
 
+
 snapshot = campaign.read_log(
     allocation_id,
     task_key=task_key,  # omit for the allocation-level wrapper log
