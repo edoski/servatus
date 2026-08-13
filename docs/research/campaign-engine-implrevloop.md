@@ -918,8 +918,12 @@ Required public tests:
   and over-limit content without decoding;
 - timeout, stderr, nonzero status, output overflow, and unavailable log fail without partial bytes;
 - a blocked remote read does not hold the Campaign lock or prevent append/seal/plan/submit;
-- log content is absent from view/state/plan/record/exception/`repr` and never changes readiness,
-  quiescence, planning, retry, or Campaign bytes/revision.
+- log content is absent from view/state/plan/record/exception/`repr`; the complete visible
+  `ObservationError` message, notes, cause chain, and context chain also omit derived path, command,
+  host, remote stderr, and content;
+- the fresh installed-wheel smoke imports public `ObservationError`, `LogSnapshot`, and
+  `Campaign.read_log`, and log outcomes never change readiness, quiescence, planning, retry, or
+  Campaign bytes/revision.
 
 Genericity gate: include one plain-file and one structured-JSON probe in tests without adding those
 semantics to Servatus. The public interface contains no KAIROS or ML domain term. KAIROS K2 later
@@ -1008,7 +1012,8 @@ Required public tests:
   bytes without adding a newline, honors the public byte bound, and reports unavailable logs only
   through the existing error path;
 - CLI help contains the raw-byte/redirection warning; errors and chained causes contain no log
-  content, remote path, command, host secret, or remote stderr;
+  content, remote path, command, host secret, or remote stderr; this asserts CLI translation while
+  S2 remains the authority for the complete Python exception-chain contract;
 - no parallel status, completed-set, or plan implementation remains.
 
 Expected outcome:
@@ -1154,9 +1159,9 @@ Required sequence:
 6. publish through the repository's trusted PyPI workflow;
 7. record public wheel and sdist SHA-256 values and provenance;
 8. fresh no-cache install from the public index;
-9. verify metadata version, zero runtime dependencies, exported `LogSnapshot`, public
-   `Campaign.read_log`, CLI `log` command presence, seal/view/planning behavior, and publication
-   smoke without new scheduler or log contact;
+9. verify metadata version, zero runtime dependencies, exported `ObservationError` and
+   `LogSnapshot`, public `Campaign.read_log`, CLI `log` command presence, seal/view/planning
+   behavior, and publication smoke without new scheduler or log contact;
 10. preserve `0.6.0` and its tag/package plus the protected schema-3 Campaign evidence.
 
 Failure at any step stops before accepted KAIROS implementation. Do not delete local build/review
@@ -1535,3 +1540,7 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
   about untrusted binary terminal output, and E0/E3 proved the installed wheel and CLI surface.
   Those planning corrections are active; the paused S2 product delta remains uncommitted and must
   not resume until both original ledger reviewers return GREEN.
+- 2026-08-13: correction rereview made the adversarial axis GREEN. The common-path axis required S2,
+  rather than later CLI work, to prove complete `ObservationError` message/note/cause/context
+  redaction and installed-wheel exports. That final evidence-placement correction is under the same
+  reviewer; S2 remains paused.
