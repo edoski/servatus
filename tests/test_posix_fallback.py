@@ -155,6 +155,31 @@ def test_directory_fallback_publishes_complete_tree(
     assert (publication.destination / "value").read_text() == "complete"
 
 
+def test_directory_fallback_propagates_post_rename_sync_failure_without_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _force_linux_fallback(monkeypatch)
+    destination = tmp_path / "result"
+    real_sync = _posix.sync_descriptor
+    parent_syncs = 0
+
+    def fail_post_rename_parent_sync(descriptor: int) -> None:
+        nonlocal parent_syncs
+        if _posix.same_entry(os.fstat(descriptor), tmp_path.stat()) and destination.is_dir():
+            parent_syncs += 1
+            raise OSError("injected post-rename parent sync failure")
+        real_sync(descriptor)
+
+    monkeypatch.setattr(_posix, "sync_descriptor", fail_post_rename_parent_sync)
+
+    with pytest.raises(OSError, match="post-rename parent sync failure"):
+        publish(destination, lambda draft: (draft.path / "value").write_text("complete"))
+
+    assert parent_syncs == 1
+    assert (destination / "value").read_text() == "complete"
+    assert list(tmp_path.glob(".servatus-stage-*")) == []
+
+
 def test_identity_fallback_installs_workspace_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
