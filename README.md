@@ -108,9 +108,10 @@ MiB, and whole-GPU request and starts the target's immutable Apptainer image fro
 CPU-only work emits no GRES or `--nv`. Servatus never emits job-level exclusivity, overlap, all
 memory, manual CUDA indices, ranks, or raw scheduler flags.
 
-Slurm writes combined allocation stdout/stderr to `log_root/%j.out` and each combined task stream
-to `log_root/%j-<zero-based-slot>.out`. `%j` is expanded by Slurm after it assigns the job ID; plans
-and durable intent therefore remain immutable before scheduler acceptance.
+Slurm writes combined allocation stdout/stderr to
+`log_root/<allocation_id>-%j.out` and each combined task stream to
+`log_root/<allocation_id>-%j-<zero-based-slot>.out`. Slurm expands `%j` after assigning the job ID;
+the immutable allocation identity prevents reused job numbers from aliasing attempts.
 
 Actual simultaneous placement depends on truthful resource requests and site CPU/GRES topology.
 Servatus does not silently inflate CPU requests, disable binding, or expose raw scheduler flags.
@@ -160,6 +161,62 @@ for one bounded `squeue`/`sacct` query and adopts only one exact Servatus identi
 operator must resolve it explicitly as accepted or not submitted. Retry is explicit through
 `Campaign.plan(..., retry={...})`; prior receipts remain in history. Status reports unaccepted
 tasks, not incomplete work: the caller supplies `completed` after its own canonical validation.
+
+### Inspection
+
+`Campaign.inspect()` returns one immutable, revision-bound view of the complete attempt history,
+current allocation evidence, and optional caller-owned result evidence:
+
+```python
+def result_exists(task: Task) -> bool:
+    path = Path("results") / task.key
+    return path.is_file()
+
+
+view = campaign.inspect(result_exists)
+```
+
+The plain synchronous probe runs exactly once per Task outside the Campaign lock. It returns `True`
+only after validating one immutable or version-addressed canonical result, returns `False` for a
+missing or incomplete result, and raises for invalid or untrustworthy content. Servatus stores
+neither the probe nor its answer and never interprets an application schema. Omitting the probe
+marks results unobserved. `scheduler=False` makes no scheduler call and explicitly leaves scheduler
+evidence unobserved:
+
+```python
+result_view = campaign.inspect(result_exists, scheduler=False)
+```
+
+Scheduler inspection queries only exact accepted receipt identities through the Campaign's durable
+target lineage. Each SSH command has a 30-second deadline and at most 64 job IDs, 16 arguments,
+16 KiB of command text, 1 MiB per output stream, 128 lines, and 4 KiB per field. Larger Campaigns
+use deterministic chunks. A failed command, timeout, overflow, malformed or partial row, unrelated
+identity, or conflicting evidence aborts the whole inspection. A successful query with no exact row
+reports `UNKNOWN`; it does not fail or authorize retry.
+
+Allocation states normalize to `QUEUED`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, or
+`UNKNOWN`. Packed Tasks share their allocation evidence. Every Attempt remains visible, while the
+latest accepted Attempt owns a Task's current execution projection and unresolved acceptance
+dominates that projection. `results_ready` means the roster is sealed and every result probe was
+valid. `quiescent` independently requires requested scheduler evidence, no unresolved acceptance,
+and terminal evidence for every accepted Attempt. Valid results can therefore be ready while Slurm
+accounting is unknown. Inspection is transient, time-stamped, redacted, and read-only; a concurrent
+Campaign revision change rejects the view.
+
+`Campaign.read_log(allocation_id, task_key=None, max_bytes=65_536)` returns one immutable
+`LogSnapshot` containing the latest bounded suffix of an accepted Attempt's combined binary log.
+Omit `task_key` for the allocation wrapper or supply a Task from that exact Attempt; Servatus derives
+the accepted job ID, packed slot, target, and path. The byte limit must be from 1 byte through 1 MiB,
+and `truncated` reports whether the remote read found one extra byte. Empty content is valid.
+
+Log reads use one fixed bounded OpenSSH operation outside the Campaign lock. Missing, unreadable,
+unavailable, overflowing, or otherwise untrustworthy logs raise a redacted `ObservationError`
+without partial bytes. Log content is sensitive, untrusted binary data and may contain terminal
+control sequences. Do not print it directly to a terminal; redirect CLI output to a private file or
+use a safe binary viewer. Log content never enters Campaign state or views and cannot affect result
+readiness, quiescence, planning, retry, reconciliation, or application validity. The remote log
+namespace remains controlled by the same cluster account; Servatus does not prove a stable remote
+inode or authenticate content after Slurm writes the derived path.
 
 Servatus does not cancel jobs in V1. Use the receipt with the site's normal `scancel` command.
 Cancellation applies to the packed allocation, does not prove application completion, and does not
@@ -312,8 +369,8 @@ Servatus is not an ML framework, scheduler plugin, daemon, security boundary, ex
 DAG engine, secrets manager, or transfer/image-deployment tool. V1 has no Submitit or runtime Python
 dependency, plugin/backend abstraction, local executor, arrays, heterogeneous tasks, multi-node
 ranks, MPI/torchrun, fractional/shared GPUs, queue-aware packing, automatic retry, background
-polling, cancellation/requeue, raw Slurm/environment passthrough, application completion probes,
-compatibility shims, or cross-filesystem copy fallback.
+polling, cancellation/requeue, raw Slurm/environment passthrough, serialized probes, application
+schemas, log parsing/following/caching, compatibility shims, or cross-filesystem copy fallback.
 
 See the [context glossary](docs/CONTEXT.md) and [architecture decisions](docs/adr/README.md) for the
 ownership boundary.

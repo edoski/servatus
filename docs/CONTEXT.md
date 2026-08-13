@@ -19,6 +19,17 @@ Servatus uses a small generic vocabulary:
 - **Intent:** the durably synced unresolved Attempt written before possible scheduler acceptance.
 - **Receipt:** a positive Slurm job identity proving scheduler acceptance, not completion; its Task
   keys come from the immutable intent.
+- **Result probe:** one ephemeral synchronous caller function that validates the canonical result
+  for one opaque Task as valid, missing, or invalid without exposing its schema to Servatus.
+- **Allocation evidence:** one transient time-stamped observation of an exact accepted receipt,
+  normalized to queued, running, succeeded, failed, cancelled, or unknown.
+- **Campaign view:** one immutable revision-bound projection containing every Attempt, current Task
+  execution and result evidence, readiness, and quiescence without persisting observations.
+- **Log snapshot:** one transient time-stamped bounded binary suffix from the allocation or packed
+  Task log of one exact accepted Attempt; it is diagnostic evidence with no lifecycle authority.
+- **Result readiness:** the sealed roster has valid immutable caller results for every Task.
+- **Quiescence:** scheduler evidence was requested, every accepted Attempt is proven terminal, and
+  no acceptance remains unresolved; it is independent from result readiness.
 - **Unaccepted task:** one Task without a proven scheduler-acceptance receipt. Application
   completion is a separate caller-owned decision.
 - **Validation result:** one immutable, time-specific result from bounded Slurm `--test-only`

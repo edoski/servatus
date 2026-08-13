@@ -55,12 +55,13 @@ def test_job_id_logs_preserve_zero_based_combined_allocation_and_slot_shape(
 ) -> None:
     plan = Campaign.open(tmp_path / "campaign", tasks(2)).plan(target(), resources())
     argv = plan._allocations[0].argv
+    allocation_id = plan._allocations[0].allocation_id
     script = plan._allocations[0].script.decode()
 
-    assert "--output=/cluster/logs/project/%j.out" in argv
-    assert "--error=/cluster/logs/project/%j.out" in argv
+    assert f"--output=/cluster/logs/project/{allocation_id}-%j.out" in argv
+    assert f"--error=/cluster/logs/project/{allocation_id}-%j.out" in argv
     for slot in range(2):
-        path = f"/cluster/logs/project/%j-{slot}.out"
+        path = f"/cluster/logs/project/{allocation_id}-%j-{slot}.out"
         assert f"--output={path}" in script
         assert f"--error={path}" in script
     assert "%j-2.out" not in script

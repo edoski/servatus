@@ -44,9 +44,10 @@ capacity, escalates an explicit request, emits job-level exclusivity, or accepts
 Target limits prevent user mistakes but do not replace cluster policy. Application completion and
 the meaning of every task remain with the caller.
 
-Allocation stdout/stderr share `log_root/%j.out`; each task's stdout/stderr share
-`log_root/%j-<zero-based-slot>.out`. Slurm expands `%j` after acceptance, so conventional job-ID
-logs do not require post-acceptance plan mutation.
+Allocation stdout/stderr share `log_root/<allocation_id>-%j.out`; each task's stdout/stderr share
+`log_root/<allocation_id>-%j-<zero-based-slot>.out`. Slurm expands `%j` after acceptance, while the
+immutable allocation identity prevents reused job numbers from aliasing distinct Attempts without
+post-acceptance plan mutation.
 
 ## Production acceptance
 

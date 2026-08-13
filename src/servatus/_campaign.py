@@ -10,10 +10,11 @@ import os
 import re
 import stat
 import tomllib
-from collections.abc import Collection, Generator, Sequence
+from collections.abc import Callable, Collection, Generator, Sequence
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import ClassVar, Self, cast
 
@@ -21,6 +22,7 @@ from . import _slurm
 from ._errors import (
     AmbiguousSubmission,
     ConfigurationError,
+    ObservationError,
     PlanError,
     ReconciliationError,
     SubmissionError,
@@ -43,6 +45,7 @@ _HEX_32 = re.compile(r"[0-9a-f]{32}\Z")
 _HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 _WINDOW_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"
 _MAX_STATE_BYTES = 256 * 1024 * 1024
+_MAX_LOG_BYTES = 1024 * 1024
 
 
 def _configuration(condition: bool, message: str) -> None:
@@ -334,6 +337,77 @@ class CampaignStatus:
     ambiguous_allocation_ids: tuple[str, ...]
 
 
+class ResultState(StrEnum):
+    UNOBSERVED = "UNOBSERVED"
+    MISSING = "MISSING"
+    VALID = "VALID"
+
+
+class AcceptanceState(StrEnum):
+    UNRESOLVED = _UNRESOLVED
+    ACCEPTED = _ACCEPTED
+    NOT_SUBMITTED = _NOT_SUBMITTED
+
+
+AllocationState = _slurm.AllocationState
+
+
+ResultProbe = Callable[[Task], bool]
+
+
+@dataclass(frozen=True, slots=True)
+class AllocationEvidence:
+    receipt: JobReceipt
+    state: AllocationState
+    raw_state: str | None
+    accounting_state: str | None
+    exit_code: str | None
+    reason: str | None
+    started_at: str | None
+    ended_at: str | None
+    observed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptEvidence:
+    allocation_id: str
+    task_keys: tuple[str, ...]
+    retry_task_keys: tuple[str, ...]
+    acceptance: AcceptanceState
+    receipt: JobReceipt | None
+    allocation: AllocationEvidence | None
+
+
+@dataclass(frozen=True, slots=True)
+class TaskEvidence:
+    key: str
+    result: ResultState
+    result_observed_at: datetime | None
+    current_attempt_id: str | None
+    execution: AllocationState | None
+    acceptance_ambiguous: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CampaignView:
+    campaign_id: str
+    revision: int
+    sealed: bool
+    tasks: tuple[TaskEvidence, ...]
+    attempts: tuple[AttemptEvidence, ...]
+    scheduler_observed: bool
+    observed_at: datetime
+    results_ready: bool
+    quiescent: bool
+
+
+@dataclass(frozen=True, slots=True)
+class LogSnapshot:
+    content: bytes = field(repr=False)
+    truncated: bool
+    observed_at: datetime
+
+
 @dataclass(frozen=True, slots=True)
 class ValidationResult:
     task_count: int
@@ -622,6 +696,178 @@ class Campaign:
             state["revision"] = cast(int, state["revision"]) + 1
             self._write_state(state)
 
+    def inspect(
+        self,
+        probe: ResultProbe | None = None,
+        *,
+        scheduler: bool = True,
+    ) -> CampaignView:
+        state = self._read_state()
+        campaign_id = cast(str, state["campaign_id"])
+        revision = cast(int, state["revision"])
+        tasks = _tasks_from_state(state)
+
+        result_values: list[tuple[ResultState, datetime | None]] = []
+        for task in tasks:
+            if probe is None:
+                result_values.append((ResultState.UNOBSERVED, None))
+                continue
+            valid = probe(task)
+            if type(valid) is not bool:
+                raise TypeError("result probe must return bool")
+            result_values.append(
+                (ResultState.VALID if valid else ResultState.MISSING, datetime.now(UTC))
+            )
+
+        receipt_values = _receipt_values(state)
+        receipts = {receipt.allocation_id: receipt for receipt in receipt_values}
+        scheduler_values: tuple[_slurm.SchedulerObservation, ...] = ()
+        if scheduler and receipt_values:
+            lineage = _validate_lineage(state["lineage"])
+            assert lineage is not None
+            scheduler_values = _slurm.query_receipts(lineage[0], receipt_values)
+        scheduler_observed_at = datetime.now(UTC)
+        scheduler_by_allocation = (
+            {
+                receipt.allocation_id: observation
+                for receipt, observation in zip(receipt_values, scheduler_values, strict=True)
+            }
+            if scheduler
+            else {}
+        )
+        attempts: list[AttemptEvidence] = []
+        current: dict[str, AttemptEvidence] = {}
+        ambiguous: set[str] = set()
+        for attempt in cast(list[dict[str, object]], state["attempts"]):
+            acceptance = cast(dict[str, object], attempt["acceptance"])
+            status = AcceptanceState(cast(str, acceptance["status"]))
+            receipt = receipts.get(cast(str, attempt["allocation_id"]))
+            observation = scheduler_by_allocation.get(cast(str, attempt["allocation_id"]))
+            allocation = (
+                None
+                if receipt is None or observation is None
+                else AllocationEvidence(
+                    receipt,
+                    observation.state,
+                    observation.raw_state,
+                    observation.accounting_state,
+                    observation.exit_code,
+                    observation.reason,
+                    observation.started_at,
+                    observation.ended_at,
+                    scheduler_observed_at,
+                )
+            )
+            evidence = AttemptEvidence(
+                cast(str, attempt["allocation_id"]),
+                tuple(cast(list[str], attempt["task_keys"])),
+                tuple(cast(list[str], attempt["retry_task_keys"])),
+                status,
+                receipt,
+                allocation,
+            )
+            attempts.append(evidence)
+            if status is AcceptanceState.ACCEPTED:
+                for key in evidence.task_keys:
+                    current[key] = evidence
+            elif status is AcceptanceState.UNRESOLVED:
+                ambiguous.update(evidence.task_keys)
+                for key in evidence.task_keys:
+                    current[key] = evidence
+
+        after = self._read_state()
+        if after["campaign_id"] != campaign_id or after["revision"] != revision:
+            raise ObservationError("campaign changed during inspection")
+
+        observed_at = datetime.now(UTC)
+        task_items: list[TaskEvidence] = []
+        for index, task in enumerate(tasks):
+            current_attempt = current.get(task.key)
+            task_items.append(
+                TaskEvidence(
+                    task.key,
+                    result_values[index][0],
+                    result_values[index][1],
+                    None if current_attempt is None else current_attempt.allocation_id,
+                    (
+                        None
+                        if current_attempt is None or current_attempt.allocation is None
+                        else current_attempt.allocation.state
+                    ),
+                    task.key in ambiguous,
+                )
+            )
+        task_evidence = tuple(task_items)
+        results_ready = state["phase"] == _SEALED and all(
+            item.result is ResultState.VALID for item in task_evidence
+        )
+        terminal = {
+            AllocationState.SUCCEEDED,
+            AllocationState.FAILED,
+            AllocationState.CANCELLED,
+        }
+        quiescent = (
+            scheduler
+            and not ambiguous
+            and all(
+                attempt.allocation is not None and attempt.allocation.state in terminal
+                for attempt in attempts
+                if attempt.acceptance is AcceptanceState.ACCEPTED
+            )
+        )
+        return CampaignView(
+            campaign_id,
+            revision,
+            state["phase"] == _SEALED,
+            task_evidence,
+            tuple(attempts),
+            scheduler,
+            observed_at,
+            results_ready,
+            quiescent,
+        )
+
+    def read_log(
+        self,
+        allocation_id: str,
+        *,
+        task_key: str | None = None,
+        max_bytes: int = 65_536,
+    ) -> LogSnapshot:
+        if (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or not 1 <= max_bytes <= _MAX_LOG_BYTES
+        ):
+            raise ConfigurationError("max_bytes must be an integer between 1 and 1048576")
+        state = self._read_state()
+        lineage = _validate_lineage(state["lineage"])
+        location: tuple[SlurmTarget, PurePosixPath] | None = None
+        if lineage is not None:
+            target, _ = lineage
+            for attempt in cast(list[dict[str, object]], state["attempts"]):
+                acceptance = cast(dict[str, object], attempt["acceptance"])
+                if attempt["allocation_id"] != allocation_id or acceptance["status"] != _ACCEPTED:
+                    continue
+                task_keys = tuple(cast(list[str], attempt["task_keys"]))
+                if task_key is not None and task_key not in task_keys:
+                    break
+                slot = None if task_key is None else task_keys.index(task_key)
+                location = (
+                    target,
+                    _slurm._log_path(
+                        target.log_root,
+                        cast(str, attempt["allocation_id"]),
+                        cast(int, acceptance["job_id"]),
+                        slot,
+                    ),
+                )
+                break
+        if location is None:
+            raise ObservationError("campaign log is unavailable")
+        content, truncated = _slurm.read_log_suffix(*location, max_bytes)
+        return LogSnapshot(content, truncated, datetime.now(UTC))
+
     def plan(
         self,
         target: SlurmTarget,
@@ -679,7 +925,7 @@ class Campaign:
         effective_time_limit = _effective_time_limit(resources.time_limit)
         for index, group in enumerate(groups):
             allocation_id = hashlib.sha256(f"{seed}:{index}".encode()).hexdigest()[:24]
-            script = _slurm.render_script(target, resources, group)
+            script = _slurm.render_script(target, resources, group, allocation_id)
             if len(script) > target.max_script_bytes:
                 raise PlanError(
                     f"rendered script is {len(script)} bytes; target permits "

@@ -48,3 +48,16 @@ Campaign task arguments and stdin are embedded in the submitted batch script. Re
 ordinary local summaries does not make them secret; do not submit credentials or other secrets.
 Target TOML is an editable user-side guardrail, not an enforcement boundary. Slurm remains
 authoritative for identity, admission, isolation, allocation, accounting, and billing.
+
+Campaign log snapshots are sensitive, untrusted binary data. They may contain credentials,
+research data, terminal control sequences, or other hostile output. Never render them directly in
+a terminal; redirect CLI output to a private file or inspect it with a safe binary viewer. Servatus
+accepts no caller-supplied remote path or command and derives one allocation-bound path from a
+validated accepted Attempt, but the remote `log_root` namespace remains controlled by the same
+cluster account. Servatus does not pin a remote inode or authenticate log content after Slurm writes
+the path. A same-account process that replaces or mutates that path is outside this unprivileged
+library's threat model.
+
+Remote log failures are deliberately collapsed to a redacted `ObservationError`: returned error
+messages and visible exception chains contain no log bytes, remote path, host, command, or remote
+stderr. Log bytes are never stored in Campaign state, views, plans, or automatic structured output.

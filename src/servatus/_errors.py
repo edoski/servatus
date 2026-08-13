@@ -56,3 +56,7 @@ class AmbiguousSubmission(SubmissionError):
 
 class ReconciliationError(CampaignError):
     """A bounded scheduler query could not prove one allocation identity."""
+
+
+class ObservationError(CampaignError):
+    """A bounded Campaign observation was unavailable or untrustworthy."""
