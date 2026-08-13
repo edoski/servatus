@@ -600,13 +600,30 @@ def _combine_observations(
             None,
         )
     active_state = None if active is None else _normalize_state(active.state)
+    accounting_state = None if accounting is None else _normalize_state(accounting.state)
     if (
         active is not None
         and accounting is not None
-        and active_state not in {AllocationState.QUEUED, AllocationState.RUNNING}
-        and _state_base(active.state) != _state_base(accounting.state)
+        and active.submitted_at == accounting.submitted_at
     ):
-        raise ObservationError("scheduler sources returned conflicting evidence")
+        accounting_terminal = accounting_state in {
+            AllocationState.SUCCEEDED,
+            AllocationState.FAILED,
+            AllocationState.CANCELLED,
+        }
+        if active_state is accounting_state or (
+            active_state is AllocationState.RUNNING and accounting_state is AllocationState.QUEUED
+        ):
+            primary = active
+        elif (
+            active_state is AllocationState.QUEUED and accounting_state is AllocationState.RUNNING
+        ) or (
+            active_state in {AllocationState.QUEUED, AllocationState.RUNNING}
+            and accounting_terminal
+        ):
+            primary = accounting
+        else:
+            raise ObservationError("scheduler sources returned conflicting evidence")
     return SchedulerObservation(
         _normalize_state(primary.state),
         primary.state,

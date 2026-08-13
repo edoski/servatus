@@ -647,6 +647,65 @@ def test_active_scheduler_row_wins_a_legitimate_accounting_transition_and_packed
         assert secret not in repr(view)
 
 
+@pytest.mark.parametrize(
+    ("active_state", "accounting_state", "expected", "expected_raw", "quiescent"),
+    [
+        ("RUNNING", "COMPLETED", AllocationState.SUCCEEDED, "COMPLETED", True),
+        ("PENDING", "RUNNING", AllocationState.RUNNING, "RUNNING", False),
+        ("COMPLETING", "RUNNING", AllocationState.RUNNING, "COMPLETING", False),
+        ("COMPLETED", "FAILED", None, None, None),
+        ("COMPLETED", "RUNNING", None, None, None),
+    ],
+)
+def test_same_incarnation_uses_ordered_later_sample_and_rejects_conflicts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    active_state: str,
+    accounting_state: str,
+    expected: AllocationState | None,
+    expected_raw: str | None,
+    quiescent: bool | None,
+) -> None:
+    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
+    accept(monkeypatch, campaign, [42])
+    receipt = campaign.status().receipts[0]
+    identity = f"servatus-{receipt.allocation_id}"
+    submitted_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+
+    def query(_target: SlurmTarget, argv: tuple[str, ...]) -> _slurm.Result:
+        if argv[0].endswith("squeue"):
+            return _slurm.Result(
+                0,
+                active_row(identity, submitted_at, active_state),
+                b"",
+            )
+        return _slurm.Result(
+            0,
+            accounting_row(
+                identity,
+                submitted_at,
+                accounting_state,
+                "0:0",
+                "None",
+                "2030-01-01T00:00:00",
+                "2030-01-01T01:00:00",
+            ),
+            b"",
+        )
+
+    monkeypatch.setattr(_slurm, "_run_bounded_ssh", query)
+    if expected is None:
+        with pytest.raises(ObservationError, match="conflicting"):
+            campaign.inspect()
+        return
+    view = campaign.inspect()
+    allocation = view.attempts[0].allocation
+    assert allocation is not None
+    assert allocation.state is expected
+    assert allocation.raw_state == expected_raw
+    assert view.quiescent is quiescent
+
+
 def test_result_only_view_skips_scheduler_and_valid_results_survive_unknown_accounting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
