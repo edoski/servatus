@@ -1465,11 +1465,11 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
 | S1 Campaign roster and attempt state | Complete; Standards 0 / Spec 0 at `313b4d32` |
 | S2 Campaign observation and bounded logs | Complete; Standards 0 / Spec 0 at `54b05a2e` |
 | S3 Profile-based evidence planning and CLI | Complete; Standards 0 / Spec 0 at `08567547` |
-| S4 Servatus consolidation | Complete; Standards 0 / Spec 0 at `d04e567c` |
+| S4 Servatus consolidation + publication correction | Complete; Standards 0 / Spec 0 at `244e5034` |
 | E1 protected K-study closure | Complete; Runner-attested, schema-3 evidence preserved |
-| E2 disposable KAIROS client proof | Next; local and non-production |
-| E0 isolated CPU Slurm/log acceptance | Authorized; blocked by E2 |
-| Servatus `0.7.0` external release | Authorized; blocked by E0 and E2 |
+| E2 disposable KAIROS client proof | Complete; Standards 0 / Spec 0 at disposable `6c69d2f6` |
+| E0 isolated CPU Slurm/log/Ceph acceptance | Authorized; next |
+| Servatus `0.7.0` external release | Authorized; blocked by E0 |
 | K1-K2 KAIROS adoption | Blocked by public `0.7.0` |
 | I1 main/compact integration | Blocked by K1-K2 |
 | KAIROS image/config/push gates | Separately gated after K1-K2/I1; not authorized here |
@@ -1608,3 +1608,33 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
   active held-out and future inference work remain excluded. The user separately authorized E0
   isolated CPU Slurm/log acceptance and E3 Servatus `0.7.0` publication, both still subject to
   their prerequisite GREEN gates.
+- 2026-08-13: E2 applied the planned KAIROS K1/K2 shape in disposable worktree
+  `/private/tmp/kairos-e2-disposable-client-proof` from exact KAIROS baseline `85209160` against the
+  exact local Servatus candidate wheel. The proof used one `ExecutionTask` envelope, one domain
+  probe, direct public Campaign calls, one repository `SERVATUS.toml`, a Campaign-only private
+  roster, and direct result-only scientific close. It deleted bundles, TSV/request rosters,
+  active/canonical fallback, split Task paths, and client completed-set joins. Review corrections
+  centralized experiment-kind/request association and removed repeated Study loading. Final
+  independent review returned Standards 0 / Spec 0 at disposable head `6c69d2f6`; KAIROS product
+  measured `+367/-427` (net `-60`) and tests `+409/-467` (net `-58`). Root, mobile, App, static,
+  lock, build, and installed-wheel gates passed. No Servatus API correction was required and no
+  external, Slurm, GPU, output, image, or production Campaign action ran. The proof is not merged.
+- 2026-08-13: the active held-out Runner diagnosed a production publication convoy in unchanged
+  Servatus `0.6.0`/initial `0.7.0` POSIX code. CephFS rejected native directory
+  `RENAME_NOREPLACE`, so fallback publication held one distributed parent `flock` across a
+  non-returning parent-directory `fsync`: one visible canonical evaluation waited in Ceph metadata
+  safety while eight complete different-destination publishers blocked acquiring the same lock.
+  A strict Ceph kernel/MDS circular dependency was not proven, but the unbounded global critical
+  section was. The Runner preserved and validated all nine scientific outputs, performed no
+  recovery mutation, and paused awaiting this program.
+- 2026-08-13: production correction `28ee05ea` moved the required parent `fsync` outside the
+  fallback lock while preserving destination absence, exact rename, published-inode verification,
+  no-clobber, and durability-before-success. Corrections `147ef366` and `244e5034` added exact
+  success/failure durability proofs. Public multiprocess tests prove a stalled post-rename sync no
+  longer blocks another destination, a same-destination contender cannot clobber, success performs
+  exactly one parent sync, and sync failure propagates while preserving the visible canonical tree
+  without stage cleanup damage. Independent review returned Standards 0 / Spec 0 at exact head
+  `244e5034fa35fd2c84d76fccc70febb869631311`; full gates were 458 passed / 1 environment skip plus
+  static, lock, build, archive, metadata, zero-dependency, and fresh-wheel checks. No live or
+  external action ran. E0 must now exercise the exact fixed wheel on isolated Slurm and CephFS
+  before release or Runner recovery.
