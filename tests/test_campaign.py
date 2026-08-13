@@ -166,7 +166,58 @@ def test_campaign_loads_an_existing_durable_roster(tmp_path: Path) -> None:
 
     loaded = Campaign.load(path)
 
+    assert opened.tasks == tasks(2)
+    assert loaded.tasks == tasks(2)
     assert loaded.status() == opened.status()
+
+
+def test_campaign_seal_is_durable_idempotent_and_stales_plans(tmp_path: Path) -> None:
+    path = tmp_path / "campaign"
+    campaign = Campaign.open(path, tasks(2))
+    stale = campaign.plan(target(), resources())
+
+    campaign.seal()
+    sealed = (path / "campaign.json").read_bytes()
+    loaded = Campaign.load(path)
+
+    assert loaded.tasks == tasks(2)
+    loaded.seal()
+    assert (path / "campaign.json").read_bytes() == sealed
+    Campaign.open(path, tasks(2))
+    with pytest.raises(PlanError, match="stale"):
+        loaded.validate(stale)
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        tasks(3),
+        tasks(1),
+        tuple(reversed(tasks(2))),
+        (replace(tasks(2)[0], stdin=b"changed"), tasks(2)[1]),
+    ],
+)
+def test_sealed_campaign_rejects_every_roster_change(
+    tmp_path: Path, changed: tuple[Task, ...]
+) -> None:
+    path = tmp_path / "campaign"
+    Campaign.open(path, tasks(2)).seal()
+
+    with pytest.raises(TaskConflict):
+        Campaign.open(path, changed)
+
+
+def test_open_campaign_can_execute_before_sealing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(0, b"101\n", b""),
+    )
+
+    assert campaign.submit(campaign.plan(target(), resources()))[0].job_id == 101
 
 
 def test_growth_preserves_receipts_and_submits_only_new_suffix(
@@ -502,17 +553,19 @@ def test_submit_records_intent_before_ssh_and_receipt(
 
     def accepted(target_value: SlurmTarget, argv: tuple[str, ...], script: bytes) -> _slurm.Result:
         state = json.loads((tmp_path / "campaign" / "campaign.json").read_text())
-        assert len(state["intents"]) == 1
-        assert state["receipts"] == []
+        assert len(state["attempts"]) == 1
+        assert state["attempts"][0]["acceptance"] == {"status": "UNRESOLVED"}
         assert state["lineage"]["target"] == _campaign._target_dict(target())
         assert state["lineage"]["resources"] == _campaign._resource_dict(resources())
-        assert state["intents"][0]["allocation"] == {
+        assert state["attempts"][0]["target_digest"] == state["lineage"]["target_digest"]
+        assert state["attempts"][0]["resource_digest"] == state["lineage"]["resource_digest"]
+        assert state["attempts"][0]["allocation"] == {
             "cpus": 32,
             "memory_mib": 65536,
             "gpus": 1,
             "time_limit": "3-00:00:00",
         }
-        assert state["intents"][0]["sbatch_argv"] == list(argv)
+        assert state["attempts"][0]["sbatch_argv"] == list(argv)
         assert script == plan._allocations[0].script
         return _slurm.Result(0, b"4242;alpha\n", b"")
 
@@ -540,21 +593,34 @@ def test_submission_state_uses_only_authoritative_provenance(
     campaign.submit(campaign.plan(target(), resources()))
     state = json.loads((path / "campaign.json").read_text())
 
-    assert state["schema_version"] == 3
-    assert set(state["intents"][0]) == {
+    assert state["schema_version"] == 4
+    assert state["phase"] == "OPEN"
+    assert set(state["attempts"][0]) == {
         "allocation_id",
         "task_keys",
+        "campaign_revision",
+        "retry_task_keys",
         "plan_digest",
         "script_digest",
+        "target_digest",
+        "resource_digest",
         "allocation",
         "sbatch_argv",
         "window_start",
         "window_end",
+        "acceptance",
     }
-    assert set(state["receipts"][0]) == {"allocation_id", "job_id", "cluster"}
-    allocation = _campaign.plan_document(
-        Campaign.open(path, tasks(1)).plan(target(), resources(), retry={"task-0"})
-    )["allocations"][0]
+    assert state["attempts"][0]["campaign_revision"] == 0
+    assert state["attempts"][0]["retry_task_keys"] == []
+    assert state["attempts"][0]["target_digest"] == state["lineage"]["target_digest"]
+    assert state["attempts"][0]["resource_digest"] == state["lineage"]["resource_digest"]
+    assert state["attempts"][0]["acceptance"] == {
+        "status": "ACCEPTED",
+        "job_id": 4242,
+        "cluster": "alpha",
+    }
+    retry = Campaign.open(path, tasks(1)).plan(target(), resources(), retry={"task-0"})
+    allocation = _campaign.plan_document(retry)["allocations"][0]
     assert set(allocation) == {
         "allocation_id",
         "task_keys",
@@ -565,9 +631,13 @@ def test_submission_state_uses_only_authoritative_provenance(
         "sbatch_argv",
         "script_digest",
     }
+    campaign.submit(retry)
+    attempts = json.loads((path / "campaign.json").read_text())["attempts"]
+    assert attempts[1]["campaign_revision"] == 2
+    assert attempts[1]["retry_task_keys"] == ["task-0"]
 
 
-def test_campaign_rejects_allocation_with_receipt_and_negative_resolution(
+def test_campaign_rejects_attempt_with_contradictory_acceptance_fields(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "campaign"
@@ -582,25 +652,112 @@ def test_campaign_rejects_allocation_with_receipt_and_negative_resolution(
 
     state_path = path / "campaign.json"
     state = json.loads(state_path.read_text())
-    allocation_id = state["intents"][0]["allocation_id"]
-    state["receipts"].append({"allocation_id": allocation_id, "job_id": 42, "cluster": None})
-    state["resolutions"].append(allocation_id)
+    state["attempts"][0]["acceptance"] = {
+        "status": "ACCEPTED",
+        "job_id": 42,
+        "cluster": None,
+        "not_submitted": True,
+    }
     state_path.write_text(json.dumps(state))
 
-    with pytest.raises(TaskConflict, match="accepted and resolved"):
+    with pytest.raises(TaskConflict, match="acceptance"):
         Campaign.open(path, tasks(1))
 
 
-def test_campaign_rejects_float_state_schema(tmp_path: Path) -> None:
+@pytest.mark.parametrize("schema", [3, 3.0, True])
+def test_campaign_rejects_old_or_noninteger_state_schema(tmp_path: Path, schema: object) -> None:
     path = tmp_path / "campaign"
     Campaign.open(path, tasks(1))
     state_path = path / "campaign.json"
     state = json.loads(state_path.read_text())
-    state["schema_version"] = 3.0
+    state["schema_version"] = schema
     state_path.write_text(json.dumps(state))
 
     with pytest.raises(TaskConflict, match="schema"):
         Campaign.open(path, tasks(1))
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("phase",), []),
+        (("revision",), 2.0),
+        (("tasks", 0, "key"), 7),
+        (("attempts", 0, "campaign_revision"), True),
+        (("attempts", 0, "retry_task_keys"), [False]),
+        (("attempts", 0, "target_digest"), 7),
+        (("attempts", 0, "acceptance", "job_id"), 42.0),
+        (("attempts", 0, "acceptance", "status"), "NOT_SUBMITTED"),
+    ],
+)
+def test_campaign_rejects_malformed_bounded_state_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    path: tuple[str | int, ...],
+    value: object,
+) -> None:
+    campaign_path = tmp_path / "campaign"
+    campaign = Campaign.open(campaign_path, tasks(1))
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
+    )
+    campaign.submit(campaign.plan(target(), resources()))
+    state_path = campaign_path / "campaign.json"
+    state = json.loads(state_path.read_text())
+    owner: object = state
+    for component in path[:-1]:
+        owner = owner[component]  # type: ignore[index]
+    owner[path[-1]] = value  # type: ignore[index]
+    state_path.write_text(json.dumps(state))
+
+    with pytest.raises(TaskConflict):
+        Campaign.load(campaign_path)
+
+
+def test_campaign_rejects_sealed_phase_without_revision_change(tmp_path: Path) -> None:
+    campaign_path = tmp_path / "campaign"
+    Campaign.open(campaign_path, tasks(1))
+    state_path = campaign_path / "campaign.json"
+    state = json.loads(state_path.read_text())
+    state["phase"] = "SEALED"
+    state_path.write_text(json.dumps(state))
+
+    with pytest.raises(TaskConflict, match="phase"):
+        Campaign.load(campaign_path)
+
+
+def test_campaign_rejects_revision_behind_attempt_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign_path = tmp_path / "campaign"
+    campaign = Campaign.open(campaign_path, tasks(1))
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
+    )
+    campaign.submit(campaign.plan(target(), resources()))
+    state_path = campaign_path / "campaign.json"
+    state = json.loads(state_path.read_text())
+    state["revision"] = 1
+    state_path.write_text(json.dumps(state))
+
+    with pytest.raises(TaskConflict, match="revision"):
+        Campaign.load(campaign_path)
+
+
+def test_campaign_rejects_lineage_without_attempt_history(tmp_path: Path) -> None:
+    campaign_path = tmp_path / "campaign"
+    Campaign.open(campaign_path, tasks(1))
+    state_path = campaign_path / "campaign.json"
+    state = json.loads(state_path.read_text())
+    state["lineage"] = _campaign._lineage(target(), resources())
+    state_path.write_text(json.dumps(state))
+
+    with pytest.raises(TaskConflict, match="lineage"):
+        Campaign.load(campaign_path)
 
 
 @pytest.mark.parametrize("field", ["cpus", "memory_mib", "gpus"])
@@ -624,11 +781,31 @@ def test_campaign_rejects_noninteger_allocation_totals(
 
     state_path = path / "campaign.json"
     state = json.loads(state_path.read_text())
-    state["intents"][0]["allocation"][field] = value
+    state["attempts"][0]["allocation"][field] = value
     state_path.write_text(json.dumps(state))
 
     with pytest.raises(TaskConflict, match="provenance"):
         Campaign.open(path, tasks(1))
+
+
+def test_campaign_rejects_reordered_attempt_task_lineage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "campaign"
+    campaign = Campaign.open(path, tasks(2))
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
+    )
+    campaign.submit(campaign.plan(target(), resources()))
+    state_path = path / "campaign.json"
+    state = json.loads(state_path.read_text())
+    state["attempts"][0]["task_keys"].reverse()
+    state_path.write_text(json.dumps(state))
+
+    with pytest.raises(TaskConflict, match="task keys"):
+        Campaign.load(path)
 
 
 def test_intent_file_and_directory_are_synced_before_ssh(
@@ -715,6 +892,58 @@ def test_manual_resolution_and_explicit_retry_preserve_history(
     second_retry = campaign.plan(target(), resources(), retry={"task-0"})
     campaign.submit(second_retry)
     assert [receipt.job_id for receipt in campaign.status().receipts] == [101, 101]
+
+
+def test_attempt_history_retains_resolution_reconciliation_retry_and_lineage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "campaign"
+    campaign = Campaign.open(path, tasks(1))
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(1, b"", b"lost reply"),
+    )
+    with pytest.raises(AmbiguousSubmission):
+        campaign.submit(campaign.plan(target(), resources()))
+    first = campaign.status().ambiguous_allocation_ids[0]
+    campaign.resolve(first, job_id=None)
+
+    with pytest.raises(AmbiguousSubmission):
+        campaign.submit(campaign.plan(target(), resources()))
+    second = campaign.status().ambiguous_allocation_ids[0]
+    monkeypatch.setattr(
+        _slurm,
+        "query_identity",
+        lambda *_args, **_kwargs: _slurm.IdentityMatch(909, "alpha"),
+    )
+    assert campaign.reconcile(second).job_id == 909
+
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(0, b"101\n", b""),
+    )
+    campaign.submit(campaign.plan(target(), resources(), retry={"task-0"}))
+    state = json.loads((path / "campaign.json").read_text())
+
+    assert [attempt["campaign_revision"] for attempt in state["attempts"]] == [0, 2, 4]
+    assert [attempt["retry_task_keys"] for attempt in state["attempts"]] == [
+        [],
+        [],
+        ["task-0"],
+    ]
+    assert [attempt["acceptance"]["status"] for attempt in state["attempts"]] == [
+        "NOT_SUBMITTED",
+        "ACCEPTED",
+        "ACCEPTED",
+    ]
+    assert [receipt.job_id for receipt in campaign.status().receipts] == [909, 101]
+    assert all(
+        attempt["target_digest"] == state["lineage"]["target_digest"]
+        and attempt["resource_digest"] == state["lineage"]["resource_digest"]
+        for attempt in state["attempts"]
+    )
 
 
 def test_stale_foreign_and_tampered_plans_fail(tmp_path: Path) -> None:

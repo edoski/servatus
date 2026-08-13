@@ -27,8 +27,13 @@ from ._errors import (
     TaskConflict,
 )
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _PLAN_SCHEMA_VERSION = 3
+_OPEN = "OPEN"
+_SEALED = "SEALED"
+_UNRESOLVED = "UNRESOLVED"
+_ACCEPTED = "ACCEPTED"
+_NOT_SUBMITTED = "NOT_SUBMITTED"
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _GRES = re.compile(r"gpu(?::[A-Za-z0-9][A-Za-z0-9._-]*)?\Z")
@@ -544,11 +549,10 @@ class Campaign:
                         "schema_version": _SCHEMA_VERSION,
                         "campaign_id": os.urandom(16).hex(),
                         "revision": 0,
+                        "phase": _OPEN,
                         "tasks": [_task_record(task) for task in frozen],
                         "lineage": None,
-                        "intents": [],
-                        "receipts": [],
-                        "resolutions": [],
+                        "attempts": [],
                     }
                 )
             else:
@@ -556,6 +560,8 @@ class Campaign:
                 if frozen[: len(stored)] != stored:
                     raise TaskConflict("campaign tasks may only gain an exact ordered suffix")
                 if len(frozen) > len(stored):
+                    if state["phase"] == _SEALED:
+                        raise TaskConflict("sealed campaign tasks cannot change")
                     cast(list[object], state["tasks"]).extend(
                         _task_record(task) for task in frozen[len(stored) :]
                     )
@@ -569,6 +575,19 @@ class Campaign:
         campaign = cls(campaign_path, entry)
         campaign._read_state()
         return campaign
+
+    @property
+    def tasks(self) -> tuple[Task, ...]:
+        return _tasks_from_state(self._read_state())
+
+    def seal(self) -> None:
+        with self._locked_state() as state:
+            assert state is not None
+            if state["phase"] == _SEALED:
+                return
+            state["phase"] = _SEALED
+            state["revision"] = cast(int, state["revision"]) + 1
+            self._write_state(state)
 
     def plan(
         self,
@@ -726,7 +745,7 @@ class Campaign:
 
     def reconcile(self, allocation_id: str) -> JobReceipt:
         state = self._read_state()
-        intent = _unresolved_intent(state, allocation_id)
+        attempt = _unresolved_attempt(state, allocation_id)
         lineage = _validate_lineage(state["lineage"])
         if lineage is None:
             raise ReconciliationError("allocation intent has no target lineage")
@@ -734,14 +753,14 @@ class Campaign:
         match = _slurm.query_identity(
             target,
             job_name=f"servatus-{allocation_id}",
-            window_start=cast(str, intent["window_start"]),
-            window_end=cast(str, intent["window_end"]),
+            window_start=cast(str, attempt["window_start"]),
+            window_end=cast(str, attempt["window_end"]),
         )
         receipt = JobReceipt(
             allocation_id,
             match.job_id,
             match.cluster,
-            tuple(cast(list[str], intent["task_keys"])),
+            tuple(cast(list[str], attempt["task_keys"])),
         )
         self._record_receipt(receipt, expected_revision=cast(int, state["revision"]))
         return receipt
@@ -761,17 +780,15 @@ class Campaign:
             raise ConfigurationError("cluster requires a job_id")
         with self._locked_state() as state:
             assert state is not None
-            _unresolved_intent(state, allocation_id)
+            attempt = _unresolved_attempt(state, allocation_id)
             if job_id is None:
-                cast(list[str], state["resolutions"]).append(allocation_id)
+                attempt["acceptance"] = {"status": _NOT_SUBMITTED}
             else:
-                cast(list[dict[str, object]], state["receipts"]).append(
-                    {
-                        "allocation_id": allocation_id,
-                        "job_id": job_id,
-                        "cluster": cluster,
-                    }
-                )
+                attempt["acceptance"] = {
+                    "status": _ACCEPTED,
+                    "job_id": job_id,
+                    "cluster": cluster,
+                }
             state["revision"] = cast(int, state["revision"]) + 1
             self._write_state(state)
 
@@ -821,12 +838,19 @@ class Campaign:
                 state["lineage"] = lineage
             elif state["lineage"] != lineage:
                 raise PlanError("campaign is bound to different target or resource semantics")
-            cast(list[dict[str, object]], state["intents"]).append(
+            lineage = cast(dict[str, object], state["lineage"])
+            cast(list[dict[str, object]], state["attempts"]).append(
                 {
                     "allocation_id": allocation.allocation_id,
                     "task_keys": list(allocation.allocation.task_keys),
+                    "campaign_revision": plan._state_revision,
+                    "retry_task_keys": [
+                        key for key in allocation.allocation.task_keys if key in plan._retry
+                    ],
                     "plan_digest": plan.digest,
                     "script_digest": allocation.script_digest,
+                    "target_digest": lineage["target_digest"],
+                    "resource_digest": lineage["resource_digest"],
                     "allocation": {
                         "cpus": allocation.allocation.cpus,
                         "memory_mib": allocation.allocation.memory_mib,
@@ -836,6 +860,7 @@ class Campaign:
                     "sbatch_argv": list(allocation.argv),
                     "window_start": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S"),
                     "window_end": (now + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S"),
+                    "acceptance": {"status": _UNRESOLVED},
                 }
             )
             state["revision"] = expected_revision + 1
@@ -847,14 +872,12 @@ class Campaign:
             assert state is not None
             if state["revision"] != expected_revision:
                 raise PlanError("campaign changed before receipt")
-            _unresolved_intent(state, receipt.allocation_id)
-            cast(list[dict[str, object]], state["receipts"]).append(
-                {
-                    "allocation_id": receipt.allocation_id,
-                    "job_id": receipt.job_id,
-                    "cluster": receipt.cluster,
-                }
-            )
+            attempt = _unresolved_attempt(state, receipt.allocation_id)
+            attempt["acceptance"] = {
+                "status": _ACCEPTED,
+                "job_id": receipt.job_id,
+                "cluster": receipt.cluster,
+            }
             state["revision"] = expected_revision + 1
             self._write_state(state)
             return expected_revision + 1
@@ -986,39 +1009,36 @@ def _balanced_groups(tasks: tuple[Task, ...], capacity: int) -> tuple[tuple[Task
 
 
 def _receipt_values(state: dict[str, object]) -> tuple[JobReceipt, ...]:
-    intents = {
-        cast(str, intent["allocation_id"]): tuple(cast(list[str], intent["task_keys"]))
-        for intent in cast(list[dict[str, object]], state["intents"])
-    }
     values: list[JobReceipt] = []
-    for raw in cast(list[dict[str, object]], state["receipts"]):
+    for attempt in cast(list[dict[str, object]], state["attempts"]):
+        acceptance = cast(dict[str, object], attempt["acceptance"])
+        if acceptance["status"] != _ACCEPTED:
+            continue
         values.append(
             JobReceipt(
-                cast(str, raw["allocation_id"]),
-                cast(int, raw["job_id"]),
-                cast(str | None, raw["cluster"]),
-                intents[cast(str, raw["allocation_id"])],
+                cast(str, attempt["allocation_id"]),
+                cast(int, acceptance["job_id"]),
+                cast(str | None, acceptance["cluster"]),
+                tuple(cast(list[str], attempt["task_keys"])),
             )
         )
     return tuple(values)
 
 
 def _ambiguous_ids(state: dict[str, object]) -> list[str]:
-    resolved = set(cast(list[str], state["resolutions"]))
-    receipted = {receipt.allocation_id for receipt in _receipt_values(state)}
     return [
-        cast(str, intent["allocation_id"])
-        for intent in cast(list[dict[str, object]], state["intents"])
-        if intent["allocation_id"] not in receipted and intent["allocation_id"] not in resolved
+        cast(str, attempt["allocation_id"])
+        for attempt in cast(list[dict[str, object]], state["attempts"])
+        if cast(dict[str, object], attempt["acceptance"])["status"] == _UNRESOLVED
     ]
 
 
-def _unresolved_intent(state: dict[str, object], allocation_id: str) -> dict[str, object]:
+def _unresolved_attempt(state: dict[str, object], allocation_id: str) -> dict[str, object]:
     if allocation_id not in _ambiguous_ids(state):
         raise ReconciliationError("allocation is not an unresolved ambiguous intent")
-    for intent in cast(list[dict[str, object]], state["intents"]):
-        if intent["allocation_id"] == allocation_id:
-            return intent
+    for attempt in cast(list[dict[str, object]], state["attempts"]):
+        if attempt["allocation_id"] == allocation_id:
+            return attempt
     raise ReconciliationError("allocation intent is missing")
 
 
@@ -1151,11 +1171,10 @@ def _validate_state(state: dict[str, object]) -> None:
         "schema_version",
         "campaign_id",
         "revision",
+        "phase",
         "tasks",
         "lineage",
-        "intents",
-        "receipts",
-        "resolutions",
+        "attempts",
     }
     if (
         set(state) != keys
@@ -1169,21 +1188,28 @@ def _validate_state(state: dict[str, object]) -> None:
         or not isinstance(state["revision"], int)
         or isinstance(state["revision"], bool)
         or state["revision"] < 0
+        or not isinstance(state["phase"], str)
+        or state["phase"] not in {_OPEN, _SEALED}
         or not isinstance(state["tasks"], list)
-        or not isinstance(state["intents"], list)
-        or not isinstance(state["receipts"], list)
-        or not isinstance(state["resolutions"], list)
+        or not isinstance(state["attempts"], list)
     ):
         raise TaskConflict("campaign state values are invalid")
+    if state["phase"] == _SEALED and state["revision"] == 0:
+        raise TaskConflict("campaign roster phase is invalid for its revision")
     task_keys = tuple(task.key for task in _tasks_from_state(state))
     if len(set(task_keys)) != len(task_keys):
         raise TaskConflict("campaign task keys are not unique")
     lineage = _validate_lineage(state["lineage"])
-    intents = _validate_intents(cast(list[object], state["intents"]), task_keys, lineage)
-    receipted = _validate_receipts(cast(list[object], state["receipts"]), intents)
-    resolved = _validate_resolutions(cast(list[object], state["resolutions"]), intents)
-    if receipted & resolved:
-        raise TaskConflict("campaign allocation cannot be accepted and resolved not submitted")
+    minimum_revision = _validate_attempts(
+        cast(list[object], state["attempts"]),
+        task_keys,
+        lineage,
+        state["revision"],
+    )
+    if state["phase"] == _SEALED:
+        minimum_revision += 1
+    if state["revision"] < minimum_revision:
+        raise TaskConflict("campaign revision is behind durable history")
 
 
 def _validate_lineage(
@@ -1211,57 +1237,98 @@ def _validate_lineage(
     return target, resources
 
 
-def _validate_intents(
+def _validate_attempts(
     value: list[object],
     task_keys: tuple[str, ...],
     lineage: tuple[SlurmTarget, ResourceRequest] | None,
-) -> dict[str, tuple[str, ...]]:
+    state_revision: int,
+) -> int:
     expected = {
         "allocation_id",
         "task_keys",
+        "campaign_revision",
+        "retry_task_keys",
         "plan_digest",
         "script_digest",
+        "target_digest",
+        "resource_digest",
         "allocation",
         "sbatch_argv",
         "window_start",
         "window_end",
+        "acceptance",
     }
-    intents: dict[str, tuple[str, ...]] = {}
+    allocation_ids: set[str] = set()
+    accepted_task_keys: set[str] = set()
+    previous_campaign_revision = -1
+    minimum_revision = 0
+    if not value:
+        if lineage is not None:
+            raise TaskConflict("campaign lineage has no attempt history")
+        return minimum_revision
+    if lineage is None:
+        raise TaskConflict("campaign attempt has no resource lineage")
+    target, resources = lineage
+    lineage_values = _lineage(target, resources)
     for raw in value:
         if not isinstance(raw, dict):
-            raise TaskConflict("campaign intent is invalid")
-        intent = cast(dict[str, object], raw)
-        allocation_id = intent.get("allocation_id")
-        raw_keys = intent.get("task_keys")
+            raise TaskConflict("campaign attempt is invalid")
+        attempt = cast(dict[str, object], raw)
+        allocation_id = attempt.get("allocation_id")
+        raw_keys = attempt.get("task_keys")
+        campaign_revision = attempt.get("campaign_revision")
         if (
-            set(intent) != expected
+            set(attempt) != expected
             or not isinstance(allocation_id, str)
             or _HEX_24.fullmatch(allocation_id) is None
-            or allocation_id in intents
+            or allocation_id in allocation_ids
             or not isinstance(raw_keys, list)
+            or type(campaign_revision) is not int
+            or campaign_revision < previous_campaign_revision
+            or campaign_revision >= state_revision
         ):
-            raise TaskConflict("campaign intent is invalid")
-        intent_keys = tuple(cast(list[object], raw_keys))
+            raise TaskConflict("campaign attempt is invalid")
+        attempt_keys = tuple(cast(list[object], raw_keys))
         if (
-            not intent_keys
-            or any(not isinstance(key, str) or key not in task_keys for key in intent_keys)
-            or len(set(intent_keys)) != len(intent_keys)
+            not attempt_keys
+            or any(not isinstance(key, str) or key not in task_keys for key in attempt_keys)
+            or len(set(attempt_keys)) != len(attempt_keys)
         ):
-            raise TaskConflict("campaign intent task keys are invalid")
-        if lineage is None:
-            raise TaskConflict("campaign intent has no resource lineage")
-        target, resources = lineage
+            raise TaskConflict("campaign attempt task keys are invalid")
+        typed_attempt_keys = cast(tuple[str, ...], attempt_keys)
+        if tuple(key for key in task_keys if key in set(typed_attempt_keys)) != typed_attempt_keys:
+            raise TaskConflict("campaign attempt task keys are out of order")
         for name in ("plan_digest", "script_digest"):
-            digest = intent[name]
+            digest = attempt[name]
             if not isinstance(digest, str) or _HEX_64.fullmatch(digest) is None:
-                raise TaskConflict("campaign intent digest is invalid")
-        allocation = intent["allocation"]
-        argv = intent["sbatch_argv"]
+                raise TaskConflict("campaign attempt digest is invalid")
+        if (
+            attempt["target_digest"] != lineage_values["target_digest"]
+            or attempt["resource_digest"] != lineage_values["resource_digest"]
+        ):
+            raise TaskConflict("campaign attempt lineage is invalid")
+        retry_keys = attempt["retry_task_keys"]
+        if not isinstance(retry_keys, list):
+            raise TaskConflict("campaign attempt retry keys are invalid")
+        typed_retry_keys = tuple(cast(list[object], retry_keys))
+        if (
+            any(not isinstance(key, str) for key in typed_retry_keys)
+            or len(set(typed_retry_keys)) != len(typed_retry_keys)
+            or any(
+                key not in attempt_keys or key not in accepted_task_keys for key in typed_retry_keys
+            )
+        ):
+            raise TaskConflict("campaign attempt retry keys are invalid")
+        typed_retries = cast(tuple[str, ...], typed_retry_keys)
+        if tuple(key for key in typed_attempt_keys if key in set(typed_retries)) != typed_retries:
+            raise TaskConflict("campaign attempt retry keys are out of order")
+        allocation = attempt["allocation"]
+        argv = attempt["sbatch_argv"]
         if not isinstance(allocation, dict) or not isinstance(argv, list):
-            raise TaskConflict("campaign intent provenance is invalid")
+            raise TaskConflict("campaign attempt provenance is invalid")
         totals = cast(dict[str, object], allocation)
         typed_argv = cast(list[object], argv)
-        task_count = len(intent_keys)
+        task_count = len(attempt_keys)
         expected_totals = {
             "cpus": task_count * resources.cpus_per_task,
             "memory_mib": task_count * resources.memory_mib_per_task,
@@ -1286,54 +1353,43 @@ def _validate_intents(
             or totals != expected_totals
             or typed_argv != expected_argv
         ):
-            raise TaskConflict("campaign intent provenance is invalid")
+            raise TaskConflict("campaign attempt provenance is invalid")
         if any(
-            not isinstance(intent[name], str) or _CONTROL.search(cast(str, intent[name]))
+            not isinstance(attempt[name], str) or _CONTROL.search(cast(str, attempt[name]))
             for name in ("window_start", "window_end")
         ):
-            raise TaskConflict("campaign intent identity is invalid")
-        intents[allocation_id] = cast(tuple[str, ...], intent_keys)
-    return intents
-
-
-def _validate_receipts(value: list[object], intents: dict[str, tuple[str, ...]]) -> set[str]:
-    seen: set[str] = set()
-    for raw in value:
-        if not isinstance(raw, dict):
-            raise TaskConflict("campaign receipt is invalid")
-        receipt = cast(dict[str, object], raw)
-        allocation_id = receipt.get("allocation_id")
-        job_id = receipt.get("job_id")
-        cluster = receipt.get("cluster")
-        if (
-            set(receipt) != {"allocation_id", "job_id", "cluster"}
-            or not isinstance(allocation_id, str)
-            or allocation_id not in intents
-            or allocation_id in seen
-            or isinstance(job_id, bool)
-            or not isinstance(job_id, int)
-            or job_id <= 0
-            or (
-                cluster is not None
-                and (not isinstance(cluster, str) or _TOKEN.fullmatch(cluster) is None)
-            )
-        ):
-            raise TaskConflict("campaign receipt is invalid")
-        seen.add(allocation_id)
-    return seen
-
-
-def _validate_resolutions(value: list[object], intents: dict[str, tuple[str, ...]]) -> set[str]:
-    seen: set[str] = set()
-    for allocation_id in value:
-        if (
-            not isinstance(allocation_id, str)
-            or allocation_id not in intents
-            or allocation_id in seen
-        ):
-            raise TaskConflict("campaign resolution is invalid")
-        seen.add(allocation_id)
-    return seen
+            raise TaskConflict("campaign attempt identity is invalid")
+        acceptance = attempt["acceptance"]
+        if not isinstance(acceptance, dict):
+            raise TaskConflict("campaign attempt acceptance is invalid")
+        typed_acceptance = cast(dict[str, object], acceptance)
+        status = typed_acceptance.get("status")
+        if isinstance(status, str) and status in {_UNRESOLVED, _NOT_SUBMITTED}:
+            if set(typed_acceptance) != {"status"}:
+                raise TaskConflict("campaign attempt acceptance is invalid")
+            if status == _NOT_SUBMITTED:
+                minimum_revision += 1
+        elif status == _ACCEPTED:
+            job_id = typed_acceptance.get("job_id")
+            cluster = typed_acceptance.get("cluster")
+            if (
+                set(typed_acceptance) != {"status", "job_id", "cluster"}
+                or type(job_id) is not int
+                or job_id <= 0
+                or (
+                    cluster is not None
+                    and (not isinstance(cluster, str) or _TOKEN.fullmatch(cluster) is None)
+                )
+            ):
+                raise TaskConflict("campaign attempt acceptance is invalid")
+            accepted_task_keys.update(typed_attempt_keys)
+            minimum_revision += 1
+        else:
+            raise TaskConflict("campaign attempt acceptance is invalid")
+        allocation_ids.add(allocation_id)
+        previous_campaign_revision = campaign_revision
+        minimum_revision += 1
+    return minimum_revision
 
 
 def _plan_strings(value: object, *, name: str) -> list[str]:

@@ -84,6 +84,34 @@ def test_cli_plan_status_and_help(tmp_path: Path, capsys: pytest.CaptureFixture[
     assert "--retry" in plan_help
 
 
+def test_cli_seal_is_idempotent_and_rejects_later_suffix(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    tasks, resources, target = write_inputs(tmp_path)
+    campaign = tmp_path / "campaign"
+    main(plan_arguments(tasks, resources, target, campaign, tmp_path / "PLAN.json"))
+    capsys.readouterr()
+
+    assert main(["seal", str(campaign)]) == 0
+    assert json.loads(capsys.readouterr().out) == {"sealed": True}
+    sealed = (campaign / "campaign.json").read_bytes()
+    assert main(["seal", str(campaign)]) == 0
+    assert (campaign / "campaign.json").read_bytes() == sealed
+    capsys.readouterr()
+
+    stdin = tmp_path / "stdin.bin"
+    tasks.write_text(
+        json.dumps({"key": "one", "args": ["run"], "stdin_file": stdin.name})
+        + "\n"
+        + json.dumps({"key": "two", "args": ["run"], "stdin_file": stdin.name})
+        + "\n"
+    )
+    with pytest.raises(SystemExit) as rejected:
+        main(plan_arguments(tasks, resources, target, campaign, tmp_path / "GROWN.json"))
+    assert rejected.value.code == 2
+    assert "sealed campaign tasks cannot change" in capsys.readouterr().err
+
+
 def test_cli_plan_output_is_owner_only_and_immutable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

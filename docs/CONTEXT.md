@@ -3,15 +3,20 @@
 Servatus uses a small generic vocabulary:
 
 - **Task:** one stable opaque key, argument vector, and byte payload.
-- **Campaign:** one append-only ordered task sequence and its durable submission history; `open`
-  registers the complete authored roster while `load` reopens existing state without authoring it.
+- **Campaign:** one ordered Task roster and its durable submission history; `open` authors an exact
+  roster or ordered suffix while the roster is open, `seal` ends authoring irreversibly, and `load`
+  reopens existing state without authoring it.
+- **Roster phase:** `OPEN` permits exact ordered suffixes and execution; `SEALED` permits execution
+  but no roster change.
 - **Resource request:** one homogeneous per-Task CPU, MiB, whole-GPU, and wall-time requirement.
 - **Target:** one concrete SSH/Slurm/Apptainer route with conservative request ceilings.
 - **Plan:** a local immutable selection whose exported document is accepted only when regeneration
   from its typed inputs produces the same canonical bytes.
 - **Allocation:** one single-node Slurm job containing concurrent exact Task steps.
-- **Intent:** the synced record written before possible scheduler acceptance; it retains ordered
-  Task keys, plan and script digests, exact command, allocation totals, and query window.
+- **Attempt:** one durable allocation record written before possible scheduler acceptance; it owns
+  ordered Task and retry keys, Campaign revision, lineage, plan and script digests, exact command,
+  allocation totals, query window, and one unresolved, accepted, or not-submitted outcome.
+- **Intent:** the durably synced unresolved Attempt written before possible scheduler acceptance.
 - **Receipt:** a positive Slurm job identity proving scheduler acceptance, not completion; its Task
   keys come from the immutable intent.
 - **Unaccepted task:** one Task without a proven scheduler-acceptance receipt. Application

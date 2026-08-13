@@ -10,11 +10,12 @@ pip install servatus
 
 ## Campaigns
 
-A Campaign freezes an ordered prefix of opaque tasks. Reopening with the exact sequence is
-idempotent; reopening with that exact prefix plus a nonempty suffix durably registers the new
-tasks. Removing, reordering, or changing any registered task fails. Planning is local and
-deterministic. Submission records durable intent before contacting Slurm, records the acceptance
-receipt afterward, and stops on an ambiguous missing receipt rather than risking duplicate work.
+A Campaign owns an ordered roster of opaque tasks. While open, reopening with the exact sequence is
+idempotent and reopening with that exact prefix plus a nonempty suffix durably registers the new
+tasks. Sealing ends authoring irreversibly. Removing, reordering, or changing any registered task
+fails. Planning is local and deterministic. Submission records durable intent before contacting
+Slurm, records the acceptance afterward, and stops on an ambiguous missing receipt rather than
+risking duplicate work.
 
 ```python
 from pathlib import Path, PurePosixPath
@@ -25,6 +26,7 @@ campaign = Campaign.open(
     Path("state/training"),
     [Task("candidate-0", ("train", "--candidate", "0"), b'{"seed": 7}\n')],
 )
+campaign.seal()  # Seal fixed rosters; appendable campaigns may execute while still open.
 resources = ResourceRequest(
     cpus_per_task=8,
     memory_mib_per_task=32768,
@@ -89,13 +91,16 @@ ceiling. An allocation containing `n` Tasks requests exactly `n*C` CPUs, `n*M` M
 time remains `T`. A caller may lower packing with `tasks_per_allocation`, but a cap above feasible
 capacity is rejected rather than clamped. Servatus never rounds up to node capacity.
 
-Append-only growth preserves target/resource lineage, accepted receipts, retry history, and
-ambiguous intents. It increments campaign revision, so a plan made before the append becomes stale.
-Accepted prefix tasks are not selected again unless the caller explicitly requests retry.
+`Campaign.tasks` returns the immutable authored Task tuple. Append-only growth is allowed only while
+the roster is open and preserves target/resource lineage plus every accepted, ambiguous,
+not-submitted, and retry attempt. Append and seal each increment Campaign revision, so older plans
+become stale. Execution remains valid while open. `Campaign.seal()` is atomic and idempotent; a
+sealed Campaign accepts only an exact-roster reopen. Accepted Tasks are not selected again unless
+the caller explicitly requests retry.
 
-The current development line uses Campaign and plan schema 3. Loading a plan regenerates it from
-typed inputs and requires identical canonical bytes. Schema 2 state and plans are rejected; create
-a new Campaign when upgrading.
+The current development line uses Campaign schema 4 and plan schema 3. Campaign schema 3 is rejected
+without migration; create a new Campaign when upgrading. Loading a plan regenerates it from typed
+inputs and requires identical canonical bytes.
 
 Each allocation runs one concurrent
 `srun --exclusive --exact --nodes=1 --ntasks=1` step per Task. Each step receives its exact CPU,
@@ -129,6 +134,7 @@ servatus plan TASKS.jsonl --target TARGET.toml --resources RESOURCES.toml \
 # Explicit sensitive diagnostic; prints complete scripts, arguments, and payloads:
 servatus plan TASKS.jsonl --target TARGET.toml --resources RESOURCES.toml \
   --campaign STATE_DIR --output PLAN.json --show-scripts
+servatus seal STATE_DIR
 servatus validate STATE_DIR PLAN.json
 servatus submit STATE_DIR PLAN.json
 servatus status STATE_DIR
@@ -137,9 +143,9 @@ servatus resolve STATE_DIR ALLOCATION_ID --job-id 1234 --cluster alpha
 servatus resolve STATE_DIR ALLOCATION_ID --not-submitted
 ```
 
-To extend an existing Campaign through the CLI, pass the complete previously registered JSONL
-prefix followed by the new suffix. Supplying only the suffix or changing the prefix fails closed.
-Relative `stdin_file` paths resolve against `TASKS.jsonl`'s parent.
+To extend an open Campaign through the CLI, pass the complete previously registered JSONL prefix
+followed by the new suffix. Supplying only the suffix, changing the prefix, or extending after
+`servatus seal` fails closed. Relative `stdin_file` paths resolve against `TASKS.jsonl`'s parent.
 
 `PLAN.json` is published owner-only and never overwrites an existing path. It contains task keys,
 requested resources, effective allocation totals, target values,
@@ -271,8 +277,8 @@ filesystem with stable cross-client inode identities. See [SECURITY.md](SECURITY
 ## Guarantees and support boundary
 
 - Campaign files are bounded, owner-only, schema-versioned, symlink-safe, atomically replaced, and
-  synced. Every durable read validates the complete snapshot, including the rule that one
-  allocation cannot be both accepted and resolved as not submitted.
+  synced. Every durable read validates the complete snapshot. One tagged Attempt outcome prevents
+  an allocation from being both accepted and resolved as not submitted.
 - Intent preserves the normalized route, guardrails, requested resources, exact allocation totals,
   and reviewed nonsecret `sbatch` command before external acceptance.
 - A destination is absent or one complete regular file or directory. Native commits and the Linux

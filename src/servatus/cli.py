@@ -60,6 +60,9 @@ def _parser() -> argparse.ArgumentParser:
     submit.add_argument("campaign", type=Path)
     submit.add_argument("plan", type=Path)
 
+    seal = commands.add_parser("seal", help="irreversibly seal a Campaign roster")
+    seal.add_argument("campaign", type=Path)
+
     status = commands.add_parser(
         "status", help="show unaccepted tasks, receipts, and ambiguous allocations"
     )
@@ -167,6 +170,9 @@ def _run(arguments: argparse.Namespace) -> None:
         campaign = Campaign.load(arguments.campaign)
         receipts = campaign.submit(restore_plan(campaign, _read_json(arguments.plan)))
         print(json.dumps([_receipt_json(receipt) for receipt in receipts], sort_keys=True))
+    elif command == "seal":
+        Campaign.load(arguments.campaign).seal()
+        print(json.dumps({"sealed": True}, sort_keys=True))
     elif command == "status":
         status = Campaign.load(arguments.campaign).status()
         print(

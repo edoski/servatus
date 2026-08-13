@@ -3,27 +3,32 @@
 Status: accepted
 
 Servatus V1 supports one concrete lane: an unprivileged workstation invokes OpenSSH, absolute Slurm
-executables, and one immutable Apptainer image. A Campaign freezes each registered opaque task and
-permits only an exact append-only suffix, preserving prior order, bytes, resource lineage, intent,
-and receipts. It owns deterministic balanced single-node allocations, complete scripts, and durable
-submission records, and fails closed when scheduler acceptance is ambiguous.
+executables, and one immutable Apptainer image. A Campaign freezes each registered opaque task,
+permits only an exact append-only suffix while its roster is open, and seals authoring
+irreversibly. Append, seal, and submission mutations preserve prior order, bytes, resource lineage,
+and every attempt. Campaign owns deterministic balanced single-node allocations, complete scripts,
+and durable submission records, and fails closed when scheduler acceptance is ambiguous.
 
-The durable lineage retains normalized target guardrails and requested resources once. Each intent
-adds ordered Task keys, plan and script digests, exact effective allocation totals, the nonsecret
-`sbatch` argument vector, and its reconciliation window. Job names derive from allocation identity;
-receipts retain only allocation and Slurm identities; negative resolutions are allocation IDs.
+The durable lineage retains normalized target guardrails and requested resources once. Each Attempt
+adds ordered Task and explicit-retry keys, its Campaign revision, lineage digests, plan and script
+digests, exact effective allocation totals, the nonsecret `sbatch` argument vector, its
+reconciliation window, and one unresolved, accepted, or not-submitted outcome. Job names derive
+from allocation identity; receipts remain public projections of accepted Attempt outcomes.
 Public plan files redact task arguments and payloads. A loaded plan parses only its typed planning
 inputs, regenerates the immutable plan once, and requires identical canonical bytes, so no second
 derived-field validator is needed. Complete script display remains an explicit sensitive
 diagnostic. Authored wall time remains provenance while planned and submitted time reflects Slurm's
 one-time upward minute rounding.
 
-Campaign and plan schema 3 are a clean break. Every bounded owner-only state read validates the
-complete atomic snapshot, including that an allocation cannot have both an acceptance receipt and
-an explicit not-submitted resolution. Internally typed mutations are encoded directly rather than
-decoded again immediately before the atomic write.
+Campaign schema 4 and plan schema 3 are a clean break. Schema-3 Campaign state is rejected without
+migration. Every bounded owner-only state read validates the complete atomic snapshot; one tagged
+Attempt outcome removes the former parallel receipt and negative-resolution authorities.
+Internally typed mutations are encoded directly rather than decoded again immediately before the
+atomic write.
 
 `Campaign.open` registers an authored roster; `Campaign.load` reopens an existing one.
+`Campaign.tasks` exposes the immutable authored tuple, and `Campaign.seal()` atomically and
+idempotently ends suffix authoring. Execution is valid in both roster phases.
 `Campaign.validate` first proves that a plan belongs to the current Campaign revision, then issues
 bounded time-specific `sbatch --test-only` calls. Status reports `unaccepted_task_keys`: receipts
 prove scheduler acceptance, never application completion. Reconciliation reconstructs its target
