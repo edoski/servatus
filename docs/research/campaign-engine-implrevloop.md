@@ -412,6 +412,57 @@ conflicting identities, or partial untrustworthy results raises and aborts inspe
 is synchronous, read-only, and bounded. There is no poll loop, background worker, cache, database,
 or automatic mutation. Current scheduler observations are not durable state.
 
+### Bounded diagnostic logs
+
+Servatus owns the deterministic Slurm log layout, accepted Attempt identity, receipt, packed Task
+order, remote host, and `log_root`. Clients must not reconstruct `%j.out`, `%j-<slot>.out`, packed
+slots, or SSH transport. Log access therefore deepens the same Campaign authority through one
+explicit operation, separate from ordinary inspection:
+
+```python
+@dataclass(frozen=True, slots=True)
+class LogSnapshot:
+    content: bytes = field(repr=False)
+    truncated: bool
+    observed_at: datetime
+
+snapshot = campaign.read_log(
+    allocation_id,
+    task_key=task_key,  # omit for the allocation-level wrapper log
+    max_bytes=65_536,
+)
+```
+
+`allocation_id` must name one exact accepted Attempt owned by the Campaign. A supplied `task_key`
+must belong to that Attempt; its immutable Attempt-local order determines the zero-based packed
+slot. Omitting it selects the allocation wrapper log. Servatus privately derives the stored target,
+receipt Job ID, and exact remote path. Callers cannot supply a host, path, Job ID, shell fragment, or
+arbitrary remote command.
+
+One call returns only the latest suffix, defaults to 64 KiB, and accepts an exact positive byte
+limit no greater than 1 MiB. The implementation may read one extra byte solely to determine
+`truncated`; it never returns more than `max_bytes`. Content is arbitrary bytes and may split lines
+or encoded characters. stdout and stderr stay combined exactly as authored by the existing Slurm
+renderer. Empty content is valid. A missing, unreadable, rejected, or unavailable log; a foreign,
+unaccepted, unresolved, or not-submitted Attempt; an unrelated Task; timeout; nonzero remote
+command; diagnostic stderr; or output overflow raises one redacted `ObservationError` without
+partial content.
+
+The remote operation uses the same private bounded OpenSSH implementation seam as scheduler
+observation: fixed command shape, normalized environment, finite timeout, bounded argv and
+stdout/stderr, and no public transport adapter. The path comes only from validated immutable
+Campaign lineage. Log files may append concurrently; a snapshot claims only the returned bounded
+suffix at `observed_at`, not a stable file or immutable provenance. The existing same-account remote
+log-namespace trust model remains explicit; Servatus does not add a nonportable remote inode
+transaction merely to defend against an out-of-contract hostile replacement.
+
+Log bytes are sensitive diagnostic data. They are never placed in Campaign state, a Campaign view,
+plan documents, operational records, exceptions, `repr`, or automatic CLI JSON. Log presence,
+absence, silence, text, or failure never affects result state, scheduler state, readiness,
+quiescence, planning, retry, reconciliation, or scientific validity. There is no decoder, line
+model, parser registry, progress/epoch concept, search, offset/range protocol, follow mode, stream,
+poller, cache, persistence, multi-log read, or arbitrary-path escape hatch.
+
 ### Campaign view and readiness
 
 One immutable Campaign view binds:
@@ -799,6 +850,8 @@ Scope:
 - retain every attempt observation and project current Task execution from its latest accepted
   attempt, with unresolved acceptance dominant;
 - add the optional plain synchronous result probe to the same `inspect()` path;
+- add one explicit bounded `Campaign.read_log()` diagnostic snapshot over exact accepted Attempt
+  and optional packed Task identity, keeping raw bytes outside `CampaignView`;
 - run probes and scheduler queries outside the Campaign lock and reject revision changes;
 - derive result readiness and execution quiescence independently;
 - keep observations transient, time-stamped, read-only, and redacted;
@@ -809,6 +862,8 @@ Non-goals:
 - no account-wide scan, polling, watcher, cache, or persistence;
 - no invented task-step state from allocation-only evidence;
 - no callback registry, serializer, async API, schema knowledge, finalizer, retry, or queue policy;
+- no log parsing, progress inference, offsets, follow/streaming, polling, cache, arbitrary remote
+  path, public SSH adapter, or log-derived authority;
 - no public scheduler plugin, `observe()` sibling, or second view type.
 
 Required public tests:
@@ -830,6 +885,13 @@ Required public tests:
 - valid immutable results remain result-ready despite unknown scheduler visibility;
 - view output contains no stdin, args, target secrets, or result content;
 - inspection never mutates Campaign bytes or revision.
+- accepted allocation and packed-Task log reads derive exact private paths from durable receipt and
+  Attempt order; foreign/unaccepted identity and unrelated Task input fail before SSH;
+- bounded binary tail snapshots prove exact limit/truncation behavior for empty, small, exact-limit,
+  and over-limit content without decoding;
+- timeout, stderr, nonzero status, output overflow, and unavailable log fail without partial bytes;
+- log content is absent from view/state/plan/record/exception/`repr` and never changes readiness,
+  quiescence, planning, retry, or Campaign bytes/revision.
 
 Genericity gate: include one plain-file and one structured-JSON probe in tests without adding those
 semantics to Servatus. The public interface contains no KAIROS or ML domain term. KAIROS K2 later
@@ -870,6 +932,8 @@ Scope:
 - abort changed eligibility before each mutating `sbatch` call;
 - add CLI `seal` and scheduler-only `inspect`, route plan persistence through the public codec, and
   make CLI planning load exact `SERVATUS.toml` plus optional `--profile`;
+- add thin `servatus log CAMPAIGN ALLOCATION_ID [--task TASK_KEY] [--bytes N]`, writing exact raw
+  snapshot bytes to stdout and delegating all selection, bounds, and errors to `Campaign.read_log()`;
 - remove obsolete acceptance-only status and manual completed-key paths;
 - keep validate/submit/reconcile/resolve thin over public Campaign methods;
 - update README, context, ADR 0003, Campaign-engine ADR, and CLI help.
@@ -878,6 +942,8 @@ Non-goals:
 
 - no automatic retry, cancellation, policy, `run()` facade, probe loader, result-aware CLI, generic
   finalizer, provenance record, or Workspace/publication change.
+- no CLI log parser, decoder, metadata wrapper, arbitrary path, multi-log command, follow mode, or
+  second implementation of Campaign log selection;
 - no global profile store, discovery search, environment fallback, inheritance, composition,
   credentials, profile-management CLI, or compatibility for paired target/resource files.
 
@@ -908,6 +974,9 @@ Required public tests:
 - changed result or execution eligibility aborts;
 - scheduler-only plans need no probe;
 - CLI output and owner-only no-clobber plan files remain safe;
+- CLI `log` addresses one exact accepted allocation and optional member Task, preserves arbitrary
+  bytes without adding a newline, honors the public byte bound, and reports unavailable logs only
+  through the existing error path;
 - no parallel status, completed-set, or plan implementation remains.
 
 Expected outcome:
@@ -984,9 +1053,14 @@ Evidence must prove:
 - bounded query commands and response sizes;
 - at least queued or running observation when placement permits;
 - terminal observation and raw/normalized state agreement;
+- one exact Task log containing a known synthetic stdout/stderr sentinel and one allocation-level
+  log snapshot read through the public bounded interface;
+- exact packed-slot selection where the isolated allocation contains multiple synthetic Tasks;
 - missing/expired-row handling through a synthetic unit test remains authoritative if the live site
   retains the accounting row;
 - Campaign state is unchanged by observation;
+- Campaign state is unchanged by diagnostic log reads, and log content changes no readiness,
+  quiescence, planning, or retry fact;
 - no unrelated job is returned;
 - no automatic retry or mutation occurs.
 
@@ -1410,3 +1484,12 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
   `main`, then removed only temporary/stale Markdown. K1 must re-pin exact then-current KAIROS
   baseline `85209160b57ad146d868090e002cf69ed23a4503`. Its only expected overlap is
   `docs/KAIROS.md`; App product lives under `app/`. This ordering does not affect Servatus S1-S4.
+- 2026-08-13: while S2 was focused-green but uncommitted, the user approved generic bounded Campaign
+  log access. Three independent interface designs compared reference-only provenance, a ranged
+  reader, and a view-centered reader. Reference-only access was too shallow because callers still
+  owned SSH and bounds; offsets/following added mutable-file machinery without a demonstrated need;
+  embedding content in `inspect()` would make routine views sensitive, large, and failure-prone.
+  The accepted design adds one tail-only `Campaign.read_log()` plus `LogSnapshot` to S2, one thin
+  raw-byte `servatus log` command to S3, and exact isolated live evidence to E0. It adds no slice,
+  KAIROS wrapper, log parser, progress model, completion authority, or persistent log state. S2
+  remains paused before commit until this ledger correction receives independent rereview.
