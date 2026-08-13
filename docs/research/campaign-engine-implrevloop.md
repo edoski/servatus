@@ -1468,8 +1468,8 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
 | S4 Servatus consolidation + publication correction | Complete; Standards 0 / Spec 0 at `244e5034` |
 | E1 protected K-study closure | Complete; Runner-attested, schema-3 evidence preserved |
 | E2 disposable KAIROS client proof | Complete; Standards 0 / Spec 0 at disposable `6c69d2f6` |
-| E0 isolated CPU Slurm/log/Ceph acceptance | Authorized; next |
-| Servatus `0.7.0` external release | Authorized; blocked by E0 |
+| E0 isolated CPU Slurm/log/Ceph acceptance | Complete; independently audited GREEN at `bed595a4` |
+| Servatus `0.7.0` external release | Authorized; next |
 | K1-K2 KAIROS adoption | Blocked by public `0.7.0` |
 | I1 main/compact integration | Blocked by K1-K2 |
 | KAIROS image/config/push gates | Separately gated after K1-K2/I1; not authorized here |
@@ -1638,3 +1638,28 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
   static, lock, build, archive, metadata, zero-dependency, and fresh-wheel checks. No live or
   external action ran. E0 must now exercise the exact fixed wheel on isolated Slurm and CephFS
   before release or Runner recovery.
+- 2026-08-13: the first E0 attempt used exact candidate wheel `2b6257e8`, proved the Ceph correction
+  live, and exposed one Slurm portability defect on own CPU-only job `45291`: this site preserved
+  immutable Comment in `squeue` but returned a blank Comment in otherwise exact `sacct` evidence.
+  The job was cancelled after the first failed inspection. Correction `4918d323` split active and
+  accounting identity rules; independent review then rejected padded identity acceptance and mixed
+  unrelated reconciliation rows. Correction `bed595a4` retained raw identity fields through exact
+  source validation and made every reconciliation row fail closed. The same reviewer returned
+  Standards 0 / Spec 0; full gates were 480 passed / 1 environment skip plus static, lock, build,
+  archive, zero-dependency, and fresh-wheel checks.
+- 2026-08-13: final E0 ran exact wheel
+  `18a48551956ab76294902ea13f47fcc0a5dede71dd61ddc70f7551114bdfa8c2` from exact clean product head
+  `bed595a4eb800a65287526890e923812edcc86a6`. CPU-only Campaign
+  `2ec670cdc3278f793a2ab49e506d24fc` submitted one two-Task allocation
+  `5c58c693c160c39ea2a2f7a0` as exact job `45293` on `amdepyc9754`. Public inspection observed
+  QUEUED/PENDING, RUNNING/RUNNING, then SUCCEEDED/COMPLETED with exit `0:0`; result readiness and
+  quiescence were true. Allocation and both packed-Task logs contained their exact sentinels; the
+  installed `servatus log` output was byte-identical to Python with no added newline. Campaign state
+  SHA-256 remained `b9e56f1557cfc0d9892bc47bd4f7cc380ac90a779647abb6d77adba45290ff16`
+  across inspection, Python/CLI log reads, reinspection, and planning; no retry or mutation occurred.
+  Fresh exact-wheel Ceph evidence again proved different-destination progress while one publisher
+  paused after visible rename, same-destination no-clobber, canonical preservation on sync failure,
+  exact content hashes, and zero stage/lock residue. Campaign evidence SHA-256 is
+  `3a43d24d06c95ace61cd27b36565bcd1995b7561bf63be1bb41cc6f6b6dd2977`; publication evidence is
+  `c56576fbc84047f0a42608f27d33f1fdeb48a8cba50c48604e6b71d616f974ca`. Independent read-only audit
+  found zero gaps. E0 is GREEN and the user-authorized E3 release may proceed.
