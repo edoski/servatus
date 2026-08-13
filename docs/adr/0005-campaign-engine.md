@@ -25,7 +25,7 @@ The existing native OpenSSH/Slurm/Apptainer lane, balanced single-node packing, 
 submission cap, intent-before-contact rule, ambiguity handling, explicit retry, reconciliation,
 and validation remain. Plan schema 4 is the clean evidence-aware planning boundary.
 
-One frozen public Profile groups a safe nonbinding label, complete Slurm Target, and homogeneous
+One frozen public Profile groups an opaque nonempty nonbinding label, complete Slurm Target, and homogeneous
 Resource request. The strict repository-local `SERVATUS.toml` document contains a nonempty named
 Profile table and optional default, validates every declared Profile, and offers no inheritance,
 search, environment fallback, global store, or management interface. Exact resolved values own
@@ -73,7 +73,8 @@ default, rejects retry while any accepted Attempt is active, and requires both e
 recorded duplicate-risk acknowledgement while any accepted Attempt is unknown. Ambiguity blocks
 only affected Tasks. The canonical plan freezes revision, roster and attempt projection,
 observations, selection, retry/override keys, Profile label and resolved values, and allocations;
-restoration performs no probe or scheduler query.
+restoration performs no probe or scheduler query. Duplicate-risk warnings derive from the recorded
+override keys rather than a separate canonical plan field.
 
 Before each mutating allocation submission, Campaign reads current state, reprobes only selected
 Tasks for result-aware plans, refreshes relevant accepted Attempts, rereads state, compares

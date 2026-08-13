@@ -220,6 +220,8 @@ Campaign revision change rejects the view.
 A plan freezes the exact Campaign revision, roster and attempt projection, result and scheduler
 observations, selection, retry and duplicate-risk choices, profile label and resolved values, and
 allocations. `plan_document()` and `restore_plan()` provide its canonical cross-process codec.
+Duplicate-risk warnings derive from the frozen acknowledgement keys rather than a second serialized
+field.
 Before each allocation submission, `Campaign.submit()` rereads Campaign state, reprobes only its
 selected Tasks when the plan was result-aware, refreshes relevant accepted Attempts, rereads state,
 and aborts changed eligibility before recording intent or calling `sbatch`. Pass the same probe as

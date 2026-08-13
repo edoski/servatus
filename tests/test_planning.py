@@ -51,6 +51,13 @@ def profile_text(*, default: str | None = "cpu", second: bool = False) -> str:
     return document + document.replace(prefix, "").replace("profiles.cpu", "profiles.alias")
 
 
+def labeled_profile_text(label: str) -> str:
+    encoded = json.dumps(label, ensure_ascii=False)
+    return (
+        profile_text().replace('"cpu"', encoded, 1).replace("profiles.cpu", f"profiles.{encoded}")
+    )
+
+
 def test_profile_loads_the_explicit_complete_lane(tmp_path: Path) -> None:
     path = tmp_path / "SERVATUS.toml"
     path.write_text(profile_text())
@@ -73,6 +80,21 @@ def test_profile_explicit_selection_overrides_default_and_aliases_keep_values(
     assert selected.label == "alias"
     assert selected.target == Profile.load(path).target
     assert selected.resources == Profile.load(path).resources
+
+
+@pytest.mark.parametrize("label", ["cpu lane", "計算 🚀", "cpu\tlane"])
+def test_profile_labels_are_opaque_nonempty_strings(tmp_path: Path, label: str) -> None:
+    path = tmp_path / "SERVATUS.toml"
+    path.write_text(labeled_profile_text(label))
+
+    assert Profile.load(path).label == label
+    assert Profile.load(path, name=label).label == label
+
+
+@pytest.mark.parametrize("label", ["", 7])
+def test_profile_rejects_only_empty_or_nonstr_labels(label: object) -> None:
+    with pytest.raises(ConfigurationError, match="nonempty string"):
+        Profile(label, target(), resources())  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -224,6 +246,7 @@ def test_unknown_retry_requires_recorded_duplicate_risk_warning(
     )
     assert plan.duplicate_risk_task_keys == ("task-0",)
     assert "duplicate execution risk" in plan.warnings[0]
+    assert "warnings" not in plan_document(plan)
 
     monkeypatch.setattr(
         _slurm,
@@ -314,6 +337,20 @@ def test_ambiguous_allocation_blocks_only_affected_tasks(
             view=view,
             retry={"task-0"},
         )
+
+    contacts = 0
+
+    def accept_unaffected(*_args: object, **_kwargs: object) -> _slurm.Result:
+        nonlocal contacts
+        contacts += 1
+        return _slurm.Result(0, b"43;alpha\n", b"")
+
+    monkeypatch.setattr(_slurm, "_run_ssh", accept_unaffected)
+    receipts = campaign.submit(plan)
+
+    assert contacts == 1
+    assert len(receipts) == 1
+    assert receipts[0].task_keys == ("task-1",)
 
 
 def test_accepted_campaign_requires_scheduler_observed_view(
@@ -407,18 +444,27 @@ def test_restored_plan_label_is_retained_by_submitted_attempt(
 ) -> None:
     path = tmp_path / "campaign"
     campaign = Campaign.open(path, tasks(1))
-    plan = campaign.plan(profile(label="restored-lane"), view=campaign.inspect(scheduler=False))
+    label = "cpu lane 🚀\t"
+    plan = campaign.plan(profile(label=label), view=campaign.inspect(scheduler=False))
     restored = restore_plan(campaign, plan_document(plan))
+    contacted: list[tuple[tuple[str, ...], bytes]] = []
+
+    def accept_label(_target: SlurmTarget, argv: tuple[str, ...], script: bytes) -> _slurm.Result:
+        contacted.append((argv, script))
+        return _slurm.Result(0, b"42\n", b"")
+
     monkeypatch.setattr(
         _slurm,
         "_run_ssh",
-        lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
+        accept_label,
     )
 
     campaign.submit(restored)
 
     state = json.loads((path / "campaign.json").read_text())
-    assert state["attempts"][0]["profile_label"] == "restored-lane"
+    assert state["attempts"][0]["profile_label"] == label
+    assert label not in " ".join(contacted[0][0])
+    assert label.encode() not in contacted[0][1]
 
 
 def test_result_aware_submit_reprobes_selected_tasks_and_aborts_changed_result(

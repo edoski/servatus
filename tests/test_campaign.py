@@ -967,7 +967,7 @@ def test_campaign_rejects_invalid_reconciliation_window(
         Campaign.load(path)
 
 
-def test_campaign_rejects_nonfinal_unresolved_attempt(
+def test_campaign_rejects_allocation_after_unresolved_outcome_in_same_plan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "campaign"
@@ -983,7 +983,7 @@ def test_campaign_rejects_nonfinal_unresolved_attempt(
     state["attempts"][0]["acceptance"] = {"status": "UNRESOLVED"}
     state_path.write_text(json.dumps(state))
 
-    with pytest.raises(TaskConflict, match="unresolved"):
+    with pytest.raises(TaskConflict, match="plan outcome is terminal"):
         Campaign.load(path)
 
 

@@ -20,7 +20,8 @@ projections of accepted Attempt outcomes.
 Public plan files redact task arguments and payloads but retain private operational evidence. A
 loaded plan parses its frozen revision-bound Campaign view, selection, retry/override decisions,
 Profile, and allocations, regenerates the immutable plan without external observation, and requires
-identical canonical bytes. Complete script display remains an explicit sensitive diagnostic.
+identical canonical bytes. Presentation warnings derive from recorded duplicate-risk keys rather
+than another canonical field. Complete script display remains an explicit sensitive diagnostic.
 Authored wall time remains provenance while planned and submitted time reflects Slurm's one-time
 upward minute rounding.
 

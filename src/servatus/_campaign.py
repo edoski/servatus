@@ -91,6 +91,12 @@ def _safe_token(value: object, *, name: str, optional: bool = False) -> str | No
     return value
 
 
+def _nonempty_string(value: object, *, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ConfigurationError(f"{name} must be a nonempty string")
+    return value
+
+
 def _absolute_path(value: object, *, name: str) -> PurePosixPath:
     if not isinstance(value, (str, os.PathLike)):
         raise ConfigurationError(f"{name} must be an absolute POSIX path")
@@ -229,7 +235,16 @@ class SlurmTarget:
         )
 
 
-def _resource_from_values(values: object) -> ResourceRequest:
+def _resource_from_values(mapping: dict[str, object]) -> ResourceRequest:
+    return ResourceRequest(
+        cpus_per_task=cast(int, mapping["cpus_per_task"]),
+        memory_mib_per_task=cast(int, mapping["memory_mib_per_task"]),
+        gpus_per_task=cast(int, mapping["gpus_per_task"]),
+        time_limit=cast(str, mapping["time_limit"]),
+    )
+
+
+def _profile_resources(values: object) -> ResourceRequest:
     if not isinstance(values, dict):
         raise ConfigurationError("resources must be a table")
     mapping = cast(dict[str, object], values)
@@ -239,25 +254,10 @@ def _resource_from_values(values: object) -> ResourceRequest:
         raise ConfigurationError(f"unknown resource keys: {', '.join(sorted(unknown))}")
     if missing:
         raise ConfigurationError(f"missing resource keys: {', '.join(sorted(missing))}")
-    return ResourceRequest(
-        cpus_per_task=cast(int, mapping["cpus_per_task"]),
-        memory_mib_per_task=cast(int, mapping["memory_mib_per_task"]),
-        gpus_per_task=cast(int, mapping["gpus_per_task"]),
-        time_limit=cast(str, mapping["time_limit"]),
-    )
+    return _resource_from_values(mapping)
 
 
-def _target_from_values(values: object) -> SlurmTarget:
-    if not isinstance(values, dict):
-        raise ConfigurationError("target must be a table")
-    mapping = cast(dict[str, object], values)
-    allowed = SlurmTarget._REQUIRED | SlurmTarget._OPTIONAL
-    unknown = mapping.keys() - allowed
-    missing = SlurmTarget._REQUIRED - mapping.keys()
-    if unknown:
-        raise ConfigurationError(f"unknown target keys: {', '.join(sorted(unknown))}")
-    if missing:
-        raise ConfigurationError(f"missing target keys: {', '.join(sorted(missing))}")
+def _target_from_values(mapping: dict[str, object]) -> SlurmTarget:
     raw_partitions = mapping["partitions"]
     if not isinstance(raw_partitions, list):
         raise ConfigurationError("partitions must be an array of strings")
@@ -283,6 +283,20 @@ def _target_from_values(values: object) -> SlurmTarget:
     )
 
 
+def _profile_target(values: object) -> SlurmTarget:
+    if not isinstance(values, dict):
+        raise ConfigurationError("target must be a table")
+    mapping = cast(dict[str, object], values)
+    allowed = SlurmTarget._REQUIRED | SlurmTarget._OPTIONAL
+    unknown = mapping.keys() - allowed
+    missing = SlurmTarget._REQUIRED - mapping.keys()
+    if unknown:
+        raise ConfigurationError(f"unknown target keys: {', '.join(sorted(unknown))}")
+    if missing:
+        raise ConfigurationError(f"missing target keys: {', '.join(sorted(missing))}")
+    return _target_from_values(mapping)
+
+
 @dataclass(frozen=True, slots=True)
 class Profile:
     label: str
@@ -290,7 +304,7 @@ class Profile:
     resources: ResourceRequest
 
     def __post_init__(self) -> None:
-        _safe_token(self.label, name="profile label")
+        _nonempty_string(self.label, name="profile label")
         _configuration(isinstance(self.target, SlurmTarget), "profile target is invalid")
         _configuration(isinstance(self.resources, ResourceRequest), "profile resources are invalid")
 
@@ -306,7 +320,7 @@ class Profile:
 
         loaded: dict[str, Self] = {}
         for label, raw in cast(dict[str, object], profiles).items():
-            _safe_token(label, name="profile label")
+            _nonempty_string(label, name="profile label")
             if not isinstance(raw, dict):
                 raise ConfigurationError(f"profile {label!r} must contain target and resources")
             mapping = cast(dict[str, object], raw)
@@ -314,19 +328,19 @@ class Profile:
                 raise ConfigurationError(f"profile {label!r} must contain target and resources")
             loaded[label] = cls(
                 label,
-                _target_from_values(mapping["target"]),
-                _resource_from_values(mapping["resources"]),
+                _profile_target(mapping["target"]),
+                _profile_resources(mapping["resources"]),
             )
 
         default = document.get("default_profile")
         if default is not None:
-            _safe_token(default, name="default_profile")
+            _nonempty_string(default, name="default_profile")
             if cast(str, default) not in loaded:
                 raise ConfigurationError("default_profile does not name a declared profile")
         selected = name if name is not None else cast(str | None, default)
         if selected is None:
             raise ConfigurationError("profile selection is required")
-        _safe_token(selected, name="profile name")
+        _nonempty_string(selected, name="profile name")
         try:
             return loaded[selected]
         except KeyError:
@@ -613,30 +627,8 @@ def _target_from_dict(value: object) -> SlurmTarget:
     if frozenset(mapping) != SlurmTarget._REQUIRED | SlurmTarget._OPTIONAL:
         raise PlanError("plan target keys are invalid")
     try:
-        partitions = mapping["partitions"]
-        if not isinstance(partitions, list):
-            raise TypeError
-        return SlurmTarget(
-            host=cast(str, mapping["host"]),
-            slurm_bin=cast(PurePosixPath, mapping["slurm_bin"]),
-            apptainer=cast(PurePosixPath, mapping["apptainer"]),
-            image=cast(PurePosixPath, mapping["image"]),
-            work_root=cast(PurePosixPath, mapping["work_root"]),
-            log_root=cast(PurePosixPath, mapping["log_root"]),
-            partitions=tuple(cast(list[str], partitions)),
-            account=cast(str | None, mapping["account"]),
-            qos=cast(str | None, mapping["qos"]),
-            constraint=cast(str | None, mapping["constraint"]),
-            gpu_gres=cast(str | None, mapping["gpu_gres"]),
-            max_tasks_per_allocation=cast(int, mapping["max_tasks_per_allocation"]),
-            max_cpus_per_allocation=cast(int, mapping["max_cpus_per_allocation"]),
-            max_memory_mib_per_allocation=cast(int, mapping["max_memory_mib_per_allocation"]),
-            max_gpus_per_allocation=cast(int, mapping["max_gpus_per_allocation"]),
-            max_time_limit=cast(str, mapping["max_time_limit"]),
-            max_allocations_per_submit=cast(int, mapping["max_allocations_per_submit"]),
-            max_script_bytes=cast(int, mapping["max_script_bytes"]),
-        )
-    except (TypeError, ConfigurationError) as error:
+        return _target_from_values(mapping)
+    except ConfigurationError as error:
         raise PlanError("plan target is invalid") from error
 
 
@@ -647,12 +639,7 @@ def _resource_from_dict(value: object) -> ResourceRequest:
     if frozenset(mapping) != ResourceRequest._KEYS:
         raise PlanError("plan resource keys are invalid")
     try:
-        return ResourceRequest(
-            cpus_per_task=cast(int, mapping["cpus_per_task"]),
-            memory_mib_per_task=cast(int, mapping["memory_mib_per_task"]),
-            gpus_per_task=cast(int, mapping["gpus_per_task"]),
-            time_limit=cast(str, mapping["time_limit"]),
-        )
+        return _resource_from_values(mapping)
     except ConfigurationError as error:
         raise PlanError("plan resources are invalid") from error
 
@@ -764,7 +751,6 @@ def _plan_semantics(plan: SubmissionPlan) -> dict[str, object]:
         "excluded": list(plan._excluded),
         "retry": list(plan._retry),
         "duplicate_risk": list(plan._duplicate_risk),
-        "warnings": list(plan.warnings),
         "tasks_per_allocation": plan._tasks_per_allocation,
         "allocations": [_allocation_summary(item) for item in plan._allocations],
     }
@@ -1053,7 +1039,8 @@ class Campaign:
             if requested > capacity:
                 raise PlanError("tasks_per_allocation exceeds feasible capacity")
             capacity = requested
-        selected = tuple(task for task in tasks if task.key in set(selected_keys))
+        selected_key_set = set(selected_keys)
+        selected = tuple(task for task in tasks if task.key in selected_key_set)
         groups = _balanced_groups(selected, capacity)
         campaign_id = cast(str, state["campaign_id"])
         revision = cast(int, state["revision"])
@@ -1361,7 +1348,13 @@ class Campaign:
         now = datetime.now(UTC)
         with self._locked_state() as state:
             assert state is not None
-            if state["revision"] != expected_revision or _ambiguous_ids(state):
+            allocation_keys = set(allocation.allocation.task_keys)
+            conflicting_ambiguity = any(
+                allocation_keys & set(cast(list[str], attempt["task_keys"]))
+                for attempt in cast(list[dict[str, object]], state["attempts"])
+                if cast(dict[str, object], attempt["acceptance"])["status"] == _UNRESOLVED
+            )
+            if state["revision"] != expected_revision or conflicting_ambiguity:
                 raise PlanError("campaign changed before submission intent")
             lineage = _lineage(plan._profile.target, plan._profile.resources)
             if state["lineage"] is None:
@@ -1611,6 +1604,11 @@ def _select_tasks(
     selected: list[str] = []
     excluded: list[str] = []
     used_acknowledgements: set[str] = set()
+    accepted_by_task: dict[str, list[AttemptEvidence]] = {task.key: [] for task in view.tasks}
+    for attempt in view.attempts:
+        if attempt.acceptance is AcceptanceState.ACCEPTED:
+            for key in attempt.task_keys:
+                accepted_by_task[key].append(attempt)
 
     for task in view.tasks:
         if task.result is ResultState.VALID:
@@ -1624,11 +1622,7 @@ def _select_tasks(
             excluded.append(task.key)
             continue
 
-        accepted = tuple(
-            attempt
-            for attempt in view.attempts
-            if attempt.acceptance is AcceptanceState.ACCEPTED and task.key in attempt.task_keys
-        )
+        accepted = accepted_by_task[task.key]
         if not accepted:
             if task.key in retries:
                 raise PlanError("retry requires an earlier accepted attempt")
@@ -1972,6 +1966,7 @@ def _validate_attempts(
     }
     allocation_ids: set[str] = set()
     accepted_task_keys: set[str] = set()
+    unresolved_task_keys: set[str] = set()
     task_positions = {key: index for index, key in enumerate(task_keys)}
     plan_revisions: dict[str, int] = {}
     group_revision: int | None = None
@@ -1992,7 +1987,7 @@ def _validate_attempts(
         raise TaskConflict("campaign attempt has no resource lineage")
     target, resources = lineage
     lineage_values = _lineage(target, resources)
-    for index, raw in enumerate(value):
+    for raw in value:
         if not isinstance(raw, dict):
             raise TaskConflict("campaign attempt is invalid")
         attempt = cast(dict[str, object], raw)
@@ -2020,13 +2015,15 @@ def _validate_attempts(
         typed_attempt_keys = cast(tuple[str, ...], attempt_keys)
         if tuple(key for key in task_keys if key in set(typed_attempt_keys)) != typed_attempt_keys:
             raise TaskConflict("campaign attempt task keys are out of order")
+        if unresolved_task_keys & set(typed_attempt_keys):
+            raise TaskConflict("campaign attempt overlaps unresolved history")
         for name in ("plan_digest", "script_digest"):
             digest = attempt[name]
             if not isinstance(digest, str) or _HEX_64.fullmatch(digest) is None:
                 raise TaskConflict("campaign attempt digest is invalid")
         plan_digest = cast(str, attempt["plan_digest"])
         profile_label = attempt["profile_label"]
-        if not isinstance(profile_label, str) or _TOKEN.fullmatch(profile_label) is None:
+        if not isinstance(profile_label, str) or not profile_label:
             raise TaskConflict("campaign attempt profile label is invalid")
         known_revision = plan_revisions.setdefault(plan_digest, campaign_revision)
         if known_revision != campaign_revision:
@@ -2130,8 +2127,8 @@ def _validate_attempts(
             if set(typed_acceptance) != {"status"}:
                 raise TaskConflict("campaign attempt acceptance is invalid")
             group_terminal = True
-            if status == _UNRESOLVED and index != len(value) - 1:
-                raise TaskConflict("campaign unresolved attempt must be final")
+            if status == _UNRESOLVED:
+                unresolved_task_keys.update(typed_attempt_keys)
             if status == _NOT_SUBMITTED:
                 group_end_revision += 1
         elif status == _ACCEPTED:
@@ -2394,7 +2391,6 @@ def _plan_inputs(
         "excluded",
         "retry",
         "duplicate_risk",
-        "warnings",
         "tasks_per_allocation",
         "allocations",
         "digest",
@@ -2420,7 +2416,7 @@ def _plan_inputs(
     view = _view_from_dict(mapping["view"])
     retry = _plan_strings(mapping["retry"], name="retry")
     duplicate_risk = _plan_strings(mapping["duplicate_risk"], name="duplicate_risk")
-    for name in ("selected", "excluded", "warnings"):
+    for name in ("selected", "excluded"):
         _plan_strings(mapping[name], name=name)
     if len(set(retry)) != len(retry) or len(set(duplicate_risk)) != len(duplicate_risk):
         raise PlanError("plan selections contain duplicate task keys")
