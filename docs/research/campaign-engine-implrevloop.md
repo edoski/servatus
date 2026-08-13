@@ -1,8 +1,7 @@
 # Campaign Engine Implementation and Review Ledger
 
-Status: bounded-log amendment rereview active; S2 product work paused before commit.
-This remains the active plan, but the amended S2/S3/E0 contract is not accepted until both ledger
-review axes return GREEN.
+Status: architecture and amended complete ledger independently reviewed GREEN; implementation
+authorized. This is the active plan.
 
 Date: 2026-08-13
 
@@ -1459,9 +1458,9 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
 | Historical extraction/consolidation/deployment ledger | Complete; archived authority |
 | New Campaign-engine architecture | User-approved |
 | Repository-local Profile revision | User-approved; independent rereview GREEN |
-| New ledger | Prior architecture GREEN; bounded-log amendment rereview active |
+| New ledger | GREEN, including bounded-log amendment |
 | S1 Campaign roster and attempt state | Complete; Standards 0 / Spec 0 at `313b4d32` |
-| S2-S4 Servatus implementation | S2 paused uncommitted during ledger amendment rereview |
+| S2-S4 Servatus implementation | Authorized; S2 resumed from accepted amendment head |
 | Servatus `0.7.0` external release | Not authorized |
 | Active K-study | Running under separate Runner; protected |
 | K1-K2 KAIROS adoption | Blocked by public `0.7.0` and K-study closure |
@@ -1544,3 +1543,9 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
   rather than later CLI work, to prove complete `ObservationError` message/note/cause/context
   redaction and installed-wheel exports. That final evidence-placement correction is under the same
   reviewer; S2 remains paused.
+- 2026-08-13: final bounded-log amendment rereview returned GREEN on both original axes. The
+  accepted ledger head owns allocation-bound filenames, lock-free bounded remote reads, sensitive
+  binary CLI warnings, complete Python exception-chain redaction, installed-wheel exports, and E0
+  live CLI evidence without adding a slice or application authority. S2 may resume from this exact
+  accepted ledger state; its earlier observation delta remains uncommitted and must incorporate the
+  amended contract before fixed-range product review.
