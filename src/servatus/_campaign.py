@@ -41,6 +41,7 @@ _DURATION = re.compile(r"(?:(0|[1-9][0-9]*)-)?([0-9]{2}):([0-5][0-9]):([0-5][0-9
 _HEX_24 = re.compile(r"[0-9a-f]{24}\Z")
 _HEX_32 = re.compile(r"[0-9a-f]{32}\Z")
 _HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
+_WINDOW_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"
 _MAX_STATE_BYTES = 256 * 1024 * 1024
 
 
@@ -361,6 +362,18 @@ def _task_record(task: Task) -> dict[str, object]:
         "stdin": base64.b64encode(task.stdin).decode("ascii"),
     }
     return {**semantic, "digest": _digest(semantic)}
+
+
+def _reconciliation_timestamp(value: object) -> datetime:
+    if not isinstance(value, str) or len(value) != 19:
+        raise TaskConflict("campaign attempt reconciliation window is invalid")
+    try:
+        parsed = datetime.strptime(value, _WINDOW_TIMESTAMP_FORMAT)
+    except ValueError as error:
+        raise TaskConflict("campaign attempt reconciliation window is invalid") from error
+    if parsed.strftime(_WINDOW_TIMESTAMP_FORMAT) != value:
+        raise TaskConflict("campaign attempt reconciliation window is invalid")
+    return parsed
 
 
 def _task_from_record(record: object) -> Task:
@@ -1200,16 +1213,13 @@ def _validate_state(state: dict[str, object]) -> None:
     if len(set(task_keys)) != len(task_keys):
         raise TaskConflict("campaign task keys are not unique")
     lineage = _validate_lineage(state["lineage"])
-    minimum_revision = _validate_attempts(
+    _validate_attempts(
         cast(list[object], state["attempts"]),
         task_keys,
         lineage,
         state["revision"],
+        sealed=state["phase"] == _SEALED,
     )
-    if state["phase"] == _SEALED:
-        minimum_revision += 1
-    if state["revision"] < minimum_revision:
-        raise TaskConflict("campaign revision is behind durable history")
 
 
 def _validate_lineage(
@@ -1242,7 +1252,9 @@ def _validate_attempts(
     task_keys: tuple[str, ...],
     lineage: tuple[SlurmTarget, ResourceRequest] | None,
     state_revision: int,
-) -> int:
+    *,
+    sealed: bool,
+) -> None:
     expected = {
         "allocation_id",
         "task_keys",
@@ -1260,17 +1272,20 @@ def _validate_attempts(
     }
     allocation_ids: set[str] = set()
     accepted_task_keys: set[str] = set()
-    previous_campaign_revision = -1
-    minimum_revision = 0
+    plan_revisions: dict[str, int] = {}
+    group_revision: int | None = None
+    group_plan_digest: str | None = None
+    group_end_revision = 0
+    unexplained_revisions = 0
     if not value:
         if lineage is not None:
             raise TaskConflict("campaign lineage has no attempt history")
-        return minimum_revision
+        return
     if lineage is None:
         raise TaskConflict("campaign attempt has no resource lineage")
     target, resources = lineage
     lineage_values = _lineage(target, resources)
-    for raw in value:
+    for index, raw in enumerate(value):
         if not isinstance(raw, dict):
             raise TaskConflict("campaign attempt is invalid")
         attempt = cast(dict[str, object], raw)
@@ -1284,7 +1299,7 @@ def _validate_attempts(
             or allocation_id in allocation_ids
             or not isinstance(raw_keys, list)
             or type(campaign_revision) is not int
-            or campaign_revision < previous_campaign_revision
+            or campaign_revision < 0
             or campaign_revision >= state_revision
         ):
             raise TaskConflict("campaign attempt is invalid")
@@ -1302,6 +1317,25 @@ def _validate_attempts(
             digest = attempt[name]
             if not isinstance(digest, str) or _HEX_64.fullmatch(digest) is None:
                 raise TaskConflict("campaign attempt digest is invalid")
+        plan_digest = cast(str, attempt["plan_digest"])
+        known_revision = plan_revisions.setdefault(plan_digest, campaign_revision)
+        if known_revision != campaign_revision:
+            raise TaskConflict("campaign attempt plan revision is inconsistent")
+        if group_revision is None:
+            unexplained_revisions = campaign_revision
+            group_revision = campaign_revision
+            group_plan_digest = plan_digest
+            group_end_revision = campaign_revision
+        elif campaign_revision == group_revision:
+            if plan_digest != group_plan_digest:
+                raise TaskConflict("campaign attempt plan group is invalid")
+        else:
+            if campaign_revision < group_end_revision:
+                raise TaskConflict("campaign attempt revision precedes durable history")
+            unexplained_revisions += campaign_revision - group_end_revision
+            group_revision = campaign_revision
+            group_plan_digest = plan_digest
+            group_end_revision = campaign_revision
         if (
             attempt["target_digest"] != lineage_values["target_digest"]
             or attempt["resource_digest"] != lineage_values["resource_digest"]
@@ -1311,17 +1345,12 @@ def _validate_attempts(
         if not isinstance(retry_keys, list):
             raise TaskConflict("campaign attempt retry keys are invalid")
         typed_retry_keys = tuple(cast(list[object], retry_keys))
-        if (
-            any(not isinstance(key, str) for key in typed_retry_keys)
-            or len(set(typed_retry_keys)) != len(typed_retry_keys)
-            or any(
-                key not in attempt_keys or key not in accepted_task_keys for key in typed_retry_keys
-            )
-        ):
+        if any(not isinstance(key, str) for key in typed_retry_keys):
             raise TaskConflict("campaign attempt retry keys are invalid")
         typed_retries = cast(tuple[str, ...], typed_retry_keys)
-        if tuple(key for key in typed_attempt_keys if key in set(typed_retries)) != typed_retries:
-            raise TaskConflict("campaign attempt retry keys are out of order")
+        expected_retries = tuple(key for key in typed_attempt_keys if key in accepted_task_keys)
+        if typed_retries != expected_retries:
+            raise TaskConflict("campaign attempt retry keys do not match accepted history")
         allocation = attempt["allocation"]
         argv = attempt["sbatch_argv"]
         if not isinstance(allocation, dict) or not isinstance(argv, list):
@@ -1354,11 +1383,10 @@ def _validate_attempts(
             or typed_argv != expected_argv
         ):
             raise TaskConflict("campaign attempt provenance is invalid")
-        if any(
-            not isinstance(attempt[name], str) or _CONTROL.search(cast(str, attempt[name]))
-            for name in ("window_start", "window_end")
-        ):
-            raise TaskConflict("campaign attempt identity is invalid")
+        window_start = _reconciliation_timestamp(attempt["window_start"])
+        window_end = _reconciliation_timestamp(attempt["window_end"])
+        if window_start >= window_end:
+            raise TaskConflict("campaign attempt reconciliation window is not ordered")
         acceptance = attempt["acceptance"]
         if not isinstance(acceptance, dict):
             raise TaskConflict("campaign attempt acceptance is invalid")
@@ -1367,8 +1395,10 @@ def _validate_attempts(
         if isinstance(status, str) and status in {_UNRESOLVED, _NOT_SUBMITTED}:
             if set(typed_acceptance) != {"status"}:
                 raise TaskConflict("campaign attempt acceptance is invalid")
+            if status == _UNRESOLVED and index != len(value) - 1:
+                raise TaskConflict("campaign unresolved attempt must be final")
             if status == _NOT_SUBMITTED:
-                minimum_revision += 1
+                group_end_revision += 1
         elif status == _ACCEPTED:
             job_id = typed_acceptance.get("job_id")
             cluster = typed_acceptance.get("cluster")
@@ -1383,13 +1413,16 @@ def _validate_attempts(
             ):
                 raise TaskConflict("campaign attempt acceptance is invalid")
             accepted_task_keys.update(typed_attempt_keys)
-            minimum_revision += 1
+            group_end_revision += 1
         else:
             raise TaskConflict("campaign attempt acceptance is invalid")
         allocation_ids.add(allocation_id)
-        previous_campaign_revision = campaign_revision
-        minimum_revision += 1
-    return minimum_revision
+        group_end_revision += 1
+    if state_revision < group_end_revision:
+        raise TaskConflict("campaign revision is behind durable attempt history")
+    unexplained_revisions += state_revision - group_end_revision
+    if sealed and unexplained_revisions < 1:
+        raise TaskConflict("campaign roster phase is invalid for its revision history")
 
 
 def _plan_strings(value: object, *, name: str) -> list[str]:

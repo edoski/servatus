@@ -748,6 +748,37 @@ def test_campaign_rejects_revision_behind_attempt_history(
         Campaign.load(campaign_path)
 
 
+@pytest.mark.parametrize(
+    ("revisions", "repeat_plan_digest"),
+    [((-1, 2), False), ((0, 1), False), ((0, 0), False), ((0, 2), True)],
+)
+def test_campaign_rejects_impossible_attempt_revision_groups(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    revisions: tuple[int, int],
+    repeat_plan_digest: bool,
+) -> None:
+    campaign_path = tmp_path / "campaign"
+    campaign = Campaign.open(campaign_path, tasks(1))
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
+    )
+    campaign.submit(campaign.plan(target(), resources()))
+    campaign.submit(campaign.plan(target(), resources(), retry={"task-0"}))
+    state_path = campaign_path / "campaign.json"
+    state = json.loads(state_path.read_text())
+    for attempt, revision in zip(state["attempts"], revisions, strict=True):
+        attempt["campaign_revision"] = revision
+    if repeat_plan_digest:
+        state["attempts"][1]["plan_digest"] = state["attempts"][0]["plan_digest"]
+    state_path.write_text(json.dumps(state))
+
+    with pytest.raises(TaskConflict):
+        Campaign.load(campaign_path)
+
+
 def test_campaign_rejects_lineage_without_attempt_history(tmp_path: Path) -> None:
     campaign_path = tmp_path / "campaign"
     Campaign.open(campaign_path, tasks(1))
@@ -805,6 +836,83 @@ def test_campaign_rejects_reordered_attempt_task_lineage(
     state_path.write_text(json.dumps(state))
 
     with pytest.raises(TaskConflict, match="task keys"):
+        Campaign.load(path)
+
+
+@pytest.mark.parametrize("retry_task_keys", [[], ["task-0"]])
+def test_campaign_rejects_erased_retry_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retry_task_keys: list[str],
+) -> None:
+    path = tmp_path / "campaign"
+    campaign = Campaign.open(path, tasks(2))
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
+    )
+    campaign.submit(campaign.plan(target(), resources()))
+    campaign.submit(campaign.plan(target(), resources(), retry={"task-0", "task-1"}))
+    state_path = path / "campaign.json"
+    state = json.loads(state_path.read_text())
+    state["attempts"][1]["retry_task_keys"] = retry_task_keys
+    state_path.write_text(json.dumps(state))
+
+    with pytest.raises(TaskConflict, match="retry keys"):
+        Campaign.load(path)
+
+
+@pytest.mark.parametrize("corruption", ["empty", "noncanonical", "reversed"])
+def test_campaign_rejects_invalid_reconciliation_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    path = tmp_path / "campaign"
+    campaign = Campaign.open(path, tasks(1))
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(1, b"", b"lost reply"),
+    )
+    with pytest.raises(AmbiguousSubmission):
+        campaign.submit(campaign.plan(target(), resources()))
+    state_path = path / "campaign.json"
+    state = json.loads(state_path.read_text())
+    attempt = state["attempts"][0]
+    if corruption == "empty":
+        attempt["window_start"] = ""
+    elif corruption == "noncanonical":
+        attempt["window_start"] = "2026-8-13T00:00:00"
+    else:
+        attempt["window_start"], attempt["window_end"] = (
+            attempt["window_end"],
+            attempt["window_start"],
+        )
+    state_path.write_text(json.dumps(state))
+
+    with pytest.raises(TaskConflict, match="window"):
+        Campaign.load(path)
+
+
+def test_campaign_rejects_nonfinal_unresolved_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "campaign"
+    campaign = Campaign.open(path, tasks(2))
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
+    )
+    campaign.submit(campaign.plan(target(max_tasks_per_allocation=1), resources()))
+    state_path = path / "campaign.json"
+    state = json.loads(state_path.read_text())
+    state["attempts"][0]["acceptance"] = {"status": "UNRESOLVED"}
+    state_path.write_text(json.dumps(state))
+
+    with pytest.raises(TaskConflict, match="unresolved"):
         Campaign.load(path)
 
 
