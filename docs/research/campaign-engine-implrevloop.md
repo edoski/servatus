@@ -1462,7 +1462,8 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
 | New ledger | GREEN, including bounded-log amendment |
 | S1 Campaign roster and attempt state | Complete; Standards 0 / Spec 0 at `313b4d32` |
 | S2 Campaign observation and bounded logs | Complete; Standards 0 / Spec 0 at `54b05a2e` |
-| S3-S4 Servatus implementation | Authorized; S3 next |
+| S3 Profile-based evidence planning and CLI | Complete; Standards 0 / Spec 0 at `08567547` |
+| S4 Servatus consolidation | Authorized; S4 next |
 | Servatus `0.7.0` external release | Not authorized |
 | Active K-study | Running under separate Runner; protected |
 | K1-K2 KAIROS adoption | Blocked by public `0.7.0` and K-study closure |
@@ -1567,3 +1568,19 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
   and fresh installed-wheel public API plus both CLI entry points. No live SSH/Slurm, KAIROS,
   protected Campaign, remote, release, or S3+ action ran. Exact accepted S2 head is
   `54b05a2eb8371efd8cda741ca1f7f1161147df11`.
+- 2026-08-13: S3 implemented strict repository Profile loading, one revision-bound evidence-aware
+  planning path, canonical plan schema 4, per-allocation submit freshness, scheduler-only CLI
+  `inspect`, and raw bounded CLI `log` from exact baseline `eaa08ab4`. Initial commit `8f8c5957`
+  passed all local gates but independent review rejected global ambiguity blocking unaffected work,
+  over-restricted Profile labels, quadratic scans, duplicate decoders, and serialized derived
+  warnings. Correction `5eb08f83` closed those findings but exposed delayed acceptance-outcome
+  chronology and one remaining refresh scan. Correction `1d166087` added the minimal
+  `acceptance.outcome_revision` fact and direct refresh pairs; rereview then rejected raw-revision
+  memory growth and repeated append scans. Final correction `08567547` bounded revision validation
+  arithmetically by roster/Attempt facts and used one monotone chronology traversal. The same
+  reviewer returned final GREEN with Standards 0 / Spec 0 on `1d166087..08567547`; all earlier S3
+  findings remained closed. Final gates were 454 passed / 1 environment skip, lock and dry-sync,
+  Ruff check/format, strict Pyright, Vulture, build/archive/metadata inspection, zero runtime
+  dependencies, diff check, and fresh installed-wheel Profile/plan plus both CLI entry points. No
+  live SSH/Slurm, KAIROS, protected Campaign, remote, release, or S4 action ran. Exact accepted S3
+  head is `08567547568f945db4ea250dedde818b870cab6a`.
