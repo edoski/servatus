@@ -90,9 +90,9 @@ Every slice records its exact baseline, head, worktree, commit range, status, an
 next slice starts. Later baselines are the preceding independently accepted heads, never an
 unreviewed moving branch.
 
-## Protected active Campaign
+## Protected completed Campaign
 
-The Runner task owns the current K-study:
+The Runner task owns the completed K-study evidence:
 
 - K-study UUID `b0e6d421-86e9-4ef6-8d81-d02f355b2da0`;
 - Servatus Campaign `9afb18b38088a3dfa88147011945ba7f`;
@@ -100,12 +100,14 @@ The Runner task owns the current K-study:
 - initial jobs `45085` through `45090`;
 - never-started `BadConstraints` attempts `45085` and `45086`, whose exact eight keys were
   explicitly retried as jobs `45091` through `45094`;
-- an independent hourly Runner heartbeat named `kairos-final-k-study`.
+- its retired hourly Runner heartbeat was named `kairos-final-k-study`.
 
 This program must not inspect, edit, migrate, reopen, resolve, retry, cancel, reprioritize, or delete
 that Campaign or its jobs. Servatus `0.7` state is a clean break and must reject `0.6` state. The
-running Campaign continues under its pinned KAIROS checkout, Servatus `0.6.0`, immutable image, and
-Runner until the Runner reports it closed.
+Runner has attested that every intended K-study Task has valid canonical evidence, no retry or
+authoring remains, and no job or heartbeat still needs this schema-3 Campaign. The exact manifest is
+`outputs/experiments/k_study/b0e6d421-86e9-4ef6-8d81-d02f355b2da0/manifest.json`. Current held-out
+and future inference work remain outside this program.
 
 Servatus implementation, local synthetic tests, and CI may proceed without touching the protected
 Campaign. The isolated E0 live gate, stable `0.7.0` release, KAIROS adoption, dependency repinning,
@@ -1463,12 +1465,14 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
 | S1 Campaign roster and attempt state | Complete; Standards 0 / Spec 0 at `313b4d32` |
 | S2 Campaign observation and bounded logs | Complete; Standards 0 / Spec 0 at `54b05a2e` |
 | S3 Profile-based evidence planning and CLI | Complete; Standards 0 / Spec 0 at `08567547` |
-| S4 Servatus consolidation | Authorized; S4 next |
-| Servatus `0.7.0` external release | Not authorized |
-| Active K-study | Running under separate Runner; protected |
-| K1-K2 KAIROS adoption | Blocked by public `0.7.0` and K-study closure |
+| S4 Servatus consolidation | Complete; Standards 0 / Spec 0 at `d04e567c` |
+| E1 protected K-study closure | Complete; Runner-attested, schema-3 evidence preserved |
+| E2 disposable KAIROS client proof | Next; local and non-production |
+| E0 isolated CPU Slurm/log acceptance | Authorized; blocked by E2 |
+| Servatus `0.7.0` external release | Authorized; blocked by E0 and E2 |
+| K1-K2 KAIROS adoption | Blocked by public `0.7.0` |
 | I1 main/compact integration | Blocked by K1-K2 |
-| Push/image/acceptance/config/cleanup | Separately gated and not authorized |
+| KAIROS image/config/push gates | Separately gated after K1-K2/I1; not authorized here |
 
 ## Run record
 
@@ -1584,3 +1588,23 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
   dependencies, diff check, and fresh installed-wheel Profile/plan plus both CLI entry points. No
   live SSH/Slurm, KAIROS, protected Campaign, remote, release, or S4 action ran. Exact accepted S3
   head is `08567547568f945db4ea250dedde818b870cab6a`.
+- 2026-08-13: S4 added canonical redacted `Campaign.record()` provenance, completed the package
+  audit, and prepared version `0.7.0` from exact baseline `c8591386`. Initial commit `0238ac0a`
+  passed all local gates but independent review rejected forgeable included view evidence, repeated
+  roster decoding, and missing explicit attempt/retry digests. Separate correction `d04e567c`
+  bound the complete authentic view semantics without a new public token, reused one validated
+  roster projection, and added documented canonical redacted digests. The same reviewer returned
+  GREEN with Standards 0 / Spec 0 on `0238ac0a..d04e567c`; all earlier S4 findings remained closed.
+  Final gates were 456 passed / 1 environment skip, lock and dry-sync, Ruff check/format, strict
+  Pyright, Vulture, build/archive/metadata inspection, zero runtime dependencies, diff check, and
+  fresh installed-wheel record/API plus both CLI entry points. Exact accepted S4 head is
+  `d04e567c82f9f3b566b664ea24d132aba9f3b81b`. No external action ran.
+- 2026-08-13: the Runner attested E1 complete for protected K-study
+  `b0e6d421-86e9-4ef6-8d81-d02f355b2da0` and schema-3 Campaign
+  `9afb18b38088a3dfa88147011945ba7f`. Its canonical manifest contains exactly 27 unique selected
+  LSTM references: 24 newly trained artifacts plus the three frozen `K=5` artifacts. Every intended
+  Task has valid canonical evidence; no K-study job, heartbeat, retry, ambiguity resolution,
+  authoring, copying, or closure work remains. The schema-3 Campaign stays preserved and untouched;
+  active held-out and future inference work remain excluded. The user separately authorized E0
+  isolated CPU Slurm/log acceptance and E3 Servatus `0.7.0` publication, both still subject to
+  their prerequisite GREEN gates.
