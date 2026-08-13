@@ -376,6 +376,26 @@ def _reconciliation_timestamp(value: object) -> datetime:
     return parsed
 
 
+def _validate_revision_feasibility(
+    gaps: list[int], required_prefixes: list[int], task_count: int, *, sealed: bool
+) -> None:
+    append_count = sum(gaps) - int(sealed)
+    if append_count < 0 or append_count > task_count:
+        raise TaskConflict("campaign revision cannot be explained by roster history")
+    future_revisions = 0
+    seal_after = -1
+    for group_index in range(len(required_prefixes) - 1, -1, -1):
+        future_revisions += gaps[group_index + 1]
+        capacity_without_seal = task_count - future_revisions
+        required = required_prefixes[group_index]
+        if required > capacity_without_seal:
+            if not sealed or required > capacity_without_seal + 1:
+                raise TaskConflict("campaign revision cannot be explained by roster history")
+            seal_after = max(seal_after, group_index)
+    if sealed and not any(gaps[index] > 0 for index in range(seal_after + 1, len(gaps))):
+        raise TaskConflict("campaign revision cannot be explained by one roster seal")
+
+
 def _task_from_record(record: object) -> Task:
     if not isinstance(record, dict):
         raise TaskConflict("campaign task record is invalid")
@@ -1272,14 +1292,19 @@ def _validate_attempts(
     }
     allocation_ids: set[str] = set()
     accepted_task_keys: set[str] = set()
+    task_positions = {key: index for index, key in enumerate(task_keys)}
     plan_revisions: dict[str, int] = {}
     group_revision: int | None = None
     group_plan_digest: str | None = None
     group_end_revision = 0
-    unexplained_revisions = 0
+    group_required_prefix = 0
+    group_last_task_position = -1
+    revision_gaps: list[int] = []
+    required_prefixes: list[int] = []
     if not value:
         if lineage is not None:
             raise TaskConflict("campaign lineage has no attempt history")
+        _validate_revision_feasibility([state_revision], [], len(task_keys), sealed=sealed)
         return
     if lineage is None:
         raise TaskConflict("campaign attempt has no resource lineage")
@@ -1322,7 +1347,7 @@ def _validate_attempts(
         if known_revision != campaign_revision:
             raise TaskConflict("campaign attempt plan revision is inconsistent")
         if group_revision is None:
-            unexplained_revisions = campaign_revision
+            revision_gaps.append(campaign_revision)
             group_revision = campaign_revision
             group_plan_digest = plan_digest
             group_end_revision = campaign_revision
@@ -1332,10 +1357,18 @@ def _validate_attempts(
         else:
             if campaign_revision < group_end_revision:
                 raise TaskConflict("campaign attempt revision precedes durable history")
-            unexplained_revisions += campaign_revision - group_end_revision
+            revision_gaps.append(campaign_revision - group_end_revision)
+            required_prefixes.append(group_required_prefix)
             group_revision = campaign_revision
             group_plan_digest = plan_digest
             group_end_revision = campaign_revision
+            group_required_prefix = 0
+            group_last_task_position = -1
+        positions = tuple(task_positions[key] for key in typed_attempt_keys)
+        if positions[0] <= group_last_task_position:
+            raise TaskConflict("campaign plan allocation sequence is invalid")
+        group_last_task_position = positions[-1]
+        group_required_prefix = max(group_required_prefix, positions[-1] + 1)
         if (
             attempt["target_digest"] != lineage_values["target_digest"]
             or attempt["resource_digest"] != lineage_values["resource_digest"]
@@ -1420,9 +1453,9 @@ def _validate_attempts(
         group_end_revision += 1
     if state_revision < group_end_revision:
         raise TaskConflict("campaign revision is behind durable attempt history")
-    unexplained_revisions += state_revision - group_end_revision
-    if sealed and unexplained_revisions < 1:
-        raise TaskConflict("campaign roster phase is invalid for its revision history")
+    revision_gaps.append(state_revision - group_end_revision)
+    required_prefixes.append(group_required_prefix)
+    _validate_revision_feasibility(revision_gaps, required_prefixes, len(task_keys), sealed=sealed)
 
 
 def _plan_strings(value: object, *, name: str) -> list[str]:

@@ -779,6 +779,32 @@ def test_campaign_rejects_impossible_attempt_revision_groups(
         Campaign.load(campaign_path)
 
 
+@pytest.mark.parametrize("with_attempt", [False, True])
+def test_campaign_rejects_unexplained_revision_inflation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_attempt: bool,
+) -> None:
+    campaign_path = tmp_path / "campaign"
+    campaign = Campaign.open(campaign_path, tasks(1))
+    if with_attempt:
+        monkeypatch.setattr(
+            _slurm,
+            "_run_ssh",
+            lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
+        )
+        campaign.submit(campaign.plan(target(), resources()))
+    state_path = campaign_path / "campaign.json"
+    state = json.loads(state_path.read_text())
+    state["revision"] = 102 if with_attempt else 100
+    if with_attempt:
+        state["attempts"][0]["campaign_revision"] = 100
+    state_path.write_text(json.dumps(state))
+
+    with pytest.raises(TaskConflict, match="revision"):
+        Campaign.load(campaign_path)
+
+
 def test_campaign_rejects_lineage_without_attempt_history(tmp_path: Path) -> None:
     campaign_path = tmp_path / "campaign"
     Campaign.open(campaign_path, tasks(1))
@@ -913,6 +939,33 @@ def test_campaign_rejects_nonfinal_unresolved_attempt(
     state_path.write_text(json.dumps(state))
 
     with pytest.raises(TaskConflict, match="unresolved"):
+        Campaign.load(path)
+
+
+@pytest.mark.parametrize("corruption", ["reversed", "overlap"])
+def test_campaign_rejects_changed_plan_allocation_sequence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    path = tmp_path / "campaign"
+    campaign = Campaign.open(path, tasks(2))
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
+    )
+    campaign.submit(campaign.plan(target(max_tasks_per_allocation=1), resources()))
+    state_path = path / "campaign.json"
+    state = json.loads(state_path.read_text())
+    if corruption == "reversed":
+        state["attempts"].reverse()
+    else:
+        state["attempts"][1]["task_keys"] = ["task-0"]
+        state["attempts"][1]["retry_task_keys"] = ["task-0"]
+    state_path.write_text(json.dumps(state))
+
+    with pytest.raises(TaskConflict, match="allocation sequence"):
         Campaign.load(path)
 
 
