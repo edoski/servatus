@@ -611,9 +611,15 @@ def _combine_observations(
             AllocationState.FAILED,
             AllocationState.CANCELLED,
         }
-        if active_state is accounting_state or (
+        same_base = _state_base(active.state) == _state_base(accounting.state)
+        compatible_active_variant = active_state is accounting_state and active_state in {
+            AllocationState.QUEUED,
+            AllocationState.RUNNING,
+        }
+        accounting_is_older = (
             active_state is AllocationState.RUNNING and accounting_state is AllocationState.QUEUED
-        ):
+        )
+        if same_base or compatible_active_variant or accounting_is_older:
             primary = active
         elif (
             active_state is AllocationState.QUEUED and accounting_state is AllocationState.RUNNING

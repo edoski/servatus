@@ -653,8 +653,12 @@ def test_active_scheduler_row_wins_a_legitimate_accounting_transition_and_packed
         ("RUNNING", "COMPLETED", AllocationState.SUCCEEDED, "COMPLETED", True),
         ("PENDING", "RUNNING", AllocationState.RUNNING, "RUNNING", False),
         ("COMPLETING", "RUNNING", AllocationState.RUNNING, "COMPLETING", False),
+        ("CANCELLED by 1234", "CANCELLED+", AllocationState.CANCELLED, "CANCELLED by 1234", True),
         ("COMPLETED", "FAILED", None, None, None),
         ("COMPLETED", "RUNNING", None, None, None),
+        ("FAILED", "TIMEOUT", None, None, None),
+        ("CANCELLED", "PREEMPTED", None, None, None),
+        ("FUTURE_ACTIVE", "FUTURE_ACCOUNTING", None, None, None),
     ],
 )
 def test_same_incarnation_uses_ordered_later_sample_and_rejects_conflicts(
