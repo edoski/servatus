@@ -146,11 +146,21 @@ def test_directory_fallback_publishes_complete_tree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _force_linux_fallback(monkeypatch)
+    destination = tmp_path / "result"
+    real_sync = _posix.sync_descriptor
+    parent_syncs = 0
 
-    publication = publish(
-        tmp_path / "result", lambda draft: (draft.path / "value").write_text("complete")
-    )
+    def count_post_rename_parent_sync(descriptor: int) -> None:
+        nonlocal parent_syncs
+        if _posix.same_entry(os.fstat(descriptor), tmp_path.stat()) and destination.is_dir():
+            parent_syncs += 1
+        real_sync(descriptor)
 
+    monkeypatch.setattr(_posix, "sync_descriptor", count_post_rename_parent_sync)
+
+    publication = publish(destination, lambda draft: (draft.path / "value").write_text("complete"))
+
+    assert parent_syncs == 1
     assert publication.cleanup_pending is False
     assert (publication.destination / "value").read_text() == "complete"
 
