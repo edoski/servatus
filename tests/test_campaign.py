@@ -700,8 +700,10 @@ def test_campaign_rejects_attempt_with_contradictory_acceptance_fields(
         "status": "ACCEPTED",
         "job_id": 42,
         "cluster": None,
+        "outcome_revision": 2,
         "not_submitted": True,
     }
+    state["revision"] = 2
     state_path.write_text(json.dumps(state))
 
     with pytest.raises(TaskConflict, match="acceptance"):
@@ -855,7 +857,7 @@ def test_campaign_rejects_impossible_attempt_revision_groups(
 
 
 @pytest.mark.parametrize("with_attempt", [False, True])
-def test_campaign_rejects_unexplained_revision_inflation(
+def test_campaign_rejects_huge_unexplained_revision(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     with_attempt: bool,
@@ -871,9 +873,7 @@ def test_campaign_rejects_unexplained_revision_inflation(
         campaign.submit(planning(campaign))
     state_path = campaign_path / "campaign.json"
     state = json.loads(state_path.read_text())
-    state["revision"] = 102 if with_attempt else 100
-    if with_attempt:
-        state["attempts"][0]["campaign_revision"] = 100
+    state["revision"] = 10**100
     state_path.write_text(json.dumps(state))
 
     with pytest.raises(TaskConflict, match="revision"):

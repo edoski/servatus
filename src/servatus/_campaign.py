@@ -553,17 +553,28 @@ def _validate_revision_history(
     *,
     sealed: bool,
 ) -> None:
-    unexplained = set(range(1, state_revision + 1)) - mutation_revisions
-    if sealed:
-        if not unexplained:
-            raise TaskConflict("campaign revision cannot be explained by one roster seal")
-        append_revisions = unexplained - {max(unexplained)}
-    else:
-        append_revisions = unexplained
-    if len(append_revisions) > task_count:
+    missing_count = state_revision - len(mutation_revisions)
+    if missing_count < int(sealed) or missing_count > task_count + int(sealed):
         raise TaskConflict("campaign revision cannot be explained by roster history")
+    append_revisions: list[int] = []
+    candidate = 1
+    for mutation_revision in sorted(mutation_revisions):
+        while candidate < mutation_revision:
+            append_revisions.append(candidate)
+            candidate += 1
+        candidate = mutation_revision + 1
+    while candidate <= state_revision:
+        append_revisions.append(candidate)
+        candidate += 1
+    if sealed:
+        append_revisions.pop()
+    append_index = 0
     for plan_revision, required_prefix in plan_requirements:
-        future_appends = sum(revision > plan_revision for revision in append_revisions)
+        while (
+            append_index < len(append_revisions) and append_revisions[append_index] <= plan_revision
+        ):
+            append_index += 1
+        future_appends = len(append_revisions) - append_index
         if required_prefix > task_count - future_appends:
             raise TaskConflict("campaign revision cannot be explained by roster history")
 
@@ -1954,6 +1965,23 @@ def _validate_attempts(
     *,
     sealed: bool,
 ) -> None:
+    outcome_count = 0
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        acceptance = cast(dict[str, object], raw).get("acceptance")
+        if isinstance(acceptance, dict) and cast(dict[str, object], acceptance).get("status") in {
+            _ACCEPTED,
+            _NOT_SUBMITTED,
+        }:
+            outcome_count += 1
+    mutation_count = len(value) + outcome_count
+    if not (
+        mutation_count + int(sealed)
+        <= state_revision
+        <= mutation_count + len(task_keys) + int(sealed)
+    ):
+        raise TaskConflict("campaign revision cannot be explained by durable history")
     expected = {
         "allocation_id",
         "task_keys",
