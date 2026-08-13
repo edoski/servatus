@@ -1469,10 +1469,14 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
 | E1 protected K-study closure | Complete; Runner-attested, schema-3 evidence preserved |
 | E2 disposable KAIROS client proof | Complete; Standards 0 / Spec 0 at disposable `6c69d2f6` |
 | E0 isolated CPU Slurm/log/Ceph acceptance | Complete; independently audited GREEN at `bed595a4` |
-| Servatus `0.7.0` external release | Authorized; next |
-| K1-K2 KAIROS adoption | Blocked by public `0.7.0` |
-| I1 main/compact integration | Blocked by K1-K2 |
-| KAIROS image/config/push gates | Separately gated after K1-K2/I1; not authorized here |
+| Servatus `0.7.0` external release | Complete at tag `v0.7.0` / `e2496c87` |
+| K1 KAIROS execution adoption | Complete; Standards 0 / Spec 0 at `d06ac11c` |
+| K2 KAIROS sole Campaign roster | Complete; Standards 0 / Spec 0 at `ac634995` |
+| I1 main/compact integration | Complete; Standards 0 / Spec 0 at `c11288e3` / `598986b6` |
+| E4 combined image and isolated acceptance | Complete; GREEN for image `kairos-cuda-598986b.sif` |
+| E5 reviewed image selection | Complete at local candidates `eabea354` / `df17e851` |
+| E6 coherent KAIROS publication | Complete on `origin` and `research` |
+| Runner fixed-runtime handoff | Delivered; Runner owns only its planned held-out recovery |
 
 ## Run record
 
@@ -1663,3 +1667,44 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
   `3a43d24d06c95ace61cd27b36565bcd1995b7561bf63be1bb41cc6f6b6dd2977`; publication evidence is
   `c56576fbc84047f0a42608f27d33f1fdeb48a8cba50c48604e6b71d616f974ca`. Independent read-only audit
   found zero gaps. E0 is GREEN and the user-authorized E3 release may proceed.
+- 2026-08-13: E3 fast-forwarded Servatus `main`, ran Linux and macOS CI, created annotated tag
+  `v0.7.0`, published the GitHub Release and trusted PyPI artifacts, and verified a fresh public-index
+  install. The release tag and source head are
+  `e2496c87b143789f9c1ab45c656f278c058319af`; the public wheel SHA-256 is
+  `18a48551956ab76294902ea13f47fcc0a5dede71dd61ddc70f7551114bdfa8c2`. The package has zero runtime
+  dependencies and retains `0.6.0` as historical evidence.
+- 2026-08-13: K1 adopted the public Servatus `0.7.0` Campaign/Profile interface in KAIROS from exact
+  baseline `85209160`. Corrections removed repeated scientific reads and envelope reconstruction,
+  restored exact Task-to-envelope binding, used retained Workspace child paths, and kept one typed
+  scientific scan. No KAIROS GPU-count guard or compatibility path remains. Independent review
+  returned Standards 0 / Spec 0 at `d06ac11ca1dbd47fdfada1b046004ccd500f3202`.
+- 2026-08-13: K2 made Campaign the sole private experiment roster and deleted authored bundles,
+  `cells.tsv`, request files, completed-set joins, fallback roster ownership, and retirement of
+  Campaign state. Corrections made HPO authoring validation ordered and pre-seal, kept incomplete
+  Campaigns appendable, and made the post-seal Task tuple authoritative without repeated common-path
+  decoding. Independent review returned Standards 0 / Spec 0 at
+  `ac6349955af752b5d1c23f39872e4d859f75a067`. Cumulative K2 production code was net `-53` lines;
+  root, mobile, App, static, lock, build, and installed-interface gates passed.
+- 2026-08-13: I1 produced local main and compact-CUDA candidates from exact current main, accepted
+  K2, and published compact history. Main was a mechanical merge; compact preserved the original
+  twelve nonmerge commits and exact eleven-file CUDA delta. One review correction made
+  `kairos.workers.load_profile()` the sole KAIROS profile-ingress owner. Independent review returned
+  Standards 0 / Spec 0 at main `c11288e348a3790a1feb789b16821b5be8676f6b` and compact
+  `598986b678e05080bb9d2d6ae80da8e11095982a`; all root, mobile, App, CUDA, static, lock, build, and
+  topology gates passed.
+- 2026-08-13: the user authorized E4-E6 and waived separate review agents for those three external
+  gates while retaining exact orchestrator verification. E4 built and tested exact compact source
+  `598986b6` as immutable image
+  `/scratch.hpc/edoardo.galli3/deployments/kairos-cuda-598986b.sif`, SHA-256
+  `17b2e41938e0134706e8a4b1c329d50a4ce89fe439afed5e96bfa7f38c2095e9`. Isolated acceptance proved
+  queued/running/terminal observation, explicit terminal retry, exact TRES and logs, redacted record,
+  CUDA on A100, KAIROS result-probe missing-to-valid behavior, result-aware planning, and synthetic
+  Evaluation plus manifest publication/load. The old image and all accepted evidence remain.
+- 2026-08-13: E5 changed only `profiles.KAIROS.target.image` plus the existing one-line expected-image
+  assertion. Final main `eabea35436064eae989e14f5a245f9f62a672bfb` and compact
+  `df17e851a7c9bd410f184f692e80f12af8e8a587` share byte-identical `SERVATUS.toml`, SHA-256
+  `68b004f03735e4066c681f81a4e0a6bafbeab16f9cf8ed0e521529106237d2e7`, and compact retains the exact
+  eleven-file CUDA delta. E6 atomically pushed those exact refs without force to both `origin` and
+  `research`, then freshly verified refs, profile blobs, image hash, ancestry, and residue. No
+  GitHub workflow exists for automatic KAIROS CI. The fixed-runtime callback was delivered to the
+  Runner; only its separately owned held-out recovery remains outside this completed program.
