@@ -489,6 +489,13 @@ def test_result_only_inspection_is_read_only_and_derives_sealed_readiness(
 def test_operational_record_is_canonical_redacted_and_read_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return datetime(2030, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    monkeypatch.setattr(_campaign, "datetime", Clock)
+    monkeypatch.setattr(_campaign.os, "urandom", lambda size: b"\x01" * size)
     campaign_path = tmp_path / "campaign"
     sensitive = "sensitive-marker"
     campaign = Campaign.open(
@@ -568,6 +575,8 @@ def test_operational_record_is_canonical_redacted_and_read_only(
         "duplicate_risk_task_keys",
         "target_digest",
         "resource_digest",
+        "attempt_digest",
+        "retry_digest",
         "plan_digest",
         "script_digest",
         "allocation",
@@ -589,7 +598,20 @@ def test_operational_record_is_canonical_redacted_and_read_only(
         [],
     )
     assert all(
-        len(attempt[name]) == 64 for name in ("target_digest", "resource_digest", "script_digest")
+        len(attempt[name]) == 64
+        for name in (
+            "target_digest",
+            "resource_digest",
+            "attempt_digest",
+            "retry_digest",
+            "script_digest",
+        )
+    )
+    assert attempt["attempt_digest"] == (
+        "bf8314337c5832e06f4492aea8980605728920a03b7a85b809d4dbef43b21e65"
+    )
+    assert attempt["retry_digest"] == (
+        "ccec1b74e90dc1985d16018aa363ecea3a45039113f89bd232ae4e50ceba0a45"
     )
     assert attempt["plan_digest"] == plan.digest
     assert attempt["allocation"] == {
@@ -625,21 +647,36 @@ def test_operational_record_is_canonical_redacted_and_read_only(
         b'"environment":',
     ):
         assert excluded_field not in record
-    changed_raw = replace(
-        view,
-        attempts=(
-            replace(
-                view.attempts[0],
-                allocation=replace(
-                    allocation_observation,
-                    raw_state="PRIVATE_RAW_STATE",
-                    accounting_state="PRIVATE_ACCOUNTING_STATE",
-                    reason="another-private-reason",
-                ),
-            ),
+    monkeypatch.setattr(
+        _slurm,
+        "query_attempts",
+        lambda _target, queries: tuple(
+            _slurm.SchedulerObservation(
+                AllocationState.FAILED,
+                "PRIVATE_RAW_STATE",
+                "PRIVATE_ACCOUNTING_STATE",
+                "1:0",
+                "another-private-reason",
+                "2030-01-01T00:00:00",
+                "2030-01-01T01:00:00",
+            )
+            for _query in queries
         ),
     )
-    assert campaign.record(changed_raw) == record
+    assert campaign.record(campaign.inspect()) == record
+
+    changed_allocation = (
+        replace(allocation_observation, exit_code="9:0"),
+        replace(allocation_observation, started_at="2031-01-01T00:00:00"),
+        replace(allocation_observation, observed_at=datetime(2031, 1, 1, tzinfo=UTC)),
+    )
+    forged = (replace(view, observed_at=datetime(2031, 1, 1, tzinfo=UTC)),) + tuple(
+        replace(view, attempts=(replace(view.attempts[0], allocation=value),))
+        for value in changed_allocation
+    )
+    for altered in forged:
+        with pytest.raises(ObservationError, match="stale, foreign, or changed"):
+            campaign.record(altered)
 
 
 def test_operational_record_is_revision_bound_and_ignores_result_evidence(

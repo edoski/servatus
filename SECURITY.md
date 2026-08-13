@@ -60,9 +60,11 @@ replayed only after a separate explicit duplicate-execution-risk acknowledgement
 Canonical operational records redact Task arguments, stdin, scripts, target values, raw scheduler
 details, result evidence, and application outputs. Redaction is not anonymity or a secrecy
 guarantee: Task keys, allocation identities, Profile labels, lineage digests, and Slurm Job IDs may
-identify work. `Campaign.record()` returns bytes without publishing them. Keep records and the
-owner-only Campaign state private unless a separate review approves a narrower projection; Campaign
-state retains the complete Task arguments and stdin required for retry.
+identify work. Attempt and retry digests hash only the record's redacted immutable intent and retry
+choices, but remain identifying correlators. `Campaign.record()` returns bytes without publishing
+them. Keep records and the owner-only Campaign state private unless a separate review approves a
+narrower projection; Campaign state retains the complete Task arguments and stdin required for
+retry.
 
 Campaign log snapshots are sensitive, untrusted binary data. They may contain credentials,
 research data, terminal control sequences, or other hostile output. Never render them directly in

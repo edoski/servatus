@@ -259,8 +259,11 @@ Path("private/campaign-record.json").write_bytes(record)
 The record contains its observation time and scheduler-observation mode; Campaign identity,
 revision, sealed state, roster digest, and ordered Task keys; and ordered Attempt provenance. Each
 Attempt retains its Profile label, Task/retry/duplicate-risk keys, target and resource lineage
-digests, allocation shape, plan and script digests, acceptance or resolution revision, receipt Job
-ID and cluster, and normalized scheduler state, exit code, timestamps, and observation time.
+digests, allocation shape, attempt/retry/plan/script digests, acceptance or resolution revision,
+receipt Job ID and cluster, and normalized scheduler state, exit code, timestamps, and observation
+time. The retry digest hashes the canonical ordered retry and duplicate-risk keys. The attempt digest
+hashes the canonical immutable redacted intent: allocation identity, Campaign revision, Profile
+label, ordered Task keys, retry digest, lineage digests, allocation shape, and plan/script digests.
 
 Task arguments, stdin, per-Task digests, complete scripts, `sbatch` arguments, target values,
 environment, raw scheduler states and reasons, result evidence, logs, checkpoints, metrics, and

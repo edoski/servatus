@@ -495,6 +495,7 @@ class CampaignView:
     observed_at: datetime
     results_ready: bool
     quiescent: bool
+    _semantics_digest: str = field(init=False, repr=False, compare=False, default="")
 
 
 @dataclass(frozen=True, slots=True)
@@ -601,6 +602,11 @@ def _task_from_record(record: object) -> Task:
 
 def _tasks_from_state(state: dict[str, object]) -> tuple[Task, ...]:
     return tuple(_task_from_record(record) for record in cast(list[object], state["tasks"]))
+
+
+def _validated_roster_facts(state: dict[str, object]) -> tuple[tuple[str, ...], str]:
+    records = cast(list[dict[str, object]], state["tasks"])
+    return tuple(cast(str, record["key"]) for record in records), _digest(records)
 
 
 def _resource_dict(resources: ResourceRequest) -> dict[str, object]:
@@ -748,12 +754,43 @@ def _view_semantics(view: CampaignView) -> dict[str, object]:
     }
 
 
+def _bind_view(view: CampaignView) -> CampaignView:
+    object.__setattr__(view, "_semantics_digest", _digest(_view_semantics(view)))
+    return view
+
+
 def campaign_view_document(view: CampaignView) -> dict[str, object]:
     return _view_semantics(view)
 
 
-def _operational_record(state: dict[str, object], view: CampaignView) -> dict[str, object]:
-    tasks = _tasks_from_state(state)
+def _retry_semantics(stored: dict[str, object]) -> dict[str, object]:
+    return {
+        "retry_task_keys": stored["retry_task_keys"],
+        "duplicate_risk_task_keys": stored["duplicate_risk_task_keys"],
+    }
+
+
+def _attempt_semantics(stored: dict[str, object], retry_digest: str) -> dict[str, object]:
+    return {
+        "allocation_id": stored["allocation_id"],
+        "campaign_revision": stored["campaign_revision"],
+        "profile_label": stored["profile_label"],
+        "task_keys": stored["task_keys"],
+        "retry_digest": retry_digest,
+        "target_digest": stored["target_digest"],
+        "resource_digest": stored["resource_digest"],
+        "plan_digest": stored["plan_digest"],
+        "script_digest": stored["script_digest"],
+        "allocation": stored["allocation"],
+    }
+
+
+def _operational_record(
+    state: dict[str, object],
+    view: CampaignView,
+    task_keys: tuple[str, ...],
+    roster_digest: str,
+) -> dict[str, object]:
     attempts: list[dict[str, object]] = []
     for stored, evidence in zip(
         cast(list[dict[str, object]], state["attempts"]), view.attempts, strict=True
@@ -767,6 +804,7 @@ def _operational_record(state: dict[str, object], view: CampaignView) -> dict[st
             acceptance_record["job_id"] = acceptance["job_id"]
             acceptance_record["cluster"] = acceptance["cluster"]
         observation = evidence.allocation
+        retry_digest = _digest(_retry_semantics(stored))
         attempts.append(
             {
                 "allocation_id": stored["allocation_id"],
@@ -777,6 +815,8 @@ def _operational_record(state: dict[str, object], view: CampaignView) -> dict[st
                 "duplicate_risk_task_keys": stored["duplicate_risk_task_keys"],
                 "target_digest": stored["target_digest"],
                 "resource_digest": stored["resource_digest"],
+                "attempt_digest": _digest(_attempt_semantics(stored, retry_digest)),
+                "retry_digest": retry_digest,
                 "plan_digest": stored["plan_digest"],
                 "script_digest": stored["script_digest"],
                 "allocation": stored["allocation"],
@@ -802,8 +842,8 @@ def _operational_record(state: dict[str, object], view: CampaignView) -> dict[st
             "id": view.campaign_id,
             "revision": view.revision,
             "sealed": view.sealed,
-            "roster_digest": _digest([_task_record(task) for task in tasks]),
-            "task_keys": [task.key for task in tasks],
+            "roster_digest": roster_digest,
+            "task_keys": list(task_keys),
         },
         "attempts": attempts,
     }
@@ -1031,27 +1071,30 @@ class Campaign:
                 if attempt.acceptance is AcceptanceState.ACCEPTED
             )
         )
-        return CampaignView(
-            campaign_id,
-            revision,
-            state["phase"] == _SEALED,
-            task_evidence,
-            tuple(attempts),
-            scheduler,
-            observed_at,
-            results_ready,
-            quiescent,
+        return _bind_view(
+            CampaignView(
+                campaign_id,
+                revision,
+                state["phase"] == _SEALED,
+                task_evidence,
+                tuple(attempts),
+                scheduler,
+                observed_at,
+                results_ready,
+                quiescent,
+            )
         )
 
     def record(self, view: CampaignView) -> bytes:
         state = self._read_state()
+        task_keys, roster_digest = _validated_roster_facts(state)
         try:
-            _verify_view(state, view)
+            _verify_view(state, view, task_keys)
         except PlanError:
             raise ObservationError(
                 "operational record view is stale, foreign, or changed"
             ) from None
-        return _canonical(_operational_record(state, view))
+        return _canonical(_operational_record(state, view, task_keys, roster_digest))
 
     def read_log(
         self,
@@ -1105,12 +1148,12 @@ class Campaign:
     ) -> SubmissionPlan:
         state = self._read_state()
         tasks = _tasks_from_state(state)
-        known = tuple(task.key for task in tasks)
+        known, roster_digest = _validated_roster_facts(state)
         retry_values = _ordered_selection(retry, known, "retry")
         duplicate_risk = _ordered_selection(allow_duplicate_risk, known, "allow_duplicate_risk")
         if any(key not in retry_values for key in duplicate_risk):
             raise PlanError("duplicate-risk acknowledgement requires explicit retry")
-        _verify_view(state, view)
+        _verify_view(state, view, known)
         if (
             any(attempt.acceptance is AcceptanceState.ACCEPTED for attempt in view.attempts)
             and not view.scheduler_observed
@@ -1131,7 +1174,6 @@ class Campaign:
         groups = _balanced_groups(selected, capacity)
         campaign_id = cast(str, state["campaign_id"])
         revision = cast(int, state["revision"])
-        roster_digest = _digest([_task_record(task) for task in tasks])
         view_digest = _digest(_view_semantics(view))
         seed = _digest(
             {
@@ -1325,17 +1367,16 @@ class Campaign:
 
     def _verify_plan(self, plan: SubmissionPlan, *, operation: str) -> None:
         state = self._read_state()
+        task_keys, roster_digest = _validated_roster_facts(state)
         if plan._campaign_id != state["campaign_id"]:
             raise PlanError(f"{operation} plan belongs to another campaign")
         if plan._state_revision != state["revision"]:
             raise PlanError(f"{operation} plan is stale")
-        if plan._roster_digest != _digest(
-            [_task_record(task) for task in _tasks_from_state(state)]
-        ):
+        if plan._roster_digest != roster_digest:
             raise PlanError(f"{operation} plan roster was changed")
         if plan._view_digest != _digest(_view_semantics(plan._view)):
             raise PlanError(f"{operation} plan view was changed")
-        _verify_view(state, plan._view)
+        _verify_view(state, plan._view, task_keys)
         selected, excluded = _select_tasks(plan._view, plan._retry, plan._duplicate_risk)
         if selected != plan._selected or excluded != plan._excluded:
             raise PlanError(f"{operation} plan selection was changed")
@@ -1593,13 +1634,14 @@ def _ordered_selection(
     return tuple(key for key in known if key in selected)
 
 
-def _verify_view(state: dict[str, object], view: CampaignView) -> None:
+def _verify_view(state: dict[str, object], view: CampaignView, task_keys: tuple[str, ...]) -> None:
+    if view._semantics_digest != _digest(_view_semantics(view)):
+        raise PlanError("view was changed")
     if view.campaign_id != state["campaign_id"]:
         raise PlanError("view belongs to another campaign")
     if view.revision != state["revision"]:
         raise PlanError("view is stale")
-    tasks = _tasks_from_state(state)
-    if tuple(item.key for item in view.tasks) != tuple(task.key for task in tasks):
+    if tuple(item.key for item in view.tasks) != task_keys:
         raise PlanError("view roster projection is invalid")
     if view.sealed != (state["phase"] == _SEALED):
         raise PlanError("view roster projection is invalid")
@@ -2494,7 +2536,7 @@ def _view_from_dict(value: object) -> CampaignView:
         raise PlanError("plan view is invalid") from error
     if _view_semantics(view) != mapping:
         raise PlanError("plan view values are invalid")
-    return view
+    return _bind_view(view)
 
 
 def _plan_inputs(
