@@ -1461,7 +1461,8 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
 | Repository-local Profile revision | User-approved; independent rereview GREEN |
 | New ledger | GREEN, including bounded-log amendment |
 | S1 Campaign roster and attempt state | Complete; Standards 0 / Spec 0 at `313b4d32` |
-| S2-S4 Servatus implementation | Authorized; S2 resumed from accepted amendment head |
+| S2 Campaign observation and bounded logs | Complete; Standards 0 / Spec 0 at `54b05a2e` |
+| S3-S4 Servatus implementation | Authorized; S3 next |
 | Servatus `0.7.0` external release | Not authorized |
 | Active K-study | Running under separate Runner; protected |
 | K1-K2 KAIROS adoption | Blocked by public `0.7.0` and K-study closure |
@@ -1550,3 +1551,19 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
   live CLI evidence without adding a slice or application authority. S2 may resume from this exact
   accepted ledger state; its earlier observation delta remains uncommitted and must incorporate the
   amended contract before fixed-range product review.
+- 2026-08-13: S2 implemented `Campaign.inspect()`, immutable Campaign evidence, bounded exact Slurm
+  observation, independent result readiness/quiescence, `Campaign.read_log()`, allocation-bound log
+  filenames, and complete sensitive-output documentation from exact baseline `99cb093b`. Initial
+  commit `a78215e9` passed all local gates but independent review rejected scheduler queries that
+  were not exact under native Slurm semantics, missing accounting fallback, Job-ID reuse, incomplete
+  SSH/control bounds, duplicate receipt authority, and private-knob tests. Separate corrections
+  `296875fa`, `1e68d2a0`, `86195dae`, and `54b05a2e` made each query Attempt-specific, anchored
+  duplicate/requeue accounting history, forced remote `TZ=UTC`, separated active/accounting
+  protocols, restored real subprocess deadline/pipe-cap tests, and ordered same-incarnation state
+  transitions without hiding conflicting terminal or future states. The same reviewer returned
+  final GREEN with Standards 0 / Spec 0 on `86195dae..54b05a2e`; all earlier findings remained
+  closed. Final gates were 408 passed / 1 environment skip, locked dry sync, Ruff check/format,
+  strict Pyright, Vulture, build/archive/metadata inspection, zero runtime dependencies, diff check,
+  and fresh installed-wheel public API plus both CLI entry points. No live SSH/Slurm, KAIROS,
+  protected Campaign, remote, release, or S3+ action ran. Exact accepted S2 head is
+  `54b05a2eb8371efd8cda741ca1f7f1161147df11`.
