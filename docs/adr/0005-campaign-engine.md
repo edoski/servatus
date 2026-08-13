@@ -23,7 +23,13 @@ rewritten or collapsed.
 
 The existing native OpenSSH/Slurm/Apptainer lane, balanced single-node packing, target ceilings,
 submission cap, intent-before-contact rule, ambiguity handling, explicit retry, reconciliation,
-validation, and status projections remain. Plan schema 3 remains current for this state slice.
+and validation remain. Plan schema 4 is the clean evidence-aware planning boundary.
+
+One frozen public Profile groups a safe nonbinding label, complete Slurm Target, and homogeneous
+Resource request. The strict repository-local `SERVATUS.toml` document contains a nonempty named
+Profile table and optional default, validates every declared Profile, and offers no inheritance,
+search, environment fallback, global store, or management interface. Exact resolved values own
+Campaign lineage compatibility; labels remain plan and Attempt provenance.
 
 `Campaign.inspect()` adds one immutable, revision-bound view to this same authority. It invokes an
 optional synchronous boolean result probe exactly once per Task and queries only exact accepted
@@ -60,6 +66,22 @@ add a durable finalized phase, authorize retry, or move application publication 
 Diagnostic log content likewise never enters Campaign state, views, plans, or records and has no
 effect on readiness, quiescence, planning, retry, reconciliation, or result validity. There is no
 log decoder, parser, range/offset protocol, follow mode, poller, cache, or public transport adapter.
+
+`Campaign.plan()` consumes one exact current Campaign view. Its selection matrix excludes valid
+results, selects never-accepted missing/unobserved Tasks, withholds ambiguity and accepted work by
+default, rejects retry while any accepted Attempt is active, and requires both explicit retry and a
+recorded duplicate-risk acknowledgement while any accepted Attempt is unknown. Ambiguity blocks
+only affected Tasks. The canonical plan freezes revision, roster and attempt projection,
+observations, selection, retry/override keys, Profile label and resolved values, and allocations;
+restoration performs no probe or scheduler query.
+
+Before each mutating allocation submission, Campaign reads current state, reprobes only selected
+Tasks for result-aware plans, refreshes relevant accepted Attempts, rereads state, compares
+eligibility, records durable intent, contacts `sbatch`, and records its outcome. Scheduler-only
+plans need no probe. The CLI reads only cwd `SERVATUS.toml`, offers optional `--profile`, exposes
+scheduler-only `inspect`, and writes raw bounded log bytes through `Campaign.read_log()`. The old
+acceptance-only status, caller completed sets, and paired target/resource configuration paths are
+removed.
 
 This decision narrows ADR 0001 only by allowing an ephemeral boolean result probe; application
 schemas remain opaque. It supersedes ADR 0003's roster and durable submission-record shape while

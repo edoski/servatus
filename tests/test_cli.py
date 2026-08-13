@@ -1,55 +1,52 @@
 from __future__ import annotations
 
-import base64
 import json
 import os
 import stat
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from servatus import SlurmTarget, _slurm
+from servatus import Campaign, LogSnapshot, ObservationError, Profile, SlurmTarget, Task, _slurm
 from servatus.cli import main
 
 
-def write_inputs(tmp_path: Path) -> tuple[Path, Path, Path]:
+def write_inputs(tmp_path: Path) -> Path:
     stdin = tmp_path / "stdin.bin"
     stdin.write_bytes(b"opaque\x00payload")
     tasks = tmp_path / "tasks.jsonl"
     tasks.write_text(json.dumps({"key": "one", "args": ["run"], "stdin_file": stdin.name}) + "\n")
-    resources = tmp_path / "resources.toml"
-    resources.write_text(
-        "cpus_per_task = 2\nmemory_mib_per_task = 1024\ngpus_per_task = 0\n"
+    (tmp_path / "SERVATUS.toml").write_text(
+        'default_profile = "cpu"\n'
+        "[profiles.cpu.target]\n"
+        'host = "login.example.edu"\n'
+        'slurm_bin = "/opt/slurm/bin"\n'
+        'apptainer = "/usr/bin/apptainer"\n'
+        'image = "/images/work.sif"\n'
+        'work_root = "/work/project"\n'
+        'log_root = "/logs/project"\n'
+        'partitions = ["cpu"]\n'
+        "max_tasks_per_allocation = 4\n"
+        "max_cpus_per_allocation = 16\n"
+        "max_memory_mib_per_allocation = 8192\n"
+        "max_gpus_per_allocation = 0\n"
+        'max_time_limit = "1-00:00:00"\n'
+        "max_allocations_per_submit = 4\n"
+        "max_script_bytes = 1048576\n"
+        "[profiles.cpu.resources]\n"
+        "cpus_per_task = 2\n"
+        "memory_mib_per_task = 1024\n"
+        "gpus_per_task = 0\n"
         'time_limit = "00:10:00"\n'
     )
-    target = tmp_path / "target.toml"
-    target.write_text(
-        'host = "login.example.edu"\nslurm_bin = "/opt/slurm/bin"\n'
-        'apptainer = "/usr/bin/apptainer"\nimage = "/images/work.sif"\n'
-        'work_root = "/work/project"\nlog_root = "/logs/project"\npartitions = ["cpu"]\n'
-        "max_tasks_per_allocation = 4\nmax_cpus_per_allocation = 16\n"
-        "max_memory_mib_per_allocation = 8192\nmax_gpus_per_allocation = 0\n"
-        'max_time_limit = "1-00:00:00"\nmax_allocations_per_submit = 4\n'
-        "max_script_bytes = 1048576\n"
-    )
-    return tasks, resources, target
+    return tasks
 
 
-def plan_arguments(
-    tasks: Path,
-    resources: Path,
-    target: Path,
-    campaign: Path,
-    output: Path,
-    *extra: str,
-) -> list[str]:
+def plan_arguments(tasks: Path, campaign: Path, output: Path, *extra: str) -> list[str]:
     return [
         "plan",
         str(tasks),
-        "--target",
-        str(target),
-        "--resources",
-        str(resources),
         "--campaign",
         str(campaign),
         "--output",
@@ -58,86 +55,111 @@ def plan_arguments(
     ]
 
 
-def test_cli_plan_status_and_help(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    tasks, resources, target = write_inputs(tmp_path)
-    campaign = tmp_path / "campaign"
-    output = tmp_path / "PLAN.json"
-    assert main(plan_arguments(tasks, resources, target, campaign, output)) == 0
-    document = output.read_text()
-    assert "opaque" not in document
-    assert "payload" not in document
-    assert '"one"' in document
-    capsys.readouterr()
-    assert main(["status", str(campaign)]) == 0
-    status = json.loads(capsys.readouterr().out)
-    assert status["unaccepted_task_keys"] == ["one"]
-    with pytest.raises(SystemExit) as help_exit:
-        main(["--help"])
-    assert help_exit.value.code == 0
-    assert "unaccepted tasks" in capsys.readouterr().out
-
-    with pytest.raises(SystemExit) as plan_help_exit:
-        main(["plan", "--help"])
-    assert plan_help_exit.value.code == 0
-    plan_help = capsys.readouterr().out
-    assert "--completed" in plan_help
-    assert "--retry" in plan_help
-
-
-def test_cli_seal_is_idempotent_and_rejects_later_suffix(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    tasks, resources, target = write_inputs(tmp_path)
-    campaign = tmp_path / "campaign"
-    main(plan_arguments(tasks, resources, target, campaign, tmp_path / "PLAN.json"))
-    capsys.readouterr()
-
-    assert main(["seal", str(campaign)]) == 0
-    assert json.loads(capsys.readouterr().out) == {"sealed": True}
-    sealed = (campaign / "campaign.json").read_bytes()
-    assert main(["seal", str(campaign)]) == 0
-    assert (campaign / "campaign.json").read_bytes() == sealed
-    capsys.readouterr()
-
-    stdin = tmp_path / "stdin.bin"
-    tasks.write_text(
-        json.dumps({"key": "one", "args": ["run"], "stdin_file": stdin.name})
-        + "\n"
-        + json.dumps({"key": "two", "args": ["run"], "stdin_file": stdin.name})
-        + "\n"
+def terminal_observations(
+    _target: SlurmTarget, queries: tuple[_slurm._AttemptQuery, ...]
+) -> tuple[_slurm.SchedulerObservation, ...]:
+    return tuple(
+        _slurm.SchedulerObservation(
+            _slurm.AllocationState.SUCCEEDED,
+            "COMPLETED",
+            "COMPLETED",
+            "0:0",
+            None,
+            None,
+            None,
+        )
+        for _query in queries
     )
-    with pytest.raises(SystemExit) as rejected:
-        main(plan_arguments(tasks, resources, target, campaign, tmp_path / "GROWN.json"))
-    assert rejected.value.code == 2
-    assert "sealed campaign tasks cannot change" in capsys.readouterr().err
 
 
-def test_cli_plan_output_is_owner_only_and_immutable(
+def test_cli_plan_uses_only_cwd_profile_and_inspect_replaces_status(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    tasks, resources, target = write_inputs(tmp_path)
+    tasks = write_inputs(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    campaign = tmp_path / "campaign"
+    output = tmp_path / "PLAN.json"
+
+    assert main(plan_arguments(tasks, campaign, output)) == 0
+    document = json.loads(output.read_text())
+    assert document["profile_label"] == "cpu"
+    assert document["selected"] == ["one"]
+    assert "completed" not in document
+    assert "opaque" not in output.read_text()
+    capsys.readouterr()
+
+    assert main(["inspect", str(campaign)]) == 0
+    view = json.loads(capsys.readouterr().out)
+    assert view["tasks"][0]["key"] == "one"
+    assert view["tasks"][0]["result"] == "UNOBSERVED"
+
+    with pytest.raises(SystemExit) as help_exit:
+        main(["--help"])
+    assert help_exit.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "inspect" in help_text
+    assert "status" not in help_text
+
+
+def test_cli_plan_does_not_search_parent_for_servatus_toml(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    tasks = write_inputs(tmp_path)
+    child = tmp_path / "child"
+    child.mkdir()
+    monkeypatch.chdir(child)
+
+    with pytest.raises(SystemExit) as rejected:
+        main(plan_arguments(tasks, child / "campaign", child / "PLAN.json"))
+
+    assert rejected.value.code == 2
+    assert "SERVATUS.toml" in capsys.readouterr().err
+
+
+def test_cli_explicit_profile_overrides_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tasks = write_inputs(tmp_path)
+    config = tmp_path / "SERVATUS.toml"
+    config.write_text(
+        config.read_text()
+        + config.read_text()
+        .replace('default_profile = "cpu"\n', "")
+        .replace("profiles.cpu", "profiles.other")
+        .replace('image = "/images/work.sif"', 'image = "/images/other.sif"')
+    )
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "PLAN.json"
+
+    main(plan_arguments(tasks, tmp_path / "campaign", output, "--profile", "other"))
+
+    document = json.loads(output.read_text())
+    assert document["profile_label"] == "other"
+    assert document["target"]["image"] == "/images/other.sif"
+
+
+def test_cli_plan_output_is_owner_only_and_no_clobber(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    tasks = write_inputs(tmp_path)
+    monkeypatch.chdir(tmp_path)
     output = tmp_path / "plans" / "PLAN.json"
-    arguments = plan_arguments(tasks, resources, target, tmp_path / "campaign", output)
-    original_write = Path.write_bytes
-    modes_at_write: list[int] = []
-
-    def observe_stage_mode(path: Path, data: bytes) -> int:
-        if path.name.startswith(".servatus-file-stage-"):
-            modes_at_write.append(stat.S_IMODE(path.stat().st_mode))
-        return original_write(path, data)
-
-    monkeypatch.setattr(Path, "write_bytes", observe_stage_mode)
+    arguments = plan_arguments(tasks, tmp_path / "campaign", output)
 
     previous_umask = os.umask(0)
     try:
-        assert main(arguments) == 0
+        main(arguments)
     finally:
         os.umask(previous_umask)
     original = output.read_bytes()
-    assert modes_at_write == [0o600]
-    assert output.stat().st_mode & 0o777 == 0o600
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
     capsys.readouterr()
 
     with pytest.raises(SystemExit) as duplicate:
@@ -147,169 +169,150 @@ def test_cli_plan_output_is_owner_only_and_immutable(
     assert output.read_bytes() == original
 
 
-def test_cli_plan_exposes_completed_and_retry_controls(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_cli_unknown_retry_prints_duplicate_risk_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    tasks_path, resources, target = write_inputs(tmp_path)
-    stdin = tmp_path / "stdin.bin"
-    tasks_path.write_text(
-        "".join(
-            json.dumps(
-                {"key": f"task-{index}", "args": ["run", str(index)], "stdin_file": stdin.name}
-            )
-            + "\n"
-            for index in range(4)
-        )
-    )
-    campaign = tmp_path / "campaign"
-    original = tmp_path / "PLAN.json"
-    main(plan_arguments(tasks_path, resources, target, campaign, original))
+    tasks_path = write_inputs(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    campaign_path = tmp_path / "campaign"
+    campaign = Campaign.open(campaign_path, (Task("one", ("run",), b"opaque\x00payload"),))
+    selected_profile = Profile.load(tmp_path / "SERVATUS.toml")
+    first = campaign.plan(selected_profile, view=campaign.inspect(scheduler=False))
     monkeypatch.setattr(
         _slurm,
         "_run_ssh",
-        lambda *args, **kwargs: _slurm.Result(0, b"700;alpha\n", b""),
+        lambda *_args, **_kwargs: _slurm.Result(0, b"42;alpha\n", b""),
     )
-    main(["submit", str(campaign), str(original)])
-    capsys.readouterr()
-
-    retry_plan = tmp_path / "RETRY.json"
-    assert (
-        main(
-            plan_arguments(
-                tasks_path,
-                resources,
-                target,
-                campaign,
-                retry_plan,
-                "--completed",
-                "task-2",
-                "--completed",
-                "task-3",
-                "--retry",
-                "task-0",
-            )
-        )
-        == 0
-    )
-    document = json.loads(retry_plan.read_text())
-    assert document["completed"] == ["task-2", "task-3"]
-    assert document["retry"] == ["task-0"]
-    assert [allocation["task_keys"] for allocation in document["allocations"]] == [["task-0"]]
-
-
-def test_cli_reconciles_with_campaign_lineage(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    tasks, resources, target = write_inputs(tmp_path)
-    campaign = tmp_path / "campaign"
-    output = tmp_path / "PLAN.json"
-    main(plan_arguments(tasks, resources, target, campaign, output))
+    campaign.submit(first)
     monkeypatch.setattr(
         _slurm,
-        "_run_ssh",
-        lambda *args, **kwargs: _slurm.Result(1, b"", b"lost reply"),
+        "query_attempts",
+        lambda _target, queries: tuple(
+            _slurm.SchedulerObservation(
+                _slurm.AllocationState.UNKNOWN,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            for _query in queries
+        ),
     )
     capsys.readouterr()
-    with pytest.raises(SystemExit):
-        main(["submit", str(campaign), str(output)])
-    capsys.readouterr()
-    main(["status", str(campaign)])
-    allocation_id = json.loads(capsys.readouterr().out)["ambiguous_allocation_ids"][0]
-    queried: list[SlurmTarget] = []
 
-    def query(target_value: SlurmTarget, **kwargs: object) -> _slurm.IdentityMatch:
-        queried.append(target_value)
-        return _slurm.IdentityMatch(701, "alpha")
+    main(
+        plan_arguments(
+            tasks_path,
+            campaign_path,
+            tmp_path / "RETRY.json",
+            "--retry",
+            "one",
+            "--allow-duplicate-risk",
+            "one",
+        )
+    )
 
-    monkeypatch.setattr(_slurm, "query_identity", query)
-
-    assert main(["reconcile", str(campaign), allocation_id]) == 0
-    assert queried == [SlurmTarget.from_toml(target)]
-    assert json.loads(capsys.readouterr().out)["job_id"] == 701
+    assert "duplicate execution risk" in capsys.readouterr().err
 
 
-def test_cli_validate_and_submit_exact_plan(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_cli_validate_submit_seal_and_reconcile_remain_thin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    tasks, resources, target = write_inputs(tmp_path)
-    campaign = tmp_path / "campaign"
+    tasks = write_inputs(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    campaign_path = tmp_path / "campaign"
     output = tmp_path / "PLAN.json"
-    main(plan_arguments(tasks, resources, target, campaign, output))
+    main(plan_arguments(tasks, campaign_path, output))
     capsys.readouterr()
+
     calls: list[tuple[str, ...]] = []
 
-    def fake(target_value: object, argv: tuple[str, ...], script: bytes) -> _slurm.Result:
+    def fake(_target: SlurmTarget, argv: tuple[str, ...], _script: bytes) -> _slurm.Result:
         calls.append(argv)
         if argv[-1] == "--test-only":
             return _slurm.Result(0, b"valid now\n", b"")
-        return _slurm.Result(0, b"700;alpha\n", b"")
+        return _slurm.Result(1, b"", b"lost receipt")
 
     monkeypatch.setattr(_slurm, "_run_ssh", fake)
-    assert main(["validate", str(campaign), str(output)]) == 0
-    validation = json.loads(capsys.readouterr().out)
-    assert validation["time_specific"] is True
-    assert len(validation["results"]) == 1
-    result = validation["results"][0]
-    assert result["shape"] == {
-        "task_count": 1,
-        "cpus": 2,
-        "memory_mib": 1024,
-        "gpus": 0,
-        "time_limit": "00:10:00",
-    }
-    assert len(result["shape_digest"]) == 64
-    assert len(result["script_digest"]) == 64
-    assert result["controller_stdout"] == "valid now"
-    assert main(["submit", str(campaign), str(output)]) == 0
-    assert any(argv[-1] == "--test-only" for argv in calls)
-    assert any(argv[-1] != "--test-only" for argv in calls)
-
-
-def test_cli_sensitive_script_diagnostic_is_explicit_and_plan_stays_redacted(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    tasks, resources, target = write_inputs(tmp_path)
-    output = tmp_path / "PLAN.json"
-    assert (
-        main(
-            plan_arguments(
-                tasks,
-                resources,
-                target,
-                tmp_path / "campaign",
-                output,
-                "--show-scripts",
-            )
-        )
-        == 0
-    )
-    captured = capsys.readouterr()
-    diagnostic = json.loads(captured.out)
-    assert diagnostic["sensitive"] is True
-    assert "expose task arguments and payloads" in captured.err
-    script = diagnostic["scripts"][0]["script"]
-    assert "run" in script
-    assert base64.b64encode(b"opaque\x00payload").decode() in script
-    persisted = output.read_text()
-    assert "opaque" not in persisted
-    assert "payload" not in persisted
-    assert base64.b64encode(b"opaque\x00payload").decode() not in persisted
-
-
-def test_cli_malformed_plan_is_concise_nonzero_error(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    tasks, resources, target = write_inputs(tmp_path)
-    campaign = tmp_path / "campaign"
-    output = tmp_path / "PLAN.json"
-    main(plan_arguments(tasks, resources, target, campaign, output))
-    document = json.loads(output.read_text())
-    document["schema_version"] = True
-    output.write_text(json.dumps(document))
+    assert main(["validate", str(campaign_path), str(output)]) == 0
+    assert json.loads(capsys.readouterr().out)["time_specific"] is True
+    with pytest.raises(SystemExit):
+        main(["submit", str(campaign_path), str(output)])
     capsys.readouterr()
-    with pytest.raises(SystemExit) as exit_status:
-        main(["submit", str(campaign), str(output)])
-    assert exit_status.value.code == 2
+
+    allocation_id = Campaign.load(campaign_path).inspect(scheduler=False).attempts[-1].allocation_id
+    monkeypatch.setattr(
+        _slurm,
+        "query_identity",
+        lambda *_args, **_kwargs: _slurm.IdentityMatch(701, "alpha"),
+    )
+    assert main(["reconcile", str(campaign_path), allocation_id]) == 0
+    assert json.loads(capsys.readouterr().out)["job_id"] == 701
+    monkeypatch.setattr(_slurm, "query_attempts", terminal_observations)
+    assert main(["inspect", str(campaign_path)]) == 0
+    inspected = json.loads(capsys.readouterr().out)
+    assert inspected["scheduler_observed"] is True
+    assert inspected["attempts"][0]["allocation"]["state"] == "SUCCEEDED"
+    assert main(["seal", str(campaign_path)]) == 0
+    assert json.loads(capsys.readouterr().out) == {"sealed": True}
+    assert any(argv[-1] == "--test-only" for argv in calls)
+
+
+def test_cli_log_delegates_one_exact_raw_byte_snapshot_without_newline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfdbinary: pytest.CaptureFixture[bytes],
+) -> None:
+    campaign_path = tmp_path / "campaign"
+    Campaign.open(campaign_path, ())
+    calls: list[tuple[str, str | None, int]] = []
+
+    def read_log(
+        self: Campaign,
+        allocation_id: str,
+        *,
+        task_key: str | None = None,
+        max_bytes: int = 65_536,
+    ) -> LogSnapshot:
+        calls.append((allocation_id, task_key, max_bytes))
+        return LogSnapshot(b"\x00raw\xff", True, datetime.now(UTC))
+
+    monkeypatch.setattr(Campaign, "read_log", read_log)
+
+    assert main(["log", str(campaign_path), "alloc", "--task", "one", "--bytes", "9"]) == 0
+
+    captured = capfdbinary.readouterr()
+    assert captured.out == b"\x00raw\xff"
+    assert calls == [("alloc", "one", 9)]
+
+
+def test_cli_log_help_warns_and_errors_use_existing_redacted_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    campaign_path = tmp_path / "campaign"
+    Campaign.open(campaign_path, ())
+    with pytest.raises(SystemExit) as help_exit:
+        main(["log", "--help"])
+    assert help_exit.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "untrusted raw log bytes" in help_text
+    assert "redirect" in help_text.lower()
+
+    def unavailable(*_args: object, **_kwargs: object) -> LogSnapshot:
+        raise ObservationError("campaign log is unavailable")
+
+    monkeypatch.setattr(Campaign, "read_log", unavailable)
+    with pytest.raises(SystemExit) as rejected:
+        main(["log", str(campaign_path), "alloc"])
+    assert rejected.value.code == 2
     error = capsys.readouterr().err
-    assert "plan document schema is unsupported" in error
+    assert "campaign log is unavailable" in error
     assert "Traceback" not in error

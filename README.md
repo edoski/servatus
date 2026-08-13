@@ -20,21 +20,16 @@ risking duplicate work.
 ```python
 from pathlib import Path, PurePosixPath
 
-from servatus import Campaign, ResourceRequest, SlurmTarget, Task
+from servatus import Campaign, Profile, Task
 
 campaign = Campaign.open(
     Path("state/training"),
     [Task("candidate-0", ("train", "--candidate", "0"), b'{"seed": 7}\n')],
 )
 campaign.seal()  # Seal fixed rosters; appendable campaigns may execute while still open.
-resources = ResourceRequest(
-    cpus_per_task=8,
-    memory_mib_per_task=32768,
-    gpus_per_task=1,
-    time_limit="1-00:00:00",
-)
-target = SlurmTarget.from_toml(Path("TARGET.toml"))
-plan = campaign.plan(target, resources)
+profile = Profile.load(Path("SERVATUS.toml"), name="research")
+view = campaign.inspect()  # Scheduler-only unless an application result probe is supplied.
+plan = campaign.plan(profile, view=view)
 # Review plan.allocations and plan.digest, then submit explicitly:
 # validation = campaign.validate(plan)  # Optional, time-specific Slurm --test-only check.
 receipts = campaign.submit(plan)
@@ -51,18 +46,14 @@ The request retains the authored wall time for provenance. Plans and `sbatch` sh
 limit, rounded upward once to whole minutes. The same rounding is applied before comparing a request
 with the target ceiling; packed task count never multiplies wall time.
 
-`RESOURCES.toml` contains exactly four required values:
+`SERVATUS.toml` is one repository-owned document containing one or more complete named execution
+profiles. Its root contains exactly `profiles` and optional `default_profile`. Every profile is
+validated even when it is not selected, and an explicit name overrides the default.
 
 ```toml
-cpus_per_task = 32
-memory_mib_per_task = 65536
-gpus_per_task = 1
-time_limit = "3-00:00:00"
-```
+default_profile = "research"
 
-`TARGET.toml` describes one concrete execution lane and its conservative guardrails:
-
-```toml
+[profiles.research.target]
 host = "login.example.edu"
 slurm_bin = "/opt/slurm/bin"
 apptainer = "/usr/bin/apptainer"
@@ -79,12 +70,20 @@ max_gpus_per_allocation = 4 # use 0 when gpu_gres is omitted
 max_time_limit = "7-00:00:00"
 max_allocations_per_submit = 64
 max_script_bytes = 4194304
+
+[profiles.research.resources]
+cpus_per_task = 32
+memory_mib_per_task = 65536
+gpus_per_task = 1
+time_limit = "3-00:00:00"
 ```
 
 Unknown keys, counted GRES, relative remote paths, unsafe site tokens, controls, booleans used as
-integers, unlimited/zero resources, and conflicting GPU settings are rejected. A target profile is
-a user-side mistake guard, not cluster authorization. Every listed partition must fit one truthful
-conservative envelope.
+integers, unlimited/zero resources, incomplete profiles, and conflicting GPU settings are rejected.
+Profiles do not inherit, merge, search parent directories, consult environment variables, or use a
+global store. The label is nonbinding provenance; exact resolved target and resource values own
+Campaign compatibility. A target is a user-side mistake guard, not cluster authorization. Every
+listed partition must fit one truthful conservative envelope.
 
 The planner preserves authored order and uses the fewest balanced groups allowed by every declared
 ceiling. An allocation containing `n` Tasks requests exactly `n*C` CPUs, `n*M` MiB, and `n*G` GPUs;
@@ -95,12 +94,17 @@ capacity is rejected rather than clamped. Servatus never rounds up to node capac
 the roster is open and preserves target/resource lineage plus every accepted, ambiguous,
 not-submitted, and retry attempt. Append and seal each increment Campaign revision, so older plans
 become stale. Execution remains valid while open. `Campaign.seal()` is atomic and idempotent; a
-sealed Campaign accepts only an exact-roster reopen. Accepted Tasks are not selected again unless
-the caller explicitly requests retry.
+sealed Campaign accepts only an exact-roster reopen.
 
-The current development line uses Campaign schema 4 and plan schema 3. Campaign schema 3 is rejected
-without migration; create a new Campaign when upgrading. Loading a plan regenerates it from typed
-inputs and requires identical canonical bytes.
+Planning consumes one exact revision-bound `CampaignView`. Valid results are excluded.
+Never-accepted missing or unobserved Tasks are selected. Accepted active work and ambiguous
+acceptance are withheld. Terminal accepted work requires explicit retry; unknown accepted work also
+requires explicit duplicate-execution-risk acknowledgement. Any older active or unknown accepted
+attempt still governs retry safety.
+
+The current development line uses Campaign schema 4 and plan schema 4. Campaign schema 3 is rejected
+without migration; create a new Campaign when upgrading. Loading a plan regenerates it from its
+typed frozen view without probing or scheduler contact and requires identical canonical bytes.
 
 Each allocation runs one concurrent
 `srun --exclusive --exact --nodes=1 --ntasks=1` step per Task. Each step receives its exact CPU,
@@ -117,7 +121,7 @@ Actual simultaneous placement depends on truthful resource requests and site CPU
 Servatus does not silently inflate CPU requests, disable binding, or expose raw scheduler flags.
 
 Task arguments and byte-exact stdin are embedded in the complete batch script before `sbatch`
-acceptance. They are excluded from ordinary plan and status output, but are not secrets: cluster
+acceptance. They are excluded from ordinary plan and inspection output, but are not secrets: cluster
 administrators and accounting systems may be able to inspect them. Scheduler names expose only a
 random Servatus allocation identity.
 
@@ -127,18 +131,18 @@ The Python interface is authoritative. The CLI task JSONL adapter has exactly `k
 `args`, and `stdin_file` per line:
 
 ```sh
-servatus plan TASKS.jsonl --target TARGET.toml --resources RESOURCES.toml \
-  --campaign STATE_DIR --output PLAN.json --tasks-per-allocation 4
-# Exclude caller-validated work or explicitly retry accepted work; both flags are repeatable:
-servatus plan TASKS.jsonl --target TARGET.toml --resources RESOURCES.toml \
-  --campaign STATE_DIR --output RETRY.json --completed task-2 --retry task-0
+servatus plan TASKS.jsonl --campaign STATE_DIR --output PLAN.json --tasks-per-allocation 4
+servatus plan TASKS.jsonl --campaign STATE_DIR --output RETRY.json --retry task-0
+# Unknown accepted work requires the separate duplicate-risk acknowledgement:
+servatus plan TASKS.jsonl --campaign STATE_DIR --output RISKY.json \
+  --retry task-0 --allow-duplicate-risk task-0
 # Explicit sensitive diagnostic; prints complete scripts, arguments, and payloads:
-servatus plan TASKS.jsonl --target TARGET.toml --resources RESOURCES.toml \
-  --campaign STATE_DIR --output PLAN.json --show-scripts
+servatus plan TASKS.jsonl --campaign STATE_DIR --output PLAN.json --show-scripts
 servatus seal STATE_DIR
 servatus validate STATE_DIR PLAN.json
 servatus submit STATE_DIR PLAN.json
-servatus status STATE_DIR
+servatus inspect STATE_DIR
+servatus log STATE_DIR ALLOCATION_ID --task TASK_KEY --bytes 65536 > task.log
 servatus reconcile STATE_DIR ALLOCATION_ID
 servatus resolve STATE_DIR ALLOCATION_ID --job-id 1234 --cluster alpha
 servatus resolve STATE_DIR ALLOCATION_ID --not-submitted
@@ -147,6 +151,8 @@ servatus resolve STATE_DIR ALLOCATION_ID --not-submitted
 To extend an open Campaign through the CLI, pass the complete previously registered JSONL prefix
 followed by the new suffix. Supplying only the suffix, changing the prefix, or extending after
 `servatus seal` fails closed. Relative `stdin_file` paths resolve against `TASKS.jsonl`'s parent.
+The CLI loads exactly `Path.cwd() / "SERVATUS.toml"`; `--profile NAME` overrides its declared
+default. It never accepts a configuration path or searches a parent directory.
 
 `PLAN.json` is published owner-only and never overwrites an existing path. It contains task keys,
 requested resources, effective allocation totals, target values,
@@ -159,8 +165,8 @@ or mutate campaign state.
 An intent without a receipt is ambiguous. `reconcile` uses the Campaign's validated target lineage
 for one bounded `squeue`/`sacct` query and adopts only one exact Servatus identity. Otherwise an
 operator must resolve it explicitly as accepted or not submitted. Retry is explicit through
-`Campaign.plan(..., retry={...})`; prior receipts remain in history. Status reports unaccepted
-tasks, not incomplete work: the caller supplies `completed` after its own canonical validation.
+`Campaign.plan(..., retry={...})`; prior receipts remain in history. `inspect` reports
+scheduler-only evidence as JSON. There is no acceptance-only status or caller-built completed set.
 
 ### Inspection
 
@@ -210,6 +216,14 @@ valid. `quiescent` independently requires requested scheduler evidence, no unres
 and terminal evidence for every accepted Attempt. Valid results can therefore be ready while Slurm
 accounting is unknown. Inspection is transient, time-stamped, redacted, and read-only; a concurrent
 Campaign revision change rejects the view.
+
+A plan freezes the exact Campaign revision, roster and attempt projection, result and scheduler
+observations, selection, retry and duplicate-risk choices, profile label and resolved values, and
+allocations. `plan_document()` and `restore_plan()` provide its canonical cross-process codec.
+Before each allocation submission, `Campaign.submit()` rereads Campaign state, reprobes only its
+selected Tasks when the plan was result-aware, refreshes relevant accepted Attempts, rereads state,
+and aborts changed eligibility before recording intent or calling `sbatch`. Pass the same probe as
+`submit(plan, probe=result_exists)` for result-aware plans. Scheduler-only plans need no probe.
 
 `Campaign.read_log(allocation_id, task_key=None, max_bytes=65_536)` returns one immutable
 `LogSnapshot` containing the latest bounded suffix of an accepted Attempt's combined binary log.

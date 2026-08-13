@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
 import pytest
-from test_campaign import resources, target, tasks
+from test_campaign import planning, target, tasks
 
 from servatus import (
     AcceptanceState,
@@ -26,6 +26,23 @@ from servatus import (
 )
 
 
+def terminal_observations(
+    _target: SlurmTarget, queries: tuple[_slurm._AttemptQuery, ...]
+) -> tuple[_slurm.SchedulerObservation, ...]:
+    return tuple(
+        _slurm.SchedulerObservation(
+            _slurm.AllocationState.SUCCEEDED,
+            "COMPLETED",
+            "COMPLETED",
+            "0:0",
+            None,
+            None,
+            None,
+        )
+        for _query in queries
+    )
+
+
 def accept(
     monkeypatch: pytest.MonkeyPatch,
     campaign: Campaign,
@@ -36,27 +53,38 @@ def accept(
 ) -> None:
     replies = iter(job_ids)
     remaining = len(job_ids)
-    monkeypatch.setattr(
-        _slurm,
-        "_run_ssh",
-        lambda *_args, **_kwargs: _slurm.Result(0, f"{next(replies)};alpha\n".encode(), b""),
-    )
-    while remaining:
-        retry_keys = (
-            {key for receipt in campaign.status().receipts for key in receipt.task_keys}
-            if retry
-            else ()
+    with monkeypatch.context() as context:
+        context.setattr(
+            _slurm,
+            "_run_ssh",
+            lambda *_args, **_kwargs: _slurm.Result(0, f"{next(replies)};alpha\n".encode(), b""),
         )
-        accepted = campaign.submit(
-            campaign.plan(
-                target(),
-                resources(),
-                retry=retry_keys,
-                tasks_per_allocation=task_count,
+        context.setattr(
+            _slurm,
+            "query_attempts",
+            terminal_observations,
+        )
+        while remaining:
+            evidence = campaign.inspect(scheduler=False)
+            retry_keys = (
+                {
+                    key
+                    for attempt in evidence.attempts
+                    if attempt.receipt is not None
+                    for key in attempt.task_keys
+                }
+                if retry
+                else ()
             )
-        )
-        assert accepted
-        remaining -= len(accepted)
+            accepted = campaign.submit(
+                planning(
+                    campaign,
+                    retry=retry_keys,
+                    tasks_per_allocation=task_count,
+                )
+            )
+            assert accepted
+            remaining -= len(accepted)
 
 
 def scheduler_rows(
@@ -120,7 +148,7 @@ def test_native_missing_active_job_still_uses_exact_terminal_accounting(
 ) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(1))
     accept(monkeypatch, campaign, [42])
-    receipt = campaign.status().receipts[0]
+    receipt = campaign.inspect(scheduler=False).attempts[0].receipt
     identity = f"servatus-{receipt.allocation_id}"
     calls: list[str] = []
 
@@ -192,7 +220,11 @@ def test_reused_job_identity_remains_bound_to_each_immutable_attempt(
     accept(monkeypatch, campaign, [42])
     Clock.current = datetime(2030, 1, 2, 12, 0, 0, tzinfo=UTC)
     accept(monkeypatch, campaign, [42], retry=True)
-    receipts = campaign.status().receipts
+    receipts = tuple(
+        attempt.receipt
+        for attempt in campaign.inspect(scheduler=False).attempts
+        if attempt.receipt is not None
+    )
     identities = [f"servatus-{receipt.allocation_id}" for receipt in receipts]
     states = {identities[0]: "FAILED", identities[1]: "COMPLETED"}
     submits = {identities[0]: "2030-01-01T12:00:00", identities[1]: "2030-01-02T12:00:00"}
@@ -243,7 +275,7 @@ def test_requeue_history_anchors_original_and_uses_unique_latest_incarnation(
     monkeypatch.setattr(_campaign, "datetime", Clock)
     campaign = Campaign.open(tmp_path / "campaign", tasks(1))
     accept(monkeypatch, campaign, [42])
-    identity = f"servatus-{campaign.status().receipts[0].allocation_id}"
+    identity = f"servatus-{campaign.inspect(scheduler=False).attempts[0].receipt.allocation_id}"
 
     def rows(active: bool, terminal: bool = False):
         def query(_target: SlurmTarget, argv: tuple[str, ...]) -> _slurm.Result:
@@ -344,7 +376,7 @@ def test_ambiguous_or_noncanonical_requeue_history_fails_closed(
     monkeypatch.setattr(_campaign, "datetime", Clock)
     campaign = Campaign.open(tmp_path / "campaign", tasks(1))
     accept(monkeypatch, campaign, [42])
-    identity = f"servatus-{campaign.status().receipts[0].allocation_id}"
+    identity = f"servatus-{campaign.inspect(scheduler=False).attempts[0].receipt.allocation_id}"
 
     def query(_target: SlurmTarget, argv: tuple[str, ...]) -> _slurm.Result:
         if argv[0].endswith("squeue"):
@@ -373,7 +405,7 @@ def test_reused_or_multiply_plausible_accounting_identity_fails_closed(
 ) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(1))
     accept(monkeypatch, campaign, [42])
-    receipt = campaign.status().receipts[0]
+    receipt = campaign.inspect(scheduler=False).attempts[0].receipt
     identity = f"servatus-{receipt.allocation_id}"
     submitted_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
     wrong_identity = "servatus-000000000000000000000000"
@@ -490,7 +522,11 @@ def test_each_attempt_uses_exact_single_job_scheduler_queries_in_durable_order(
 ) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(3))
     accept(monkeypatch, campaign, [100, 101, 102], task_count=1)
-    receipts = campaign.status().receipts
+    receipts = tuple(
+        attempt.receipt
+        for attempt in campaign.inspect(scheduler=False).attempts
+        if attempt.receipt is not None
+    )
     calls: list[tuple[str, ...]] = []
 
     def query(_target: SlurmTarget, argv: tuple[str, ...]) -> _slurm.Result:
@@ -590,7 +626,7 @@ def test_active_scheduler_row_wins_a_legitimate_accounting_transition_and_packed
     campaign = Campaign.open(tmp_path / "campaign", tasks(2))
     accept(monkeypatch, campaign, [42], task_count=2)
     campaign.seal()
-    receipt = campaign.status().receipts[0]
+    receipt = campaign.inspect(scheduler=False).attempts[0].receipt
     identity = f"servatus-{receipt.allocation_id}"
     submitted_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -672,7 +708,7 @@ def test_same_incarnation_uses_ordered_later_sample_and_rejects_conflicts(
 ) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(1))
     accept(monkeypatch, campaign, [42])
-    receipt = campaign.status().receipts[0]
+    receipt = campaign.inspect(scheduler=False).attempts[0].receipt
     identity = f"servatus-{receipt.allocation_id}"
     submitted_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -775,7 +811,7 @@ def test_scheduler_fields_reject_controls_before_literal_space_normalization(
 ) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(1))
     accept(monkeypatch, campaign, [42])
-    receipt = campaign.status().receipts[0]
+    receipt = campaign.inspect(scheduler=False).attempts[0].receipt
     identity = f"servatus-{receipt.allocation_id}"
     submitted_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -860,7 +896,7 @@ def test_scheduler_structural_and_complete_invocation_bounds_fail_closed(
             "_run_ssh",
             lambda *_args, **_kwargs: _slurm.Result(0, b"43;alpha\n", b""),
         )
-        oversized.submit(oversized.plan(oversized_target, resources()))
+        oversized.submit(planning(oversized, oversized_target))
         oversized_campaigns.append(oversized)
 
     contacted = False
@@ -876,7 +912,9 @@ def test_scheduler_structural_and_complete_invocation_bounds_fail_closed(
             oversized.inspect()
     host_campaign = oversized_campaigns[1]
     with pytest.raises(ObservationError, match="campaign log is unavailable"):
-        host_campaign.read_log(host_campaign.status().receipts[0].allocation_id)
+        host_campaign.read_log(
+            host_campaign.inspect(scheduler=False).attempts[0].receipt.allocation_id
+        )
     assert not contacted
 
 
@@ -933,7 +971,7 @@ def test_inspection_and_reconciliation_force_utc_despite_local_timezone(
 
     campaign = Campaign.open(tmp_path / "accepted", tasks(1))
     accept(monkeypatch, campaign, [42])
-    receipt = campaign.status().receipts[0]
+    receipt = campaign.inspect(scheduler=False).attempts[0].receipt
     identity = f"servatus-{receipt.allocation_id}"
     submitted_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
     remote_commands: list[str] = []
@@ -971,8 +1009,8 @@ def test_inspection_and_reconciliation_force_utc_despite_local_timezone(
         lambda *_args, **_kwargs: _slurm.Result(1, b"", b"lost reply"),
     )
     with pytest.raises(AmbiguousSubmission):
-        ambiguous.submit(ambiguous.plan(target(), resources()))
-    allocation_id = ambiguous.status().ambiguous_allocation_ids[0]
+        ambiguous.submit(planning(ambiguous))
+    allocation_id = ambiguous.inspect(scheduler=False).attempts[-1].allocation_id
     reconcile_identity = f"servatus-{allocation_id}"
     monkeypatch.setattr(_slurm, "_run_ssh", real_run_ssh)
 
@@ -1051,17 +1089,17 @@ def test_unresolved_acceptance_dominates_task_projection(
     campaign = Campaign.open(tmp_path / "campaign", tasks(1))
     accept(monkeypatch, campaign, [41])
     monkeypatch.setattr(
-        _slurm, "_run_ssh", lambda *_args, **_kwargs: _slurm.Result(1, b"", b"lost")
-    )
-    with pytest.raises(AmbiguousSubmission):
-        campaign.submit(campaign.plan(target(), resources(), retry={"task-0"}))
-    monkeypatch.setattr(
         _slurm,
         "_run_bounded_ssh",
         scheduler_rows(
             {41: ("COMPLETED", "0:0", "None", "2030-01-01T00:00:00", "2030-01-01T01:00:00")}
         ),
     )
+    monkeypatch.setattr(
+        _slurm, "_run_ssh", lambda *_args, **_kwargs: _slurm.Result(1, b"", b"lost")
+    )
+    with pytest.raises(AmbiguousSubmission):
+        campaign.submit(planning(campaign, retry={"task-0"}))
     view = campaign.inspect()
     assert len(view.attempts) == 2
     assert view.tasks[0].acceptance_ambiguous
@@ -1113,7 +1151,7 @@ def test_accepted_allocation_and_task_logs_are_exact_bounded_binary_suffixes(
 ) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(2))
     accept(monkeypatch, campaign, [42], task_count=2)
-    allocation_id = campaign.status().receipts[0].allocation_id
+    allocation_id = campaign.inspect(scheduler=False).attempts[0].receipt.allocation_id
     replies = iter((b"", b"\x00\xff", b"abcd", b"Xabcd"))
     calls: list[tuple[tuple[str, ...], int]] = []
 
@@ -1175,8 +1213,8 @@ def test_foreign_unaccepted_and_unrelated_log_inputs_fail_before_ssh(
 
     monkeypatch.setattr(_slurm, "_run_ssh", lambda *_args, **_kwargs: _slurm.Result(1, b"", b""))
     with pytest.raises(AmbiguousSubmission):
-        campaign.submit(campaign.plan(target(), resources()))
-    unresolved = campaign.status().ambiguous_allocation_ids[0]
+        campaign.submit(planning(campaign))
+    unresolved = campaign.inspect(scheduler=False).attempts[-1].allocation_id
     with pytest.raises(ObservationError):
         campaign.read_log(unresolved)
     campaign.resolve(unresolved, job_id=None)
@@ -1189,7 +1227,7 @@ def test_foreign_unaccepted_and_unrelated_log_inputs_fail_before_ssh(
         "_run_ssh",
         lambda *_args, **_kwargs: _slurm.Result(0, b"42;alpha\n", b""),
     )
-    receipt = campaign.submit(campaign.plan(target(), resources()))[0]
+    receipt = campaign.submit(planning(campaign))[0]
     with pytest.raises(ObservationError):
         campaign.read_log(receipt.allocation_id, task_key="not-in-attempt")
     assert not contacted
@@ -1205,8 +1243,9 @@ def test_retry_logs_with_equal_job_ids_and_distinct_clusters_cannot_alias(
         "_run_ssh",
         lambda *_args, **_kwargs: _slurm.Result(0, next(replies), b""),
     )
-    first = campaign.submit(campaign.plan(target(), resources()))[0]
-    second = campaign.submit(campaign.plan(target(), resources(), retry={"task-0"}))[0]
+    first = campaign.submit(planning(campaign))[0]
+    monkeypatch.setattr(_slurm, "query_attempts", terminal_observations)
+    second = campaign.submit(planning(campaign, retry={"task-0"}))[0]
     paths: list[str] = []
 
     def read(
@@ -1256,7 +1295,7 @@ def test_log_failures_are_redacted_and_never_return_partial_content(
         "_run_ssh",
         lambda *_args, **_kwargs: _slurm.Result(0, b"42;alpha\n", b""),
     )
-    receipt = campaign.submit(campaign.plan(secret_target, resources()))[0]
+    receipt = campaign.submit(planning(campaign, secret_target))[0]
 
     def fail(*_args: object, **_kwargs: object) -> _slurm.Result:
         if isinstance(outcome, BaseException):
@@ -1299,7 +1338,7 @@ def test_blocked_log_read_releases_campaign_lock_and_does_not_change_campaign_fa
         "_run_ssh",
         lambda *_args, **_kwargs: _slurm.Result(0, next(replies), b""),
     )
-    first = campaign.submit(campaign.plan(target(), resources()))[0]
+    first = campaign.submit(planning(campaign))[0]
     state_path = campaign_path / "campaign.json"
     before_log = state_path.read_bytes()
     entered = threading.Event()
@@ -1330,10 +1369,11 @@ def test_blocked_log_read_releases_campaign_lock_and_does_not_change_campaign_fa
     reader.start()
     assert entered.wait(timeout=5)
 
+    monkeypatch.setattr(_slurm, "query_attempts", terminal_observations)
     extended = Campaign.open(campaign_path, tasks(2))
-    extended.plan(target(), resources())
+    planning(extended)
     extended.seal()
-    second = extended.submit(extended.plan(target(), resources()))
+    second = extended.submit(planning(extended))
     assert second[0].task_keys == ("task-1",)
 
     release.set()
@@ -1350,13 +1390,14 @@ def test_blocked_log_read_releases_campaign_lock_and_does_not_change_campaign_fa
         lambda *_args, **_kwargs: _slurm.Result(0, b"read-again", b""),
     )
     before_view = extended.inspect(lambda _task: True, scheduler=False)
-    before_plan = extended.plan(target(), resources())
+    before_plan = planning(extended)
     extended.read_log(first.allocation_id)
     after_view = extended.inspect(lambda _task: True, scheduler=False)
-    after_plan = extended.plan(target(), resources())
+    after_plan = planning(extended)
     assert state_path.read_bytes() == final_state
     assert (before_view.results_ready, before_view.quiescent) == (
         after_view.results_ready,
         after_view.quiescent,
     )
-    assert before_plan == after_plan
+    assert before_plan.selected_task_keys == after_plan.selected_task_keys
+    assert before_plan.allocations == after_plan.allocations

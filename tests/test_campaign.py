@@ -7,6 +7,7 @@ import os
 import stat
 import threading
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -16,6 +17,7 @@ from servatus import (
     Campaign,
     ConfigurationError,
     PlanError,
+    Profile,
     ResourceRequest,
     SlurmTarget,
     Task,
@@ -62,6 +64,49 @@ def resources(**changes: object) -> ResourceRequest:
     return ResourceRequest(**values)  # type: ignore[arg-type]
 
 
+def profile(
+    target_value: SlurmTarget | None = None,
+    resource_value: ResourceRequest | None = None,
+    *,
+    label: str = "test",
+) -> Profile:
+    return Profile(label, target_value or target(), resource_value or resources())
+
+
+def planning(
+    campaign: Campaign,
+    target_value: SlurmTarget | None = None,
+    resource_value: ResourceRequest | None = None,
+    **options: object,
+) -> _campaign.SubmissionPlan:
+    return campaign.plan(
+        profile(target_value, resource_value),
+        view=campaign.inspect(),
+        **options,  # type: ignore[arg-type]
+    )
+
+
+@pytest.fixture(autouse=True)
+def terminal_scheduler(monkeypatch: pytest.MonkeyPatch) -> None:
+    def observe(
+        _target: SlurmTarget, queries: tuple[_slurm._AttemptQuery, ...]
+    ) -> tuple[_slurm.SchedulerObservation, ...]:
+        return tuple(
+            _slurm.SchedulerObservation(
+                _slurm.AllocationState.SUCCEEDED,
+                "COMPLETED",
+                "COMPLETED",
+                "0:0",
+                None,
+                datetime.now(UTC).isoformat(),
+                datetime.now(UTC).isoformat(),
+            )
+            for _query in queries
+        )
+
+    monkeypatch.setattr(_slurm, "query_attempts", observe)
+
+
 def tasks(count: int) -> tuple[Task, ...]:
     return tuple(
         Task(f"task-{index}", ("run", str(index)), f"input-{index}".encode())
@@ -85,15 +130,7 @@ def test_resource_request_rejects_invalid_values(field: str, value: object) -> N
         resources(**{field: value})
 
 
-def test_strict_resource_toml_and_target_values(tmp_path: Path) -> None:
-    resource_file = tmp_path / "resources.toml"
-    resource_file.write_text(
-        "cpus_per_task = 1\nmemory_mib_per_task = 1024\ngpus_per_task = 0\n"
-        'time_limit = "00:10:00"\nextra = true\n'
-    )
-    with pytest.raises(ConfigurationError, match="unknown"):
-        ResourceRequest.from_toml(resource_file)
-
+def test_direct_target_and_resources_reject_invalid_values() -> None:
     with pytest.raises(ConfigurationError):
         target(host="-oProxyCommand=bad")
     with pytest.raises(ConfigurationError):
@@ -109,21 +146,6 @@ def test_gpu_gres_accepts_only_count_free_gpu_family(gres: str) -> None:
         target(gpu_gres=gres)
 
 
-def test_target_toml_rejects_non_gpu_gres_family(tmp_path: Path) -> None:
-    path = tmp_path / "target.toml"
-    path.write_text(
-        'host = "login.example.edu"\nslurm_bin = "/opt/slurm/bin"\n'
-        'apptainer = "/usr/bin/apptainer"\nimage = "/images/work.sif"\n'
-        'work_root = "/work"\nlog_root = "/logs"\npartitions = ["gpu"]\n'
-        'gpu_gres = "scratch"\nmax_tasks_per_allocation = 1\n'
-        "max_cpus_per_allocation = 8\nmax_memory_mib_per_allocation = 8192\n"
-        'max_gpus_per_allocation = 1\nmax_time_limit = "01:00:00"\n'
-        "max_allocations_per_submit = 1\nmax_script_bytes = 1048576\n"
-    )
-    with pytest.raises(ConfigurationError):
-        SlurmTarget.from_toml(path)
-
-
 def test_direct_target_normalizes_pathlike_values_and_rejects_other_types() -> None:
     direct = target(slurm_bin="/opt/slurm/bin", image=Path("/images/work.sif"))
     assert direct.slurm_bin == PurePosixPath("/opt/slurm/bin")
@@ -137,7 +159,7 @@ def test_campaign_accepts_only_an_exact_append_only_suffix(tmp_path: Path) -> No
     path = tmp_path / "campaign"
     original = tasks(2)
     campaign = Campaign.open(path, original)
-    stale = campaign.plan(target(), resources())
+    stale = planning(campaign)
     before = json.loads((path / "campaign.json").read_text())
 
     grown = Campaign.open(path, tasks(4))
@@ -168,13 +190,12 @@ def test_campaign_loads_an_existing_durable_roster(tmp_path: Path) -> None:
 
     assert opened.tasks == tasks(2)
     assert loaded.tasks == tasks(2)
-    assert loaded.status() == opened.status()
 
 
 def test_campaign_seal_is_durable_idempotent_and_stales_plans(tmp_path: Path) -> None:
     path = tmp_path / "campaign"
     campaign = Campaign.open(path, tasks(2))
-    stale = campaign.plan(target(), resources())
+    stale = planning(campaign)
 
     campaign.seal()
     sealed = (path / "campaign.json").read_bytes()
@@ -217,7 +238,7 @@ def test_open_campaign_can_execute_before_sealing(
         lambda *_args, **_kwargs: _slurm.Result(0, b"101\n", b""),
     )
 
-    assert campaign.submit(campaign.plan(target(), resources()))[0].job_id == 101
+    assert campaign.submit(planning(campaign))[0].job_id == 101
 
 
 def test_growth_preserves_receipts_and_submits_only_new_suffix(
@@ -232,20 +253,25 @@ def test_growth_preserves_receipts_and_submits_only_new_suffix(
         return _slurm.Result(0, f"{100 + len(submitted)}\n".encode(), b"")
 
     monkeypatch.setattr(_slurm, "_run_ssh", accepted)
-    campaign.submit(campaign.plan(target(), resources()))
+    campaign.submit(planning(campaign))
     grown = Campaign.open(path, tasks(4))
-    suffix_plan = grown.plan(target(), resources())
+    suffix_plan = planning(grown)
 
     assert [allocation.task_keys for allocation in suffix_plan.allocations] == [
         ("task-2", "task-3")
     ]
     grown.submit(suffix_plan)
-    assert [receipt.task_keys for receipt in grown.status().receipts] == [
+    accepted_attempts = [
+        attempt
+        for attempt in grown.inspect(scheduler=False).attempts
+        if attempt.receipt is not None
+    ]
+    assert [attempt.receipt.task_keys for attempt in accepted_attempts] == [  # type: ignore[union-attr]
         ("task-0", "task-1"),
         ("task-2", "task-3"),
     ]
-    assert grown.status().unaccepted_task_keys == ()
-    retry = grown.plan(target(), resources(), retry={"task-0"})
+    assert planning(grown).allocations == ()
+    retry = planning(grown, retry={"task-0"})
     assert [allocation.task_keys for allocation in retry.allocations] == [("task-0",)]
 
 
@@ -259,17 +285,15 @@ def test_old_handle_reads_appended_roster_for_status_plan_and_retry(
         "_run_ssh",
         lambda *_args, **_kwargs: _slurm.Result(0, b"101\n", b""),
     )
-    old.submit(old.plan(target(), resources()))
+    old.submit(planning(old))
     Campaign.open(path, tasks(3))
 
-    assert old.status().unaccepted_task_keys == ("task-1", "task-2")
-    assert [allocation.task_keys for allocation in old.plan(target(), resources()).allocations] == [
+    assert [allocation.task_keys for allocation in planning(old).allocations] == [
         ("task-1", "task-2")
     ]
-    assert [
-        allocation.task_keys
-        for allocation in old.plan(target(), resources(), retry={"task-0"}).allocations
-    ] == [("task-0", "task-1", "task-2")]
+    assert [allocation.task_keys for allocation in planning(old, retry={"task-0"}).allocations] == [
+        ("task-0", "task-1", "task-2")
+    ]
 
 
 def test_append_after_submit_verification_blocks_before_ssh(
@@ -277,7 +301,7 @@ def test_append_after_submit_verification_blocks_before_ssh(
 ) -> None:
     path = tmp_path / "campaign"
     old = Campaign.open(path, tasks(1))
-    plan = old.plan(target(), resources())
+    plan = planning(old)
     verify = old._verify_plan
     ssh_calls = 0
 
@@ -293,10 +317,10 @@ def test_append_after_submit_verification_blocks_before_ssh(
     monkeypatch.setattr(old, "_verify_plan", verify_then_append)
     monkeypatch.setattr(_slurm, "_run_ssh", accepted)
 
-    with pytest.raises(PlanError, match="changed before submission intent"):
+    with pytest.raises(PlanError, match="changed before submission freshness"):
         old.submit(plan)
     assert ssh_calls == 0
-    assert old.status().unaccepted_task_keys == ("task-0", "task-1")
+    assert old.tasks == tasks(2)
 
 
 def test_growth_preserves_ambiguous_intent_and_resource_lineage(
@@ -310,21 +334,29 @@ def test_growth_preserves_ambiguous_intent_and_resource_lineage(
 
     monkeypatch.setattr(_slurm, "_run_ssh", lose_reply)
     with pytest.raises(AmbiguousSubmission):
-        campaign.submit(campaign.plan(target(), resources()))
-    ambiguous = campaign.status().ambiguous_allocation_ids
+        campaign.submit(planning(campaign))
+    ambiguous = tuple(
+        attempt.allocation_id
+        for attempt in campaign.inspect(scheduler=False).attempts
+        if attempt.acceptance is _campaign.AcceptanceState.UNRESOLVED
+    )
 
     grown = Campaign.open(path, tasks(2))
 
-    assert grown.status().ambiguous_allocation_ids == ambiguous
-    with pytest.raises(AmbiguousSubmission):
-        grown.plan(target(), resources())
+    assert (
+        tuple(
+            attempt.allocation_id
+            for attempt in grown.inspect(scheduler=False).attempts
+            if attempt.acceptance is _campaign.AcceptanceState.UNRESOLVED
+        )
+        == ambiguous
+    )
+    assert [allocation.task_keys for allocation in planning(grown).allocations] == [("task-1",)]
     campaign.resolve(ambiguous[0], job_id=None)
     with pytest.raises(PlanError, match="resource semantics"):
-        campaign.plan(target(), resources(cpus_per_task=16))
+        planning(campaign, resource_value=resources(cpus_per_task=16))
     assert tuple(
-        key
-        for allocation in campaign.plan(target(), resources()).allocations
-        for key in allocation.task_keys
+        key for allocation in planning(campaign).allocations for key in allocation.task_keys
     ) == ("task-0", "task-1")
 
 
@@ -371,7 +403,7 @@ def test_growth_postcommit_sync_failure_is_recoverable(
     recovered = Campaign.open(path, tasks(2))
     state = json.loads((path / "campaign.json").read_text())
     assert state["revision"] == 1
-    assert recovered.status().unaccepted_task_keys == ("task-0", "task-1")
+    assert recovered.tasks == tasks(2)
     assert list(path.glob(".campaign-*.tmp")) == []
 
 
@@ -389,7 +421,7 @@ def test_growth_task_digest_tampering_fails_closed(tmp_path: Path) -> None:
 
 def test_kairos_shape_and_balanced_order(tmp_path: Path) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(9))
-    plan = campaign.plan(target(), resources(), tasks_per_allocation=3)
+    plan = planning(campaign, tasks_per_allocation=3)
 
     assert [len(allocation.task_keys) for allocation in plan.allocations] == [3, 3, 3]
     assert tuple(key for allocation in plan.allocations for key in allocation.task_keys) == tuple(
@@ -401,7 +433,7 @@ def test_kairos_shape_and_balanced_order(tmp_path: Path) -> None:
         for allocation in plan.allocations
     )
 
-    four = Campaign.open(tmp_path / "four", tasks(4)).plan(target(), resources())
+    four = planning(Campaign.open(tmp_path / "four", tasks(4)))
     assert four.allocations[0].cpus == 128
     assert four.allocations[0].memory_mib == 262144
     assert four.allocations[0].gpus == 4
@@ -420,7 +452,7 @@ def test_kairos_shape_and_balanced_order(tmp_path: Path) -> None:
 
 
 def test_empty_campaign_has_empty_plan(tmp_path: Path) -> None:
-    plan = Campaign.open(tmp_path / "campaign", ()).plan(target(), resources())
+    plan = planning(Campaign.open(tmp_path / "campaign", ()))
     assert plan.allocations == ()
 
 
@@ -438,7 +470,7 @@ def test_every_target_ceiling_can_reject_one_task(
 ) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(1))
     with pytest.raises(PlanError):
-        campaign.plan(target(**changes), resources())
+        planning(campaign, target(**changes))
 
 
 @pytest.mark.parametrize("count", range(1, 18))
@@ -446,14 +478,16 @@ def test_every_target_ceiling_can_reject_one_task(
 def test_balanced_groups_preserve_exact_resources(tmp_path: Path, count: int, gpus: int) -> None:
     maximum = 4
     gpu_ceiling = 0 if gpus == 0 else maximum * gpus
-    plan = Campaign.open(tmp_path / f"campaign-{count}-{gpus}", tasks(count)).plan(
+    campaign = Campaign.open(tmp_path / f"campaign-{count}-{gpus}", tasks(count))
+    plan = planning(
+        campaign,
         target(
             gpu_gres=None if gpus == 0 else "gpu",
             max_gpus_per_allocation=gpu_ceiling,
             max_cpus_per_allocation=maximum * 2,
             max_memory_mib_per_allocation=maximum * 100,
         ),
-        resources(
+        resource_value=resources(
             cpus_per_task=2,
             memory_mib_per_task=100,
             gpus_per_task=gpus,
@@ -477,7 +511,7 @@ def test_balanced_groups_preserve_exact_resources(tmp_path: Path, count: int, gp
 def test_requested_cap_above_feasible_is_rejected(tmp_path: Path) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(4))
     with pytest.raises(PlanError, match="capacity"):
-        campaign.plan(target(max_tasks_per_allocation=2), resources(), tasks_per_allocation=3)
+        planning(campaign, target(max_tasks_per_allocation=2), tasks_per_allocation=3)
 
 
 def test_plan_is_local_stable_and_public_document_redacts_payload(
@@ -493,8 +527,9 @@ def test_plan_is_local_stable_and_public_document_redacts_payload(
         raise AssertionError("planning contacted an external process")
 
     monkeypatch.setattr(_slurm, "_run_ssh", forbidden)
-    first = campaign.plan(target(), resources())
-    second = campaign.plan(target(), resources())
+    view = campaign.inspect()
+    first = campaign.plan(profile(), view=view)
+    second = campaign.plan(profile(), view=view)
     document = _campaign.plan_document(first)
 
     assert first.digest == second.digest
@@ -508,9 +543,10 @@ def test_effective_slurm_time_is_rounded_once_and_requested_time_is_preserved(
     tmp_path: Path,
 ) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(4))
-    plan = campaign.plan(
+    plan = planning(
+        campaign,
         target(max_time_limit="00:00:01"),
-        resources(time_limit="00:00:30"),
+        resource_value=resources(time_limit="00:00:30"),
     )
     document = _campaign.plan_document(plan)
     assert document["resources"] == {
@@ -522,34 +558,37 @@ def test_effective_slurm_time_is_rounded_once_and_requested_time_is_preserved(
     assert plan.allocations[0].time_limit == "00:01:00"
     assert "--time=00:01:00" in plan._allocations[0].argv
 
-    seconds = Campaign.open(tmp_path / "seconds", tasks(1)).plan(
-        target(), resources(time_limit="01:02:03")
+    seconds = planning(
+        Campaign.open(tmp_path / "seconds", tasks(1)),
+        resource_value=resources(time_limit="01:02:03"),
     )
     assert seconds.allocations[0].time_limit == "01:03:00"
     assert "--time=01:03:00" in seconds._allocations[0].argv
 
     with pytest.raises(PlanError, match="time_limit"):
-        Campaign.open(tmp_path / "too-long", tasks(1)).plan(
-            target(max_time_limit="00:01:00"), resources(time_limit="00:01:01")
+        planning(
+            Campaign.open(tmp_path / "too-long", tasks(1)),
+            target(max_time_limit="00:01:00"),
+            resource_value=resources(time_limit="00:01:01"),
         )
 
 
 def test_script_size_exact_boundary(tmp_path: Path) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    roomy = campaign.plan(target(), resources())
+    roomy = planning(campaign)
     size = len(roomy._allocations[0].script)
     exact_target = replace(target(), max_script_bytes=size)
 
-    campaign.plan(exact_target, resources())
+    planning(campaign, exact_target)
     with pytest.raises(PlanError, match="script"):
-        campaign.plan(replace(exact_target, max_script_bytes=size - 1), resources())
+        planning(campaign, replace(exact_target, max_script_bytes=size - 1))
 
 
 def test_submit_records_intent_before_ssh_and_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    plan = campaign.plan(target(), resources())
+    plan = planning(campaign)
 
     def accepted(target_value: SlurmTarget, argv: tuple[str, ...], script: bytes) -> _slurm.Result:
         state = json.loads((tmp_path / "campaign" / "campaign.json").read_text())
@@ -573,7 +612,7 @@ def test_submit_records_intent_before_ssh_and_receipt(
     receipts = campaign.submit(plan)
 
     assert [(receipt.job_id, receipt.cluster) for receipt in receipts] == [(4242, "alpha")]
-    assert campaign.status().unaccepted_task_keys == ()
+    assert planning(campaign).allocations == ()
     state_path = tmp_path / "campaign" / "campaign.json"
     assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
     assert list((tmp_path / "campaign").glob(".campaign-*.tmp")) == []
@@ -590,7 +629,7 @@ def test_submission_state_uses_only_authoritative_provenance(
         lambda *_args, **_kwargs: _slurm.Result(0, b"4242;alpha\n", b""),
     )
 
-    campaign.submit(campaign.plan(target(), resources()))
+    campaign.submit(planning(campaign))
     state = json.loads((path / "campaign.json").read_text())
 
     assert state["schema_version"] == 4
@@ -599,7 +638,9 @@ def test_submission_state_uses_only_authoritative_provenance(
         "allocation_id",
         "task_keys",
         "campaign_revision",
+        "profile_label",
         "retry_task_keys",
+        "duplicate_risk_task_keys",
         "plan_digest",
         "script_digest",
         "target_digest",
@@ -610,6 +651,8 @@ def test_submission_state_uses_only_authoritative_provenance(
         "window_end",
         "acceptance",
     }
+    assert state["attempts"][0]["profile_label"] == "test"
+    assert state["attempts"][0]["duplicate_risk_task_keys"] == []
     assert state["attempts"][0]["campaign_revision"] == 0
     assert state["attempts"][0]["retry_task_keys"] == []
     assert state["attempts"][0]["target_digest"] == state["lineage"]["target_digest"]
@@ -619,7 +662,7 @@ def test_submission_state_uses_only_authoritative_provenance(
         "job_id": 4242,
         "cluster": "alpha",
     }
-    retry = Campaign.open(path, tasks(1)).plan(target(), resources(), retry={"task-0"})
+    retry = planning(Campaign.open(path, tasks(1)), retry={"task-0"})
     allocation = _campaign.plan_document(retry)["allocations"][0]
     assert set(allocation) == {
         "allocation_id",
@@ -648,7 +691,7 @@ def test_campaign_rejects_attempt_with_contradictory_acceptance_fields(
         lambda *_args, **_kwargs: _slurm.Result(1, b"", b"lost reply"),
     )
     with pytest.raises(AmbiguousSubmission):
-        campaign.submit(campaign.plan(target(), resources()))
+        campaign.submit(planning(campaign))
 
     state_path = path / "campaign.json"
     state = json.loads(state_path.read_text())
@@ -684,7 +727,9 @@ def test_campaign_rejects_old_or_noninteger_state_schema(tmp_path: Path, schema:
         (("revision",), 2.0),
         (("tasks", 0, "key"), 7),
         (("attempts", 0, "campaign_revision"), True),
+        (("attempts", 0, "profile_label"), ""),
         (("attempts", 0, "retry_task_keys"), [False]),
+        (("attempts", 0, "duplicate_risk_task_keys"), ["task-0"]),
         (("attempts", 0, "target_digest"), 7),
         (("attempts", 0, "acceptance", "job_id"), 42.0),
         (("attempts", 0, "acceptance", "status"), "NOT_SUBMITTED"),
@@ -703,7 +748,7 @@ def test_campaign_rejects_malformed_bounded_state_values(
         "_run_ssh",
         lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
     )
-    campaign.submit(campaign.plan(target(), resources()))
+    campaign.submit(planning(campaign))
     state_path = campaign_path / "campaign.json"
     state = json.loads(state_path.read_text())
     owner: object = state
@@ -738,7 +783,7 @@ def test_campaign_rejects_revision_behind_attempt_history(
         "_run_ssh",
         lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
     )
-    campaign.submit(campaign.plan(target(), resources()))
+    campaign.submit(planning(campaign))
     state_path = campaign_path / "campaign.json"
     state = json.loads(state_path.read_text())
     state["revision"] = 1
@@ -765,8 +810,8 @@ def test_campaign_rejects_impossible_attempt_revision_groups(
         "_run_ssh",
         lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
     )
-    campaign.submit(campaign.plan(target(), resources()))
-    campaign.submit(campaign.plan(target(), resources(), retry={"task-0"}))
+    campaign.submit(planning(campaign))
+    campaign.submit(planning(campaign, retry={"task-0"}))
     state_path = campaign_path / "campaign.json"
     state = json.loads(state_path.read_text())
     for attempt, revision in zip(state["attempts"], revisions, strict=True):
@@ -793,7 +838,7 @@ def test_campaign_rejects_unexplained_revision_inflation(
             "_run_ssh",
             lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
         )
-        campaign.submit(campaign.plan(target(), resources()))
+        campaign.submit(planning(campaign))
     state_path = campaign_path / "campaign.json"
     state = json.loads(state_path.read_text())
     state["revision"] = 102 if with_attempt else 100
@@ -834,7 +879,7 @@ def test_campaign_rejects_noninteger_allocation_totals(
         lambda *_args, **_kwargs: _slurm.Result(1, b"", b"lost reply"),
     )
     with pytest.raises(AmbiguousSubmission):
-        campaign.submit(campaign.plan(target(), request))
+        campaign.submit(planning(campaign, resource_value=request))
 
     state_path = path / "campaign.json"
     state = json.loads(state_path.read_text())
@@ -855,7 +900,7 @@ def test_campaign_rejects_reordered_attempt_task_lineage(
         "_run_ssh",
         lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
     )
-    campaign.submit(campaign.plan(target(), resources()))
+    campaign.submit(planning(campaign))
     state_path = path / "campaign.json"
     state = json.loads(state_path.read_text())
     state["attempts"][0]["task_keys"].reverse()
@@ -878,8 +923,8 @@ def test_campaign_rejects_erased_retry_provenance(
         "_run_ssh",
         lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
     )
-    campaign.submit(campaign.plan(target(), resources()))
-    campaign.submit(campaign.plan(target(), resources(), retry={"task-0", "task-1"}))
+    campaign.submit(planning(campaign))
+    campaign.submit(planning(campaign, retry={"task-0", "task-1"}))
     state_path = path / "campaign.json"
     state = json.loads(state_path.read_text())
     state["attempts"][1]["retry_task_keys"] = retry_task_keys
@@ -903,7 +948,7 @@ def test_campaign_rejects_invalid_reconciliation_window(
         lambda *_args, **_kwargs: _slurm.Result(1, b"", b"lost reply"),
     )
     with pytest.raises(AmbiguousSubmission):
-        campaign.submit(campaign.plan(target(), resources()))
+        campaign.submit(planning(campaign))
     state_path = path / "campaign.json"
     state = json.loads(state_path.read_text())
     attempt = state["attempts"][0]
@@ -932,7 +977,7 @@ def test_campaign_rejects_nonfinal_unresolved_attempt(
         "_run_ssh",
         lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
     )
-    campaign.submit(campaign.plan(target(max_tasks_per_allocation=1), resources()))
+    campaign.submit(planning(campaign, target(max_tasks_per_allocation=1)))
     state_path = path / "campaign.json"
     state = json.loads(state_path.read_text())
     state["attempts"][0]["acceptance"] = {"status": "UNRESOLVED"}
@@ -952,7 +997,7 @@ def test_campaign_rejects_attempt_after_not_submitted_plan_outcome(
         "_run_ssh",
         lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
     )
-    campaign.submit(campaign.plan(target(max_tasks_per_allocation=1), resources()))
+    campaign.submit(planning(campaign, target(max_tasks_per_allocation=1)))
     state_path = path / "campaign.json"
     state = json.loads(state_path.read_text())
     state["attempts"][0]["acceptance"] = {"status": "NOT_SUBMITTED"}
@@ -975,7 +1020,7 @@ def test_campaign_rejects_changed_plan_allocation_sequence(
         "_run_ssh",
         lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
     )
-    campaign.submit(campaign.plan(target(max_tasks_per_allocation=1), resources()))
+    campaign.submit(planning(campaign, target(max_tasks_per_allocation=1)))
     state_path = path / "campaign.json"
     state = json.loads(state_path.read_text())
     if corruption == "reversed":
@@ -993,7 +1038,7 @@ def test_intent_file_and_directory_are_synced_before_ssh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    plan = campaign.plan(target(), resources())
+    plan = planning(campaign)
     campaign_entry = (tmp_path / "campaign").stat()
     events: list[str] = []
     real_fsync = _campaign.os.fsync
@@ -1028,7 +1073,7 @@ def test_accepted_without_receipt_is_ambiguous_and_halts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(5))
-    plan = campaign.plan(replace(target(), max_tasks_per_allocation=2), resources())
+    plan = planning(campaign, replace(target(), max_tasks_per_allocation=2))
     calls = 0
 
     def accepted(target_value: SlurmTarget, argv: tuple[str, ...], script: bytes) -> _slurm.Result:
@@ -1045,14 +1090,20 @@ def test_accepted_without_receipt_is_ambiguous_and_halts(
     with pytest.raises(AmbiguousSubmission):
         campaign.submit(plan)
     assert calls == 1
-    assert len(campaign.status().ambiguous_allocation_ids) == 1
+    assert (
+        sum(
+            attempt.acceptance is _campaign.AcceptanceState.UNRESOLVED
+            for attempt in campaign.inspect(scheduler=False).attempts
+        )
+        == 1
+    )
 
 
 def test_manual_resolution_and_explicit_retry_preserve_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    plan = campaign.plan(target(), resources())
+    plan = planning(campaign)
     monkeypatch.setattr(
         _slurm,
         "_run_ssh",
@@ -1061,18 +1112,22 @@ def test_manual_resolution_and_explicit_retry_preserve_history(
     with pytest.raises(AmbiguousSubmission):
         campaign.submit(plan)
 
-    allocation_id = campaign.status().ambiguous_allocation_ids[0]
+    allocation_id = campaign.inspect(scheduler=False).attempts[-1].allocation_id
     campaign.resolve(allocation_id, job_id=None)
-    retry_plan = campaign.plan(target(), resources())
+    retry_plan = planning(campaign)
     monkeypatch.setattr(
         _slurm,
         "_run_ssh",
         lambda *args, **kwargs: _slurm.Result(0, b"101\n", b""),
     )
     campaign.submit(retry_plan)
-    second_retry = campaign.plan(target(), resources(), retry={"task-0"})
+    second_retry = planning(campaign, retry={"task-0"})
     campaign.submit(second_retry)
-    assert [receipt.job_id for receipt in campaign.status().receipts] == [101, 101]
+    assert [
+        attempt.receipt.job_id
+        for attempt in campaign.inspect(scheduler=False).attempts
+        if attempt.receipt is not None
+    ] == [101, 101]
 
 
 def test_attempt_history_retains_resolution_reconciliation_retry_and_lineage(
@@ -1086,13 +1141,13 @@ def test_attempt_history_retains_resolution_reconciliation_retry_and_lineage(
         lambda *_args, **_kwargs: _slurm.Result(1, b"", b"lost reply"),
     )
     with pytest.raises(AmbiguousSubmission):
-        campaign.submit(campaign.plan(target(), resources()))
-    first = campaign.status().ambiguous_allocation_ids[0]
+        campaign.submit(planning(campaign))
+    first = campaign.inspect(scheduler=False).attempts[-1].allocation_id
     campaign.resolve(first, job_id=None)
 
     with pytest.raises(AmbiguousSubmission):
-        campaign.submit(campaign.plan(target(), resources()))
-    second = campaign.status().ambiguous_allocation_ids[0]
+        campaign.submit(planning(campaign))
+    second = campaign.inspect(scheduler=False).attempts[-1].allocation_id
     monkeypatch.setattr(
         _slurm,
         "query_identity",
@@ -1105,7 +1160,7 @@ def test_attempt_history_retains_resolution_reconciliation_retry_and_lineage(
         "_run_ssh",
         lambda *_args, **_kwargs: _slurm.Result(0, b"101\n", b""),
     )
-    campaign.submit(campaign.plan(target(), resources(), retry={"task-0"}))
+    campaign.submit(planning(campaign, retry={"task-0"}))
     state = json.loads((path / "campaign.json").read_text())
 
     assert [attempt["campaign_revision"] for attempt in state["attempts"]] == [0, 2, 4]
@@ -1119,7 +1174,11 @@ def test_attempt_history_retains_resolution_reconciliation_retry_and_lineage(
         "ACCEPTED",
         "ACCEPTED",
     ]
-    assert [receipt.job_id for receipt in campaign.status().receipts] == [909, 101]
+    assert [
+        attempt.receipt.job_id
+        for attempt in campaign.inspect(scheduler=False).attempts
+        if attempt.receipt is not None
+    ] == [909, 101]
     assert all(
         attempt["target_digest"] == state["lineage"]["target_digest"]
         and attempt["resource_digest"] == state["lineage"]["resource_digest"]
@@ -1129,7 +1188,7 @@ def test_attempt_history_retains_resolution_reconciliation_retry_and_lineage(
 
 def test_stale_foreign_and_tampered_plans_fail(tmp_path: Path) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    plan = campaign.plan(target(), resources())
+    plan = planning(campaign)
     foreign = Campaign.open(tmp_path / "foreign", tasks(1))
     with pytest.raises(PlanError):
         foreign.submit(plan)
@@ -1144,7 +1203,7 @@ def test_submission_call_cap_leaves_later_groups_pending(
 ) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(5))
     limited = target(max_tasks_per_allocation=2, max_allocations_per_submit=2)
-    plan = campaign.plan(limited, resources())
+    plan = planning(campaign, limited)
     calls = 0
 
     def accepted(*args: object, **kwargs: object) -> _slurm.Result:
@@ -1157,7 +1216,9 @@ def test_submission_call_cap_leaves_later_groups_pending(
 
     assert len(receipts) == 2
     assert calls == 2
-    assert campaign.status().unaccepted_task_keys == ("task-4",)
+    assert [allocation.task_keys for allocation in planning(campaign, limited).allocations] == [
+        ("task-4",)
+    ]
     with pytest.raises(PlanError, match="stale"):
         campaign.submit(plan)
 
@@ -1166,7 +1227,7 @@ def test_validate_deduplicates_shapes_and_never_mutates_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(5))
-    plan = campaign.plan(target(max_tasks_per_allocation=2), resources())
+    plan = planning(campaign, target(max_tasks_per_allocation=2))
     before = (tmp_path / "campaign" / "campaign.json").read_bytes()
     calls: list[tuple[str, ...]] = []
 
@@ -1188,7 +1249,7 @@ def test_validate_deduplicates_shapes_and_never_mutates_state(
 def test_validate_rejects_foreign_plan_before_contacting_slurm(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    plan = Campaign.open(tmp_path / "source", tasks(1)).plan(target(), resources())
+    plan = planning(Campaign.open(tmp_path / "source", tasks(1)))
     foreign = Campaign.open(tmp_path / "foreign", tasks(1))
     called = False
 
@@ -1212,7 +1273,7 @@ def test_reconcile_adopts_only_private_query_result(
 ) -> None:
     path = tmp_path / "campaign"
     campaign = Campaign.open(path, tasks(1))
-    plan = campaign.plan(target(), resources())
+    plan = planning(campaign)
     monkeypatch.setattr(
         _slurm,
         "_run_ssh",
@@ -1220,7 +1281,7 @@ def test_reconcile_adopts_only_private_query_result(
     )
     with pytest.raises(AmbiguousSubmission):
         campaign.submit(plan)
-    allocation_id = campaign.status().ambiguous_allocation_ids[0]
+    allocation_id = campaign.inspect(scheduler=False).attempts[-1].allocation_id
     Campaign.open(path, tasks(2))
     queried_targets: list[SlurmTarget] = []
 
@@ -1234,8 +1295,12 @@ def test_reconcile_adopts_only_private_query_result(
 
     assert (receipt.job_id, receipt.cluster) == (909, "alpha")
     assert queried_targets == [target()]
-    assert campaign.status().ambiguous_allocation_ids == ()
-    assert campaign.status().unaccepted_task_keys == ("task-1",)
+    evidence = campaign.inspect(scheduler=False)
+    assert all(
+        attempt.acceptance is not _campaign.AcceptanceState.UNRESOLVED
+        for attempt in evidence.attempts
+    )
+    assert [allocation.task_keys for allocation in planning(campaign).allocations] == [("task-1",)]
 
 
 def test_state_size_boundary_is_symmetric_and_overflow_does_not_mutate(
@@ -1281,7 +1346,7 @@ def test_campaign_rejects_truncated_state_read(
 
     monkeypatch.setattr(_campaign.os, "read", truncated_read)
     with pytest.raises(TaskConflict, match="changed while reading"):
-        campaign.status()
+        _ = campaign.tasks
 
 
 def test_campaign_rejects_oversized_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1290,7 +1355,7 @@ def test_campaign_rejects_oversized_state(tmp_path: Path, monkeypatch: pytest.Mo
     state_path = path / "campaign.json"
     monkeypatch.setattr(_campaign, "_MAX_STATE_BYTES", state_path.stat().st_size - 1)
     with pytest.raises(TaskConflict, match="too large"):
-        campaign.status()
+        _ = campaign.tasks
 
 
 def test_campaign_rejects_permissive_state_file(tmp_path: Path) -> None:
@@ -1299,7 +1364,7 @@ def test_campaign_rejects_permissive_state_file(tmp_path: Path) -> None:
     state_path = path / "campaign.json"
     state_path.chmod(0o640)
     with pytest.raises(TaskConflict, match="owner-only"):
-        campaign.status()
+        _ = campaign.tasks
 
 
 @pytest.mark.parametrize("failure", ["write", "fsync"])
@@ -1426,7 +1491,7 @@ def test_concurrent_observer_proves_parent_durability_while_creator_is_blocked(
     creator.join(timeout=5)
     assert not creator.is_alive()
     assert set(results) == {"creator", "observer"}
-    assert results["creator"].status() == results["observer"].status()
+    assert results["creator"].tasks == results["observer"].tasks
     assert list((tmp_path / "campaign").glob(".campaign-*.tmp")) == []
 
 
@@ -1488,7 +1553,7 @@ def test_concurrent_openers_cannot_return_when_all_parent_syncs_fail(
         (("resources", "cpus_per_task"), True),
         (("target", "max_tasks_per_allocation"), True),
         (("allocations", 0, "cpus"), True),
-        (("completed",), 7),
+        (("view", "scheduler_observed"), 1),
         (("tasks_per_allocation",), True),
     ],
 )
@@ -1496,7 +1561,7 @@ def test_plan_document_rejects_invalid_inputs_and_derived_tampering(
     tmp_path: Path, path: tuple[str | int, ...], value: object
 ) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    document = copy.deepcopy(_campaign.plan_document(campaign.plan(target(), resources())))
+    document = copy.deepcopy(_campaign.plan_document(planning(campaign)))
     owner: object = document
     for component in path[:-1]:
         owner = owner[component]  # type: ignore[index]

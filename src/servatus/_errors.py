@@ -35,7 +35,7 @@ class CampaignError(ServatusError):
 
 
 class ConfigurationError(CampaignError):
-    """A resource request or target profile is invalid."""
+    """A Task, Profile, target, or resource request is invalid."""
 
 
 class TaskConflict(CampaignError):

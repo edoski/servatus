@@ -4,7 +4,7 @@ import base64
 from pathlib import Path
 
 import pytest
-from test_campaign import resources, target, tasks
+from test_campaign import profile, resources, target, tasks
 
 from servatus import Campaign, JobReceipt, ReconciliationError, ResourceRequest, Task, _slurm
 
@@ -13,11 +13,14 @@ def script_for(tmp_path: Path, request: ResourceRequest) -> str:
     campaign = Campaign.open(tmp_path / "campaign", tasks(1))
     return (
         campaign.plan(
-            target(
-                gpu_gres=None if request.gpus_per_task == 0 else "gpu:a100",
-                max_gpus_per_allocation=request.gpus_per_task,
+            profile(
+                target(
+                    gpu_gres=None if request.gpus_per_task == 0 else "gpu:a100",
+                    max_gpus_per_allocation=request.gpus_per_task,
+                ),
+                request,
             ),
-            request,
+            view=campaign.inspect(scheduler=False),
         )
         ._allocations[0]
         .script.decode()
@@ -43,7 +46,8 @@ def test_two_gpu_script_starts_one_exact_process(tmp_path: Path) -> None:
 
 
 def test_multitask_script_starts_all_siblings_before_waiting(tmp_path: Path) -> None:
-    plan = Campaign.open(tmp_path / "campaign", tasks(4)).plan(target(), resources())
+    campaign = Campaign.open(tmp_path / "campaign", tasks(4))
+    plan = campaign.plan(profile(), view=campaign.inspect(scheduler=False))
     script = plan._allocations[0].script.decode()
     assert script.count("/opt/slurm/bin/srun --exclusive") == 4
     assert script.index("pid_4=$!") < script.index('wait "$pid_1"')
@@ -53,7 +57,8 @@ def test_multitask_script_starts_all_siblings_before_waiting(tmp_path: Path) -> 
 def test_job_id_logs_preserve_zero_based_combined_allocation_and_slot_shape(
     tmp_path: Path,
 ) -> None:
-    plan = Campaign.open(tmp_path / "campaign", tasks(2)).plan(target(), resources())
+    campaign = Campaign.open(tmp_path / "campaign", tasks(2))
+    plan = campaign.plan(profile(), view=campaign.inspect(scheduler=False))
     argv = plan._allocations[0].argv
     allocation_id = plan._allocations[0].allocation_id
     script = plan._allocations[0].script.decode()
@@ -70,9 +75,8 @@ def test_job_id_logs_preserve_zero_based_combined_allocation_and_slot_shape(
 
 def test_binary_payload_is_embedded_before_acceptance_without_raw_bytes(tmp_path: Path) -> None:
     payload = b"line one\n\x00\xffline two"
-    plan = Campaign.open(tmp_path / "campaign", (Task("binary", ("run",), payload),)).plan(
-        target(), resources()
-    )
+    campaign = Campaign.open(tmp_path / "campaign", (Task("binary", ("run",), payload),))
+    plan = campaign.plan(profile(), view=campaign.inspect(scheduler=False))
     script = plan._allocations[0].script
     assert base64.b64encode(payload) in script
     assert payload not in script

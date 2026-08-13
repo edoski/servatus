@@ -9,18 +9,22 @@ irreversibly. Append, seal, and submission mutations preserve prior order, bytes
 and every attempt. Campaign owns deterministic balanced single-node allocations, complete scripts,
 and durable submission records, and fails closed when scheduler acceptance is ambiguous.
 
-The durable lineage retains normalized target guardrails and requested resources once. Each Attempt
-adds ordered Task and explicit-retry keys, its Campaign revision, lineage digests, plan and script
-digests, exact effective allocation totals, the nonsecret `sbatch` argument vector, its
-reconciliation window, and one unresolved, accepted, or not-submitted outcome. Job names derive
-from allocation identity; receipts remain public projections of accepted Attempt outcomes.
-Public plan files redact task arguments and payloads. A loaded plan parses only its typed planning
-inputs, regenerates the immutable plan once, and requires identical canonical bytes, so no second
-derived-field validator is needed. Complete script display remains an explicit sensitive
-diagnostic. Authored wall time remains provenance while planned and submitted time reflects Slurm's
-one-time upward minute rounding.
+One immutable Profile supplies a nonbinding label plus complete target guardrails and requested
+resources. Durable compatibility binds only to exact resolved target/resource values. Each Attempt
+adds the selected label, ordered Task, explicit-retry, and duplicate-risk keys, its Campaign
+revision, lineage digests, plan and script digests, exact effective allocation totals, the
+nonsecret `sbatch` argument vector, its reconciliation window, and one unresolved, accepted, or
+not-submitted outcome. Job names derive from allocation identity; receipts remain public
+projections of accepted Attempt outcomes.
 
-Campaign schema 4 and plan schema 3 are a clean break. Schema-3 Campaign state is rejected without
+Public plan files redact task arguments and payloads but retain private operational evidence. A
+loaded plan parses its frozen revision-bound Campaign view, selection, retry/override decisions,
+Profile, and allocations, regenerates the immutable plan without external observation, and requires
+identical canonical bytes. Complete script display remains an explicit sensitive diagnostic.
+Authored wall time remains provenance while planned and submitted time reflects Slurm's one-time
+upward minute rounding.
+
+Campaign schema 4 and plan schema 4 are a clean break. Schema-3 Campaign state is rejected without
 migration. Every bounded owner-only state read validates the complete atomic snapshot; one tagged
 Attempt outcome removes the former parallel receipt and negative-resolution authorities.
 Internally typed mutations are encoded directly rather than decoded again immediately before the
@@ -29,10 +33,19 @@ atomic write.
 `Campaign.open` registers an authored roster; `Campaign.load` reopens an existing one.
 `Campaign.tasks` exposes the immutable authored tuple, and `Campaign.seal()` atomically and
 idempotently ends suffix authoring. Execution is valid in both roster phases.
-`Campaign.validate` first proves that a plan belongs to the current Campaign revision, then issues
-bounded time-specific `sbatch --test-only` calls. Status reports `unaccepted_task_keys`: receipts
-prove scheduler acceptance, never application completion. Reconciliation reconstructs its target
-from validated immutable lineage, so callers cannot supply a second route.
+`Campaign.plan` requires one exact current Campaign view. Valid results are excluded; never-accepted
+missing/unobserved Tasks are selected; ambiguity and active accepted work are withheld; terminal
+accepted work requires explicit retry; and unknown accepted work also requires a recorded
+duplicate-risk acknowledgement. Every accepted Attempt matters, so older active or unknown work
+cannot be hidden by a newer Attempt. `Campaign.validate` first proves that a plan belongs to the
+current Campaign revision, then issues bounded time-specific `sbatch --test-only` calls.
+Scheduler-only `inspect` replaces the old acceptance-only status. Reconciliation reconstructs its
+target from validated immutable lineage, so callers cannot supply a second route.
+
+Before every allocation's mutating `sbatch`, submission rereads local state, reprobes only selected
+Tasks for result-aware plans, refreshes relevant accepted scheduler evidence, rereads state, and
+compares current eligibility with the frozen decision. It then durably records intent and contacts
+Slurm. Revisions created by earlier allocations are carried through the same submission call.
 
 The package invokes stable command-line seams directly. Submitit is prior art, not a dependency:
 its cluster-local Python callable and post-acceptance pickle transport do not fit the workstation

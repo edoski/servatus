@@ -30,7 +30,7 @@ from ._errors import (
 )
 
 _SCHEMA_VERSION = 4
-_PLAN_SCHEMA_VERSION = 3
+_PLAN_SCHEMA_VERSION = 4
 _OPEN = "OPEN"
 _SEALED = "SEALED"
 _UNRESOLVED = "UNRESOLVED"
@@ -146,22 +146,6 @@ class ResourceRequest:
         _integer(self.gpus_per_task, minimum=0, name="gpus_per_task")
         _duration_seconds(self.time_limit, name="time_limit")
 
-    @classmethod
-    def from_toml(cls, path: Path) -> Self:
-        values = _read_toml(path)
-        unknown = values.keys() - cls._KEYS
-        missing = cls._KEYS - values.keys()
-        if unknown:
-            raise ConfigurationError(f"unknown resource keys: {', '.join(sorted(unknown))}")
-        if missing:
-            raise ConfigurationError(f"missing resource keys: {', '.join(sorted(missing))}")
-        return cls(
-            cpus_per_task=cast(int, values["cpus_per_task"]),
-            memory_mib_per_task=cast(int, values["memory_mib_per_task"]),
-            gpus_per_task=cast(int, values["gpus_per_task"]),
-            time_limit=cast(str, values["time_limit"]),
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class SlurmTarget:
@@ -244,39 +228,109 @@ class SlurmTarget:
             "gpu_gres and max_gpus_per_allocation conflict",
         )
 
+
+def _resource_from_values(values: object) -> ResourceRequest:
+    if not isinstance(values, dict):
+        raise ConfigurationError("resources must be a table")
+    mapping = cast(dict[str, object], values)
+    unknown = mapping.keys() - ResourceRequest._KEYS
+    missing = ResourceRequest._KEYS - mapping.keys()
+    if unknown:
+        raise ConfigurationError(f"unknown resource keys: {', '.join(sorted(unknown))}")
+    if missing:
+        raise ConfigurationError(f"missing resource keys: {', '.join(sorted(missing))}")
+    return ResourceRequest(
+        cpus_per_task=cast(int, mapping["cpus_per_task"]),
+        memory_mib_per_task=cast(int, mapping["memory_mib_per_task"]),
+        gpus_per_task=cast(int, mapping["gpus_per_task"]),
+        time_limit=cast(str, mapping["time_limit"]),
+    )
+
+
+def _target_from_values(values: object) -> SlurmTarget:
+    if not isinstance(values, dict):
+        raise ConfigurationError("target must be a table")
+    mapping = cast(dict[str, object], values)
+    allowed = SlurmTarget._REQUIRED | SlurmTarget._OPTIONAL
+    unknown = mapping.keys() - allowed
+    missing = SlurmTarget._REQUIRED - mapping.keys()
+    if unknown:
+        raise ConfigurationError(f"unknown target keys: {', '.join(sorted(unknown))}")
+    if missing:
+        raise ConfigurationError(f"missing target keys: {', '.join(sorted(missing))}")
+    raw_partitions = mapping["partitions"]
+    if not isinstance(raw_partitions, list):
+        raise ConfigurationError("partitions must be an array of strings")
+    return SlurmTarget(
+        host=cast(str, mapping["host"]),
+        slurm_bin=cast(PurePosixPath, mapping["slurm_bin"]),
+        apptainer=cast(PurePosixPath, mapping["apptainer"]),
+        image=cast(PurePosixPath, mapping["image"]),
+        work_root=cast(PurePosixPath, mapping["work_root"]),
+        log_root=cast(PurePosixPath, mapping["log_root"]),
+        partitions=tuple(cast(list[str], raw_partitions)),
+        account=cast(str | None, mapping.get("account")),
+        qos=cast(str | None, mapping.get("qos")),
+        constraint=cast(str | None, mapping.get("constraint")),
+        gpu_gres=cast(str | None, mapping.get("gpu_gres")),
+        max_tasks_per_allocation=cast(int, mapping["max_tasks_per_allocation"]),
+        max_cpus_per_allocation=cast(int, mapping["max_cpus_per_allocation"]),
+        max_memory_mib_per_allocation=cast(int, mapping["max_memory_mib_per_allocation"]),
+        max_gpus_per_allocation=cast(int, mapping["max_gpus_per_allocation"]),
+        max_time_limit=cast(str, mapping["max_time_limit"]),
+        max_allocations_per_submit=cast(int, mapping["max_allocations_per_submit"]),
+        max_script_bytes=cast(int, mapping["max_script_bytes"]),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class Profile:
+    label: str
+    target: SlurmTarget
+    resources: ResourceRequest
+
+    def __post_init__(self) -> None:
+        _safe_token(self.label, name="profile label")
+        _configuration(isinstance(self.target, SlurmTarget), "profile target is invalid")
+        _configuration(isinstance(self.resources, ResourceRequest), "profile resources are invalid")
+
     @classmethod
-    def from_toml(cls, path: Path) -> Self:
-        values = _read_toml(path)
-        allowed = cls._REQUIRED | cls._OPTIONAL
-        unknown = values.keys() - allowed
-        missing = cls._REQUIRED - values.keys()
-        if unknown:
-            raise ConfigurationError(f"unknown target keys: {', '.join(sorted(unknown))}")
-        if missing:
-            raise ConfigurationError(f"missing target keys: {', '.join(sorted(missing))}")
-        raw_partitions = values["partitions"]
-        if not isinstance(raw_partitions, list):
-            raise ConfigurationError("partitions must be an array of strings")
-        return cls(
-            host=cast(str, values["host"]),
-            slurm_bin=cast(PurePosixPath, values["slurm_bin"]),
-            apptainer=cast(PurePosixPath, values["apptainer"]),
-            image=cast(PurePosixPath, values["image"]),
-            work_root=cast(PurePosixPath, values["work_root"]),
-            log_root=cast(PurePosixPath, values["log_root"]),
-            partitions=tuple(cast(list[str], raw_partitions)),
-            account=cast(str | None, values.get("account")),
-            qos=cast(str | None, values.get("qos")),
-            constraint=cast(str | None, values.get("constraint")),
-            gpu_gres=cast(str | None, values.get("gpu_gres")),
-            max_tasks_per_allocation=cast(int, values["max_tasks_per_allocation"]),
-            max_cpus_per_allocation=cast(int, values["max_cpus_per_allocation"]),
-            max_memory_mib_per_allocation=cast(int, values["max_memory_mib_per_allocation"]),
-            max_gpus_per_allocation=cast(int, values["max_gpus_per_allocation"]),
-            max_time_limit=cast(str, values["max_time_limit"]),
-            max_allocations_per_submit=cast(int, values["max_allocations_per_submit"]),
-            max_script_bytes=cast(int, values["max_script_bytes"]),
-        )
+    def load(cls, path: Path, name: str | None = None) -> Self:
+        document = _read_toml(path)
+        if document.keys() - {"profiles", "default_profile"}:
+            unknown = document.keys() - {"profiles", "default_profile"}
+            raise ConfigurationError(f"unknown profile document keys: {', '.join(sorted(unknown))}")
+        profiles = document.get("profiles")
+        if not isinstance(profiles, dict) or not profiles:
+            raise ConfigurationError("profiles must be a nonempty table")
+
+        loaded: dict[str, Self] = {}
+        for label, raw in cast(dict[str, object], profiles).items():
+            _safe_token(label, name="profile label")
+            if not isinstance(raw, dict):
+                raise ConfigurationError(f"profile {label!r} must contain target and resources")
+            mapping = cast(dict[str, object], raw)
+            if set(mapping) != {"target", "resources"}:
+                raise ConfigurationError(f"profile {label!r} must contain target and resources")
+            loaded[label] = cls(
+                label,
+                _target_from_values(mapping["target"]),
+                _resource_from_values(mapping["resources"]),
+            )
+
+        default = document.get("default_profile")
+        if default is not None:
+            _safe_token(default, name="default_profile")
+            if cast(str, default) not in loaded:
+                raise ConfigurationError("default_profile does not name a declared profile")
+        selected = name if name is not None else cast(str | None, default)
+        if selected is None:
+            raise ConfigurationError("profile selection is required")
+        _safe_token(selected, name="profile name")
+        try:
+            return loaded[selected]
+        except KeyError:
+            raise ConfigurationError(f"profile {selected!r} is not declared") from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,10 +355,14 @@ class _AllocationPlan:
 class SubmissionPlan:
     _campaign_id: str
     _state_revision: int
-    _target: SlurmTarget
-    _resources: ResourceRequest
-    _completed: tuple[str, ...]
+    _profile: Profile
+    _roster_digest: str
+    _view: CampaignView
+    _view_digest: str
+    _selected: tuple[str, ...]
+    _excluded: tuple[str, ...]
     _retry: tuple[str, ...]
+    _duplicate_risk: tuple[str, ...]
     _tasks_per_allocation: int | None
     _allocations: tuple[_AllocationPlan, ...]
     _digest: str
@@ -317,6 +375,35 @@ class SubmissionPlan:
     def allocations(self) -> tuple[PlannedAllocation, ...]:
         return tuple(item.allocation for item in self._allocations)
 
+    @property
+    def profile(self) -> Profile:
+        return self._profile
+
+    @property
+    def selected_task_keys(self) -> tuple[str, ...]:
+        return self._selected
+
+    @property
+    def excluded_task_keys(self) -> tuple[str, ...]:
+        return self._excluded
+
+    @property
+    def retry_task_keys(self) -> tuple[str, ...]:
+        return self._retry
+
+    @property
+    def duplicate_risk_task_keys(self) -> tuple[str, ...]:
+        return self._duplicate_risk
+
+    @property
+    def warnings(self) -> tuple[str, ...]:
+        if not self._duplicate_risk:
+            return ()
+        return (
+            "duplicate execution risk accepted for unknown prior work: "
+            + ", ".join(self._duplicate_risk),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class JobReceipt:
@@ -328,13 +415,6 @@ class JobReceipt:
     def __str__(self) -> str:
         suffix = "" if self.cluster is None else f";{self.cluster}"
         return f"{self.job_id}{suffix}"
-
-
-@dataclass(frozen=True, slots=True)
-class CampaignStatus:
-    unaccepted_task_keys: tuple[str, ...]
-    receipts: tuple[JobReceipt, ...]
-    ambiguous_allocation_ids: tuple[str, ...]
 
 
 class ResultState(StrEnum):
@@ -372,6 +452,8 @@ class AttemptEvidence:
     allocation_id: str
     task_keys: tuple[str, ...]
     retry_task_keys: tuple[str, ...]
+    duplicate_risk_task_keys: tuple[str, ...]
+    profile_label: str
     acceptance: AcceptanceState
     receipt: JobReceipt | None
     allocation: AllocationEvidence | None
@@ -600,14 +682,89 @@ def _lineage(target: SlurmTarget, resources: ResourceRequest) -> dict[str, objec
     }
 
 
+def _timestamp_text(value: datetime | None) -> str | None:
+    return None if value is None else value.isoformat()
+
+
+def _allocation_evidence_dict(value: AllocationEvidence | None) -> dict[str, object] | None:
+    if value is None:
+        return None
+    return {
+        "state": value.state.value,
+        "raw_state": value.raw_state,
+        "accounting_state": value.accounting_state,
+        "exit_code": value.exit_code,
+        "reason": value.reason,
+        "started_at": value.started_at,
+        "ended_at": value.ended_at,
+        "observed_at": _timestamp_text(value.observed_at),
+    }
+
+
+def _view_semantics(view: CampaignView) -> dict[str, object]:
+    return {
+        "campaign_id": view.campaign_id,
+        "revision": view.revision,
+        "sealed": view.sealed,
+        "tasks": [
+            {
+                "key": task.key,
+                "result": task.result.value,
+                "result_observed_at": _timestamp_text(task.result_observed_at),
+                "current_attempt_id": task.current_attempt_id,
+                "execution": None if task.execution is None else task.execution.value,
+                "acceptance_ambiguous": task.acceptance_ambiguous,
+            }
+            for task in view.tasks
+        ],
+        "attempts": [
+            {
+                "allocation_id": attempt.allocation_id,
+                "task_keys": list(attempt.task_keys),
+                "retry_task_keys": list(attempt.retry_task_keys),
+                "duplicate_risk_task_keys": list(attempt.duplicate_risk_task_keys),
+                "profile_label": attempt.profile_label,
+                "acceptance": attempt.acceptance.value,
+                "receipt": (
+                    None
+                    if attempt.receipt is None
+                    else {
+                        "allocation_id": attempt.receipt.allocation_id,
+                        "job_id": attempt.receipt.job_id,
+                        "cluster": attempt.receipt.cluster,
+                        "task_keys": list(attempt.receipt.task_keys),
+                    }
+                ),
+                "allocation": _allocation_evidence_dict(attempt.allocation),
+            }
+            for attempt in view.attempts
+        ],
+        "scheduler_observed": view.scheduler_observed,
+        "observed_at": _timestamp_text(view.observed_at),
+        "results_ready": view.results_ready,
+        "quiescent": view.quiescent,
+    }
+
+
+def campaign_view_document(view: CampaignView) -> dict[str, object]:
+    return _view_semantics(view)
+
+
 def _plan_semantics(plan: SubmissionPlan) -> dict[str, object]:
     return {
         "campaign_id": plan._campaign_id,
         "state_revision": plan._state_revision,
-        "target": _target_dict(plan._target),
-        "resources": _resource_dict(plan._resources),
-        "completed": list(plan._completed),
+        "profile_label": plan._profile.label,
+        "target": _target_dict(plan._profile.target),
+        "resources": _resource_dict(plan._profile.resources),
+        "roster_digest": plan._roster_digest,
+        "view": _view_semantics(plan._view),
+        "view_digest": plan._view_digest,
+        "selected": list(plan._selected),
+        "excluded": list(plan._excluded),
         "retry": list(plan._retry),
+        "duplicate_risk": list(plan._duplicate_risk),
+        "warnings": list(plan.warnings),
         "tasks_per_allocation": plan._tasks_per_allocation,
         "allocations": [_allocation_summary(item) for item in plan._allocations],
     }
@@ -761,6 +918,8 @@ class Campaign:
                 cast(str, attempt["allocation_id"]),
                 tuple(cast(list[str], attempt["task_keys"])),
                 tuple(cast(list[str], attempt["retry_task_keys"])),
+                tuple(cast(list[str], attempt["duplicate_risk_task_keys"])),
+                cast(str, attempt["profile_label"]),
                 status,
                 receipt,
                 allocation,
@@ -869,79 +1028,76 @@ class Campaign:
 
     def plan(
         self,
-        target: SlurmTarget,
-        resources: ResourceRequest,
+        profile: Profile,
         *,
-        completed: Collection[str] = (),
+        view: CampaignView,
         retry: Collection[str] = (),
+        allow_duplicate_risk: Collection[str] = (),
         tasks_per_allocation: int | None = None,
     ) -> SubmissionPlan:
         state = self._read_state()
         tasks = _tasks_from_state(state)
-        ambiguous = _ambiguous_ids(state)
-        if ambiguous:
-            raise AmbiguousSubmission("resolve ambiguous allocation intent before planning")
         known = tuple(task.key for task in tasks)
-        completed_values = _ordered_selection(completed, known, "completed")
         retry_values = _ordered_selection(retry, known, "retry")
-        if set(completed_values) & set(retry_values):
-            raise PlanError("completed and retry selections overlap")
-        receipts = _receipt_values(state)
-        accepted = {key for receipt in receipts for key in receipt.task_keys}
-        if any(key not in accepted for key in retry_values):
-            raise PlanError("retry requires an earlier accepted receipt")
+        duplicate_risk = _ordered_selection(allow_duplicate_risk, known, "allow_duplicate_risk")
+        if any(key not in retry_values for key in duplicate_risk):
+            raise PlanError("duplicate-risk acknowledgement requires explicit retry")
+        _verify_view(state, view)
         lineage = state["lineage"]
-        if lineage is not None and lineage != _lineage(target, resources):
+        if lineage is not None and lineage != _lineage(profile.target, profile.resources):
             raise PlanError("campaign is bound to different target or resource semantics")
-        capacity = _capacity(target, resources)
+        selected_keys, excluded_keys = _select_tasks(view, retry_values, duplicate_risk)
+        capacity = _capacity(profile.target, profile.resources)
         if tasks_per_allocation is not None:
             requested = _integer(tasks_per_allocation, minimum=1, name="tasks_per_allocation")
             if requested > capacity:
                 raise PlanError("tasks_per_allocation exceeds feasible capacity")
             capacity = requested
-        selected = tuple(
-            task
-            for task in tasks
-            if task.key not in completed_values
-            and (task.key not in accepted or task.key in retry_values)
-        )
+        selected = tuple(task for task in tasks if task.key in set(selected_keys))
         groups = _balanced_groups(selected, capacity)
         campaign_id = cast(str, state["campaign_id"])
         revision = cast(int, state["revision"])
+        roster_digest = _digest([_task_record(task) for task in tasks])
+        view_digest = _digest(_view_semantics(view))
         seed = _digest(
             {
                 "campaign_id": campaign_id,
                 "revision": revision,
-                "target": _target_dict(target),
-                "resources": _resource_dict(resources),
-                "completed": list(completed_values),
+                "profile_label": profile.label,
+                "target": _target_dict(profile.target),
+                "resources": _resource_dict(profile.resources),
+                "roster_digest": roster_digest,
+                "view_digest": view_digest,
+                "selected": list(selected_keys),
+                "excluded": list(excluded_keys),
                 "retry": list(retry_values),
+                "duplicate_risk": list(duplicate_risk),
                 "tasks_per_allocation": tasks_per_allocation,
                 "groups": [[task.key for task in group] for group in groups],
             }
         )
         allocations: list[_AllocationPlan] = []
-        effective_time_limit = _effective_time_limit(resources.time_limit)
+        effective_time_limit = _effective_time_limit(profile.resources.time_limit)
         for index, group in enumerate(groups):
             allocation_id = hashlib.sha256(f"{seed}:{index}".encode()).hexdigest()[:24]
-            script = _slurm.render_script(target, resources, group, allocation_id)
-            if len(script) > target.max_script_bytes:
+            script = _slurm.render_script(profile.target, profile.resources, group, allocation_id)
+            if len(script) > profile.target.max_script_bytes:
                 raise PlanError(
                     f"rendered script is {len(script)} bytes; target permits "
-                    f"{target.max_script_bytes}"
+                    f"{profile.target.max_script_bytes}"
                 )
             argv = _slurm.sbatch_argv(
-                target,
-                resources,
+                profile.target,
+                profile.resources,
                 len(group),
                 allocation_id,
                 effective_time_limit,
             )
             public = PlannedAllocation(
                 task_keys=tuple(task.key for task in group),
-                cpus=len(group) * resources.cpus_per_task,
-                memory_mib=len(group) * resources.memory_mib_per_task,
-                gpus=len(group) * resources.gpus_per_task,
+                cpus=len(group) * profile.resources.cpus_per_task,
+                memory_mib=len(group) * profile.resources.memory_mib_per_task,
+                gpus=len(group) * profile.resources.gpus_per_task,
                 time_limit=effective_time_limit,
             )
             allocations.append(
@@ -956,10 +1112,14 @@ class Campaign:
         partial = SubmissionPlan(
             campaign_id,
             revision,
-            target,
-            resources,
-            completed_values,
+            profile,
+            roster_digest,
+            view,
+            view_digest,
+            selected_keys,
+            excluded_keys,
             retry_values,
+            duplicate_risk,
             tasks_per_allocation,
             tuple(allocations),
             "",
@@ -967,25 +1127,40 @@ class Campaign:
         return SubmissionPlan(
             campaign_id,
             revision,
-            target,
-            resources,
-            completed_values,
+            profile,
+            roster_digest,
+            view,
+            view_digest,
+            selected_keys,
+            excluded_keys,
             retry_values,
+            duplicate_risk,
             tasks_per_allocation,
             tuple(allocations),
             _digest(_plan_semantics(partial)),
         )
 
-    def submit(self, plan: SubmissionPlan) -> tuple[JobReceipt, ...]:
+    def submit(
+        self, plan: SubmissionPlan, *, probe: ResultProbe | None = None
+    ) -> tuple[JobReceipt, ...]:
         self._verify_plan(plan, operation="submit")
+        result_aware = any(task.result is not ResultState.UNOBSERVED for task in plan._view.tasks)
+        if result_aware and plan._allocations and probe is None:
+            raise PlanError("result-aware submission requires the planning result probe")
         expected_revision = plan._state_revision
         receipts: list[JobReceipt] = []
-        for allocation in plan._allocations[: plan._target.max_allocations_per_submit]:
+        for allocation in plan._allocations[: plan._profile.target.max_allocations_per_submit]:
+            self._refresh_allocation(
+                plan,
+                allocation,
+                expected_revision=expected_revision,
+                probe=probe if result_aware else None,
+            )
             expected_revision = self._record_intent(
                 plan, allocation, expected_revision=expected_revision
             )
             try:
-                result = _slurm._run_ssh(plan._target, allocation.argv, allocation.script)
+                result = _slurm._run_ssh(plan._profile.target, allocation.argv, allocation.script)
             except BaseException as error:
                 raise AmbiguousSubmission(
                     f"allocation {allocation.allocation_id} may have been accepted"
@@ -1070,34 +1245,111 @@ class Campaign:
             state["revision"] = cast(int, state["revision"]) + 1
             self._write_state(state)
 
-    def status(self) -> CampaignStatus:
-        state = self._read_state()
-        tasks = _tasks_from_state(state)
-        receipts = _receipt_values(state)
-        accepted = {key for receipt in receipts for key in receipt.task_keys}
-        return CampaignStatus(
-            tuple(task.key for task in tasks if task.key not in accepted),
-            receipts,
-            tuple(_ambiguous_ids(state)),
-        )
-
     def _verify_plan(self, plan: SubmissionPlan, *, operation: str) -> None:
         state = self._read_state()
         if plan._campaign_id != state["campaign_id"]:
             raise PlanError(f"{operation} plan belongs to another campaign")
         if plan._state_revision != state["revision"]:
             raise PlanError(f"{operation} plan is stale")
+        if plan._roster_digest != _digest(
+            [_task_record(task) for task in _tasks_from_state(state)]
+        ):
+            raise PlanError(f"{operation} plan roster was changed")
+        if plan._view_digest != _digest(_view_semantics(plan._view)):
+            raise PlanError(f"{operation} plan view was changed")
+        _verify_view(state, plan._view)
+        selected, excluded = _select_tasks(plan._view, plan._retry, plan._duplicate_risk)
+        if selected != plan._selected or excluded != plan._excluded:
+            raise PlanError(f"{operation} plan selection was changed")
         for allocation in plan._allocations:
             if allocation.script_digest != hashlib.sha256(allocation.script).hexdigest():
                 raise PlanError(f"{operation} plan script was changed")
         if plan.digest != _digest(_plan_semantics(plan)):
             raise PlanError(f"{operation} plan was changed")
-        if _ambiguous_ids(state):
-            raise AmbiguousSubmission(f"resolve ambiguous allocation intent before {operation}")
         lineage = state["lineage"]
-        expected = _lineage(plan._target, plan._resources)
+        expected = _lineage(plan._profile.target, plan._profile.resources)
         if lineage is not None and lineage != expected:
             raise PlanError("campaign is bound to different target or resource semantics")
+
+    def _refresh_allocation(
+        self,
+        plan: SubmissionPlan,
+        allocation: _AllocationPlan,
+        *,
+        expected_revision: int,
+        probe: ResultProbe | None,
+    ) -> None:
+        state = self._read_state()
+        if state["campaign_id"] != plan._campaign_id or state["revision"] != expected_revision:
+            raise PlanError("campaign changed before submission freshness check")
+        current_roster_digest = _digest([_task_record(task) for task in _tasks_from_state(state)])
+        if current_roster_digest != plan._roster_digest:
+            raise PlanError("campaign roster changed before submission")
+
+        selected = set(allocation.allocation.task_keys)
+        if probe is not None:
+            tasks = {task.key: task for task in _tasks_from_state(state)}
+            for key in allocation.allocation.task_keys:
+                valid = probe(tasks[key])
+                if type(valid) is not bool:
+                    raise TypeError("result probe must return bool")
+                if valid:
+                    raise PlanError(f"task {key!r} became ineligible before submission")
+
+        attempts = cast(list[dict[str, object]], state["attempts"])
+        relevant_queries = tuple(
+            query
+            for attempt, query in zip(
+                (
+                    attempt
+                    for attempt in attempts
+                    if cast(dict[str, object], attempt["acceptance"])["status"] == _ACCEPTED
+                ),
+                _attempt_queries(state),
+                strict=True,
+            )
+            if selected & set(cast(list[str], attempt["task_keys"]))
+        )
+        observations = (
+            _slurm.query_attempts(plan._profile.target, relevant_queries)
+            if relevant_queries
+            else ()
+        )
+
+        after = self._read_state()
+        if after["campaign_id"] != plan._campaign_id or after["revision"] != expected_revision:
+            raise PlanError("campaign changed during submission freshness check")
+        if any(
+            selected & set(cast(list[str], attempt["task_keys"]))
+            for attempt in cast(list[dict[str, object]], after["attempts"])
+            if cast(dict[str, object], attempt["acceptance"])["status"] == _UNRESOLVED
+        ):
+            raise PlanError("selected task became acceptance-ambiguous before submission")
+
+        states_by_key: dict[str, list[AllocationState]] = {key: [] for key in selected}
+        for query, observation in zip(relevant_queries, observations, strict=True):
+            attempt = next(
+                item for item in attempts if item["allocation_id"] == query.allocation_id
+            )
+            for key in selected & set(cast(list[str], attempt["task_keys"])):
+                states_by_key[key].append(observation.state)
+        active = {AllocationState.QUEUED, AllocationState.RUNNING}
+        retries = set(plan._retry)
+        acknowledged = set(plan._duplicate_risk)
+        for key in allocation.allocation.task_keys:
+            states = states_by_key[key]
+            if any(state in active for state in states):
+                raise PlanError(f"task {key!r} became active before submission")
+            if states and key not in retries:
+                raise PlanError(f"task {key!r} became accepted before submission")
+            if not states and key in retries:
+                raise PlanError(f"task {key!r} lost accepted-attempt evidence")
+            if AllocationState.UNKNOWN in states and key not in acknowledged:
+                raise PlanError(f"task {key!r} now requires duplicate-risk acknowledgement")
+            if AllocationState.UNKNOWN not in states and key in acknowledged:
+                raise PlanError(
+                    f"task {key!r} no longer matches its duplicate-risk acknowledgement"
+                )
 
     def _record_intent(
         self,
@@ -1111,7 +1363,7 @@ class Campaign:
             assert state is not None
             if state["revision"] != expected_revision or _ambiguous_ids(state):
                 raise PlanError("campaign changed before submission intent")
-            lineage = _lineage(plan._target, plan._resources)
+            lineage = _lineage(plan._profile.target, plan._profile.resources)
             if state["lineage"] is None:
                 state["lineage"] = lineage
             elif state["lineage"] != lineage:
@@ -1122,8 +1374,14 @@ class Campaign:
                     "allocation_id": allocation.allocation_id,
                     "task_keys": list(allocation.allocation.task_keys),
                     "campaign_revision": plan._state_revision,
+                    "profile_label": plan._profile.label,
                     "retry_task_keys": [
                         key for key in allocation.allocation.task_keys if key in plan._retry
+                    ],
+                    "duplicate_risk_task_keys": [
+                        key
+                        for key in allocation.allocation.task_keys
+                        if key in plan._duplicate_risk
                     ],
                     "plan_digest": plan.digest,
                     "script_digest": allocation.script_digest,
@@ -1249,6 +1507,163 @@ def _ordered_selection(
     if unknown:
         raise PlanError(f"{name} contains unknown task keys")
     return tuple(key for key in known if key in selected)
+
+
+def _verify_view(state: dict[str, object], view: CampaignView) -> None:
+    if view.campaign_id != state["campaign_id"]:
+        raise PlanError("view belongs to another campaign")
+    if view.revision != state["revision"]:
+        raise PlanError("view is stale")
+    tasks = _tasks_from_state(state)
+    if tuple(item.key for item in view.tasks) != tuple(task.key for task in tasks):
+        raise PlanError("view roster projection is invalid")
+    if view.sealed != (state["phase"] == _SEALED):
+        raise PlanError("view roster projection is invalid")
+
+    attempts = cast(list[dict[str, object]], state["attempts"])
+    if len(view.attempts) != len(attempts):
+        raise PlanError("view attempt projection is invalid")
+    current: dict[str, AttemptEvidence] = {}
+    ambiguous: set[str] = set()
+    for evidence, attempt in zip(view.attempts, attempts, strict=True):
+        acceptance = cast(dict[str, object], attempt["acceptance"])
+        status = AcceptanceState(cast(str, acceptance["status"]))
+        receipt = None
+        if status is AcceptanceState.ACCEPTED:
+            receipt = JobReceipt(
+                cast(str, attempt["allocation_id"]),
+                cast(int, acceptance["job_id"]),
+                cast(str | None, acceptance["cluster"]),
+                tuple(cast(list[str], attempt["task_keys"])),
+            )
+        if (
+            evidence.allocation_id != attempt["allocation_id"]
+            or evidence.task_keys != tuple(cast(list[str], attempt["task_keys"]))
+            or evidence.retry_task_keys != tuple(cast(list[str], attempt["retry_task_keys"]))
+            or evidence.duplicate_risk_task_keys
+            != tuple(cast(list[str], attempt["duplicate_risk_task_keys"]))
+            or evidence.profile_label != attempt["profile_label"]
+            or evidence.acceptance is not status
+            or evidence.receipt != receipt
+        ):
+            raise PlanError("view attempt projection is invalid")
+        if status is AcceptanceState.ACCEPTED:
+            if view.scheduler_observed and evidence.allocation is None:
+                raise PlanError("scheduler-observed view lacks accepted-attempt evidence")
+        elif evidence.allocation is not None:
+            raise PlanError("view contains scheduler evidence for an unaccepted attempt")
+        if status is AcceptanceState.ACCEPTED:
+            for key in evidence.task_keys:
+                current[key] = evidence
+        elif status is AcceptanceState.UNRESOLVED:
+            ambiguous.update(evidence.task_keys)
+            for key in evidence.task_keys:
+                current[key] = evidence
+
+    for task in view.tasks:
+        current_attempt = current.get(task.key)
+        expected_execution = (
+            None
+            if current_attempt is None or current_attempt.allocation is None
+            else current_attempt.allocation.state
+        )
+        if (
+            task.current_attempt_id
+            != (None if current_attempt is None else current_attempt.allocation_id)
+            or task.execution is not expected_execution
+            or task.acceptance_ambiguous != (task.key in ambiguous)
+            or (task.result is ResultState.UNOBSERVED) != (task.result_observed_at is None)
+        ):
+            raise PlanError("view task projection is invalid")
+
+    if (
+        any(attempt.acceptance is AcceptanceState.ACCEPTED for attempt in view.attempts)
+        and not view.scheduler_observed
+    ):
+        raise PlanError("planning an accepted campaign requires scheduler-observed evidence")
+    expected_ready = view.sealed and all(task.result is ResultState.VALID for task in view.tasks)
+    terminal = {
+        AllocationState.SUCCEEDED,
+        AllocationState.FAILED,
+        AllocationState.CANCELLED,
+    }
+    expected_quiescent = (
+        view.scheduler_observed
+        and not ambiguous
+        and all(
+            attempt.allocation is not None and attempt.allocation.state in terminal
+            for attempt in view.attempts
+            if attempt.acceptance is AcceptanceState.ACCEPTED
+        )
+    )
+    if view.results_ready != expected_ready or view.quiescent != expected_quiescent:
+        raise PlanError("view readiness projection is invalid")
+
+
+def _select_tasks(
+    view: CampaignView,
+    retry: tuple[str, ...],
+    duplicate_risk: tuple[str, ...],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    retries = set(retry)
+    acknowledged = set(duplicate_risk)
+    active = {AllocationState.QUEUED, AllocationState.RUNNING}
+    selected: list[str] = []
+    excluded: list[str] = []
+    used_acknowledgements: set[str] = set()
+
+    for task in view.tasks:
+        if task.result is ResultState.VALID:
+            if task.key in retries:
+                raise PlanError(f"valid task {task.key!r} cannot be retried")
+            excluded.append(task.key)
+            continue
+        if task.acceptance_ambiguous:
+            if task.key in retries:
+                raise PlanError(f"ambiguous task {task.key!r} cannot be retried")
+            excluded.append(task.key)
+            continue
+
+        accepted = tuple(
+            attempt
+            for attempt in view.attempts
+            if attempt.acceptance is AcceptanceState.ACCEPTED and task.key in attempt.task_keys
+        )
+        if not accepted:
+            if task.key in retries:
+                raise PlanError("retry requires an earlier accepted attempt")
+            selected.append(task.key)
+            continue
+
+        states = tuple(
+            attempt.allocation.state for attempt in accepted if attempt.allocation is not None
+        )
+        if len(states) != len(accepted):
+            raise PlanError("accepted attempt lacks scheduler evidence")
+        if any(state in active for state in states):
+            if task.key in retries:
+                raise PlanError(f"active task {task.key!r} cannot be retried")
+            excluded.append(task.key)
+            continue
+        if task.key not in retries:
+            excluded.append(task.key)
+            continue
+        if AllocationState.UNKNOWN in states:
+            if task.key not in acknowledged:
+                raise PlanError(
+                    f"unknown task {task.key!r} retry requires duplicate-risk acknowledgement"
+                )
+            used_acknowledgements.add(task.key)
+        elif task.key in acknowledged:
+            raise PlanError(
+                f"duplicate-risk acknowledgement for {task.key!r} has no unknown attempt"
+            )
+        selected.append(task.key)
+
+    unused = acknowledged - used_acknowledgements
+    if unused:
+        raise PlanError("duplicate-risk acknowledgement does not match unknown accepted work")
+    return tuple(selected), tuple(excluded)
 
 
 def _capacity(target: SlurmTarget, resources: ResourceRequest) -> int:
@@ -1542,7 +1957,9 @@ def _validate_attempts(
         "allocation_id",
         "task_keys",
         "campaign_revision",
+        "profile_label",
         "retry_task_keys",
+        "duplicate_risk_task_keys",
         "plan_digest",
         "script_digest",
         "target_digest",
@@ -1559,6 +1976,7 @@ def _validate_attempts(
     plan_revisions: dict[str, int] = {}
     group_revision: int | None = None
     group_plan_digest: str | None = None
+    group_profile_label: str | None = None
     group_end_revision = 0
     group_required_prefix = 0
     group_last_task_position = -1
@@ -1607,6 +2025,9 @@ def _validate_attempts(
             if not isinstance(digest, str) or _HEX_64.fullmatch(digest) is None:
                 raise TaskConflict("campaign attempt digest is invalid")
         plan_digest = cast(str, attempt["plan_digest"])
+        profile_label = attempt["profile_label"]
+        if not isinstance(profile_label, str) or _TOKEN.fullmatch(profile_label) is None:
+            raise TaskConflict("campaign attempt profile label is invalid")
         known_revision = plan_revisions.setdefault(plan_digest, campaign_revision)
         if known_revision != campaign_revision:
             raise TaskConflict("campaign attempt plan revision is inconsistent")
@@ -1614,9 +2035,10 @@ def _validate_attempts(
             revision_gaps.append(campaign_revision)
             group_revision = campaign_revision
             group_plan_digest = plan_digest
+            group_profile_label = profile_label
             group_end_revision = campaign_revision
         elif campaign_revision == group_revision:
-            if plan_digest != group_plan_digest:
+            if plan_digest != group_plan_digest or profile_label != group_profile_label:
                 raise TaskConflict("campaign attempt plan group is invalid")
         else:
             if campaign_revision < group_end_revision:
@@ -1625,6 +2047,7 @@ def _validate_attempts(
             required_prefixes.append(group_required_prefix)
             group_revision = campaign_revision
             group_plan_digest = plan_digest
+            group_profile_label = profile_label
             group_end_revision = campaign_revision
             group_required_prefix = 0
             group_last_task_position = -1
@@ -1651,6 +2074,17 @@ def _validate_attempts(
         expected_retries = tuple(key for key in typed_attempt_keys if key in accepted_task_keys)
         if typed_retries != expected_retries:
             raise TaskConflict("campaign attempt retry keys do not match accepted history")
+        duplicate_risk_keys = attempt["duplicate_risk_task_keys"]
+        if not isinstance(duplicate_risk_keys, list):
+            raise TaskConflict("campaign attempt duplicate-risk keys are invalid")
+        typed_duplicate_risk = tuple(cast(list[object], duplicate_risk_keys))
+        if (
+            any(not isinstance(key, str) for key in typed_duplicate_risk)
+            or len(set(typed_duplicate_risk)) != len(typed_duplicate_risk)
+            or tuple(key for key in typed_retries if key in set(typed_duplicate_risk))
+            != typed_duplicate_risk
+        ):
+            raise TaskConflict("campaign attempt duplicate-risk keys are invalid")
         allocation = attempt["allocation"]
         argv = attempt["sbatch_argv"]
         if not isinstance(allocation, dict) or not isinstance(argv, list):
@@ -1737,12 +2171,208 @@ def _plan_strings(value: object, *, name: str) -> list[str]:
     return strings
 
 
+def _plan_timestamp(value: object, *, name: str, optional: bool = False) -> datetime | None:
+    if value is None and optional:
+        return None
+    if not isinstance(value, str):
+        raise PlanError(f"plan {name} is invalid")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise PlanError(f"plan {name} is invalid") from error
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0) or parsed.isoformat() != value:
+        raise PlanError(f"plan {name} is invalid")
+    return parsed
+
+
+def _optional_plan_string(value: object, *, name: str) -> str | None:
+    if value is not None and not isinstance(value, str):
+        raise PlanError(f"plan {name} is invalid")
+    return value
+
+
+def _plan_string(value: object, *, name: str) -> str:
+    if not isinstance(value, str):
+        raise PlanError(f"plan {name} is invalid")
+    return value
+
+
+def _plan_bool(value: object, *, name: str) -> bool:
+    if type(value) is not bool:
+        raise PlanError(f"plan {name} is invalid")
+    return value
+
+
+def _plan_integer(value: object, *, name: str, minimum: int = 0) -> int:
+    if type(value) is not int or value < minimum:
+        raise PlanError(f"plan {name} is invalid")
+    return value
+
+
+def _view_from_dict(value: object) -> CampaignView:
+    if not isinstance(value, dict):
+        raise PlanError("plan view is invalid")
+    mapping = cast(dict[str, object], value)
+    if set(mapping) != {
+        "campaign_id",
+        "revision",
+        "sealed",
+        "tasks",
+        "attempts",
+        "scheduler_observed",
+        "observed_at",
+        "results_ready",
+        "quiescent",
+    }:
+        raise PlanError("plan view is invalid")
+    raw_tasks = mapping["tasks"]
+    raw_attempts = mapping["attempts"]
+    if not isinstance(raw_tasks, list) or not isinstance(raw_attempts, list):
+        raise PlanError("plan view is invalid")
+    tasks: list[TaskEvidence] = []
+    attempts: list[AttemptEvidence] = []
+    try:
+        for raw in cast(list[object], raw_tasks):
+            if not isinstance(raw, dict):
+                raise PlanError("plan task evidence is invalid")
+            item = cast(dict[str, object], raw)
+            if set(item) != {
+                "key",
+                "result",
+                "result_observed_at",
+                "current_attempt_id",
+                "execution",
+                "acceptance_ambiguous",
+            }:
+                raise PlanError("plan task evidence is invalid")
+            execution = item["execution"]
+            tasks.append(
+                TaskEvidence(
+                    _plan_string(item["key"], name="task key"),
+                    ResultState(_plan_string(item["result"], name="result state")),
+                    _plan_timestamp(
+                        item["result_observed_at"],
+                        name="result observation time",
+                        optional=True,
+                    ),
+                    _optional_plan_string(
+                        item["current_attempt_id"], name="current attempt identity"
+                    ),
+                    None
+                    if execution is None
+                    else AllocationState(_plan_string(execution, name="execution state")),
+                    _plan_bool(item["acceptance_ambiguous"], name="acceptance ambiguity"),
+                )
+            )
+        for raw in cast(list[object], raw_attempts):
+            if not isinstance(raw, dict):
+                raise PlanError("plan attempt evidence is invalid")
+            item = cast(dict[str, object], raw)
+            if set(item) != {
+                "allocation_id",
+                "task_keys",
+                "retry_task_keys",
+                "duplicate_risk_task_keys",
+                "profile_label",
+                "acceptance",
+                "receipt",
+                "allocation",
+            }:
+                raise PlanError("plan attempt evidence is invalid")
+            allocation_id = _plan_string(item["allocation_id"], name="allocation identity")
+            task_keys = tuple(_plan_strings(item["task_keys"], name="attempt task keys"))
+            receipt = None
+            raw_receipt = item["receipt"]
+            if raw_receipt is not None:
+                if not isinstance(raw_receipt, dict):
+                    raise PlanError("plan receipt evidence is invalid")
+                receipt_values = cast(dict[str, object], raw_receipt)
+                if set(receipt_values) != {"allocation_id", "job_id", "cluster", "task_keys"}:
+                    raise PlanError("plan receipt evidence is invalid")
+                receipt = JobReceipt(
+                    _plan_string(receipt_values["allocation_id"], name="receipt allocation"),
+                    _plan_integer(receipt_values["job_id"], name="receipt job", minimum=1),
+                    _optional_plan_string(receipt_values["cluster"], name="receipt cluster"),
+                    tuple(_plan_strings(receipt_values["task_keys"], name="receipt task keys")),
+                )
+            allocation = None
+            raw_allocation = item["allocation"]
+            if raw_allocation is not None:
+                if not isinstance(raw_allocation, dict):
+                    raise PlanError("plan allocation evidence is invalid")
+                allocation_values = cast(dict[str, object], raw_allocation)
+                if set(allocation_values) != {
+                    "state",
+                    "raw_state",
+                    "accounting_state",
+                    "exit_code",
+                    "reason",
+                    "started_at",
+                    "ended_at",
+                    "observed_at",
+                }:
+                    raise PlanError("plan allocation evidence is invalid")
+                observed = _plan_timestamp(
+                    allocation_values["observed_at"], name="allocation observation time"
+                )
+                assert observed is not None
+                allocation = AllocationEvidence(
+                    AllocationState(
+                        _plan_string(allocation_values["state"], name="allocation state")
+                    ),
+                    _optional_plan_string(allocation_values["raw_state"], name="raw state"),
+                    _optional_plan_string(
+                        allocation_values["accounting_state"], name="accounting state"
+                    ),
+                    _optional_plan_string(allocation_values["exit_code"], name="exit code"),
+                    _optional_plan_string(allocation_values["reason"], name="reason"),
+                    _optional_plan_string(allocation_values["started_at"], name="start time"),
+                    _optional_plan_string(allocation_values["ended_at"], name="end time"),
+                    observed,
+                )
+            attempts.append(
+                AttemptEvidence(
+                    allocation_id,
+                    task_keys,
+                    tuple(_plan_strings(item["retry_task_keys"], name="attempt retry keys")),
+                    tuple(
+                        _plan_strings(
+                            item["duplicate_risk_task_keys"],
+                            name="attempt duplicate-risk keys",
+                        )
+                    ),
+                    _plan_string(item["profile_label"], name="attempt profile label"),
+                    AcceptanceState(_plan_string(item["acceptance"], name="attempt acceptance")),
+                    receipt,
+                    allocation,
+                )
+            )
+        observed_at = _plan_timestamp(mapping["observed_at"], name="view observation time")
+        assert observed_at is not None
+        view = CampaignView(
+            _plan_string(mapping["campaign_id"], name="view campaign identity"),
+            _plan_integer(mapping["revision"], name="view revision"),
+            _plan_bool(mapping["sealed"], name="view sealed state"),
+            tuple(tasks),
+            tuple(attempts),
+            _plan_bool(mapping["scheduler_observed"], name="scheduler observation state"),
+            observed_at,
+            _plan_bool(mapping["results_ready"], name="result readiness"),
+            _plan_bool(mapping["quiescent"], name="quiescence"),
+        )
+    except (TypeError, ValueError) as error:
+        raise PlanError("plan view is invalid") from error
+    if _view_semantics(view) != mapping:
+        raise PlanError("plan view values are invalid")
+    return view
+
+
 def _plan_inputs(
     document: object,
 ) -> tuple[
     dict[str, object],
-    SlurmTarget,
-    ResourceRequest,
+    Profile,
+    CampaignView,
     list[str],
     list[str],
     int | None,
@@ -1754,10 +2384,17 @@ def _plan_inputs(
         "schema_version",
         "campaign_id",
         "state_revision",
+        "profile_label",
         "target",
         "resources",
-        "completed",
+        "roster_digest",
+        "view",
+        "view_digest",
+        "selected",
+        "excluded",
         "retry",
+        "duplicate_risk",
+        "warnings",
         "tasks_per_allocation",
         "allocations",
         "digest",
@@ -1769,27 +2406,39 @@ def _plan_inputs(
         or mapping["schema_version"] != _PLAN_SCHEMA_VERSION
     ):
         raise PlanError("plan document schema is unsupported")
-    target = _target_from_dict(mapping["target"])
-    resources = _resource_from_dict(mapping["resources"])
-    completed = _plan_strings(mapping["completed"], name="completed")
+    label = mapping["profile_label"]
+    if not isinstance(label, str):
+        raise PlanError("plan profile label is invalid")
+    try:
+        profile = Profile(
+            label,
+            _target_from_dict(mapping["target"]),
+            _resource_from_dict(mapping["resources"]),
+        )
+    except ConfigurationError as error:
+        raise PlanError("plan profile is invalid") from error
+    view = _view_from_dict(mapping["view"])
     retry = _plan_strings(mapping["retry"], name="retry")
-    if len(set(completed)) != len(completed) or len(set(retry)) != len(retry):
+    duplicate_risk = _plan_strings(mapping["duplicate_risk"], name="duplicate_risk")
+    for name in ("selected", "excluded", "warnings"):
+        _plan_strings(mapping[name], name=name)
+    if len(set(retry)) != len(retry) or len(set(duplicate_risk)) != len(duplicate_risk):
         raise PlanError("plan selections contain duplicate task keys")
     tasks_per = mapping["tasks_per_allocation"]
     if tasks_per is not None and (
         isinstance(tasks_per, bool) or not isinstance(tasks_per, int) or tasks_per < 1
     ):
         raise PlanError("plan tasks_per_allocation must be an integer >= 1")
-    return mapping, target, resources, completed, retry, tasks_per
+    return mapping, profile, view, retry, duplicate_risk, tasks_per
 
 
 def restore_plan(campaign: Campaign, document: object) -> SubmissionPlan:
-    mapping, target, resources, completed, retry, tasks_per = _plan_inputs(document)
+    mapping, profile, view, retry, duplicate_risk, tasks_per = _plan_inputs(document)
     plan = campaign.plan(
-        target,
-        resources,
-        completed=completed,
+        profile,
+        view=view,
         retry=retry,
+        allow_duplicate_risk=duplicate_risk,
         tasks_per_allocation=tasks_per,
     )
     try:
@@ -1816,7 +2465,7 @@ def _validate_plan(plan: SubmissionPlan) -> tuple[ValidationResult, ...]:
         if shape_key in seen:
             continue
         seen.add(shape_key)
-        result = _slurm._run_ssh(plan._target, (*item.argv, "--test-only"), item.script)
+        result = _slurm._run_ssh(plan._profile.target, (*item.argv, "--test-only"), item.script)
         if result.returncode != 0:
             raise SubmissionError(
                 "Slurm rejected a time-specific validation: "

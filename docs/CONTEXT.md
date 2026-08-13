@@ -10,12 +10,16 @@ Servatus uses a small generic vocabulary:
   but no roster change.
 - **Resource request:** one homogeneous per-Task CPU, MiB, whole-GPU, and wall-time requirement.
 - **Target:** one concrete SSH/Slurm/Apptainer route with conservative request ceilings.
-- **Plan:** a local immutable selection whose exported document is accepted only when regeneration
-  from its typed inputs produces the same canonical bytes.
+- **Profile:** one immutable nonbinding label plus a complete Target and Resource request; exact
+  resolved values, not the label, own Campaign compatibility.
+- **Plan:** one immutable decision over an exact Campaign view, including roster and attempt
+  projection, observations, selection, retry and duplicate-risk choices, Profile, and allocations;
+  its canonical document restores without external observation and must regenerate byte-for-byte.
 - **Allocation:** one single-node Slurm job containing concurrent exact Task steps.
 - **Attempt:** one durable allocation record written before possible scheduler acceptance; it owns
-  ordered Task and retry keys, Campaign revision, lineage, plan and script digests, exact command,
-  allocation totals, query window, and one unresolved, accepted, or not-submitted outcome.
+  ordered Task, retry, and duplicate-risk keys, Campaign revision, selected Profile label, lineage,
+  plan and script digests, exact command, allocation totals, query window, and one unresolved,
+  accepted, or not-submitted outcome.
 - **Intent:** the durably synced unresolved Attempt written before possible scheduler acceptance.
 - **Receipt:** a positive Slurm job identity proving scheduler acceptance, not completion; its Task
   keys come from the immutable intent.
@@ -31,8 +35,8 @@ Servatus uses a small generic vocabulary:
 - **Result readiness:** the sealed roster has valid immutable caller results for every Task.
 - **Quiescence:** scheduler evidence was requested, every accepted Attempt is proven terminal, and
   no acceptance remains unresolved; it is independent from result readiness.
-- **Unaccepted task:** one Task without a proven scheduler-acceptance receipt. Application
-  completion is a separate caller-owned decision.
+- **Duplicate-risk acknowledgement:** one explicit recorded operator decision allowing retry when
+  accepted scheduler evidence is unknown; it never claims the older attempt stopped.
 - **Validation result:** one immutable, time-specific result from bounded Slurm `--test-only`
   validation of an authoritative Campaign plan.
 - **Ambiguous allocation:** an intent without a receipt or explicit operator resolution.

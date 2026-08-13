@@ -46,10 +46,16 @@ outside the threat model.
 
 Campaign task arguments and stdin are embedded in the submitted batch script. Redaction from
 ordinary local summaries does not make them secret; do not submit credentials or other secrets.
-Target TOML is an editable user-side guardrail, not an enforcement boundary. Slurm remains
+Resolved values from repository-owned `SERVATUS.toml` are editable user-side guardrails, not an
+enforcement boundary. Profile labels are nonbinding provenance. Slurm remains
 authoritative for identity, admission, isolation, allocation, accounting, and billing. Servatus
 clears the remote command environment and supplies only a fixed path, C locale, and UTC timezone;
 local scheduler or timezone overrides are not forwarded.
+
+Canonical plan files retain exact target/resource values, scheduler observations, job identities,
+and Task keys. They exclude Task arguments and stdin but are still private operational data. Store
+them owner-only; the CLI publishes with mode `0600` and refuses overwrite. Unknown accepted work is
+replayed only after a separate explicit duplicate-execution-risk acknowledgement.
 
 Campaign log snapshots are sensitive, untrusted binary data. They may contain credentials,
 research data, terminal control sequences, or other hostile output. Never render them directly in

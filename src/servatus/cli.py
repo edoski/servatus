@@ -9,9 +9,9 @@ from typing import cast
 from ._campaign import (
     Campaign,
     JobReceipt,
-    ResourceRequest,
-    SlurmTarget,
+    Profile,
     Task,
+    campaign_view_document,
     plan_document,
     restore_plan,
     sensitive_script_document,
@@ -25,26 +25,25 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="servatus", description="Durable Slurm work campaigns")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    plan = commands.add_parser("plan", help="build a fully local immutable plan")
+    plan = commands.add_parser("plan", help="build an evidence-bound immutable plan")
     plan.add_argument("tasks", type=Path)
-    plan.add_argument("--target", type=Path, required=True)
-    plan.add_argument("--resources", type=Path, required=True)
     plan.add_argument("--campaign", type=Path, required=True)
     plan.add_argument("--output", type=Path, required=True)
+    plan.add_argument("--profile", metavar="NAME")
     plan.add_argument("--tasks-per-allocation", type=int)
-    plan.add_argument(
-        "--completed",
-        action="append",
-        default=[],
-        metavar="TASK_KEY",
-        help="exclude an application-validated task; repeat for multiple tasks",
-    )
     plan.add_argument(
         "--retry",
         action="append",
         default=[],
         metavar="TASK_KEY",
         help="retry a task with a prior scheduler receipt; repeat for multiple tasks",
+    )
+    plan.add_argument(
+        "--allow-duplicate-risk",
+        action="append",
+        default=[],
+        metavar="TASK_KEY",
+        help="acknowledge duplicate-execution risk for an unknown accepted attempt",
     )
     plan.add_argument(
         "--show-scripts",
@@ -63,10 +62,21 @@ def _parser() -> argparse.ArgumentParser:
     seal = commands.add_parser("seal", help="irreversibly seal a Campaign roster")
     seal.add_argument("campaign", type=Path)
 
-    status = commands.add_parser(
-        "status", help="show unaccepted tasks, receipts, and ambiguous allocations"
+    inspect = commands.add_parser("inspect", help="show scheduler-only Campaign evidence as JSON")
+    inspect.add_argument("campaign", type=Path)
+
+    log = commands.add_parser(
+        "log",
+        help="write sensitive untrusted raw log bytes; redirect to a private file or safe viewer",
+        description=(
+            "Write sensitive untrusted raw log bytes, which may contain terminal control "
+            "sequences. Redirect output to a private file or safe binary viewer."
+        ),
     )
-    status.add_argument("campaign", type=Path)
+    log.add_argument("campaign", type=Path)
+    log.add_argument("allocation_id")
+    log.add_argument("--task", metavar="TASK_KEY")
+    log.add_argument("--bytes", type=int, default=65_536, metavar="N")
 
     reconcile = commands.add_parser("reconcile", help="query one ambiguous allocation once")
     reconcile.add_argument("campaign", type=Path)
@@ -146,14 +156,18 @@ def _run(arguments: argparse.Namespace) -> None:
     command = cast(str, arguments.command)
     if command == "plan":
         campaign = Campaign.open(arguments.campaign, _load_tasks(arguments.tasks))
+        profile = Profile.load(Path.cwd() / "SERVATUS.toml", name=arguments.profile)
+        view = campaign.inspect()
         plan = campaign.plan(
-            SlurmTarget.from_toml(arguments.target),
-            ResourceRequest.from_toml(arguments.resources),
-            completed=arguments.completed,
+            profile,
+            view=view,
             retry=arguments.retry,
+            allow_duplicate_risk=arguments.allow_duplicate_risk,
             tasks_per_allocation=arguments.tasks_per_allocation,
         )
         _write_json(arguments.output, plan_document(plan))
+        for warning in plan.warnings:
+            print(f"warning: {warning}", file=sys.stderr)
         if arguments.show_scripts:
             print(
                 "warning: complete scripts expose task arguments and payloads",
@@ -173,18 +187,16 @@ def _run(arguments: argparse.Namespace) -> None:
     elif command == "seal":
         Campaign.load(arguments.campaign).seal()
         print(json.dumps({"sealed": True}, sort_keys=True))
-    elif command == "status":
-        status = Campaign.load(arguments.campaign).status()
-        print(
-            json.dumps(
-                {
-                    "unaccepted_task_keys": list(status.unaccepted_task_keys),
-                    "receipts": [_receipt_json(receipt) for receipt in status.receipts],
-                    "ambiguous_allocation_ids": list(status.ambiguous_allocation_ids),
-                },
-                sort_keys=True,
-            )
+    elif command == "inspect":
+        view = Campaign.load(arguments.campaign).inspect()
+        print(json.dumps(campaign_view_document(view), sort_keys=True))
+    elif command == "log":
+        snapshot = Campaign.load(arguments.campaign).read_log(
+            arguments.allocation_id,
+            task_key=arguments.task,
+            max_bytes=arguments.bytes,
         )
+        sys.stdout.buffer.write(snapshot.content)
     elif command == "reconcile":
         campaign = Campaign.load(arguments.campaign)
         receipt = campaign.reconcile(arguments.allocation_id)
