@@ -357,7 +357,6 @@ ResultProbe = Callable[[Task], bool]
 
 @dataclass(frozen=True, slots=True)
 class AllocationEvidence:
-    receipt: JobReceipt
     state: AllocationState
     raw_state: str | None
     accounting_state: str | None
@@ -721,16 +720,17 @@ class Campaign:
 
         receipt_values = _receipt_values(state)
         receipts = {receipt.allocation_id: receipt for receipt in receipt_values}
+        attempt_queries = _attempt_queries(state)
         scheduler_values: tuple[_slurm.SchedulerObservation, ...] = ()
-        if scheduler and receipt_values:
+        if scheduler and attempt_queries:
             lineage = _validate_lineage(state["lineage"])
             assert lineage is not None
-            scheduler_values = _slurm.query_receipts(lineage[0], receipt_values)
+            scheduler_values = _slurm.query_attempts(lineage[0], attempt_queries)
         scheduler_observed_at = datetime.now(UTC)
         scheduler_by_allocation = (
             {
-                receipt.allocation_id: observation
-                for receipt, observation in zip(receipt_values, scheduler_values, strict=True)
+                query.allocation_id: observation
+                for query, observation in zip(attempt_queries, scheduler_values, strict=True)
             }
             if scheduler
             else {}
@@ -747,7 +747,6 @@ class Campaign:
                 None
                 if receipt is None or observation is None
                 else AllocationEvidence(
-                    receipt,
                     observation.state,
                     observation.raw_state,
                     observation.accounting_state,
@@ -1299,6 +1298,24 @@ def _receipt_values(state: dict[str, object]) -> tuple[JobReceipt, ...]:
                 cast(int, acceptance["job_id"]),
                 cast(str | None, acceptance["cluster"]),
                 tuple(cast(list[str], attempt["task_keys"])),
+            )
+        )
+    return tuple(values)
+
+
+def _attempt_queries(state: dict[str, object]) -> tuple[_slurm._AttemptQuery, ...]:
+    values: list[_slurm._AttemptQuery] = []
+    for attempt in cast(list[dict[str, object]], state["attempts"]):
+        acceptance = cast(dict[str, object], attempt["acceptance"])
+        if acceptance["status"] != _ACCEPTED:
+            continue
+        values.append(
+            _slurm._AttemptQuery(
+                cast(str, attempt["allocation_id"]),
+                cast(int, acceptance["job_id"]),
+                cast(str | None, acceptance["cluster"]),
+                cast(str, attempt["window_start"]),
+                cast(str, attempt["window_end"]),
             )
         )
     return tuple(values)

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 from ._errors import ObservationError, ReconciliationError
 
 if TYPE_CHECKING:
-    from ._campaign import JobReceipt, ResourceRequest, SlurmTarget, Task
+    from ._campaign import ResourceRequest, SlurmTarget, Task
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,8 +43,6 @@ class AllocationState(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class SchedulerObservation:
-    job_id: int
-    cluster: str | None
     state: AllocationState
     raw_state: str | None
     accounting_state: str | None
@@ -56,8 +54,8 @@ class SchedulerObservation:
 
 @dataclass(frozen=True, slots=True)
 class _RawJob:
-    job_id: int
     cluster: str | None
+    submitted_at: str
     state: str
     exit_code: str | None
     reason: str | None
@@ -65,7 +63,19 @@ class _RawJob:
     ended_at: str | None
 
 
-_MAX_JOB_IDS_PER_QUERY = 64
+@dataclass(frozen=True, slots=True)
+class _AttemptQuery:
+    allocation_id: str
+    job_id: int
+    cluster: str | None
+    window_start: str
+    window_end: str
+
+    @property
+    def identity(self) -> str:
+        return f"servatus-{self.allocation_id}"
+
+
 _MAX_QUERY_ARGC = 16
 _MAX_QUERY_ARG_BYTES = 16 * 1024
 _MAX_QUERY_FIELD_BYTES = 4096
@@ -205,15 +215,9 @@ def _run_bounded_ssh(
     *,
     max_stdout_bytes: int = _MAX_QUERY_OUTPUT_BYTES,
 ) -> Result:
-    if len(argv) > _MAX_QUERY_ARGC or any(
-        len(value.encode("utf-8")) > _MAX_QUERY_FIELD_BYTES for value in argv
-    ):
-        raise ObservationError("scheduler query command exceeds its argument bounds")
-    remote = "/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C " + shlex.join(argv)
-    if len(remote.encode("utf-8")) > _MAX_QUERY_ARG_BYTES:
-        raise ObservationError("scheduler query command exceeds its byte bound")
+    command = _bounded_ssh_command(target, argv)
     process = subprocess.Popen(
-        ["ssh", "-T", "-o", "BatchMode=yes", target.host, remote],
+        command,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -272,6 +276,20 @@ def _run_bounded_ssh(
             stream.close()
 
 
+def _bounded_ssh_command(target: SlurmTarget, argv: tuple[str, ...]) -> tuple[str, ...]:
+    remote = "/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C " + shlex.join(argv)
+    command = ("ssh", "-T", "-o", "BatchMode=yes", target.host, remote)
+    fields = (*command[:-1], *argv)
+    if (
+        len(argv) > _MAX_QUERY_ARGC
+        or len(command) > _MAX_QUERY_ARGC
+        or any(len(value.encode("utf-8")) > _MAX_QUERY_FIELD_BYTES for value in fields)
+        or sum(len(value.encode("utf-8")) + 1 for value in command) > _MAX_QUERY_ARG_BYTES
+    ):
+        raise ObservationError("observation command exceeds its argument bounds")
+    return command
+
+
 def _log_path(
     log_root: PurePosixPath,
     allocation_id: str,
@@ -307,123 +325,157 @@ def read_log_suffix(
     return result.stdout, False
 
 
-def query_receipts(
+def query_attempts(
     target: SlurmTarget,
-    receipts: tuple[JobReceipt, ...],
+    attempts: tuple[_AttemptQuery, ...],
 ) -> tuple[SchedulerObservation, ...]:
-    unique = {(receipt.job_id, receipt.cluster) for receipt in receipts}
-    observations: dict[tuple[int, str | None], SchedulerObservation] = {}
-    groups: dict[str | None, list[int]] = {}
-    for job_id, cluster in sorted(unique, key=lambda item: (item[1] or "", item[0])):
-        groups.setdefault(cluster, []).append(job_id)
-    for cluster, job_ids in groups.items():
-        for offset in range(0, len(job_ids), _MAX_JOB_IDS_PER_QUERY):
-            chunk = tuple(job_ids[offset : offset + _MAX_JOB_IDS_PER_QUERY])
-            active = _query_rows(target, chunk, cluster, accounting=False)
-            accounting = _query_rows(target, chunk, cluster, accounting=True)
-            for job_id in chunk:
-                key = (job_id, cluster)
-                observations[key] = _combine_rows(
-                    job_id,
-                    cluster,
-                    active.get(job_id),
-                    accounting.get(job_id),
-                )
-    return tuple(observations[(receipt.job_id, receipt.cluster)] for receipt in receipts)
+    observations: list[SchedulerObservation] = []
+    for attempt in attempts:
+        active = _query_row(target, attempt, accounting=False)
+        accounting = _query_row(target, attempt, accounting=True)
+        observations.append(_combine_rows(active, accounting))
+    return tuple(observations)
 
 
-def _query_rows(
+def _query_row(
     target: SlurmTarget,
-    job_ids: tuple[int, ...],
-    cluster: str | None,
+    attempt: _AttemptQuery,
     *,
     accounting: bool,
-) -> dict[int, _RawJob]:
+) -> _RawJob | None:
     command = target.slurm_bin / ("sacct" if accounting else "squeue")
     argv = [str(command), "--noheader"]
     if accounting:
-        argv.extend(("--parsable2", "--allocations"))
-    argv.extend(("--jobs", ",".join(map(str, job_ids))))
-    argv.append("--local" if cluster is None else f"--clusters={cluster}")
+        argv.extend(("--parsable2", "--allocations", "--duplicates"))
+    argv.extend(("--jobs", str(attempt.job_id)))
+    if accounting:
+        argv.extend(
+            (
+                "--name",
+                attempt.identity,
+                "--starttime",
+                attempt.window_start,
+                "--endtime",
+                attempt.window_end,
+            )
+        )
+    argv.append("--local" if attempt.cluster is None else f"--clusters={attempt.cluster}")
     if accounting:
         argv.append(
-            "--format=JobIDRaw%64,Cluster%256,State%256,ExitCode%32,Reason%4096,Start%32,End%32"
+            "--format=JobIDRaw%64,Cluster%256,JobName%256,Comment%256,Submit%32,"
+            "State%256,ExitCode%32,Reason%4096,Start%32,End%32"
         )
     else:
-        argv.append("--format=%i|%T|%r|%S|%e")
+        argv.append("--format=%i|%j|%k|%V|%T|%r|%S|%e")
     try:
         result = _run_bounded_ssh(target, tuple(argv))
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         raise ObservationError("scheduler observation was unavailable") from error
+    if not accounting and _missing_active_job(result):
+        return None
     if result.returncode != 0 or result.stderr:
         raise ObservationError("scheduler observation was unavailable")
-    return _parse_query_output(
+    rows = _parse_query_output(
         result.stdout,
-        frozenset(job_ids),
-        cluster,
+        attempt,
         accounting=accounting,
+    )
+    unique = tuple(dict.fromkeys(rows))
+    if len(unique) > 1:
+        raise ObservationError("scheduler query returned conflicting evidence")
+    return next(iter(unique), None)
+
+
+def _missing_active_job(result: Result) -> bool:
+    return result == Result(
+        1,
+        b"",
+        b"slurm_load_jobs error: Invalid job id specified\n",
     )
 
 
 def _parse_query_output(
     output: bytes,
-    expected_job_ids: frozenset[int],
-    expected_cluster: str | None,
+    attempt: _AttemptQuery,
     *,
     accounting: bool,
-) -> dict[int, _RawJob]:
+) -> tuple[_RawJob, ...]:
     if len(output) > _MAX_QUERY_OUTPUT_BYTES:
         raise ObservationError("scheduler query output exceeds its byte bound")
     if output and not output.endswith(b"\n"):
         raise ObservationError("scheduler query output is partial")
-    lines = output.splitlines()
+    lines = () if not output else output[:-1].split(b"\n")
     if len(lines) > _MAX_QUERY_LINES:
         raise ObservationError("scheduler query output exceeds its line bound")
-    rows: dict[int, _RawJob] = {}
+    rows: list[_RawJob] = []
     for line in lines:
         fields = line.split(b"|")
-        expected_fields = 7 if accounting else 5
+        expected_fields = 10 if accounting else 8
         if len(fields) != expected_fields or any(
             len(field) > _MAX_QUERY_FIELD_BYTES for field in fields
         ):
             raise ObservationError("scheduler query row is malformed")
         try:
-            decoded = tuple(field.decode("utf-8", "strict").strip() for field in fields)
+            raw_decoded = tuple(field.decode("utf-8", "strict") for field in fields)
         except UnicodeDecodeError as error:
             raise ObservationError("scheduler query row is malformed") from error
-        if len(decoded) == 7:
-            job_id_raw, cluster_raw, state_raw, exit_raw, reason_raw, start_raw, end_raw = decoded
+        if any(_CONTROL.search(value) for value in raw_decoded):
+            raise ObservationError("scheduler query row is malformed")
+        decoded = tuple(value.strip(" ") for value in raw_decoded)
+        if accounting:
+            (
+                job_id_raw,
+                cluster_raw,
+                name_raw,
+                comment_raw,
+                submit_raw,
+                state_raw,
+                exit_raw,
+                reason_raw,
+                start_raw,
+                end_raw,
+            ) = decoded
             cluster = _optional_field(cluster_raw)
             exit_code = _exit_code(exit_raw)
         else:
-            job_id_raw, state_raw, reason_raw, start_raw, end_raw = decoded
-            cluster = expected_cluster
+            (
+                job_id_raw,
+                name_raw,
+                comment_raw,
+                submit_raw,
+                state_raw,
+                reason_raw,
+                start_raw,
+                end_raw,
+            ) = decoded
+            cluster = attempt.cluster
             exit_code = None
         if not job_id_raw.isascii() or not job_id_raw.isdecimal():
             raise ObservationError("scheduler query row has an invalid job identity")
         job_id = int(job_id_raw)
+        submitted_at = _timestamp(submit_raw)
         if (
-            job_id not in expected_job_ids
-            or (expected_cluster is not None and cluster != expected_cluster)
+            job_id != attempt.job_id
+            or (attempt.cluster is not None and cluster != attempt.cluster)
             or (cluster is not None and _SITE_TOKEN.fullmatch(cluster) is None)
+            or name_raw != attempt.identity
+            or comment_raw != attempt.identity
+            or submitted_at is None
+            or not attempt.window_start <= submitted_at <= attempt.window_end
             or _state_base(state_raw) is None
-            or any(_CONTROL.search(value) for value in decoded)
         ):
             raise ObservationError("scheduler query returned unrelated evidence")
         row = _RawJob(
-            job_id,
             cluster,
+            submitted_at,
             state_raw,
             exit_code,
             _optional_field(reason_raw),
             _timestamp(start_raw),
             _timestamp(end_raw),
         )
-        existing = rows.get(job_id)
-        if existing is not None and existing != row:
-            raise ObservationError("scheduler query returned conflicting evidence")
-        rows[job_id] = row
-    return rows
+        rows.append(row)
+    return tuple(rows)
 
 
 def _optional_field(value: str) -> str | None:
@@ -472,16 +524,12 @@ def _state_base(raw: str) -> str | None:
 
 
 def _combine_rows(
-    job_id: int,
-    cluster: str | None,
     active: _RawJob | None,
     accounting: _RawJob | None,
 ) -> SchedulerObservation:
     primary = active or accounting
     if primary is None:
         return SchedulerObservation(
-            job_id,
-            cluster,
             AllocationState.UNKNOWN,
             None,
             None,
@@ -507,8 +555,6 @@ def _combine_rows(
     ):
         raise ObservationError("scheduler sources returned conflicting evidence")
     return SchedulerObservation(
-        job_id,
-        cluster,
         _normalize_state(primary.state),
         primary.state,
         None if accounting is None else accounting.state,

@@ -27,9 +27,14 @@ validation, and status projections remain. Plan schema 3 remains current for thi
 
 `Campaign.inspect()` adds one immutable, revision-bound view to this same authority. It invokes an
 optional synchronous boolean result probe exactly once per Task and queries only exact accepted
-receipt identities through bounded native `squeue` and `sacct` calls. Both operations run outside
-the Campaign lock. Inspection then rejects any Campaign revision change. Probe answers and
-scheduler observations are transient, time-stamped, redacted, and never stored.
+Attempt identities through bounded native `squeue` and `sacct` calls. Each Attempt receives one
+server-side single-job queue request plus duplicate-preserving accounting selected and verified by
+its allocation-derived job name/comment and reconciliation window. Slurm Job-ID and cluster reuse
+therefore cannot collapse Attempt evidence. The exact native invalid-job response means no active
+row and does not suppress accounting; unrelated or multiply plausible accounting fails closed.
+Probe and scheduler operations run outside the Campaign lock. Inspection then rejects any Campaign
+revision change. Their answers are transient, time-stamped, redacted, and never stored. Receipt
+identity exists once on Attempt evidence rather than being copied into allocation evidence.
 
 `Campaign.read_log()` adds one separate diagnostic operation over the same accepted Attempt
 authority. It snapshots the validated immutable target, receipt, ordered Task slot, and derived

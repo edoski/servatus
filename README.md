@@ -187,12 +187,16 @@ evidence unobserved:
 result_view = campaign.inspect(result_exists, scheduler=False)
 ```
 
-Scheduler inspection queries only exact accepted receipt identities through the Campaign's durable
-target lineage. Each SSH command has a 30-second deadline and at most 64 job IDs, 16 arguments,
-16 KiB of command text, 1 MiB per output stream, 128 lines, and 4 KiB per field. Larger Campaigns
-use deterministic chunks. A failed command, timeout, overflow, malformed or partial row, unrelated
-identity, or conflicting evidence aborts the whole inspection. A successful query with no exact row
-reports `UNKNOWN`; it does not fail or authorize retry.
+Scheduler inspection follows durable Attempt order. Each accepted Attempt gets one server-side
+single-job `squeue` request and one `sacct --duplicates` request bound to its allocation-derived job
+name/comment and reconciliation window. Distinct Attempts remain distinct even if Slurm reuses the
+same job ID and cluster. The native single-job invalid-ID response means only that no active row
+exists, so accounting is still queried; no exact active or accounting row reports `UNKNOWN`.
+
+Each SSH command has a 30-second deadline. Local and remote argument vectors have at most 16
+arguments, 16 KiB of complete command text, 1 MiB per output stream, 128 lines, and 4 KiB per source
+field. A failed command, timeout, overflow, malformed or partial row, unrelated Attempt identity,
+or conflicting duplicate evidence aborts the whole inspection.
 
 Allocation states normalize to `QUEUED`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, or
 `UNKNOWN`. Packed Tasks share their allocation evidence. Every Attempt remains visible, while the
