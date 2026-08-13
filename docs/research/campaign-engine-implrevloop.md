@@ -1345,7 +1345,8 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
 | New Campaign-engine architecture | User-approved |
 | Repository-local Profile revision | User-approved; independent rereview GREEN |
 | New ledger | GREEN; implementation-ready |
-| S1-S4 Servatus implementation | Authorized; S1 starting |
+| S1 Campaign roster and attempt state | Complete; Standards 0 / Spec 0 at `313b4d32` |
+| S2-S4 Servatus implementation | Authorized; S2 next |
 | Servatus `0.7.0` external release | Not authorized |
 | Active K-study | Running under separate Runner; protected |
 | K1-K2 KAIROS adoption | Blocked by public `0.7.0` and K-study closure |
@@ -1392,3 +1393,20 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
 - 2026-08-13: final fixed-range ledger rereviews returned GREEN with zero actionable findings on the
   common-path and adversarial axes. S1 may start from the exact accepted ledger head; no product or
   external state changed during planning.
+- 2026-08-13: S1 implemented clean-break Campaign schema 4 from exact ledger head `abe875c9`.
+  Initial commit `a057aa18` added the durable `OPEN`/`SEALED` roster phase, immutable ordered
+  `Campaign.tasks`, idempotent seal plus CLI, append/seal plan invalidation, and one tagged Attempt
+  owner for submission lineage. Independent review rejected incomplete raw-state reconstruction.
+  The same implementer added separate corrections `332168a1`, `388ee676`, and `313b4d32` for exact
+  retry provenance, feasible revisions, canonical reconciliation windows, final ambiguity,
+  disjoint authored-order plan allocations, and terminal negative outcomes. The same reviewer
+  returned final GREEN with Standards 0 / Spec 0 on `388ee676..313b4d32`; all earlier findings
+  remained closed. Final gates were 326 passed / 1 environment skip, Ruff check and format,
+  configured strict Pyright, Vulture, lock and dry-sync checks, build/archive/metadata inspection,
+  zero runtime dependencies, diff check, and fresh installed-wheel API plus both CLI entry points.
+  No SSH, Slurm, KAIROS, protected Campaign, remote, release, or S2+ action ran. Exact accepted S1
+  head is `313b4d32f905e5d8a7b380e9582ceea3b5240fac`.
+- 2026-08-13: the separate App-ownership program integrated first into the clean local KAIROS
+  `main`, then removed only temporary/stale Markdown. K1 must re-pin exact then-current KAIROS
+  baseline `85209160b57ad146d868090e002cf69ed23a4503`. Its only expected overlap is
+  `docs/KAIROS.md`; App product lives under `app/`. This ordering does not affect Servatus S1-S4.
