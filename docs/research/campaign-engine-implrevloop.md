@@ -1,7 +1,7 @@
 # Campaign Engine Implementation and Review Ledger
 
-Status: architecture and ledger independently reviewed GREEN; implementation not started. This is
-the active plan.
+Status: architecture and original ledger independently reviewed GREEN; the user-approved execution
+profile revision is under independent rereview before implementation. This is the active plan.
 
 Date: 2026-08-13
 
@@ -15,6 +15,8 @@ Slurm. Servatus will own the generic execution facts shared by KAIROS and simila
 - read-only observation of accepted Slurm allocations;
 - one caller-supplied, in-memory result probe over opaque Tasks;
 - result-aware planning and derived readiness without application schemas;
+- one repository-local named execution-profile document that replaces paired client target/resource
+  files;
 - a redacted, canonical execution-provenance record;
 - the existing Workspace and publication transactions, unchanged in responsibility.
 
@@ -74,6 +76,14 @@ At plan creation:
 - the run-owned Servatus worktree is `/private/tmp/servatus-campaign-engine-0.7`;
 - no KAIROS implementation branch or worktree exists for this program;
 - no output, image, scheduler, campaign, remote checkout, or canonical object has been touched.
+
+At implementation authorization, KAIROS `main` remained at the same exact commit but contained one
+unrelated user-owned untracked document, `docs/app-ownership-simplification-implrevloop.md`. This run
+must not read, edit, stage, remove, or claim that file. A separate task owns App simplification in an
+isolated worktree. Servatus S1-S4 may proceed independently. KAIROS K1 must re-pin the then-current
+accepted `main` after that task integrates; no current `app/` product edit is expected from this
+program, while `docs/CONTEXT.md`, `docs/KAIROS.md`, ADR 0006, and ADR 0008 remain possible later
+overlap surfaces.
 
 Every slice records its exact baseline, head, worktree, commit range, status, and gates before the
 next slice starts. Later baselines are the preceding independently accepted heads, never an
@@ -152,6 +162,7 @@ Servatus owns:
 
 - Task roster integrity and ordered suffix growth;
 - the open/sealed roster phase;
+- strict repository-local execution-profile loading and exact selected-profile lineage;
 - target/resource lineage;
 - deterministic packing and rendered Slurm scripts;
 - attempts, acceptance receipts, ambiguity, and explicit resolution;
@@ -173,7 +184,8 @@ KAIROS owns:
 - HPO extension rules and scientific roster construction;
 - manifest construction and publication;
 - metrics, figures, benchmark protocols, and scientific readiness;
-- one-GPU policy, committed target/resource values, image selection, and external queue policy.
+- profile selection, committed profile values, one-GPU policy, image selection, and external queue
+  policy.
 
 ## Accepted Campaign model
 
@@ -185,12 +197,12 @@ KAIROS owns:
 The intended Python path is:
 
 ```python
+profile = Profile.load(Path("SERVATUS.toml"), name=selected_profile)
 campaign = Campaign.open(path, tasks)
 campaign.seal()  # immediately for fixed rosters; later for appendable authoring
 view = campaign.inspect(result_probe)  # includes scheduler evidence for planning
 plan = campaign.plan(
-    target,
-    resources,
+    profile,
     view=view,
     retry=explicit_retry_keys,
     tasks_per_allocation=cap,
@@ -202,6 +214,57 @@ receipts = campaign.submit(plan, probe=result_probe)
 Exact public type and property names may change during a slice only when the implementation and
 independent reviewer show a smaller, clearer interface with the same single path and semantics.
 Adding a second equivalent path is not allowed.
+
+### Repository-local execution profiles
+
+One public immutable `Profile` groups one complete execution lane: its opaque label, one
+`SlurmTarget`, and one homogeneous `ResourceRequest`. `Campaign.plan()` consumes the Profile rather
+than a separate target/resource pair. Campaign lineage records the selected label plus the exact
+resolved target and resource values; the label is explanatory, while the values remain authority.
+A later edit to the same label cannot silently change an existing Campaign because ordinary lineage
+comparison fails.
+
+Profiles live in one client-owned, version-controlled `SERVATUS.toml` at the repository root:
+
+```toml
+default_profile = "KAIROS"
+
+[profiles.KAIROS.target]
+host = "research"
+# complete target values
+
+[profiles.KAIROS.resources]
+cpus_per_task = 24
+memory_mib_per_task = 65536
+gpus_per_task = 1
+time_limit = "3-00:00:00"
+```
+
+The document may contain multiple complete profiles. Profiles do not inherit, merge, reference one
+another, or split target and resource ownership. Selection is exactly:
+
+1. an explicit profile name supplied by the caller;
+2. otherwise the document's optional `default_profile`;
+3. otherwise one direct configuration error.
+
+An explicit name always overrides `default_profile`. A missing document, missing selected label, or
+default label absent from `profiles` fails directly. Existing target/resource typed validation owns
+the nested raw values exactly once. There is no environment fallback, repository-name inference,
+parent-directory search, global store, path-to-project registry, per-profile default boolean, or
+implicit single-profile selection.
+
+The library interface loads an explicit path once at the client composition root. Servatus's CLI may
+default its config path to the exact current-working-directory name `SERVATUS.toml` and may accept a
+`--profile` override; it never searches for that file. KAIROS uses the same exact repository-root
+file, permits `--profile NAME`, and otherwise uses the file's declared default. Git owns creation,
+editing, review, and history. Servatus adds no profile install/remove/list/show commands. A separate
+`profile check` command is also excluded until real use proves that normal load/plan errors are
+insufficient.
+
+Repository placement provides discoverability and Git provenance, but it does not replace durable
+Campaign lineage: a dirty file or another checkout can differ. No extra revision store or profile
+digest subsystem is needed because the Campaign already persists and compares the exact resolved
+execution values.
 
 ### Roster phase
 
@@ -778,6 +841,14 @@ Baseline: exact accepted S2 head.
 
 Scope:
 
+- add the immutable public `Profile` and strict one-pass loading of one repository-local
+  `SERVATUS.toml` containing one or more complete named target/resource profiles;
+- let an explicit name override the optional top-level `default_profile`, and fail directly when no
+  selection or selected profile exists;
+- make `Campaign.plan()` consume one Profile and retain its label plus exact resolved execution
+  values in immutable lineage;
+- remove paired target/resource TOML loading paths and direct planning parameters where the Profile
+  replaces them without weakening programmatic construction or durable validation;
 - make planning consume one exact current Campaign view and implement the approved selection matrix;
 - preserve unaffected planning while blocking only ambiguous Tasks;
 - allow unknown accepted work only through an explicit recorded duplicate-risk override;
@@ -787,7 +858,8 @@ Scope:
 - before each allocation's `sbatch`, refresh local state, selected-Task probe evidence, and read-only
   scheduler evidence in the exact documented order;
 - abort changed eligibility before each mutating `sbatch` call;
-- add CLI `seal` and scheduler-only `inspect`, and route plan persistence through the public codec;
+- add CLI `seal` and scheduler-only `inspect`, route plan persistence through the public codec, and
+  make CLI planning load exact `SERVATUS.toml` plus optional `--profile`;
 - remove obsolete acceptance-only status and manual completed-key paths;
 - keep validate/submit/reconcile/resolve thin over public Campaign methods;
 - update README, context, ADR 0003, Campaign-engine ADR, and CLI help.
@@ -796,9 +868,20 @@ Non-goals:
 
 - no automatic retry, cancellation, policy, `run()` facade, probe loader, result-aware CLI, generic
   finalizer, provenance record, or Workspace/publication change.
+- no global profile store, discovery search, environment fallback, inheritance, composition,
+  credentials, profile-management CLI, or compatibility for paired target/resource files.
 
 Required public tests:
 
+- exact explicit and declared-default profile selection;
+- explicit selection overrides the declared default;
+- one or multiple complete profiles load exact typed target/resource values;
+- absent document, absent selection, absent selected/default label, malformed profile, and unknown
+  raw keys fail once at configuration ingress;
+- Campaign lineage retains the selected label and exact values, and rejects a changed profile on an
+  existing Campaign;
+- no filesystem search, environment lookup, management command, or second target/resource planning
+  path remains;
 - every row of the result/acceptance/execution selection matrix;
 - explicit retry and unknown override retain exact attempt history and warnings;
 - any older or newer queued/running attempt blocks retry, and any unknown accepted attempt requires
@@ -816,6 +899,7 @@ Required public tests:
 Expected outcome:
 
 - one common Python path from roster through evidence-aware planning;
+- one visible project-owned configuration document and one explicit/default named profile selection;
 - immutable cross-process plans without false external-snapshot claims;
 - a thin execution-only CLI and explicit retry as the sole replay authority.
 
@@ -831,6 +915,8 @@ Scope:
 - exclude payloads, scripts, Task digests, raw reasons, nodes, target secrets, and environment;
 - document that Task keys/job IDs remain identifying and Campaign state remains private;
 - audit source/tests/docs for duplicate decoding, dead paths, repeated fields, and premature types;
+- verify Profile is the only repository-config loading concept and target/resource values have one
+  parser and one durable owner;
 - split private `_campaign_store.py` only if it materially improves locality and readability;
 - keep `_slurm.py`, `_workspace.py`, `_posix.py`, and `cli.py` focused on existing owners;
 - keep the public facade minimal, typed, and at zero runtime dependencies;
@@ -851,6 +937,7 @@ Required audit and tests:
 - operational record is canonical, revision-bound, and changes only with included facts;
 - excluded sensitive values are absent from its fields;
 - every public type passes a deletion test;
+- Profile removes paired caller configuration and does not create a store/manager abstraction;
 - every durable field has one owner and consumer need;
 - validations guard only raw ingress, persisted state, external responses, or demonstrated races;
 - typed internal paths do not revalidate impossible states;
@@ -958,6 +1045,11 @@ baseline remains current.
 Scope:
 
 - pin Servatus `0.7.0` in root and mobile manifests/locks;
+- replace repository-root `REMOTE.toml` plus `RESOURCES.toml` with one version-controlled
+  `SERVATUS.toml` containing exactly the unchanged complete `KAIROS` profile and
+  `default_profile = "KAIROS"`;
+- load that document once per command at the KAIROS composition root, accept optional
+  `--profile NAME`, and pass one public Profile through direct and experiment planning;
 - introduce one strict KAIROS-owned execution envelope for direct and experiment Tasks;
 - use one hidden remote worker entry point if that deletes the candidate/workflow payload split;
 - route existing direct and bundle-authored launch paths through that one envelope;
@@ -975,12 +1067,22 @@ Non-goals:
 - no sole-roster or scientific-close cutover yet;
 - no cell/request/bundle deletion;
 - no canonical output/schema/path change;
-- no Dataset, model, metric, feature, CUDA, resource, target, image, or queue-policy change;
+- no Dataset, model, metric, feature, CUDA, resolved resource, resolved target, image, or queue-policy
+  value change;
+- no global profile state, config search, environment fallback, repository-name inference, profile
+  management command, or paired-file compatibility;
 - no schema-3 reader or bundle migration;
 - no new adapter package unless multiple real owners require it.
 
 Required tests:
 
+- default KAIROS profile and explicit override load once and forward one exact Profile;
+- missing `SERVATUS.toml`, missing default/explicit profile, and malformed selected profile fail at
+  the one raw configuration boundary;
+- exact current host, image, roots, partitions, ceilings, 24 CPUs, 65536 MiB, one GPU, and three-day
+  request survive the two-file-to-one-file structural change;
+- `REMOTE.toml`, `RESOURCES.toml`, separate loader calls, and direct target/resource planning args
+  are absent from active source/tests/docs;
 - exact direct and experiment Task key/argv/stdin bytes through the one envelope;
 - candidate grouping and workflow one-to-one mappings;
 - public workers hydrate both direct and experiment envelopes into the exact existing KAIROS calls;
@@ -996,6 +1098,8 @@ Required tests:
 
 Expected outcome:
 
+- one readable project-local `SERVATUS.toml` with a declared KAIROS default and explicit profile
+  override, replacing two execution-config files without hidden state;
 - one canonical KAIROS remote payload;
 - one thin public Campaign/probe launch path with no caller-built completed sets;
 - durable Campaign history survives current bundle closure;
@@ -1036,6 +1140,7 @@ Non-goals:
 - no scheduler policy, automatic retry, generic finalizer, or Campaign close;
 - no execution record inside canonical scientific objects;
 - no Domain/Dataset/model/metric/CUDA/resource/target/image change;
+- no execution-profile value or selection change after K1;
 - no legacy bundle or schema-3 reader;
 - no held-out or inference campaign launch.
 
@@ -1074,11 +1179,13 @@ Required gates:
 - App locked install, test, typecheck, strict unused-source check where configured, and dry install;
 - installed Servatus/KAIROS CLI and API smokes;
 - no legacy roster/private Servatus/config/output/dataset residue;
+- no active `REMOTE.toml` or `RESOURCES.toml` reference;
 - clean diff and worktree.
 
 Expected outcome:
 
 - Campaign is the sole pre-publication execution roster;
+- `SERVATUS.toml` is the sole project execution-profile document;
 - scientific close remains direct KAIROS code over public Campaign result evidence;
 - durable Campaign history survives without entering scientific authority;
 - the KAIROS client is smaller, direct, and coupled only to public Servatus semantics;
@@ -1098,8 +1205,8 @@ Scope:
 - phase A: create one normal non-fast-forward main merge with current `main` first and K2 second;
 - resolve only real concurrent changes;
 - prove main merge-tree/remerge-diff and first/second-parent deltas;
-- preserve Blockweaver `0.3.4`, `datasets/<uuid>`, production `REMOTE.toml`, `RESOURCES.toml`, image
-  path, canonical schemas, and all science outside K1-K2;
+- preserve Blockweaver `0.3.4`, `datasets/<uuid>`, the accepted single `SERVATUS.toml` profile values
+  and image path, canonical schemas, and all science outside K1-K2;
 - phase B: merge the accepted main candidate into compact-CUDA with compact first;
 - preserve only the already accepted CUDA execution delta;
 - prove original compact nonmerge ancestry/order, stable patch parity, conflict resolutions, and
@@ -1156,14 +1263,14 @@ Acceptance uses only isolated synthetic data and new Campaign state. Minimum evi
 - redacted Campaign record contains no request bytes or secrets;
 - no production output or current scientific Campaign is touched.
 
-Any failure stops before `REMOTE.toml` changes.
+Any failure stops before `SERVATUS.toml` changes.
 
 ## External gate E6 — production configuration cutover
 
 Requires a separately reviewed KAIROS config-only slice after the exact new image passes E5:
 
-- change only the immutable image path in `REMOTE.toml` unless another reviewed operational fact
-  requires a narrow change;
+- change only `profiles.KAIROS.target.image` in `SERVATUS.toml` unless another reviewed operational
+  fact requires a narrow change;
 - independently review the fixed range;
 - rerun focused profile parsing and full proportionate static/test gates;
 - integrate/push main and compact as separately authorized;
@@ -1213,8 +1320,9 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
 | --- | --- |
 | Historical extraction/consolidation/deployment ledger | Complete; archived authority |
 | New Campaign-engine architecture | User-approved |
-| New ledger | GREEN; implementation-ready |
-| S1-S4 Servatus implementation | Not started |
+| Repository-local Profile revision | User-approved; independent ledger rereview active |
+| New ledger | Original GREEN; approved revision under rereview |
+| S1-S4 Servatus implementation | Authorized; starts after ledger rereview |
 | Servatus `0.7.0` external release | Not authorized |
 | Active K-study | Running under separate Runner; protected |
 | K1-K2 KAIROS adoption | Blocked by public `0.7.0` and K-study closure |
@@ -1238,3 +1346,13 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
   KAIROS transitions, and the pre-release client deletion test. The plan was consolidated to four
   Servatus, two KAIROS, and one integration slice. Both reviewers then returned GREEN with zero
   actionable findings. No product or external state changed.
+- 2026-08-13: user approved S1-S4, K1-K2, and I1, then approved replacing KAIROS's paired
+  `REMOTE.toml`/`RESOURCES.toml` with one repository-root `SERVATUS.toml`. The file contains one or
+  more complete named Profiles and an optional top-level `default_profile`; explicit `--profile`
+  overrides it. No global store, discovery, environment fallback, inheritance, config manager, or
+  profile-management CLI is allowed. Git owns configuration provenance while Campaign lineage owns
+  exact resolved execution values. The change is folded into S3/K1 without another slice.
+- 2026-08-13: implementation was authorized. The shared KAIROS checkout contained one unrelated
+  user-owned untracked App-planning document, preserved untouched; a separate task owns App work in
+  an isolated worktree. This program begins with Servatus S1-S4 and re-pins KAIROS only after the
+  separate task and E1/E3 gates complete. No product or external state changed by this ledger update.
