@@ -2,7 +2,7 @@
 
 Run resumable work through Slurm and atomically publish validated outputs.
 
-Servatus 0.6.0 combines durable publication with the native Slurm Campaign interface below.
+Servatus 0.7.0 combines durable publication with the native Slurm Campaign interface below.
 
 ```sh
 pip install servatus
@@ -244,6 +244,30 @@ use a safe binary viewer. Log content never enters Campaign state or views and c
 readiness, quiescence, planning, retry, reconciliation, or application validity. The remote log
 namespace remains controlled by the same cluster account; Servatus does not prove a stable remote
 inode or authenticate content after Slurm writes the derived path.
+
+### Operational record
+
+`Campaign.record(view)` returns schema-1 canonical JSON bytes for one exact revision-bound view. A
+stale, foreign, or altered view is rejected. The call is read-only and never publishes the bytes:
+
+```python
+view = campaign.inspect()
+record = campaign.record(view)
+Path("private/campaign-record.json").write_bytes(record)
+```
+
+The record contains its observation time and scheduler-observation mode; Campaign identity,
+revision, sealed state, roster digest, and ordered Task keys; and ordered Attempt provenance. Each
+Attempt retains its Profile label, Task/retry/duplicate-risk keys, target and resource lineage
+digests, allocation shape, plan and script digests, acceptance or resolution revision, receipt Job
+ID and cluster, and normalized scheduler state, exit code, timestamps, and observation time.
+
+Task arguments, stdin, per-Task digests, complete scripts, `sbatch` arguments, target values,
+environment, raw scheduler states and reasons, result evidence, logs, checkpoints, metrics, and
+application outputs are excluded. The record changes only with fields included in that projection.
+It is redacted, not anonymous or secret-safe: Task keys, allocation identities, and Slurm Job IDs
+can identify work. Keep Campaign state and operational records private unless a separate review
+approves a narrower publication projection.
 
 Servatus does not cancel jobs in V1. Use the receipt with the site's normal `scancel` command.
 Cancellation applies to the packed allocation, does not prove application completion, and does not

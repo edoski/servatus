@@ -275,7 +275,7 @@ def test_growth_preserves_receipts_and_submits_only_new_suffix(
     assert [allocation.task_keys for allocation in retry.allocations] == [("task-0",)]
 
 
-def test_old_handle_reads_appended_roster_for_status_plan_and_retry(
+def test_old_handle_reads_appended_roster_for_inspect_plan_and_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "campaign"
@@ -1130,37 +1130,6 @@ def test_accepted_without_receipt_is_ambiguous_and_halts(
         )
         == 1
     )
-
-
-def test_manual_resolution_and_explicit_retry_preserve_history(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    plan = planning(campaign)
-    monkeypatch.setattr(
-        _slurm,
-        "_run_ssh",
-        lambda *args, **kwargs: _slurm.Result(0, b"not-a-job\n", b""),
-    )
-    with pytest.raises(AmbiguousSubmission):
-        campaign.submit(plan)
-
-    allocation_id = campaign.inspect(scheduler=False).attempts[-1].allocation_id
-    campaign.resolve(allocation_id, job_id=None)
-    retry_plan = planning(campaign)
-    monkeypatch.setattr(
-        _slurm,
-        "_run_ssh",
-        lambda *args, **kwargs: _slurm.Result(0, b"101\n", b""),
-    )
-    campaign.submit(retry_plan)
-    second_retry = planning(campaign, retry={"task-0"})
-    campaign.submit(second_retry)
-    assert [
-        attempt.receipt.job_id
-        for attempt in campaign.inspect(scheduler=False).attempts
-        if attempt.receipt is not None
-    ] == [101, 101]
 
 
 def test_attempt_history_retains_resolution_reconciliation_retry_and_lineage(

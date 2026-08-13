@@ -85,6 +85,15 @@ scheduler-only `inspect`, and writes raw bounded log bytes through `Campaign.rea
 acceptance-only status, caller completed sets, and paired target/resource configuration paths are
 removed.
 
+`Campaign.record(view)` is the sole operational-record interface. Campaign validates the exact
+revision-bound view, joins it with its durable Attempt lineage, and returns canonical schema-1 JSON
+bytes without mutation or publication. The projection retains generic identities, ordered keys,
+Profile labels, lineage and plan/script digests, allocation shapes, tagged acceptance/resolution
+history, receipts, and normalized scheduler observations. It excludes Task bytes and digests,
+scripts and commands, resolved target values, raw scheduler details, result evidence, logs, and
+application outputs. The record is redacted but remains identifying through Task keys, allocation
+identities, and Slurm Job IDs.
+
 This decision narrows ADR 0001 only by allowing an ephemeral boolean result probe; application
 schemas remain opaque. It supersedes ADR 0003's roster and durable submission-record shape while
 retaining ADR 0003's single native lane and safety decisions. ADR 0002 publication and ADR 0004

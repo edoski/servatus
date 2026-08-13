@@ -30,6 +30,9 @@ Servatus uses a small generic vocabulary:
   strictly later requeue incarnations, and its receipt remains owned by Attempt evidence.
 - **Campaign view:** one immutable revision-bound projection containing every Attempt, current Task
   execution and result evidence, readiness, and quiescence without persisting observations.
+- **Operational record:** schema-versioned canonical JSON bytes projected from one exact Campaign
+  view and its durable Attempt lineage; redacted but identifying, read-only, and never automatically
+  published.
 - **Log snapshot:** one transient time-stamped bounded binary suffix from the allocation or packed
   Task log of one exact accepted Attempt; it is diagnostic evidence with no lifecycle authority.
 - **Result readiness:** the sealed roster has valid immutable caller results for every Task.

@@ -57,6 +57,13 @@ and Task keys. They exclude Task arguments and stdin but are still private opera
 them owner-only; the CLI publishes with mode `0600` and refuses overwrite. Unknown accepted work is
 replayed only after a separate explicit duplicate-execution-risk acknowledgement.
 
+Canonical operational records redact Task arguments, stdin, scripts, target values, raw scheduler
+details, result evidence, and application outputs. Redaction is not anonymity or a secrecy
+guarantee: Task keys, allocation identities, Profile labels, lineage digests, and Slurm Job IDs may
+identify work. `Campaign.record()` returns bytes without publishing them. Keep records and the
+owner-only Campaign state private unless a separate review approves a narrower projection; Campaign
+state retains the complete Task arguments and stdin required for retry.
+
 Campaign log snapshots are sensitive, untrusted binary data. They may contain credentials,
 research data, terminal control sequences, or other hostile output. Never render them directly in
 a terminal; redirect CLI output to a private file or inspect it with a safe binary viewer. Servatus

@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
@@ -483,6 +484,231 @@ def test_result_only_inspection_is_read_only_and_derives_sealed_readiness(
     rendered = repr(view)
     for secret in ("plain-secret", "json-secret", "plain-payload", "json-payload"):
         assert secret not in rendered
+
+
+def test_operational_record_is_canonical_redacted_and_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign_path = tmp_path / "campaign"
+    sensitive = "sensitive-marker"
+    campaign = Campaign.open(
+        campaign_path,
+        (Task("identifying-task", ("worker", sensitive), sensitive.encode()),),
+    )
+    sensitive_target = target(
+        host=sensitive,
+        slurm_bin=PurePosixPath(f"/{sensitive}"),
+        apptainer=PurePosixPath(f"/{sensitive}"),
+        image=PurePosixPath(f"/{sensitive}"),
+        work_root=PurePosixPath(f"/{sensitive}"),
+        log_root=PurePosixPath(f"/{sensitive}"),
+        account=sensitive,
+        qos=sensitive,
+    )
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(0, b"42;alpha\n", b""),
+    )
+    plan = planning(campaign, sensitive_target)
+    receipt = campaign.submit(plan)[0]
+    campaign.seal()
+    monkeypatch.setattr(
+        _slurm,
+        "query_attempts",
+        lambda _target, queries: tuple(
+            _slurm.SchedulerObservation(
+                AllocationState.FAILED,
+                "FAILED",
+                "RUNNING",
+                "1:0",
+                sensitive,
+                "2030-01-01T00:00:00",
+                "2030-01-01T01:00:00",
+            )
+            for _query in queries
+        ),
+    )
+    view = campaign.inspect()
+    allocation_observation = view.attempts[0].allocation
+    assert allocation_observation is not None
+    state_path = campaign_path / "campaign.json"
+    before = state_path.read_bytes()
+
+    record = campaign.record(view)
+    document = json.loads(record)
+
+    assert (
+        record
+        == json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    )
+    assert document.keys() == {
+        "schema_version",
+        "observed_at",
+        "scheduler_observed",
+        "campaign",
+        "attempts",
+    }
+    assert document["schema_version"] == 1
+    assert document["observed_at"] == view.observed_at.isoformat()
+    assert document["scheduler_observed"] is True
+    assert document["campaign"]["id"] == view.campaign_id
+    assert document["campaign"]["revision"] == view.revision
+    assert document["campaign"]["sealed"] is True
+    assert document["campaign"]["task_keys"] == ["identifying-task"]
+    assert len(document["campaign"]["roster_digest"]) == 64
+    assert len(document["attempts"]) == 1
+    attempt = document["attempts"][0]
+    assert attempt.keys() == {
+        "allocation_id",
+        "campaign_revision",
+        "profile_label",
+        "task_keys",
+        "retry_task_keys",
+        "duplicate_risk_task_keys",
+        "target_digest",
+        "resource_digest",
+        "plan_digest",
+        "script_digest",
+        "allocation",
+        "acceptance",
+        "scheduler_observation",
+    }
+    assert (attempt["allocation_id"], attempt["campaign_revision"], attempt["profile_label"]) == (
+        receipt.allocation_id,
+        0,
+        "test",
+    )
+    assert (
+        attempt["task_keys"],
+        attempt["retry_task_keys"],
+        attempt["duplicate_risk_task_keys"],
+    ) == (
+        ["identifying-task"],
+        [],
+        [],
+    )
+    assert all(
+        len(attempt[name]) == 64 for name in ("target_digest", "resource_digest", "script_digest")
+    )
+    assert attempt["plan_digest"] == plan.digest
+    assert attempt["allocation"] == {
+        "cpus": 32,
+        "memory_mib": 65536,
+        "gpus": 1,
+        "time_limit": "3-00:00:00",
+    }
+    assert attempt["acceptance"] == {
+        "state": "ACCEPTED",
+        "outcome_revision": 2,
+        "job_id": 42,
+        "cluster": "alpha",
+    }
+    assert attempt["scheduler_observation"] == {
+        "state": "FAILED",
+        "exit_code": "1:0",
+        "started_at": "2030-01-01T00:00:00",
+        "ended_at": "2030-01-01T01:00:00",
+        "observed_at": allocation_observation.observed_at.isoformat(),
+    }
+    assert state_path.read_bytes() == before
+    assert sensitive.encode() not in record
+    assert b"c2Vuc2l0aXZlLW1hcmtlcg==" not in record
+    for excluded_field in (
+        b'"args":',
+        b'"stdin":',
+        b'"digest":',
+        b'"sbatch_argv":',
+        b'"raw_state":',
+        b'"accounting_state":',
+        b'"reason":',
+        b'"environment":',
+    ):
+        assert excluded_field not in record
+    changed_raw = replace(
+        view,
+        attempts=(
+            replace(
+                view.attempts[0],
+                allocation=replace(
+                    allocation_observation,
+                    raw_state="PRIVATE_RAW_STATE",
+                    accounting_state="PRIVATE_ACCOUNTING_STATE",
+                    reason="another-private-reason",
+                ),
+            ),
+        ),
+    )
+    assert campaign.record(changed_raw) == record
+
+
+def test_operational_record_is_revision_bound_and_ignores_result_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return datetime(2030, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    monkeypatch.setattr(_campaign, "datetime", Clock)
+    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
+    missing = campaign.inspect(lambda _task: False, scheduler=False)
+    valid = campaign.inspect(lambda _task: True, scheduler=False)
+
+    assert campaign.record(missing) == campaign.record(valid)
+
+    foreign = Campaign.open(tmp_path / "foreign", tasks(1))
+    with pytest.raises(ObservationError, match="stale, foreign, or changed"):
+        foreign.record(missing)
+
+    altered = replace(missing, scheduler_observed=True)
+    with pytest.raises(ObservationError, match="stale, foreign, or changed"):
+        campaign.record(altered)
+
+    campaign.seal()
+    with pytest.raises(ObservationError, match="stale, foreign, or changed"):
+        campaign.record(missing)
+
+
+def test_operational_record_retains_ambiguity_retry_and_resolution_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(0, b"41;alpha\n", b""),
+    )
+    campaign.submit(planning(campaign))
+    monkeypatch.setattr(_slurm, "query_attempts", terminal_observations)
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(1, b"", b"lost acceptance"),
+    )
+    with pytest.raises(AmbiguousSubmission):
+        campaign.submit(planning(campaign, retry={"task-0"}))
+
+    ambiguous_view = campaign.inspect()
+    ambiguous = json.loads(campaign.record(ambiguous_view))
+    assert [item["acceptance"]["state"] for item in ambiguous["attempts"]] == [
+        "ACCEPTED",
+        "UNRESOLVED",
+    ]
+    assert ambiguous["attempts"][0]["acceptance"]["job_id"] == 41
+    assert ambiguous["attempts"][1]["retry_task_keys"] == ["task-0"]
+    assert ambiguous["attempts"][1]["scheduler_observation"] is None
+
+    allocation_id = ambiguous_view.attempts[1].allocation_id
+    campaign.resolve(allocation_id, job_id=None)
+    resolved = json.loads(campaign.record(campaign.inspect()))
+
+    assert resolved != ambiguous
+    assert [item["acceptance"]["state"] for item in resolved["attempts"]] == [
+        "ACCEPTED",
+        "NOT_SUBMITTED",
+    ]
+    assert resolved["attempts"][1]["acceptance"]["outcome_revision"] == 4
 
 
 def test_probe_states_are_distinct_and_invalid_aborts_without_partial_view(

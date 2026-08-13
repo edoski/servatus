@@ -31,6 +31,7 @@ from ._errors import (
 
 _SCHEMA_VERSION = 4
 _PLAN_SCHEMA_VERSION = 4
+_RECORD_SCHEMA_VERSION = 1
 _OPEN = "OPEN"
 _SEALED = "SEALED"
 _UNRESOLVED = "UNRESOLVED"
@@ -751,6 +752,63 @@ def campaign_view_document(view: CampaignView) -> dict[str, object]:
     return _view_semantics(view)
 
 
+def _operational_record(state: dict[str, object], view: CampaignView) -> dict[str, object]:
+    tasks = _tasks_from_state(state)
+    attempts: list[dict[str, object]] = []
+    for stored, evidence in zip(
+        cast(list[dict[str, object]], state["attempts"]), view.attempts, strict=True
+    ):
+        acceptance = cast(dict[str, object], stored["acceptance"])
+        status = cast(str, acceptance["status"])
+        acceptance_record: dict[str, object] = {"state": status}
+        if status != _UNRESOLVED:
+            acceptance_record["outcome_revision"] = acceptance["outcome_revision"]
+        if status == _ACCEPTED:
+            acceptance_record["job_id"] = acceptance["job_id"]
+            acceptance_record["cluster"] = acceptance["cluster"]
+        observation = evidence.allocation
+        attempts.append(
+            {
+                "allocation_id": stored["allocation_id"],
+                "campaign_revision": stored["campaign_revision"],
+                "profile_label": stored["profile_label"],
+                "task_keys": stored["task_keys"],
+                "retry_task_keys": stored["retry_task_keys"],
+                "duplicate_risk_task_keys": stored["duplicate_risk_task_keys"],
+                "target_digest": stored["target_digest"],
+                "resource_digest": stored["resource_digest"],
+                "plan_digest": stored["plan_digest"],
+                "script_digest": stored["script_digest"],
+                "allocation": stored["allocation"],
+                "acceptance": acceptance_record,
+                "scheduler_observation": (
+                    None
+                    if observation is None
+                    else {
+                        "state": observation.state.value,
+                        "exit_code": observation.exit_code,
+                        "started_at": observation.started_at,
+                        "ended_at": observation.ended_at,
+                        "observed_at": observation.observed_at.isoformat(),
+                    }
+                ),
+            }
+        )
+    return {
+        "schema_version": _RECORD_SCHEMA_VERSION,
+        "observed_at": view.observed_at.isoformat(),
+        "scheduler_observed": view.scheduler_observed,
+        "campaign": {
+            "id": view.campaign_id,
+            "revision": view.revision,
+            "sealed": view.sealed,
+            "roster_digest": _digest([_task_record(task) for task in tasks]),
+            "task_keys": [task.key for task in tasks],
+        },
+        "attempts": attempts,
+    }
+
+
 def _plan_semantics(plan: SubmissionPlan) -> dict[str, object]:
     return {
         "campaign_id": plan._campaign_id,
@@ -985,6 +1043,16 @@ class Campaign:
             quiescent,
         )
 
+    def record(self, view: CampaignView) -> bytes:
+        state = self._read_state()
+        try:
+            _verify_view(state, view)
+        except PlanError:
+            raise ObservationError(
+                "operational record view is stale, foreign, or changed"
+            ) from None
+        return _canonical(_operational_record(state, view))
+
     def read_log(
         self,
         allocation_id: str,
@@ -1043,6 +1111,11 @@ class Campaign:
         if any(key not in retry_values for key in duplicate_risk):
             raise PlanError("duplicate-risk acknowledgement requires explicit retry")
         _verify_view(state, view)
+        if (
+            any(attempt.acceptance is AcceptanceState.ACCEPTED for attempt in view.attempts)
+            and not view.scheduler_observed
+        ):
+            raise PlanError("planning an accepted campaign requires scheduler-observed evidence")
         lineage = state["lineage"]
         if lineage is not None and lineage != _lineage(profile.target, profile.resources):
             raise PlanError("campaign is bound to different target or resource semantics")
@@ -1559,8 +1632,8 @@ def _verify_view(state: dict[str, object], view: CampaignView) -> None:
         ):
             raise PlanError("view attempt projection is invalid")
         if status is AcceptanceState.ACCEPTED:
-            if view.scheduler_observed and evidence.allocation is None:
-                raise PlanError("scheduler-observed view lacks accepted-attempt evidence")
+            if view.scheduler_observed != (evidence.allocation is not None):
+                raise PlanError("view scheduler projection is invalid")
         elif evidence.allocation is not None:
             raise PlanError("view contains scheduler evidence for an unaccepted attempt")
         if status is AcceptanceState.ACCEPTED:
@@ -1587,11 +1660,6 @@ def _verify_view(state: dict[str, object], view: CampaignView) -> None:
         ):
             raise PlanError("view task projection is invalid")
 
-    if (
-        any(attempt.acceptance is AcceptanceState.ACCEPTED for attempt in view.attempts)
-        and not view.scheduler_observed
-    ):
-        raise PlanError("planning an accepted campaign requires scheduler-observed evidence")
     expected_ready = view.sealed and all(task.result is ResultState.VALID for task in view.tasks)
     terminal = {
         AllocationState.SUCCEEDED,
