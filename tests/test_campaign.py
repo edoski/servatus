@@ -942,6 +942,26 @@ def test_campaign_rejects_nonfinal_unresolved_attempt(
         Campaign.load(path)
 
 
+def test_campaign_rejects_attempt_after_not_submitted_plan_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "campaign"
+    campaign = Campaign.open(path, tasks(2))
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
+    )
+    campaign.submit(campaign.plan(target(max_tasks_per_allocation=1), resources()))
+    state_path = path / "campaign.json"
+    state = json.loads(state_path.read_text())
+    state["attempts"][0]["acceptance"] = {"status": "NOT_SUBMITTED"}
+    state_path.write_text(json.dumps(state))
+
+    with pytest.raises(TaskConflict, match="terminal"):
+        Campaign.load(path)
+
+
 @pytest.mark.parametrize("corruption", ["reversed", "overlap"])
 def test_campaign_rejects_changed_plan_allocation_sequence(
     tmp_path: Path,

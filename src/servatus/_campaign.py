@@ -1299,6 +1299,7 @@ def _validate_attempts(
     group_end_revision = 0
     group_required_prefix = 0
     group_last_task_position = -1
+    group_terminal = False
     revision_gaps: list[int] = []
     required_prefixes: list[int] = []
     if not value:
@@ -1364,6 +1365,9 @@ def _validate_attempts(
             group_end_revision = campaign_revision
             group_required_prefix = 0
             group_last_task_position = -1
+            group_terminal = False
+        if group_terminal:
+            raise TaskConflict("campaign plan outcome is terminal")
         positions = tuple(task_positions[key] for key in typed_attempt_keys)
         if positions[0] <= group_last_task_position:
             raise TaskConflict("campaign plan allocation sequence is invalid")
@@ -1428,6 +1432,7 @@ def _validate_attempts(
         if isinstance(status, str) and status in {_UNRESOLVED, _NOT_SUBMITTED}:
             if set(typed_acceptance) != {"status"}:
                 raise TaskConflict("campaign attempt acceptance is invalid")
+            group_terminal = True
             if status == _UNRESOLVED and index != len(value) - 1:
                 raise TaskConflict("campaign unresolved attempt must be final")
             if status == _NOT_SUBMITTED:
