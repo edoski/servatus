@@ -457,10 +457,10 @@ proceed while a different allocation is ambiguous, but every Task in the ambiguo
 remains blocked.
 
 The plan freezes its Campaign revision, roster digest, selected/excluded Task keys, attempt
-projection, observation timestamps, view digest, explicit retry keys, target/resources, and exact
-allocations. A canonical plan document restores that immutable decision without serializing or
-rerunning a probe. Restoration validates syntax, Campaign identity/revision, roster/attempt lineage,
-and canonical plan bytes.
+projection, observation timestamps, view digest, explicit retry keys, selected nonbinding profile
+label, resolved target/resources, and exact allocations. A canonical plan document restores that
+immutable decision without serializing or rerunning a probe. Restoration validates syntax, Campaign
+identity/revision, roster/attempt lineage, and canonical plan bytes.
 
 External evidence is time-specific. Before each allocation's mutating `sbatch` call, `submit`:
 
@@ -490,7 +490,7 @@ view. It contains only generic execution evidence:
 - record schema and observation time;
 - Campaign identity, revision, sealed state, and roster digest;
 - ordered Task keys;
-- selected nonbinding profile label;
+- each attempt's selected nonbinding profile label;
 - target/resource lineage digests and allocation shapes;
 - attempt, retry, plan, and script digests;
 - Slurm job/cluster identities and normalized current scheduler observations;
@@ -901,6 +901,8 @@ Required public tests:
 - unaffected Tasks plan while different keys are ambiguous;
 - stale/foreign views and plans fail before external contact;
 - plan round-trip preserves exact selection/allocation bytes without invoking a probe;
+- plan round-trip preserves the selected nonbinding profile label, and each submitted attempt
+  retains the label from its exact restored plan;
 - submit refreshes scheduler evidence and selected-Task result eligibility before each allocation's
   mutating `sbatch` call;
 - changed result or execution eligibility aborts;
@@ -1275,9 +1277,11 @@ Requires a separately reviewed KAIROS config-only slice after the exact new imag
 
 - change only `profiles.KAIROS.target.image` in `SERVATUS.toml` unless another reviewed operational
   fact requires a narrow change;
-- independently review the fixed range;
 - rerun focused profile parsing and full proportionate static/test gates;
-- integrate the reviewed config commit into both local main and compact candidates without push;
+- integrate the config commit into both local main and compact candidates without push, preserving
+  the accepted CUDA-only delta;
+- independently review both exact final candidate ranges, including config integration topology and
+  compact parity, and require Standards 0 / Spec 0 for each;
 - prove the resolved selected profile is byte-for-byte the one used by isolated E4 acceptance;
 - do not alter already-submitted jobs or old Campaign state.
 
@@ -1381,3 +1385,7 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
   old image. E4 now builds and accepts the exact local candidate, E5 reviews the sole image-field
   selection, and E6 publishes code plus compatible image configuration together. Common-path review
   was already GREEN; the correction returns to the same adversarial reviewer before S1 starts.
+- 2026-08-13: the first correction rereview required canonical plans and per-attempt records to
+  retain the nonbinding profile label, and required image-selection integration into both final
+  KAIROS candidates before reviewing their exact publishable ranges. The ledger was corrected
+  without changing the approved architecture or adding a slice.
