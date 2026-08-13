@@ -1,7 +1,7 @@
 # Campaign Engine Implementation and Review Ledger
 
-Status: architecture and original ledger independently reviewed GREEN; the user-approved execution
-profile revision is under independent rereview before implementation. This is the active plan.
+Status: architecture and complete ledger independently reviewed GREEN; implementation authorized.
+This is the active plan.
 
 Date: 2026-08-13
 
@@ -1343,9 +1343,9 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
 | --- | --- |
 | Historical extraction/consolidation/deployment ledger | Complete; archived authority |
 | New Campaign-engine architecture | User-approved |
-| Repository-local Profile revision | User-approved; independent ledger rereview active |
-| New ledger | Original GREEN; approved revision under rereview |
-| S1-S4 Servatus implementation | Authorized; starts after ledger rereview |
+| Repository-local Profile revision | User-approved; independent rereview GREEN |
+| New ledger | GREEN; implementation-ready |
+| S1-S4 Servatus implementation | Authorized; S1 starting |
 | Servatus `0.7.0` external release | Not authorized |
 | Active K-study | Running under separate Runner; protected |
 | K1-K2 KAIROS adoption | Blocked by public `0.7.0` and K-study closure |
@@ -1389,3 +1389,6 @@ separately changed and reviewed; the current KAIROS gate is the configured mode.
   retain the nonbinding profile label, and required image-selection integration into both final
   KAIROS candidates before reviewing their exact publishable ranges. The ledger was corrected
   without changing the approved architecture or adding a slice.
+- 2026-08-13: final fixed-range ledger rereviews returned GREEN with zero actionable findings on the
+  common-path and adversarial axes. S1 may start from the exact accepted ledger head; no product or
+  external state changed during planning.
