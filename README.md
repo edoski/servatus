@@ -189,14 +189,18 @@ result_view = campaign.inspect(result_exists, scheduler=False)
 
 Scheduler inspection follows durable Attempt order. Each accepted Attempt gets one server-side
 single-job `squeue` request and one `sacct --duplicates` request bound to its allocation-derived job
-name/comment and reconciliation window. Distinct Attempts remain distinct even if Slurm reuses the
-same job ID and cluster. The native single-job invalid-ID response means only that no active row
-exists, so accounting is still queried; no exact active or accounting row reports `UNKNOWN`.
+name/comment. Exactly one accounting record submitted inside the reconciliation window anchors the
+original job. Strictly later records with the same immutable identity are its requeue incarnations,
+and the unique latest incarnation owns accounting evidence. Distinct Attempts remain distinct even
+if Slurm reuses the same job ID and cluster. The native single-job invalid-ID response means only
+that no active row exists, so accounting is still queried; without an accounting anchor, even an
+exact active row reports `UNKNOWN`.
 
 Each SSH command has a 30-second deadline. Local and remote argument vectors have at most 16
 arguments, 16 KiB of complete command text, 1 MiB per output stream, 128 lines, and 4 KiB per source
-field. A failed command, timeout, overflow, malformed or partial row, unrelated Attempt identity,
-or conflicting duplicate evidence aborts the whole inspection.
+field. Scheduler commands run with a fixed C locale and UTC timezone. A failed command, timeout,
+overflow, malformed or partial row, unrelated Attempt identity, or ambiguous accounting history
+aborts the whole inspection.
 
 Allocation states normalize to `QUEUED`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, or
 `UNKNOWN`. Packed Tasks share their allocation evidence. Every Attempt remains visible, while the

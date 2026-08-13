@@ -47,7 +47,9 @@ outside the threat model.
 Campaign task arguments and stdin are embedded in the submitted batch script. Redaction from
 ordinary local summaries does not make them secret; do not submit credentials or other secrets.
 Target TOML is an editable user-side guardrail, not an enforcement boundary. Slurm remains
-authoritative for identity, admission, isolation, allocation, accounting, and billing.
+authoritative for identity, admission, isolation, allocation, accounting, and billing. Servatus
+clears the remote command environment and supplies only a fixed path, C locale, and UTC timezone;
+local scheduler or timezone overrides are not forwarded.
 
 Campaign log snapshots are sensitive, untrusted binary data. They may contain credentials,
 research data, terminal control sequences, or other hostile output. Never render them directly in

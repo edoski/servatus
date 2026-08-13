@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import threading
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -225,10 +226,146 @@ def test_reused_job_identity_remains_bound_to_each_immutable_attempt(
         AllocationState.SUCCEEDED,
     ]
     assert [call[call.index("--name") + 1] for call in accounting_calls] == identities
-    assert [(call[10], call[12]) for call in accounting_calls] == [
-        ("2030-01-01T11:00:00", "2030-01-01T13:00:00"),
-        ("2030-01-02T11:00:00", "2030-01-02T13:00:00"),
+    assert [call[10] for call in accounting_calls] == [
+        "2030-01-01T11:00:00",
+        "2030-01-02T11:00:00",
     ]
+
+
+def test_requeue_history_anchors_original_and_uses_unique_latest_incarnation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return datetime(2030, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    monkeypatch.setattr(_campaign, "datetime", Clock)
+    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
+    accept(monkeypatch, campaign, [42])
+    identity = f"servatus-{campaign.status().receipts[0].allocation_id}"
+
+    def rows(active: bool, terminal: bool = False):
+        def query(_target: SlurmTarget, argv: tuple[str, ...]) -> _slurm.Result:
+            if argv[0].endswith("squeue"):
+                if active:
+                    return _slurm.Result(
+                        0,
+                        active_row(identity, "2030-01-01T15:00:00", "RUNNING"),
+                        b"",
+                    )
+                return _slurm.Result(1, b"", b"slurm_load_jobs error: Invalid job id specified\n")
+            latest_state = "COMPLETED" if terminal else "PENDING"
+            return _slurm.Result(
+                0,
+                accounting_row(
+                    identity, "2030-01-01T12:00:00", "RUNNING", "0:0", "None", "Unknown", "Unknown"
+                )
+                + accounting_row(
+                    identity,
+                    "2030-01-01T14:00:00",
+                    latest_state,
+                    "0:0",
+                    "None",
+                    "Unknown",
+                    "2030-01-01T16:00:00" if terminal else "Unknown",
+                ),
+                b"",
+            )
+
+        return query
+
+    monkeypatch.setattr(_slurm, "_run_bounded_ssh", rows(active=True))
+    active = campaign.inspect().attempts[0].allocation
+    assert active is not None
+    assert active.state is AllocationState.RUNNING
+    assert active.accounting_state == "PENDING"
+
+    monkeypatch.setattr(_slurm, "_run_bounded_ssh", rows(active=False, terminal=True))
+    terminal = campaign.inspect().attempts[0].allocation
+    assert terminal is not None
+    assert terminal.state is AllocationState.SUCCEEDED
+    assert terminal.raw_state == "COMPLETED"
+
+    def unanchored(_target: SlurmTarget, argv: tuple[str, ...]) -> _slurm.Result:
+        if argv[0].endswith("squeue"):
+            return _slurm.Result(
+                0,
+                active_row(identity, "2030-01-01T15:00:00", "RUNNING"),
+                b"",
+            )
+        return _slurm.Result(0, b"", b"")
+
+    monkeypatch.setattr(_slurm, "_run_bounded_ssh", unanchored)
+    unknown = campaign.inspect().attempts[0].allocation
+    assert unknown is not None
+    assert unknown.state is AllocationState.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "submissions",
+    [
+        (("2030-01-01T14:00:00", "RUNNING"),),
+        (
+            ("2030-01-01T10:00:00", "RUNNING"),
+            ("2030-01-01T12:00:00", "RUNNING"),
+        ),
+        (
+            ("2030-01-01T12:00:00", "RUNNING"),
+            ("2030-01-01T12:30:00", "PENDING"),
+        ),
+        (
+            ("2030-01-01T12:00:00", "RUNNING"),
+            ("2030-01-01T15:00:00", "PENDING"),
+            ("2030-01-01T14:00:00", "RUNNING"),
+        ),
+        (
+            ("2030-01-01T12:00:00", "RUNNING"),
+            ("2030-01-01T14:00:00", "PENDING"),
+            ("2030-01-01T14:00:00", "PENDING"),
+        ),
+        (
+            ("2030-01-01T12:00:00", "RUNNING"),
+            ("2030-01-01T14:00:00", "PENDING"),
+            ("2030-01-01T14:00:00", "RUNNING"),
+        ),
+    ],
+)
+def test_ambiguous_or_noncanonical_requeue_history_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    submissions: tuple[tuple[str, str], ...],
+) -> None:
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return datetime(2030, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    monkeypatch.setattr(_campaign, "datetime", Clock)
+    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
+    accept(monkeypatch, campaign, [42])
+    identity = f"servatus-{campaign.status().receipts[0].allocation_id}"
+
+    def query(_target: SlurmTarget, argv: tuple[str, ...]) -> _slurm.Result:
+        if argv[0].endswith("squeue"):
+            return _slurm.Result(0, b"", b"")
+        output = b"".join(
+            accounting_row(
+                identity,
+                submitted_at,
+                state,
+                "0:0",
+                "None",
+                "Unknown",
+                "Unknown",
+            )
+            for submitted_at, state in submissions
+        )
+        return _slurm.Result(0, output, b"")
+
+    monkeypatch.setattr(_slurm, "_run_bounded_ssh", query)
+    with pytest.raises(ObservationError, match="ambiguous"):
+        campaign.inspect()
 
 
 def test_reused_or_multiply_plausible_accounting_identity_fails_closed(
@@ -275,28 +412,6 @@ def test_reused_or_multiply_plausible_accounting_identity_fails_closed(
 
     monkeypatch.setattr(_slurm, "_run_bounded_ssh", unrelated)
     with pytest.raises(ObservationError, match="unrelated"):
-        campaign.inspect()
-
-    def duplicates(_target: SlurmTarget, argv: tuple[str, ...]) -> _slurm.Result:
-        if argv[0].endswith("squeue"):
-            return _slurm.Result(0, b"", b"")
-        return _slurm.Result(
-            0,
-            accounting_row(identity, submitted_at, "RUNNING", "0:0", "None", "Unknown", "Unknown")
-            + accounting_row(
-                identity,
-                submitted_at,
-                "COMPLETED",
-                "0:0",
-                "None",
-                "2030-01-01T00:00:00",
-                "2030-01-01T01:00:00",
-            ),
-            b"",
-        )
-
-    monkeypatch.setattr(_slurm, "_run_bounded_ssh", duplicates)
-    with pytest.raises(ObservationError, match="conflicting"):
         campaign.inspect()
 
 
@@ -409,8 +524,7 @@ def test_each_attempt_uses_exact_single_job_scheduler_queries_in_durable_order(
             identity,
         )
         assert accounting[9] == "--starttime"
-        assert accounting[11] == "--endtime"
-        assert accounting[13:] == (
+        assert accounting[11:] == (
             "--clusters=alpha",
             "--format=JobIDRaw%64,Cluster%256,JobName%256,Comment%256,Submit%32,"
             "State%256,ExitCode%32,Reason%4096,Start%32,End%32",
@@ -511,7 +625,6 @@ def test_active_scheduler_row_wins_a_legitimate_accounting_transition_and_packed
     allocation = view.attempts[0].allocation
     assert allocation is not None
     assert view.attempts[0].receipt == receipt
-    assert not hasattr(allocation, "receipt")
     assert allocation.state is AllocationState.RUNNING
     assert allocation.raw_state == "RUNNING"
     assert allocation.accounting_state == "PENDING"
@@ -619,44 +732,11 @@ def test_scheduler_fields_reject_controls_before_literal_space_normalization(
         campaign.inspect()
 
 
-def test_conflicting_accounting_rows_or_cluster_identities_abort_complete_inspection(
+def test_conflicting_accounting_cluster_identity_aborts_complete_inspection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(1))
     accept(monkeypatch, campaign, [42])
-    receipt = campaign.status().receipts[0]
-    identity = f"servatus-{receipt.allocation_id}"
-    submitted_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-
-    def conflicting(_target: SlurmTarget, argv: tuple[str, ...]) -> _slurm.Result:
-        if argv[0].endswith("squeue"):
-            return _slurm.Result(0, b"", b"")
-        return _slurm.Result(
-            0,
-            accounting_row(
-                identity,
-                submitted_at,
-                "RUNNING",
-                "0:0",
-                "None",
-                "2030-01-01T00:00:00",
-                "Unknown",
-            )
-            + accounting_row(
-                identity,
-                submitted_at,
-                "COMPLETED",
-                "0:0",
-                "None",
-                "2030-01-01T00:00:00",
-                "2030-01-01T01:00:00",
-            ),
-            b"",
-        )
-
-    monkeypatch.setattr(_slurm, "_run_bounded_ssh", conflicting)
-    with pytest.raises(ObservationError, match="conflicting"):
-        campaign.inspect()
 
     monkeypatch.setattr(
         _slurm,
@@ -674,20 +754,12 @@ def test_conflicting_accounting_rows_or_cluster_identities_abort_complete_inspec
         campaign.inspect()
 
 
-def test_scheduler_timeout_and_transport_bounds_fail_closed(
+def test_scheduler_structural_and_complete_invocation_bounds_fail_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     campaign = Campaign.open(tmp_path / "campaign", tasks(1))
     accept(monkeypatch, campaign, [42])
     bounded_ssh = _slurm._run_bounded_ssh
-    monkeypatch.setattr(
-        _slurm,
-        "_run_bounded_ssh",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired("ssh", 30)),
-    )
-    with pytest.raises(ObservationError):
-        campaign.inspect()
-
     monkeypatch.setattr(
         _slurm,
         "_run_bounded_ssh",
@@ -708,14 +780,6 @@ def test_scheduler_timeout_and_transport_bounds_fail_closed(
             b"42|alpha|" + b"x" * 4097 + b"|comment|submit|RUNNING|0:0|None|Unknown|Unknown\n",
             b"",
         ),
-    )
-    with pytest.raises(ObservationError):
-        campaign.inspect()
-
-    monkeypatch.setattr(
-        _slurm,
-        "_run_bounded_ssh",
-        lambda *_args, **_kwargs: _slurm.Result(0, b"x" * (1024 * 1024 + 1), b""),
     )
     with pytest.raises(ObservationError):
         campaign.inspect()
@@ -751,6 +815,130 @@ def test_scheduler_timeout_and_transport_bounds_fail_closed(
     with pytest.raises(ObservationError, match="campaign log is unavailable"):
         host_campaign.read_log(host_campaign.status().receipts[0].allocation_id)
     assert not contacted
+
+
+def test_public_inspect_enforces_real_selector_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
+    accept(monkeypatch, campaign, [42])
+    real_popen = subprocess.Popen
+
+    def sleeping_process(*_args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        return real_popen(
+            [sys.executable, "-c", "import time; time.sleep(0.2)"],
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(_slurm.subprocess, "Popen", sleeping_process)
+    ticks = iter((0.0, 31.0))
+    monkeypatch.setattr(_slurm.time, "monotonic", lambda: next(ticks, 31.0))
+
+    with pytest.raises(ObservationError):
+        campaign.inspect()
+
+
+def test_public_inspect_enforces_real_pipe_byte_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
+    accept(monkeypatch, campaign, [42])
+    real_popen = subprocess.Popen
+
+    def overflowing_process(*_args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        return real_popen(
+            [
+                sys.executable,
+                "-c",
+                "import os; os.write(2, b'x' * 1048577)",
+            ],
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(_slurm.subprocess, "Popen", overflowing_process)
+
+    with pytest.raises(ObservationError, match="byte bound"):
+        campaign.inspect()
+
+
+def test_inspection_and_reconciliation_force_utc_despite_local_timezone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_popen = subprocess.Popen
+    real_run_ssh = _slurm._run_ssh
+    monkeypatch.setenv("TZ", "Pacific/Honolulu")
+
+    campaign = Campaign.open(tmp_path / "accepted", tasks(1))
+    accept(monkeypatch, campaign, [42])
+    receipt = campaign.status().receipts[0]
+    identity = f"servatus-{receipt.allocation_id}"
+    submitted_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    remote_commands: list[str] = []
+
+    def local_scheduler(command: tuple[str, ...], **kwargs: object) -> subprocess.Popen[bytes]:
+        remote = command[-1]
+        remote_commands.append(remote)
+        output = (
+            b""
+            if "/squeue " in remote
+            else accounting_row(
+                identity,
+                submitted_at,
+                "COMPLETED",
+                "0:0",
+                "None",
+                "2030-01-01T00:00:00",
+                "2030-01-01T01:00:00",
+            )
+        )
+        return real_popen(
+            [sys.executable, "-c", f"import os; os.write(1, {output!r})"],
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(_slurm.subprocess, "Popen", local_scheduler)
+    observed = campaign.inspect().attempts[0].allocation
+    assert observed is not None
+    assert observed.state is AllocationState.SUCCEEDED
+
+    ambiguous = Campaign.open(tmp_path / "ambiguous", tasks(1))
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(1, b"", b"lost reply"),
+    )
+    with pytest.raises(AmbiguousSubmission):
+        ambiguous.submit(ambiguous.plan(target(), resources()))
+    allocation_id = ambiguous.status().ambiguous_allocation_ids[0]
+    reconcile_identity = f"servatus-{allocation_id}"
+    monkeypatch.setattr(_slurm, "_run_ssh", real_run_ssh)
+
+    def local_reconciliation(command: list[str], **kwargs: object) -> _slurm.Result:
+        remote = command[-1]
+        remote_commands.append(remote)
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        assert "TZ" not in environment
+        if "/squeue " in remote:
+            return _slurm.Result(
+                0,
+                f"77|{reconcile_identity}|{reconcile_identity}\n".encode(),
+                b"",
+            )
+        return _slurm.Result(
+            0,
+            f"77|{reconcile_identity}|{reconcile_identity}|alpha\n".encode(),
+            b"",
+        )
+
+    monkeypatch.setattr(_slurm.subprocess, "run", local_reconciliation)
+    assert ambiguous.reconcile(allocation_id).job_id == 77
+    assert len(remote_commands) == 4
+    assert all(
+        command.startswith("/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C TZ=UTC ")
+        for command in remote_commands
+    )
+    assert all("Pacific/Honolulu" not in command for command in remote_commands)
 
 
 def test_latest_accepted_attempt_projects_current_state_but_quiescence_uses_all_attempts(

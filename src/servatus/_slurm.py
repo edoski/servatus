@@ -53,7 +53,16 @@ class SchedulerObservation:
 
 
 @dataclass(frozen=True, slots=True)
-class _RawJob:
+class _ActiveJob:
+    submitted_at: str
+    state: str
+    reason: str | None
+    started_at: str | None
+    ended_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _AccountingJob:
     cluster: str | None
     submitted_at: str
     state: str
@@ -61,6 +70,12 @@ class _RawJob:
     reason: str | None
     started_at: str | None
     ended_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _AccountingHistory:
+    original_submitted_at: str
+    latest: _AccountingJob
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,9 +213,8 @@ def _ssh_environment() -> dict[str, str]:
 
 
 def _run_ssh(target: SlurmTarget, argv: tuple[str, ...], stdin: bytes) -> Result:
-    remote = "/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C " + shlex.join(argv)
     completed = subprocess.run(
-        ["ssh", "-T", "-o", "BatchMode=yes", target.host, remote],
+        ["ssh", "-T", "-o", "BatchMode=yes", target.host, _remote_command(argv)],
         input=stdin,
         capture_output=True,
         check=False,
@@ -277,8 +291,7 @@ def _run_bounded_ssh(
 
 
 def _bounded_ssh_command(target: SlurmTarget, argv: tuple[str, ...]) -> tuple[str, ...]:
-    remote = "/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C " + shlex.join(argv)
-    command = ("ssh", "-T", "-o", "BatchMode=yes", target.host, remote)
+    command = ("ssh", "-T", "-o", "BatchMode=yes", target.host, _remote_command(argv))
     fields = (*command[:-1], *argv)
     if (
         len(argv) > _MAX_QUERY_ARGC
@@ -288,6 +301,10 @@ def _bounded_ssh_command(target: SlurmTarget, argv: tuple[str, ...]) -> tuple[st
     ):
         raise ObservationError("observation command exceeds its argument bounds")
     return command
+
+
+def _remote_command(argv: tuple[str, ...]) -> str:
+    return "/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C TZ=UTC " + shlex.join(argv)
 
 
 def _log_path(
@@ -331,59 +348,100 @@ def query_attempts(
 ) -> tuple[SchedulerObservation, ...]:
     observations: list[SchedulerObservation] = []
     for attempt in attempts:
-        active = _query_row(target, attempt, accounting=False)
-        accounting = _query_row(target, attempt, accounting=True)
-        observations.append(_combine_rows(active, accounting))
+        active = _query_active(target, attempt)
+        history = _query_accounting(target, attempt)
+        observations.append(_combine_observations(active, history))
     return tuple(observations)
 
 
-def _query_row(
+def _query_active(
     target: SlurmTarget,
     attempt: _AttemptQuery,
-    *,
-    accounting: bool,
-) -> _RawJob | None:
-    command = target.slurm_bin / ("sacct" if accounting else "squeue")
-    argv = [str(command), "--noheader"]
-    if accounting:
-        argv.extend(("--parsable2", "--allocations", "--duplicates"))
-    argv.extend(("--jobs", str(attempt.job_id)))
-    if accounting:
-        argv.extend(
-            (
-                "--name",
-                attempt.identity,
-                "--starttime",
-                attempt.window_start,
-                "--endtime",
-                attempt.window_end,
-            )
-        )
-    argv.append("--local" if attempt.cluster is None else f"--clusters={attempt.cluster}")
-    if accounting:
-        argv.append(
-            "--format=JobIDRaw%64,Cluster%256,JobName%256,Comment%256,Submit%32,"
-            "State%256,ExitCode%32,Reason%4096,Start%32,End%32"
-        )
-    else:
-        argv.append("--format=%i|%j|%k|%V|%T|%r|%S|%e")
-    try:
-        result = _run_bounded_ssh(target, tuple(argv))
-    except (OSError, subprocess.SubprocessError, ValueError) as error:
-        raise ObservationError("scheduler observation was unavailable") from error
-    if not accounting and _missing_active_job(result):
+) -> _ActiveJob | None:
+    result = _run_observation(
+        target,
+        (
+            str(target.slurm_bin / "squeue"),
+            "--noheader",
+            "--jobs",
+            str(attempt.job_id),
+            "--local" if attempt.cluster is None else f"--clusters={attempt.cluster}",
+            "--format=%i|%j|%k|%V|%T|%r|%S|%e",
+        ),
+    )
+    if _missing_active_job(result):
         return None
     if result.returncode != 0 or result.stderr:
         raise ObservationError("scheduler observation was unavailable")
-    rows = _parse_query_output(
-        result.stdout,
-        attempt,
-        accounting=accounting,
-    )
-    unique = tuple(dict.fromkeys(rows))
-    if len(unique) > 1:
+    rows = _output_lines(result.stdout)
+    if len(rows) > 1:
         raise ObservationError("scheduler query returned conflicting evidence")
-    return next(iter(unique), None)
+    if not rows:
+        return None
+    fields = _decoded_fields(rows[0], 8)
+    job_id_raw, name, comment, submitted, state, reason, started, ended = fields
+    _validate_job_identity(job_id_raw, name, comment, state, attempt)
+    submitted_at = _required_timestamp(submitted)
+    return _ActiveJob(
+        submitted_at,
+        state,
+        _optional_field(reason),
+        _timestamp(started),
+        _timestamp(ended),
+    )
+
+
+def _query_accounting(
+    target: SlurmTarget,
+    attempt: _AttemptQuery,
+) -> _AccountingHistory | None:
+    result = _run_observation(
+        target,
+        (
+            str(target.slurm_bin / "sacct"),
+            "--noheader",
+            "--parsable2",
+            "--allocations",
+            "--duplicates",
+            "--jobs",
+            str(attempt.job_id),
+            "--name",
+            attempt.identity,
+            "--starttime",
+            attempt.window_start,
+            "--local" if attempt.cluster is None else f"--clusters={attempt.cluster}",
+            "--format=JobIDRaw%64,Cluster%256,JobName%256,Comment%256,Submit%32,"
+            "State%256,ExitCode%32,Reason%4096,Start%32,End%32",
+        ),
+    )
+    if result.returncode != 0 or result.stderr:
+        raise ObservationError("scheduler observation was unavailable")
+    rows = tuple(_parse_accounting_row(line, attempt) for line in _output_lines(result.stdout))
+    if not rows:
+        return None
+    anchor_indexes = [
+        index
+        for index, row in enumerate(rows)
+        if attempt.window_start <= row.submitted_at <= attempt.window_end
+    ]
+    if anchor_indexes != [0]:
+        raise ObservationError("scheduler accounting history is ambiguous")
+    anchor = rows[0]
+    previous = ""
+    for row in rows:
+        if row.cluster != anchor.cluster or row.submitted_at < anchor.submitted_at:
+            raise ObservationError("scheduler accounting history is ambiguous")
+        if previous and row.submitted_at <= previous:
+            raise ObservationError("scheduler accounting history is ambiguous")
+        previous = row.submitted_at
+    return _AccountingHistory(anchor.submitted_at, rows[-1])
+
+
+def _run_observation(target: SlurmTarget, argv: tuple[str, ...]) -> Result:
+    try:
+        return _run_bounded_ssh(target, argv)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        raise ObservationError("scheduler observation was unavailable") from error
 
 
 def _missing_active_job(result: Result) -> bool:
@@ -394,12 +452,7 @@ def _missing_active_job(result: Result) -> bool:
     )
 
 
-def _parse_query_output(
-    output: bytes,
-    attempt: _AttemptQuery,
-    *,
-    accounting: bool,
-) -> tuple[_RawJob, ...]:
+def _output_lines(output: bytes) -> tuple[bytes, ...]:
     if len(output) > _MAX_QUERY_OUTPUT_BYTES:
         raise ObservationError("scheduler query output exceeds its byte bound")
     if output and not output.endswith(b"\n"):
@@ -407,75 +460,75 @@ def _parse_query_output(
     lines = () if not output else output[:-1].split(b"\n")
     if len(lines) > _MAX_QUERY_LINES:
         raise ObservationError("scheduler query output exceeds its line bound")
-    rows: list[_RawJob] = []
-    for line in lines:
-        fields = line.split(b"|")
-        expected_fields = 10 if accounting else 8
-        if len(fields) != expected_fields or any(
-            len(field) > _MAX_QUERY_FIELD_BYTES for field in fields
-        ):
-            raise ObservationError("scheduler query row is malformed")
-        try:
-            raw_decoded = tuple(field.decode("utf-8", "strict") for field in fields)
-        except UnicodeDecodeError as error:
-            raise ObservationError("scheduler query row is malformed") from error
-        if any(_CONTROL.search(value) for value in raw_decoded):
-            raise ObservationError("scheduler query row is malformed")
-        decoded = tuple(value.strip(" ") for value in raw_decoded)
-        if accounting:
-            (
-                job_id_raw,
-                cluster_raw,
-                name_raw,
-                comment_raw,
-                submit_raw,
-                state_raw,
-                exit_raw,
-                reason_raw,
-                start_raw,
-                end_raw,
-            ) = decoded
-            cluster = _optional_field(cluster_raw)
-            exit_code = _exit_code(exit_raw)
-        else:
-            (
-                job_id_raw,
-                name_raw,
-                comment_raw,
-                submit_raw,
-                state_raw,
-                reason_raw,
-                start_raw,
-                end_raw,
-            ) = decoded
-            cluster = attempt.cluster
-            exit_code = None
-        if not job_id_raw.isascii() or not job_id_raw.isdecimal():
-            raise ObservationError("scheduler query row has an invalid job identity")
-        job_id = int(job_id_raw)
-        submitted_at = _timestamp(submit_raw)
-        if (
-            job_id != attempt.job_id
-            or (attempt.cluster is not None and cluster != attempt.cluster)
-            or (cluster is not None and _SITE_TOKEN.fullmatch(cluster) is None)
-            or name_raw != attempt.identity
-            or comment_raw != attempt.identity
-            or submitted_at is None
-            or not attempt.window_start <= submitted_at <= attempt.window_end
-            or _state_base(state_raw) is None
-        ):
-            raise ObservationError("scheduler query returned unrelated evidence")
-        row = _RawJob(
-            cluster,
-            submitted_at,
-            state_raw,
-            exit_code,
-            _optional_field(reason_raw),
-            _timestamp(start_raw),
-            _timestamp(end_raw),
-        )
-        rows.append(row)
-    return tuple(rows)
+    return tuple(lines)
+
+
+def _decoded_fields(line: bytes, expected: int) -> tuple[str, ...]:
+    fields = line.split(b"|")
+    if len(fields) != expected or any(len(field) > _MAX_QUERY_FIELD_BYTES for field in fields):
+        raise ObservationError("scheduler query row is malformed")
+    try:
+        decoded = tuple(field.decode("utf-8", "strict") for field in fields)
+    except UnicodeDecodeError as error:
+        raise ObservationError("scheduler query row is malformed") from error
+    if any(_CONTROL.search(value) for value in decoded):
+        raise ObservationError("scheduler query row is malformed")
+    return tuple(value.strip(" ") for value in decoded)
+
+
+def _parse_accounting_row(line: bytes, attempt: _AttemptQuery) -> _AccountingJob:
+    (
+        job_id,
+        cluster_raw,
+        name,
+        comment,
+        submitted,
+        state,
+        exit_code,
+        reason,
+        started,
+        ended,
+    ) = _decoded_fields(line, 10)
+    _validate_job_identity(job_id, name, comment, state, attempt)
+    cluster = _optional_field(cluster_raw)
+    if (attempt.cluster is not None and cluster != attempt.cluster) or (
+        cluster is not None and _SITE_TOKEN.fullmatch(cluster) is None
+    ):
+        raise ObservationError("scheduler query returned unrelated evidence")
+    return _AccountingJob(
+        cluster,
+        _required_timestamp(submitted),
+        state,
+        _exit_code(exit_code),
+        _optional_field(reason),
+        _timestamp(started),
+        _timestamp(ended),
+    )
+
+
+def _validate_job_identity(
+    job_id: str,
+    name: str,
+    comment: str,
+    state: str,
+    attempt: _AttemptQuery,
+) -> None:
+    if (
+        not job_id.isascii()
+        or not job_id.isdecimal()
+        or int(job_id) != attempt.job_id
+        or name != attempt.identity
+        or comment != attempt.identity
+        or _state_base(state) is None
+    ):
+        raise ObservationError("scheduler query returned unrelated evidence")
+
+
+def _required_timestamp(value: str) -> str:
+    timestamp = _timestamp(value)
+    if timestamp is None:
+        raise ObservationError("scheduler query timestamp is malformed")
+    return timestamp
 
 
 def _optional_field(value: str) -> str | None:
@@ -523,10 +576,18 @@ def _state_base(raw: str) -> str | None:
     return base if _SITE_TOKEN.fullmatch(base) is not None else None
 
 
-def _combine_rows(
-    active: _RawJob | None,
-    accounting: _RawJob | None,
+def _combine_observations(
+    active: _ActiveJob | None,
+    history: _AccountingHistory | None,
 ) -> SchedulerObservation:
+    accounting = None if history is None else history.latest
+    if history is None:
+        active = None
+    elif active is not None and (
+        active.submitted_at < history.original_submitted_at
+        or active.submitted_at < history.latest.submitted_at
+    ):
+        raise ObservationError("scheduler sources returned conflicting evidence")
     primary = active or accounting
     if primary is None:
         return SchedulerObservation(
@@ -538,14 +599,6 @@ def _combine_rows(
             None,
             None,
         )
-    if (
-        active is not None
-        and accounting is not None
-        and active.cluster is not None
-        and accounting.cluster is not None
-        and active.cluster != accounting.cluster
-    ):
-        raise ObservationError("scheduler sources returned conflicting identities")
     active_state = None if active is None else _normalize_state(active.state)
     if (
         active is not None
@@ -558,7 +611,7 @@ def _combine_rows(
         _normalize_state(primary.state),
         primary.state,
         None if accounting is None else accounting.state,
-        primary.exit_code or (None if accounting is None else accounting.exit_code),
+        None if accounting is None else accounting.exit_code,
         primary.reason or (None if accounting is None else accounting.reason),
         primary.started_at or (None if accounting is None else accounting.started_at),
         primary.ended_at or (None if accounting is None else accounting.ended_at),
