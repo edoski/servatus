@@ -96,6 +96,9 @@ not-submitted, and retry attempt. Append and seal each increment Campaign revisi
 become stale. Execution remains valid while open. `Campaign.seal()` is atomic and idempotent; a
 sealed Campaign accepts only an exact-roster reopen.
 
+Each accepted or explicitly not-submitted outcome records its mutation revision. This preserves
+actual chronology when an older ambiguous Attempt is resolved after newer disjoint work.
+
 Planning consumes one exact revision-bound `CampaignView`. Valid results are excluded.
 Never-accepted missing or unobserved Tasks are selected. Accepted active work and ambiguous
 acceptance are withheld. Terminal accepted work requires explicit retry; unknown accepted work also
@@ -359,7 +362,8 @@ filesystem with stable cross-client inode identities. See [SECURITY.md](SECURITY
 
 - Campaign files are bounded, owner-only, schema-versioned, symlink-safe, atomically replaced, and
   synced. Every durable read validates the complete snapshot. One tagged Attempt outcome prevents
-  an allocation from being both accepted and resolved as not submitted.
+  an allocation from being both accepted and resolved as not submitted; its revision preserves
+  delayed-resolution chronology.
 - Intent preserves the normalized route, guardrails, requested resources, exact allocation totals,
   and reviewed nonsecret `sbatch` command before external acceptance.
 - A destination is absent or one complete regular file or directory. Native commits and the Linux

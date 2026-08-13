@@ -17,9 +17,10 @@ One ordered Attempt collection replaces parallel intent, receipt, and negative-r
 collections. Servatus syncs the unresolved Attempt before SSH. The same logical record then receives
 exactly one accepted or not-submitted outcome. Each Attempt retains its allocation identity, ordered
 Task and retry keys, Campaign revision, target and resource lineage digests, plan and script digests,
-effective allocation totals, exact nonsecret command, and reconciliation window. Reconciliation,
-explicit resolution, and retry append or update only these generic execution facts; history is never
-rewritten or collapsed.
+effective allocation totals, exact nonsecret command, reconciliation window, and outcome revision.
+The outcome revision preserves delayed resolution chronology after intervening disjoint work.
+Reconciliation, explicit resolution, and retry append or update only these generic execution facts;
+history is never rewritten or collapsed.
 
 The existing native OpenSSH/Slurm/Apptainer lane, balanced single-node packing, target ceilings,
 submission cap, intent-before-contact rule, ambiguity handling, explicit retry, reconciliation,

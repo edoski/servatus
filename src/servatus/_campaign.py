@@ -545,24 +545,27 @@ def _reconciliation_timestamp(value: object) -> datetime:
     return parsed
 
 
-def _validate_revision_feasibility(
-    gaps: list[int], required_prefixes: list[int], task_count: int, *, sealed: bool
+def _validate_revision_history(
+    state_revision: int,
+    mutation_revisions: set[int],
+    plan_requirements: list[tuple[int, int]],
+    task_count: int,
+    *,
+    sealed: bool,
 ) -> None:
-    append_count = sum(gaps) - int(sealed)
-    if append_count < 0 or append_count > task_count:
+    unexplained = set(range(1, state_revision + 1)) - mutation_revisions
+    if sealed:
+        if not unexplained:
+            raise TaskConflict("campaign revision cannot be explained by one roster seal")
+        append_revisions = unexplained - {max(unexplained)}
+    else:
+        append_revisions = unexplained
+    if len(append_revisions) > task_count:
         raise TaskConflict("campaign revision cannot be explained by roster history")
-    future_revisions = 0
-    seal_after = -1
-    for group_index in range(len(required_prefixes) - 1, -1, -1):
-        future_revisions += gaps[group_index + 1]
-        capacity_without_seal = task_count - future_revisions
-        required = required_prefixes[group_index]
-        if required > capacity_without_seal:
-            if not sealed or required > capacity_without_seal + 1:
-                raise TaskConflict("campaign revision cannot be explained by roster history")
-            seal_after = max(seal_after, group_index)
-    if sealed and not any(gaps[index] > 0 for index in range(seal_after + 1, len(gaps))):
-        raise TaskConflict("campaign revision cannot be explained by one roster seal")
+    for plan_revision, required_prefix in plan_requirements:
+        future_appends = sum(revision > plan_revision for revision in append_revisions)
+        if required_prefix > task_count - future_appends:
+            raise TaskConflict("campaign revision cannot be explained by roster history")
 
 
 def _task_from_record(record: object) -> Task:
@@ -1222,12 +1225,16 @@ class Campaign:
             assert state is not None
             attempt = _unresolved_attempt(state, allocation_id)
             if job_id is None:
-                attempt["acceptance"] = {"status": _NOT_SUBMITTED}
+                attempt["acceptance"] = {
+                    "status": _NOT_SUBMITTED,
+                    "outcome_revision": cast(int, state["revision"]) + 1,
+                }
             else:
                 attempt["acceptance"] = {
                     "status": _ACCEPTED,
                     "job_id": job_id,
                     "cluster": cluster,
+                    "outcome_revision": cast(int, state["revision"]) + 1,
                 }
             state["revision"] = cast(int, state["revision"]) + 1
             self._write_state(state)
@@ -1285,7 +1292,7 @@ class Campaign:
 
         attempts = cast(list[dict[str, object]], state["attempts"])
         relevant_queries = tuple(
-            query
+            (attempt, query)
             for attempt, query in zip(
                 (
                     attempt
@@ -1298,7 +1305,9 @@ class Campaign:
             if selected & set(cast(list[str], attempt["task_keys"]))
         )
         observations = (
-            _slurm.query_attempts(plan._profile.target, relevant_queries)
+            _slurm.query_attempts(
+                plan._profile.target, tuple(query for _attempt, query in relevant_queries)
+            )
             if relevant_queries
             else ()
         )
@@ -1314,10 +1323,7 @@ class Campaign:
             raise PlanError("selected task became acceptance-ambiguous before submission")
 
         states_by_key: dict[str, list[AllocationState]] = {key: [] for key in selected}
-        for query, observation in zip(relevant_queries, observations, strict=True):
-            attempt = next(
-                item for item in attempts if item["allocation_id"] == query.allocation_id
-            )
+        for (attempt, _query), observation in zip(relevant_queries, observations, strict=True):
             for key in selected & set(cast(list[str], attempt["task_keys"])):
                 states_by_key[key].append(observation.state)
         active = {AllocationState.QUEUED, AllocationState.RUNNING}
@@ -1406,6 +1412,7 @@ class Campaign:
                 "status": _ACCEPTED,
                 "job_id": receipt.job_id,
                 "cluster": receipt.cluster,
+                "outcome_revision": expected_revision + 1,
             }
             state["revision"] = expected_revision + 1
             self._write_state(state)
@@ -1965,23 +1972,23 @@ def _validate_attempts(
         "acceptance",
     }
     allocation_ids: set[str] = set()
-    accepted_task_keys: set[str] = set()
-    unresolved_task_keys: set[str] = set()
+    accepted_outcome_by_task: dict[str, int] = {}
+    unresolved_until_by_task: dict[str, int | None] = {}
+    mutation_revisions: set[int] = set()
+    plan_requirements: list[tuple[int, int]] = []
     task_positions = {key: index for index, key in enumerate(task_keys)}
     plan_revisions: dict[str, int] = {}
     group_revision: int | None = None
     group_plan_digest: str | None = None
     group_profile_label: str | None = None
-    group_end_revision = 0
-    group_required_prefix = 0
     group_last_task_position = -1
-    group_terminal = False
-    revision_gaps: list[int] = []
-    required_prefixes: list[int] = []
+    previous_intent_revision = -1
+    previous_status: str | None = None
+    previous_outcome_revision: int | None = None
     if not value:
         if lineage is not None:
             raise TaskConflict("campaign lineage has no attempt history")
-        _validate_revision_feasibility([state_revision], [], len(task_keys), sealed=sealed)
+        _validate_revision_history(state_revision, set(), [], len(task_keys), sealed=sealed)
         return
     if lineage is None:
         raise TaskConflict("campaign attempt has no resource lineage")
@@ -2015,8 +2022,6 @@ def _validate_attempts(
         typed_attempt_keys = cast(tuple[str, ...], attempt_keys)
         if tuple(key for key in task_keys if key in set(typed_attempt_keys)) != typed_attempt_keys:
             raise TaskConflict("campaign attempt task keys are out of order")
-        if unresolved_task_keys & set(typed_attempt_keys):
-            raise TaskConflict("campaign attempt overlaps unresolved history")
         for name in ("plan_digest", "script_digest"):
             digest = attempt[name]
             if not isinstance(digest, str) or _HEX_64.fullmatch(digest) is None:
@@ -2028,34 +2033,41 @@ def _validate_attempts(
         known_revision = plan_revisions.setdefault(plan_digest, campaign_revision)
         if known_revision != campaign_revision:
             raise TaskConflict("campaign attempt plan revision is inconsistent")
-        if group_revision is None:
-            revision_gaps.append(campaign_revision)
+        new_group = group_revision is None or campaign_revision != group_revision
+        if new_group:
             group_revision = campaign_revision
             group_plan_digest = plan_digest
             group_profile_label = profile_label
-            group_end_revision = campaign_revision
-        elif campaign_revision == group_revision:
+            group_last_task_position = -1
+            plan_requirements.append((campaign_revision, 0))
+        else:
             if plan_digest != group_plan_digest or profile_label != group_profile_label:
                 raise TaskConflict("campaign attempt plan group is invalid")
-        else:
-            if campaign_revision < group_end_revision:
-                raise TaskConflict("campaign attempt revision precedes durable history")
-            revision_gaps.append(campaign_revision - group_end_revision)
-            required_prefixes.append(group_required_prefix)
-            group_revision = campaign_revision
-            group_plan_digest = plan_digest
-            group_profile_label = profile_label
-            group_end_revision = campaign_revision
-            group_required_prefix = 0
-            group_last_task_position = -1
-            group_terminal = False
-        if group_terminal:
-            raise TaskConflict("campaign plan outcome is terminal")
         positions = tuple(task_positions[key] for key in typed_attempt_keys)
         if positions[0] <= group_last_task_position:
             raise TaskConflict("campaign plan allocation sequence is invalid")
         group_last_task_position = positions[-1]
-        group_required_prefix = max(group_required_prefix, positions[-1] + 1)
+        plan_revision, required_prefix = plan_requirements[-1]
+        plan_requirements[-1] = (plan_revision, max(required_prefix, positions[-1] + 1))
+        if new_group:
+            intent_revision = campaign_revision + 1
+            if intent_revision <= previous_intent_revision:
+                raise TaskConflict("campaign attempt revision precedes durable history")
+        else:
+            if (
+                previous_status != _ACCEPTED
+                or previous_outcome_revision != previous_intent_revision + 1
+            ):
+                raise TaskConflict("campaign plan outcome is terminal")
+            assert previous_outcome_revision is not None
+            intent_revision = previous_outcome_revision + 1
+        if intent_revision > state_revision or intent_revision in mutation_revisions:
+            raise TaskConflict("campaign attempt intent revision is invalid")
+        mutation_revisions.add(intent_revision)
+        for key in typed_attempt_keys:
+            unresolved_until = unresolved_until_by_task.get(key, 0)
+            if unresolved_until is None or unresolved_until > intent_revision:
+                raise TaskConflict("campaign attempt overlaps unresolved history")
         if (
             attempt["target_digest"] != lineage_values["target_digest"]
             or attempt["resource_digest"] != lineage_values["resource_digest"]
@@ -2068,7 +2080,11 @@ def _validate_attempts(
         if any(not isinstance(key, str) for key in typed_retry_keys):
             raise TaskConflict("campaign attempt retry keys are invalid")
         typed_retries = cast(tuple[str, ...], typed_retry_keys)
-        expected_retries = tuple(key for key in typed_attempt_keys if key in accepted_task_keys)
+        expected_retries = tuple(
+            key
+            for key in typed_attempt_keys
+            if accepted_outcome_by_task.get(key, state_revision + 1) < intent_revision
+        )
         if typed_retries != expected_retries:
             raise TaskConflict("campaign attempt retry keys do not match accepted history")
         duplicate_risk_keys = attempt["duplicate_risk_task_keys"]
@@ -2123,38 +2139,59 @@ def _validate_attempts(
             raise TaskConflict("campaign attempt acceptance is invalid")
         typed_acceptance = cast(dict[str, object], acceptance)
         status = typed_acceptance.get("status")
-        if isinstance(status, str) and status in {_UNRESOLVED, _NOT_SUBMITTED}:
+        outcome_revision: int | None = None
+        if status == _UNRESOLVED:
             if set(typed_acceptance) != {"status"}:
                 raise TaskConflict("campaign attempt acceptance is invalid")
-            group_terminal = True
-            if status == _UNRESOLVED:
-                unresolved_task_keys.update(typed_attempt_keys)
-            if status == _NOT_SUBMITTED:
-                group_end_revision += 1
-        elif status == _ACCEPTED:
+        elif status in {_ACCEPTED, _NOT_SUBMITTED}:
+            raw_outcome_revision = typed_acceptance.get("outcome_revision")
             job_id = typed_acceptance.get("job_id")
             cluster = typed_acceptance.get("cluster")
-            if (
-                set(typed_acceptance) != {"status", "job_id", "cluster"}
-                or type(job_id) is not int
+            expected_acceptance = (
+                {"status", "outcome_revision"}
+                if status == _NOT_SUBMITTED
+                else {"status", "job_id", "cluster", "outcome_revision"}
+            )
+            invalid_receipt = status == _ACCEPTED and (
+                type(job_id) is not int
                 or job_id <= 0
                 or (
                     cluster is not None
                     and (not isinstance(cluster, str) or _TOKEN.fullmatch(cluster) is None)
                 )
-            ):
+            )
+            if set(typed_acceptance) != expected_acceptance or invalid_receipt:
                 raise TaskConflict("campaign attempt acceptance is invalid")
-            accepted_task_keys.update(typed_attempt_keys)
-            group_end_revision += 1
+            if (
+                type(raw_outcome_revision) is not int
+                or raw_outcome_revision <= intent_revision
+                or raw_outcome_revision > state_revision
+                or raw_outcome_revision in mutation_revisions
+            ):
+                raise TaskConflict("campaign attempt outcome revision is invalid")
+            outcome_revision = raw_outcome_revision
+            mutation_revisions.add(outcome_revision)
+            if status == _ACCEPTED:
+                for key in typed_attempt_keys:
+                    accepted_outcome_by_task[key] = min(
+                        outcome_revision,
+                        accepted_outcome_by_task.get(key, outcome_revision),
+                    )
         else:
             raise TaskConflict("campaign attempt acceptance is invalid")
+        for key in typed_attempt_keys:
+            unresolved_until_by_task[key] = outcome_revision
         allocation_ids.add(allocation_id)
-        group_end_revision += 1
-    if state_revision < group_end_revision:
-        raise TaskConflict("campaign revision is behind durable attempt history")
-    revision_gaps.append(state_revision - group_end_revision)
-    required_prefixes.append(group_required_prefix)
-    _validate_revision_feasibility(revision_gaps, required_prefixes, len(task_keys), sealed=sealed)
+        previous_intent_revision = intent_revision
+        previous_status = cast(str, status)
+        previous_outcome_revision = outcome_revision
+    _validate_revision_history(
+        state_revision,
+        mutation_revisions,
+        plan_requirements,
+        len(task_keys),
+        sealed=sealed,
+    )
 
 
 def _plan_strings(value: object, *, name: str) -> list[str]:

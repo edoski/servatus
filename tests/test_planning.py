@@ -8,6 +8,7 @@ import pytest
 from test_campaign import profile, resources, target, tasks
 
 from servatus import (
+    AcceptanceState,
     AllocationState,
     AmbiguousSubmission,
     Campaign,
@@ -351,6 +352,57 @@ def test_ambiguous_allocation_blocks_only_affected_tasks(
     assert contacts == 1
     assert len(receipts) == 1
     assert receipts[0].task_keys == ("task-1",)
+
+
+@pytest.mark.parametrize("resolution", ["resolve", "reconcile"])
+def test_delayed_ambiguous_outcome_survives_disjoint_submission_and_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolution: str,
+) -> None:
+    path = tmp_path / "campaign"
+    campaign = Campaign.open(path, tasks(2))
+    selected_profile = profile(target(max_tasks_per_allocation=1))
+    first = campaign.plan(
+        selected_profile,
+        view=campaign.inspect(scheduler=False),
+        tasks_per_allocation=1,
+    )
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(1, b"", b"lost"),
+    )
+    with pytest.raises(AmbiguousSubmission):
+        campaign.submit(first)
+    unresolved = campaign.inspect(scheduler=False).attempts[0].allocation_id
+
+    disjoint = campaign.plan(
+        selected_profile,
+        view=campaign.inspect(scheduler=False),
+        tasks_per_allocation=1,
+    )
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(0, b"43;alpha\n", b""),
+    )
+    campaign.submit(disjoint)
+
+    if resolution == "resolve":
+        campaign.resolve(unresolved, job_id=None)
+        expected = (AcceptanceState.NOT_SUBMITTED, AcceptanceState.ACCEPTED)
+    else:
+        monkeypatch.setattr(
+            _slurm,
+            "query_identity",
+            lambda *_args, **_kwargs: _slurm.IdentityMatch(42, "alpha"),
+        )
+        campaign.reconcile(unresolved)
+        expected = (AcceptanceState.ACCEPTED, AcceptanceState.ACCEPTED)
+
+    reopened = Campaign.load(path)
+    assert tuple(item.acceptance for item in reopened.inspect(scheduler=False).attempts) == expected
 
 
 def test_accepted_campaign_requires_scheduler_observed_view(

@@ -14,8 +14,9 @@ resources. Durable compatibility binds only to exact resolved target/resource va
 adds the selected label, ordered Task, explicit-retry, and duplicate-risk keys, its Campaign
 revision, lineage digests, plan and script digests, exact effective allocation totals, the
 nonsecret `sbatch` argument vector, its reconciliation window, and one unresolved, accepted, or
-not-submitted outcome. Job names derive from allocation identity; receipts remain public
-projections of accepted Attempt outcomes.
+not-submitted outcome. Resolved outcomes record their mutation revision so delayed resolution stays
+ordered after intervening disjoint attempts. Job names derive from allocation identity; receipts
+remain public projections of accepted Attempt outcomes.
 
 Public plan files redact task arguments and payloads but retain private operational evidence. A
 loaded plan parses its frozen revision-bound Campaign view, selection, retry/override decisions,
@@ -28,6 +29,7 @@ upward minute rounding.
 Campaign schema 4 and plan schema 4 are a clean break. Schema-3 Campaign state is rejected without
 migration. Every bounded owner-only state read validates the complete atomic snapshot; one tagged
 Attempt outcome removes the former parallel receipt and negative-resolution authorities.
+Outcome revisions preserve atomic mutation order independently from the Attempt's intent order.
 Internally typed mutations are encoded directly rather than decoded again immediately before the
 atomic write.
 

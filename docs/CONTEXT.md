@@ -19,7 +19,7 @@ Servatus uses a small generic vocabulary:
 - **Attempt:** one durable allocation record written before possible scheduler acceptance; it owns
   ordered Task, retry, and duplicate-risk keys, Campaign revision, selected Profile label, lineage,
   plan and script digests, exact command, allocation totals, query window, and one unresolved,
-  accepted, or not-submitted outcome.
+  accepted, or not-submitted outcome whose revision preserves mutation chronology.
 - **Intent:** the durably synced unresolved Attempt written before possible scheduler acceptance.
 - **Receipt:** a positive Slurm job identity proving scheduler acceptance, not completion; its Task
   keys come from the immutable intent.

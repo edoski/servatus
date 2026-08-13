@@ -661,6 +661,7 @@ def test_submission_state_uses_only_authoritative_provenance(
         "status": "ACCEPTED",
         "job_id": 4242,
         "cluster": "alpha",
+        "outcome_revision": 2,
     }
     retry = planning(Campaign.open(path, tasks(1)), retry={"task-0"})
     allocation = _campaign.plan_document(retry)["allocations"][0]
@@ -791,6 +792,35 @@ def test_campaign_rejects_revision_behind_attempt_history(
 
     with pytest.raises(TaskConflict, match="revision"):
         Campaign.load(campaign_path)
+
+
+@pytest.mark.parametrize("corruption", ["before-intent", "duplicate", "future"])
+def test_campaign_rejects_impossible_outcome_revisions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    path = tmp_path / "campaign"
+    campaign = Campaign.open(path, tasks(1))
+    monkeypatch.setattr(
+        _slurm,
+        "_run_ssh",
+        lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
+    )
+    campaign.submit(planning(campaign))
+    campaign.submit(planning(campaign, retry={"task-0"}))
+    state_path = path / "campaign.json"
+    state = json.loads(state_path.read_text())
+    if corruption == "before-intent":
+        state["attempts"][0]["acceptance"]["outcome_revision"] = 1
+    elif corruption == "duplicate":
+        state["attempts"][1]["acceptance"]["outcome_revision"] = 2
+    else:
+        state["attempts"][1]["acceptance"]["outcome_revision"] = 5
+    state_path.write_text(json.dumps(state))
+
+    with pytest.raises(TaskConflict, match="outcome revision"):
+        Campaign.load(path)
 
 
 @pytest.mark.parametrize(
@@ -1000,7 +1030,10 @@ def test_campaign_rejects_attempt_after_not_submitted_plan_outcome(
     campaign.submit(planning(campaign, target(max_tasks_per_allocation=1)))
     state_path = path / "campaign.json"
     state = json.loads(state_path.read_text())
-    state["attempts"][0]["acceptance"] = {"status": "NOT_SUBMITTED"}
+    state["attempts"][0]["acceptance"] = {
+        "status": "NOT_SUBMITTED",
+        "outcome_revision": state["attempts"][0]["acceptance"]["outcome_revision"],
+    }
     state_path.write_text(json.dumps(state))
 
     with pytest.raises(TaskConflict, match="terminal"):
