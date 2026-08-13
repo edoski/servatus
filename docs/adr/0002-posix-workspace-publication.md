@@ -21,14 +21,17 @@ a source found under a substituted inode.
 
 A directory fallback requires an owner-controlled parent and an exclusive advisory `flock` on its
 pinned descriptor. Under that lock Servatus re-verifies the parent and source, checks the destination
-is absent, performs a descriptor-relative rename, verifies the published inode, and syncs the parent.
-The lock lives on a dedicated handle and is released by closing that handle, so an unlock error cannot
-mask a verified, parent-synced commit. Correctness requires every same-account publisher on every
-client to use Servatus and the filesystem mount to provide one coherent `flock` domain and stable
-inode identities across those clients; local-only or disabled lock modes and unstable cross-client
-inodes are unsupported. Same-account code that ignores the lock is outside the contract. Locking or
-verification failure closes the transaction. Cross-device and unexpected native errors do not enter
-the fallback.
+is absent, performs a descriptor-relative rename, and verifies the published inode. Servatus then
+closes the dedicated lock handle before syncing the parent, so an unbounded remote directory sync
+cannot retain the distributed lock or convoy independent destinations. Publication returns only
+after the parent sync. A crash or sync failure after rename can leave the complete destination
+visible with unconfirmed directory durability, so the caller must treat the failed operation as
+ambiguous and validate the canonical destination before retrying. Correctness requires every
+same-account publisher on every client to use Servatus and the filesystem mount to provide one
+coherent `flock` domain and stable inode identities across those clients; local-only or disabled lock
+modes and unstable cross-client inodes are unsupported. Same-account code that ignores the lock is
+outside the contract. Locking or verification failure closes the transaction. Cross-device and
+unexpected native errors do not enter the fallback.
 
 Work, stages, link sources, and destinations must share one filesystem. Servatus never copies during
 publication.

@@ -396,11 +396,13 @@ filesystem with stable cross-client inode identities. See [SECURITY.md](SECURITY
 - A destination is absent or one complete regular file or directory. Native commits and the Linux
   regular-file fallback never overwrite an existing entry. An already-present destination is
   rejected before its callback; the commit remains no-replace against later races. The Linux
-  directory fallback serializes cooperating Servatus publishers with an exclusive parent-directory
-  lock.
+  directory fallback locks the parent only for its absence check, rename, and published-inode
+  verification. The lock is released before the post-commit parent sync, so a stalled remote sync
+  does not serialize publications to other destinations.
 - Work, hard-link sources, stages, and destination must share a filesystem.
 - Disposable stage names are not synced merely by creation. Files and directories are synced before
-  commit; the parent is synced after publication.
+  commit; publication returns only after the parent is synced. Failure or interruption after rename
+  can leave a complete visible destination whose directory durability is not yet proven.
 - Builders and writers must be quiescent when they return. Servatus verifies pathname/inode
   identity and syncs content, but does not detect or exclude concurrent content writers.
 - Builder failures expose no destination. Resumable work remains; disposable stages are removed.

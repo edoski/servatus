@@ -15,6 +15,7 @@ import pytest
 from servatus import (
     CrossDevicePublication,
     DestinationExists,
+    Draft,
     UnsafePublication,
     UnsupportedPlatform,
     Workspace,
@@ -63,6 +64,63 @@ def _directory_fallback_worker(
         raise
     finally:
         os.close(parent_fd)
+
+
+def _public_directory_fallback_worker(
+    parent: str,
+    destination: str,
+    value: str,
+    build_ready: Connection | None,
+    build_release: Connection | None,
+    sync_ready: Connection | None,
+    sync_release: Connection | None,
+    result: Connection,
+) -> None:
+    parent_path = Path(parent)
+    expected_parent = parent_path.stat(follow_symlinks=False)
+    real_sync = _posix.sync_descriptor
+    blocked_sync = False
+
+    def unavailable(parent_fd: int, source: str, target: str) -> None:
+        del parent_fd, source, target
+        raise _posix._NoreplaceUnavailable
+
+    def controlled_sync(descriptor: int) -> None:
+        nonlocal blocked_sync
+        if (
+            sync_ready is not None
+            and not blocked_sync
+            and _posix.same_entry(os.fstat(descriptor), expected_parent)
+            and (parent_path / destination).is_dir()
+        ):
+            blocked_sync = True
+            sync_ready.send("sync")
+            if sync_release is None or not sync_release.poll(10):
+                raise AssertionError("publication sync was not released")
+            sync_release.recv()
+        real_sync(descriptor)
+
+    def build(draft: Draft) -> None:
+        (draft.path / "value").write_text(value)
+        if build_ready is not None:
+            build_ready.send("built")
+        if build_release is not None:
+            if not build_release.poll(10):
+                raise AssertionError("publication builder was not released")
+            build_release.recv()
+
+    sys.platform = "linux"
+    _posix._linux_rename_noreplace = unavailable
+    _posix.sync_descriptor = controlled_sync
+    try:
+        publish(parent_path / destination, build)
+    except DestinationExists:
+        result.send("exists")
+    except BaseException as error:
+        result.send(type(error).__name__)
+        raise
+    else:
+        result.send("committed")
 
 
 def test_regular_file_fallback_publishes_and_never_overwrites(
@@ -300,6 +358,95 @@ def test_directory_fallback_has_one_winner_across_processes(tmp_path: Path) -> N
 
     assert sorted(outcomes) == ["committed", "exists"]
     assert (tmp_path / "result/value").read_text() in {"stage-a", "stage-b"}
+
+
+def test_directory_fallback_does_not_hold_parent_lock_across_durability_sync(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+
+    same_ready, same_ready_child = context.Pipe(duplex=False)
+    same_release_child, same_release = context.Pipe(duplex=False)
+    same_result, same_result_child = context.Pipe(duplex=False)
+    same = context.Process(
+        target=_public_directory_fallback_worker,
+        args=(
+            str(tmp_path),
+            "result-a",
+            "challenger",
+            same_ready_child,
+            same_release_child,
+            None,
+            None,
+            same_result_child,
+        ),
+    )
+    same.start()
+    same_ready_child.close()
+    same_release_child.close()
+    same_result_child.close()
+    assert same_ready.poll(10)
+    assert same_ready.recv() == "built"
+
+    sync_ready, sync_ready_child = context.Pipe(duplex=False)
+    sync_release_child, sync_release = context.Pipe(duplex=False)
+    winner_result, winner_result_child = context.Pipe(duplex=False)
+    winner = context.Process(
+        target=_public_directory_fallback_worker,
+        args=(
+            str(tmp_path),
+            "result-a",
+            "winner",
+            None,
+            None,
+            sync_ready_child,
+            sync_release_child,
+            winner_result_child,
+        ),
+    )
+    winner.start()
+    sync_ready_child.close()
+    sync_release_child.close()
+    winner_result_child.close()
+    assert sync_ready.poll(10)
+    assert sync_ready.recv() == "sync"
+
+    other_result, other_result_child = context.Pipe(duplex=False)
+    other = context.Process(
+        target=_public_directory_fallback_worker,
+        args=(
+            str(tmp_path),
+            "result-b",
+            "other",
+            None,
+            None,
+            None,
+            None,
+            other_result_child,
+        ),
+    )
+    other.start()
+    other_result_child.close()
+    same_release.send("continue")
+    same_release.close()
+
+    try:
+        assert other_result.poll(5)
+        assert other_result.recv() == "committed"
+        assert same_result.poll(5)
+        assert same_result.recv() == "exists"
+        assert not winner_result.poll()
+        assert (tmp_path / "result-a/value").read_text() == "winner"
+        assert (tmp_path / "result-b/value").read_text() == "other"
+    finally:
+        sync_release.send("continue")
+        sync_release.close()
+        for process in (same, other, winner):
+            process.join(timeout=10)
+
+    assert winner_result.poll(5)
+    assert winner_result.recv() == "committed"
+    assert all(process.exitcode == 0 for process in (same, other, winner))
 
 
 def test_directory_fallback_is_absent_or_complete_for_readers(tmp_path: Path) -> None:

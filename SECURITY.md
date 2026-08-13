@@ -36,13 +36,17 @@ treat workers and builders as trusted code.
 On Linux filesystems without `renameat2(RENAME_NOREPLACE)`, regular-file publication retains
 kernel-enforced create-if-absent semantics through a same-directory hard link. Directory publication
 instead uses a check-and-rename transaction under an exclusive advisory lock on the pinned parent
-descriptor. Servatus requires that parent to be owned by the effective user and not group- or
-world-writable. This contract requires every same-account publisher on every client to use Servatus
-and the filesystem mount to provide coherent `flock` and stable inode identities across all those
-clients. The identity record stores only exact container, lock, and work inode pins; live opens still
-enforce local type, device, and pathname-to-inode identity. Local-only or disabled locking and
-unstable cross-client inodes are unsupported. A same-account process that ignores the lock remains
-outside the threat model.
+descriptor. The lock covers only the destination check, rename, and published-inode verification;
+Servatus closes it before syncing the parent. Publication does not report success until that sync
+returns, but a failure or crash after rename can leave a complete visible destination with
+unconfirmed directory durability. Callers must treat that outcome as ambiguous and validate the
+canonical destination before retrying. Servatus requires the parent to be owned by the effective
+user and not group- or world-writable. This contract requires every same-account publisher on every
+client to use Servatus and the filesystem mount to provide coherent `flock` and stable inode
+identities across all those clients. The identity record stores only exact container, lock, and work
+inode pins; live opens still enforce local type, device, and pathname-to-inode identity. Local-only
+or disabled locking and unstable cross-client inodes are unsupported. A same-account process that
+ignores the lock remains outside the threat model.
 
 Campaign task arguments and stdin are embedded in the submitted batch script. Redaction from
 ordinary local summaries does not make them secret; do not submit credentials or other secrets.

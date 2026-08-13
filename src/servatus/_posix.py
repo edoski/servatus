@@ -278,6 +278,7 @@ def commit_noreplace(
                     expected_parent,
                     current_source,
                 )
+                sync_descriptor(parent_fd)
                 return _CommitOutcome(cleanup_pending=False)
             raise UnsafePublication(
                 "publication source is not a regular file or directory"
@@ -394,7 +395,6 @@ def _locked_directory_noreplace(
         published = os.stat(destination, dir_fd=parent_fd, follow_symlinks=False)
         if not same_entry(published, expected_source):
             raise UnsafePublication("published directory does not match the verified source")
-        sync_descriptor(parent_fd)
     finally:
         with suppress(OSError):
             os.close(lock_fd)
