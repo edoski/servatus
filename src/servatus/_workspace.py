@@ -196,17 +196,16 @@ class Workspace:
         _posix.require_supported_platform()
         self._stable_parent_fd = _posix.open_directory(self._root_parent)
         try:
-            with _coordinate(self._stable_parent_fd):
-                _posix.ensure_directory_path(self._root_parent, self._stable_parent_fd)
-                _posix.ensure_absent(
-                    self._stable_parent_fd,
-                    self._root_destination_name,
-                    self._root_parent / self._root_destination_name,
-                )
-                if self._child_name is None:
-                    self._enter_root()
-                else:
-                    self._enter_child()
+            _posix.ensure_directory_path(self._root_parent, self._stable_parent_fd)
+            _posix.ensure_absent(
+                self._stable_parent_fd,
+                self._root_destination_name,
+                self._root_parent / self._root_destination_name,
+            )
+            if self._child_name is None:
+                self._enter_root()
+            else:
+                self._enter_child()
         except BaseException:
             self._close()
             raise
@@ -300,13 +299,12 @@ class Workspace:
 
     def _cleanup_published(self) -> None:
         assert self._level.container_entry is not None
-        with _coordinate(self._stable_parent_fd):
-            self._verify_live()
-            _posix.remove_tree_at(
-                self._publication_parent_fd(),
-                self._container_name,
-                self._level.container_entry,
-            )
+        self._verify_live()
+        _posix.remove_tree_at(
+            self._publication_parent_fd(),
+            self._container_name,
+            self._level.container_entry,
+        )
 
     def _close(self) -> None:
         _close_level(self._level)
@@ -329,12 +327,12 @@ def _identity_digest(identity: bytes) -> bytes:
 
 
 @contextmanager
-def _coordinate(stable_parent_fd: int) -> Generator[None]:
-    fcntl.flock(stable_parent_fd, fcntl.LOCK_EX)
+def _coordinate(parent_fd: int) -> Generator[None]:
+    fcntl.flock(parent_fd, fcntl.LOCK_EX)
     try:
         yield
     finally:
-        fcntl.flock(stable_parent_fd, fcntl.LOCK_UN)
+        fcntl.flock(parent_fd, fcntl.LOCK_UN)
 
 
 def _open_lock(container_fd: int) -> tuple[int, os.stat_result]:
@@ -369,13 +367,18 @@ def _open_level(
 ) -> _WorkspaceLevel:
     level = _WorkspaceLevel()
     try:
-        level.container_fd, level.container_entry = _posix.make_directory_at(
-            parent_fd, container_name
-        )
-        _posix.require_owner_only(level.container_entry, f"workspace container {container_name}")
-        level.lock_fd, level.lock_entry = _open_lock(level.container_fd)
-        _acquire_lifecycle(level.lock_fd, lock_mode, destination)
-        level.work_fd, level.work_entry = _posix.make_directory_at(level.container_fd, "work")
+        with _coordinate(parent_fd):
+            level.container_fd, level.container_entry = _posix.make_directory_at(
+                parent_fd, container_name
+            )
+            _posix.require_owner_only(
+                level.container_entry, f"workspace container {container_name}"
+            )
+            level.lock_fd, level.lock_entry = _open_lock(level.container_fd)
+            _acquire_lifecycle(level.lock_fd, lock_mode, destination)
+            level.work_fd, level.work_entry = _posix.make_directory_at(
+                level.container_fd, "work"
+            )
         _verify_level(parent_fd, container_name, level)
         _bind_identity(parent_fd, level.container_fd, identity, destination, level)
         _verify_level(parent_fd, container_name, level)
@@ -411,10 +414,10 @@ def _bind_identity(
 
 
 def _sync_workspace_initialization(parent_fd: int, level: _WorkspaceLevel) -> None:
+    del parent_fd
     _posix.sync_descriptor(level.lock_fd)
     _posix.sync_descriptor(level.work_fd)
     _posix.sync_descriptor(level.container_fd)
-    _posix.sync_descriptor(parent_fd)
 
 
 def _initialize_identity(

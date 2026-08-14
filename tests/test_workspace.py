@@ -1201,16 +1201,13 @@ def test_workspace_syncs_new_private_hierarchy_before_identity_commit(
         container = hidden_entries(tmp_path)[0]
         lock = (container / ".lock").stat(follow_symlinks=False)
         work = (container / "work").stat(follow_symlinks=False)
-        parent_key = (tmp_path.stat().st_dev, tmp_path.stat().st_ino)
         lock_key = (lock.st_dev, lock.st_ino)
         work_key = (work.st_dev, work.st_ino)
         assert lock_key in synced_entries
         assert work_key in synced_entries
         assert container_key in synced_entries
-        assert parent_key in synced_entries
         internal_sync = max(synced_entries.index(lock_key), synced_entries.index(work_key))
-        hierarchy_sync = synced_entries.index(container_key, internal_sync + 1)
-        assert hierarchy_sync < synced_entries.index(parent_key)
+        assert synced_entries.index(container_key) > internal_sync
         outcome = real_commit(parent_fd, source, destination, expected_source)
         committed_parent = container_key
         return outcome
@@ -1222,6 +1219,27 @@ def test_workspace_syncs_new_private_hierarchy_before_identity_commit(
         pass
 
     assert committed_parent is not None
+
+
+def test_workspace_initialization_does_not_sync_shared_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path.stat(follow_symlinks=False)
+    parent_key = (parent.st_dev, parent.st_ino)
+    synced: list[tuple[int, int]] = []
+    real_sync = _posix.sync_descriptor
+
+    def record_sync(descriptor: int) -> None:
+        entry = os.fstat(descriptor)
+        synced.append((entry.st_dev, entry.st_ino))
+        real_sync(descriptor)
+
+    monkeypatch.setattr(_posix, "sync_descriptor", record_sync)
+
+    with Workspace(tmp_path / "result", identity=b"request"):
+        pass
+
+    assert parent_key not in synced
 
 
 def test_workspace_reopen_does_not_sync_unchanged_container(

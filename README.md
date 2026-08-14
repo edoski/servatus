@@ -2,7 +2,7 @@
 
 Run resumable work through Slurm and atomically publish validated outputs.
 
-Servatus 0.7.0 combines durable publication with the native Slurm Campaign interface below.
+Servatus 0.7.1 combines durable publication with the native Slurm Campaign interface below.
 
 ```sh
 pip install servatus
