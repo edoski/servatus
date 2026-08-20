@@ -62,21 +62,21 @@ def _parser() -> argparse.ArgumentParser:
     seal = commands.add_parser("seal", help="irreversibly seal a Campaign roster")
     seal.add_argument("campaign", type=Path)
 
-    inspect = commands.add_parser("inspect", help="show scheduler-only Campaign evidence as JSON")
-    inspect.add_argument("campaign", type=Path)
+    status = commands.add_parser("status", help="show scheduler-only Campaign evidence as JSON")
+    status.add_argument("campaign", type=Path)
 
-    log = commands.add_parser(
-        "log",
+    logs = commands.add_parser(
+        "logs",
         help="write sensitive untrusted raw log bytes; redirect to a private file or safe viewer",
         description=(
             "Write sensitive untrusted raw log bytes, which may contain terminal control "
             "sequences. Redirect output to a private file or safe binary viewer."
         ),
     )
-    log.add_argument("campaign", type=Path)
-    log.add_argument("allocation_id")
-    log.add_argument("--task", metavar="TASK_KEY")
-    log.add_argument("--bytes", type=int, default=65_536, metavar="N")
+    logs.add_argument("campaign", type=Path)
+    logs.add_argument("allocation_id")
+    logs.add_argument("--task", metavar="TASK_KEY")
+    logs.add_argument("--bytes", type=int, default=65_536, metavar="N")
 
     reconcile = commands.add_parser("reconcile", help="query one ambiguous allocation once")
     reconcile.add_argument("campaign", type=Path)
@@ -187,10 +187,10 @@ def _run(arguments: argparse.Namespace) -> None:
     elif command == "seal":
         Campaign.load(arguments.campaign).seal()
         print(json.dumps({"sealed": True}, sort_keys=True))
-    elif command == "inspect":
+    elif command == "status":
         view = Campaign.load(arguments.campaign).inspect()
         print(json.dumps(campaign_view_document(view), sort_keys=True))
-    elif command == "log":
+    elif command == "logs":
         snapshot = Campaign.load(arguments.campaign).read_log(
             arguments.allocation_id,
             task_key=arguments.task,

@@ -72,7 +72,7 @@ def terminal_observations(
     )
 
 
-def test_cli_plan_uses_only_cwd_profile_and_inspect_replaces_status(
+def test_cli_plan_uses_only_cwd_profile_and_status_reports_campaign_view(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -90,7 +90,7 @@ def test_cli_plan_uses_only_cwd_profile_and_inspect_replaces_status(
     assert "opaque" not in output.read_text()
     capsys.readouterr()
 
-    assert main(["inspect", str(campaign)]) == 0
+    assert main(["status", str(campaign)]) == 0
     view = json.loads(capsys.readouterr().out)
     assert view["tasks"][0]["key"] == "one"
     assert view["tasks"][0]["result"] == "UNOBSERVED"
@@ -99,8 +99,8 @@ def test_cli_plan_uses_only_cwd_profile_and_inspect_replaces_status(
         main(["--help"])
     assert help_exit.value.code == 0
     help_text = capsys.readouterr().out
-    assert "inspect" in help_text
-    assert "status" not in help_text
+    assert "status" in help_text
+    assert "logs" in help_text
 
 
 def test_cli_plan_does_not_search_parent_for_servatus_toml(
@@ -255,7 +255,7 @@ def test_cli_validate_submit_seal_and_reconcile_remain_thin(
     assert main(["reconcile", str(campaign_path), allocation_id]) == 0
     assert json.loads(capsys.readouterr().out)["job_id"] == 701
     monkeypatch.setattr(_slurm, "query_attempts", terminal_observations)
-    assert main(["inspect", str(campaign_path)]) == 0
+    assert main(["status", str(campaign_path)]) == 0
     inspected = json.loads(capsys.readouterr().out)
     assert inspected["scheduler_observed"] is True
     assert inspected["attempts"][0]["allocation"]["state"] == "SUCCEEDED"
@@ -264,7 +264,7 @@ def test_cli_validate_submit_seal_and_reconcile_remain_thin(
     assert any(argv[-1] == "--test-only" for argv in calls)
 
 
-def test_cli_log_delegates_one_exact_raw_byte_snapshot_without_newline(
+def test_cli_logs_delegates_one_exact_raw_byte_snapshot_without_newline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capfdbinary: pytest.CaptureFixture[bytes],
@@ -285,14 +285,14 @@ def test_cli_log_delegates_one_exact_raw_byte_snapshot_without_newline(
 
     monkeypatch.setattr(Campaign, "read_log", read_log)
 
-    assert main(["log", str(campaign_path), "alloc", "--task", "one", "--bytes", "9"]) == 0
+    assert main(["logs", str(campaign_path), "alloc", "--task", "one", "--bytes", "9"]) == 0
 
     captured = capfdbinary.readouterr()
     assert captured.out == b"\x00raw\xff"
     assert calls == [("alloc", "one", 9)]
 
 
-def test_cli_log_help_warns_and_errors_use_existing_redacted_path(
+def test_cli_logs_help_warns_and_errors_use_existing_redacted_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -300,7 +300,7 @@ def test_cli_log_help_warns_and_errors_use_existing_redacted_path(
     campaign_path = tmp_path / "campaign"
     Campaign.open(campaign_path, ())
     with pytest.raises(SystemExit) as help_exit:
-        main(["log", "--help"])
+        main(["logs", "--help"])
     assert help_exit.value.code == 0
     help_text = capsys.readouterr().out
     assert "untrusted raw log bytes" in help_text
@@ -311,7 +311,7 @@ def test_cli_log_help_warns_and_errors_use_existing_redacted_path(
 
     monkeypatch.setattr(Campaign, "read_log", unavailable)
     with pytest.raises(SystemExit) as rejected:
-        main(["log", str(campaign_path), "alloc"])
+        main(["logs", str(campaign_path), "alloc"])
     assert rejected.value.code == 2
     error = capsys.readouterr().err
     assert "campaign log is unavailable" in error

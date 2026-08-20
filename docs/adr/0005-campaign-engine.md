@@ -83,9 +83,9 @@ Before each mutating allocation submission, Campaign reads current state, reprob
 Tasks for result-aware plans, refreshes relevant accepted Attempts, rereads state, compares
 eligibility, records durable intent, contacts `sbatch`, and records its outcome. Scheduler-only
 plans need no probe. The CLI reads only cwd `SERVATUS.toml`, offers optional `--profile`, exposes
-scheduler-only `inspect`, and writes raw bounded log bytes through `Campaign.read_log()`. The old
-acceptance-only status, caller completed sets, and paired target/resource configuration paths are
-removed.
+scheduler-only `status`, and writes raw bounded bytes through `logs` and `Campaign.read_log()`. The
+old acceptance-only summary, caller completed sets, and paired target/resource configuration paths
+are removed.
 
 `Campaign.record(view)` is the sole operational-record interface. Campaign validates the exact
 revision-bound view, joins it with its durable Attempt lineage, and returns canonical schema-1 JSON

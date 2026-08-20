@@ -2,7 +2,7 @@
 
 Run resumable work through Slurm and atomically publish validated outputs.
 
-Servatus 0.7.1 combines durable publication with the native Slurm Campaign interface below.
+Servatus 0.8.0 combines durable publication with the native Slurm Campaign interface below.
 
 ```sh
 pip install servatus
@@ -144,8 +144,8 @@ servatus plan TASKS.jsonl --campaign STATE_DIR --output PLAN.json --show-scripts
 servatus seal STATE_DIR
 servatus validate STATE_DIR PLAN.json
 servatus submit STATE_DIR PLAN.json
-servatus inspect STATE_DIR
-servatus log STATE_DIR ALLOCATION_ID --task TASK_KEY --bytes 65536 > task.log
+servatus status STATE_DIR
+servatus logs STATE_DIR ALLOCATION_ID --task TASK_KEY --bytes 65536 > task.log
 servatus reconcile STATE_DIR ALLOCATION_ID
 servatus resolve STATE_DIR ALLOCATION_ID --job-id 1234 --cluster alpha
 servatus resolve STATE_DIR ALLOCATION_ID --not-submitted
@@ -168,8 +168,9 @@ or mutate campaign state.
 An intent without a receipt is ambiguous. `reconcile` uses the Campaign's validated target lineage
 for one bounded `squeue`/`sacct` query and adopts only one exact Servatus identity. Otherwise an
 operator must resolve it explicitly as accepted or not submitted. Retry is explicit through
-`Campaign.plan(..., retry={...})`; prior receipts remain in history. `inspect` reports
-scheduler-only evidence as JSON. There is no acceptance-only status or caller-built completed set.
+`Campaign.plan(..., retry={...})`; prior receipts remain in history. CLI `status` reports the
+scheduler-only Campaign view as JSON. There is no legacy acceptance-only summary or caller-built
+completed set.
 
 ### Inspection
 
@@ -241,9 +242,9 @@ and `truncated` reports whether the remote read found one extra byte. Empty cont
 Log reads use one fixed bounded OpenSSH operation outside the Campaign lock. Missing, unreadable,
 unavailable, overflowing, or otherwise untrustworthy logs raise a redacted `ObservationError`
 without partial bytes. Log content is sensitive, untrusted binary data and may contain terminal
-control sequences. Do not print it directly to a terminal; redirect CLI output to a private file or
-use a safe binary viewer. Log content never enters Campaign state or views and cannot affect result
-readiness, quiescence, planning, retry, reconciliation, or application validity. The remote log
+control sequences. Do not print it directly to a terminal; redirect `servatus logs` to a private
+file or use a safe binary viewer. Log content never enters Campaign state or views and cannot affect
+result readiness, quiescence, planning, retry, reconciliation, or application validity. The remote log
 namespace remains controlled by the same cluster account; Servatus does not prove a stable remote
 inode or authenticate content after Slurm writes the derived path.
 
