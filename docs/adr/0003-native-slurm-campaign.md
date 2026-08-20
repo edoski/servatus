@@ -42,8 +42,9 @@ accepted work requires explicit retry; and unknown accepted work also requires a
 duplicate-risk acknowledgement. Every accepted Attempt matters, so older active or unknown work
 cannot be hidden by a newer Attempt. `Campaign.validate` first proves that a plan belongs to the
 current Campaign revision, then issues bounded time-specific `sbatch --test-only` calls.
-Scheduler-only `inspect` replaces the old acceptance-only status. Reconciliation reconstructs its
-target from validated immutable lineage, so callers cannot supply a second route.
+`Campaign.inspect()` remains the scheduler-observation operation; CLI `status` renders its view and
+replaces the old acceptance-only summary. Reconciliation reconstructs its target from validated
+immutable lineage, so callers cannot supply a second route.
 
 Before every allocation's mutating `sbatch`, submission rereads local state, reprobes only selected
 Tasks for result-aware plans, refreshes relevant accepted scheduler evidence, rereads state, and
