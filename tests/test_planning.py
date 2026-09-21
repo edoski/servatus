@@ -1,25 +1,14 @@
 from __future__ import annotations
 
-import copy
 import json
 from pathlib import Path, PurePosixPath
 
 import pytest
-from test_campaign import profile, resources, target, tasks
+from test_campaign import resources, target
 
 from servatus import (
-    AcceptanceState,
-    AllocationState,
-    AmbiguousSubmission,
-    Campaign,
     ConfigurationError,
-    PlanError,
     Profile,
-    SlurmTarget,
-    Task,
-    _slurm,
-    plan_document,
-    restore_plan,
 )
 
 
@@ -62,9 +51,7 @@ def labeled_profile_text(label: str) -> str:
 def test_profile_loads_the_explicit_complete_lane(tmp_path: Path) -> None:
     path = tmp_path / "SERVATUS.toml"
     path.write_text(profile_text())
-
     profile = Profile.load(path)
-
     assert profile.label == "cpu"
     assert profile.target.image == PurePosixPath("/images/cpu.sif")
     assert profile.resources.cpus_per_task == 2
@@ -75,9 +62,7 @@ def test_profile_explicit_selection_overrides_default_and_aliases_keep_values(
 ) -> None:
     path = tmp_path / "SERVATUS.toml"
     path.write_text(profile_text(second=True))
-
     selected = Profile.load(path, name="alias")
-
     assert selected.label == "alias"
     assert selected.target == Profile.load(path).target
     assert selected.resources == Profile.load(path).resources
@@ -87,7 +72,6 @@ def test_profile_explicit_selection_overrides_default_and_aliases_keep_values(
 def test_profile_labels_are_opaque_nonempty_strings(tmp_path: Path, label: str) -> None:
     path = tmp_path / "SERVATUS.toml"
     path.write_text(labeled_profile_text(label))
-
     assert Profile.load(path).label == label
     assert Profile.load(path, name=label).label == label
 
@@ -95,7 +79,7 @@ def test_profile_labels_are_opaque_nonempty_strings(tmp_path: Path, label: str) 
 @pytest.mark.parametrize("label", ["", 7])
 def test_profile_rejects_only_empty_or_nonstr_labels(label: object) -> None:
     with pytest.raises(ConfigurationError, match="nonempty string"):
-        Profile(label, target(), resources())  # type: ignore[arg-type]
+        Profile(label, target(), resources())
 
 
 @pytest.mark.parametrize(
@@ -116,17 +100,21 @@ def test_profile_rejects_missing_selection_or_malformed_document(
 ) -> None:
     path = tmp_path / "SERVATUS.toml"
     path.write_text(contents)
-
     with pytest.raises(ConfigurationError):
         Profile.load(path)
 
 
-def test_profile_validates_malformed_unselected_profile(tmp_path: Path) -> None:
+def test_profile_defers_unselected_semantics(tmp_path: Path) -> None:
     path = tmp_path / "SERVATUS.toml"
-    path.write_text(profile_text() + "\n[profiles.broken]\nvalue = 1\n")
-
-    with pytest.raises(ConfigurationError, match="broken"):
-        Profile.load(path, "cpu")
+    path.write_text(
+        profile_text(second=True).replace(
+            'profiles.alias.target]\nhost = "login.example.edu"',
+            'profiles.alias.target]\nhost = "invalid host"',
+        )
+    )
+    assert Profile.load(path).label == "cpu"
+    with pytest.raises(ConfigurationError):
+        Profile.load(path, "alias")
 
 
 def test_profile_missing_document_and_explicit_label_fail_directly(tmp_path: Path) -> None:
@@ -138,530 +126,185 @@ def test_profile_missing_document_and_explicit_label_fail_directly(tmp_path: Pat
         Profile.load(path, "missing")
 
 
-def observations(state: AllocationState):
-    def observe(
-        _target: SlurmTarget, queries: tuple[_slurm._AttemptQuery, ...]
-    ) -> tuple[_slurm.SchedulerObservation, ...]:
-        raw = None if state is AllocationState.UNKNOWN else state.value
-        return tuple(
-            _slurm.SchedulerObservation(state, raw, raw, None, None, None, None)
-            for _query in queries
-        )
-
-    return observe
-
-
-def accept(
-    monkeypatch: pytest.MonkeyPatch,
-    campaign: Campaign,
-    *,
-    selected_profile: Profile | None = None,
-) -> None:
-    monkeypatch.setattr(
-        _slurm,
-        "_run_ssh",
-        lambda *_args, **_kwargs: _slurm.Result(0, b"42;alpha\n", b""),
-    )
-    campaign.submit(
-        campaign.plan(
-            selected_profile or profile(),
-            view=campaign.inspect(scheduler=False),
+@pytest.mark.parametrize("section", ["target", "resources"])
+def test_unknown_unselected_keys_stay_errors(tmp_path: Path, section: str) -> None:
+    path = tmp_path / "SERVATUS.toml"
+    path.write_text(
+        profile_text(second=True).replace(
+            f"[profiles.alias.{section}]", f"[profiles.alias.{section}]\nmisspelled = 1"
         )
     )
+    with pytest.raises(ConfigurationError, match="unknown"):
+        Profile.load(path)
 
 
-@pytest.mark.parametrize("result", [None, False])
-def test_never_accepted_missing_or_unobserved_tasks_are_selected(
-    tmp_path: Path, result: bool | None
-) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    view = (
-        campaign.inspect(scheduler=False) if result is None else campaign.inspect(lambda _: result)
-    )
-
-    plan = campaign.plan(profile(), view=view)
-
-    assert plan.selected_task_keys == ("task-0",)
-    assert plan.excluded_task_keys == ()
-
-
-def test_valid_results_are_always_excluded_and_retry_is_rejected(tmp_path: Path) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    view = campaign.inspect(lambda _: True, scheduler=False)
-
-    assert campaign.plan(profile(), view=view).selected_task_keys == ()
-    with pytest.raises(PlanError, match="valid"):
-        campaign.plan(profile(), view=view, retry={"task-0"})
-
-
-@pytest.mark.parametrize("state", [AllocationState.QUEUED, AllocationState.RUNNING])
-def test_active_accepted_work_is_withheld_and_cannot_retry(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    state: AllocationState,
-) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    accept(monkeypatch, campaign)
-    monkeypatch.setattr(_slurm, "query_attempts", observations(state))
-    view = campaign.inspect()
-
-    assert campaign.plan(profile(), view=view).selected_task_keys == ()
-    with pytest.raises(PlanError, match="active"):
-        campaign.plan(profile(), view=view, retry={"task-0"})
-
-
-@pytest.mark.parametrize(
-    "state",
-    [AllocationState.SUCCEEDED, AllocationState.FAILED, AllocationState.CANCELLED],
-)
-def test_terminal_accepted_work_requires_explicit_retry(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    state: AllocationState,
-) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    accept(monkeypatch, campaign)
-    monkeypatch.setattr(_slurm, "query_attempts", observations(state))
-    view = campaign.inspect()
-
-    assert campaign.plan(profile(), view=view).selected_task_keys == ()
-    assert campaign.plan(profile(), view=view, retry={"task-0"}).selected_task_keys == ("task-0",)
-
-
-def test_unknown_retry_requires_recorded_duplicate_risk_warning(
+def test_saved_plan_roundtrip_requires_no_observation_and_retains_reprobe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = tmp_path / "campaign"
-    campaign = Campaign.open(path, tasks(1))
-    accept(monkeypatch, campaign)
-    monkeypatch.setattr(_slurm, "query_attempts", observations(AllocationState.UNKNOWN))
-    view = campaign.inspect()
+    from test_campaign import profile, tasks
 
-    with pytest.raises(PlanError, match="duplicate-risk"):
-        campaign.plan(profile(), view=view, retry={"task-0"})
-    plan = campaign.plan(
-        profile(),
-        view=view,
-        retry={"task-0"},
-        allow_duplicate_risk={"task-0"},
-    )
-    assert plan.duplicate_risk_task_keys == ("task-0",)
-    assert "duplicate execution risk" in plan.warnings[0]
-    assert "warnings" not in plan_document(plan)
+    from servatus import Campaign, PlanError, _slurm, plan_document, restore_plan
 
-    monkeypatch.setattr(
-        _slurm,
-        "_run_ssh",
-        lambda *_args, **_kwargs: _slurm.Result(0, b"43;alpha\n", b""),
-    )
-    campaign.submit(plan)
-    state = json.loads((path / "campaign.json").read_text())
-    assert state["attempts"][-1]["duplicate_risk_task_keys"] == ["task-0"]
+    campaign = Campaign.create(tmp_path / "campaign", tasks(3))
+    plan = campaign.plan(profile(), lambda task: task.key == "task-0")
+    document = json.loads(json.dumps(plan_document(plan)))
 
+    def unexpected(*_args):
+        raise AssertionError("restoration must remain local")
 
-def test_any_older_active_or_unknown_attempt_governs_retry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    accept(monkeypatch, campaign)
-    monkeypatch.setattr(_slurm, "query_attempts", observations(AllocationState.SUCCEEDED))
-    retry = campaign.plan(profile(), view=campaign.inspect(), retry={"task-0"})
-    monkeypatch.setattr(
-        _slurm,
-        "_run_ssh",
-        lambda *_args, **_kwargs: _slurm.Result(0, b"43;alpha\n", b""),
-    )
-    campaign.submit(retry)
+    monkeypatch.setattr(_slurm, "query_attempts", unexpected)
+    restored = restore_plan(campaign, document)
+    assert restored == plan and restored.probe_required
+    with pytest.raises(PlanError, match="probe"):
+        campaign.submit(restored)
+    visited = []
 
-    def mixed(
-        _target: SlurmTarget, queries: tuple[_slurm._AttemptQuery, ...]
-    ) -> tuple[_slurm.SchedulerObservation, ...]:
-        states = (AllocationState.QUEUED, AllocationState.SUCCEEDED)
-        return tuple(
-            _slurm.SchedulerObservation(state, state.value, state.value, None, None, None, None)
-            for state, _query in zip(states, queries, strict=True)
-        )
+    def probe(task):
+        visited.append(task.key)
+        return True
 
-    monkeypatch.setattr(_slurm, "query_attempts", mixed)
-    with pytest.raises(PlanError, match="active"):
-        campaign.plan(profile(), view=campaign.inspect(), retry={"task-0"})
-
-    def older_unknown(
-        _target: SlurmTarget, queries: tuple[_slurm._AttemptQuery, ...]
-    ) -> tuple[_slurm.SchedulerObservation, ...]:
-        states = (AllocationState.UNKNOWN, AllocationState.SUCCEEDED)
-        return tuple(
-            _slurm.SchedulerObservation(state, None, None, None, None, None, None)
-            for state, _query in zip(states, queries, strict=True)
-        )
-
-    monkeypatch.setattr(_slurm, "query_attempts", older_unknown)
-    view = campaign.inspect()
-    with pytest.raises(PlanError, match="duplicate-risk"):
-        campaign.plan(profile(), view=view, retry={"task-0"})
-    assert campaign.plan(
-        profile(),
-        view=view,
-        retry={"task-0"},
-        allow_duplicate_risk={"task-0"},
-    ).selected_task_keys == ("task-0",)
-
-
-def test_ambiguous_allocation_blocks_only_affected_tasks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(2))
-    first = campaign.plan(
-        profile(target(max_tasks_per_allocation=1)),
-        view=campaign.inspect(scheduler=False),
-        tasks_per_allocation=1,
-    )
-    monkeypatch.setattr(
-        _slurm,
-        "_run_ssh",
-        lambda *_args, **_kwargs: _slurm.Result(1, b"", b"lost"),
-    )
-    with pytest.raises(AmbiguousSubmission):
-        campaign.submit(first)
-
-    view = campaign.inspect(scheduler=False)
-    plan = campaign.plan(
-        profile(target(max_tasks_per_allocation=1)),
-        view=view,
-        tasks_per_allocation=1,
-    )
-
-    assert plan.selected_task_keys == ("task-1",)
-    with pytest.raises(PlanError, match="ambiguous"):
-        campaign.plan(
-            profile(target(max_tasks_per_allocation=1)),
-            view=view,
-            retry={"task-0"},
-        )
-
-    contacts = 0
-
-    def accept_unaffected(*_args: object, **_kwargs: object) -> _slurm.Result:
-        nonlocal contacts
-        contacts += 1
-        return _slurm.Result(0, b"43;alpha\n", b"")
-
-    monkeypatch.setattr(_slurm, "_run_ssh", accept_unaffected)
-    receipts = campaign.submit(plan)
-
-    assert contacts == 1
-    assert len(receipts) == 1
-    assert receipts[0].task_keys == ("task-1",)
-
-
-@pytest.mark.parametrize("resolution", ["resolve", "reconcile"])
-def test_delayed_ambiguous_outcome_survives_disjoint_submission_and_reopen(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    resolution: str,
-) -> None:
-    path = tmp_path / "campaign"
-    campaign = Campaign.open(path, tasks(2))
-    selected_profile = profile(target(max_tasks_per_allocation=1))
-    first = campaign.plan(
-        selected_profile,
-        view=campaign.inspect(scheduler=False),
-        tasks_per_allocation=1,
-    )
-    monkeypatch.setattr(
-        _slurm,
-        "_run_ssh",
-        lambda *_args, **_kwargs: _slurm.Result(1, b"", b"lost"),
-    )
-    with pytest.raises(AmbiguousSubmission):
-        campaign.submit(first)
-    unresolved = campaign.inspect(scheduler=False).attempts[0].allocation_id
-
-    disjoint = campaign.plan(
-        selected_profile,
-        view=campaign.inspect(scheduler=False),
-        tasks_per_allocation=1,
-    )
-    monkeypatch.setattr(
-        _slurm,
-        "_run_ssh",
-        lambda *_args, **_kwargs: _slurm.Result(0, b"43;alpha\n", b""),
-    )
-    campaign.submit(disjoint)
-
-    if resolution == "resolve":
-        campaign.resolve(unresolved, job_id=None)
-        expected = (AcceptanceState.NOT_SUBMITTED, AcceptanceState.ACCEPTED)
-    else:
-        monkeypatch.setattr(
-            _slurm,
-            "query_identity",
-            lambda *_args, **_kwargs: _slurm.IdentityMatch(42, "alpha"),
-        )
-        campaign.reconcile(unresolved)
-        expected = (AcceptanceState.ACCEPTED, AcceptanceState.ACCEPTED)
-
-    reopened = Campaign.load(path)
-    assert tuple(item.acceptance for item in reopened.inspect(scheduler=False).attempts) == expected
-
-
-def test_accepted_campaign_requires_scheduler_observed_view(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    accept(monkeypatch, campaign)
-
-    with pytest.raises(PlanError, match="scheduler-observed"):
-        campaign.plan(profile(), view=campaign.inspect(scheduler=False))
-
-
-def test_same_value_alias_is_compatible_and_changed_values_fail_lineage(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    accept(monkeypatch, campaign, selected_profile=profile(label="first"))
-    monkeypatch.setattr(_slurm, "query_attempts", observations(AllocationState.SUCCEEDED))
-    view = campaign.inspect()
-
-    alias = campaign.plan(profile(label="alias"), view=view, retry={"task-0"})
-    assert alias.profile.label == "alias"
-    with pytest.raises(PlanError, match="resource semantics"):
-        campaign.plan(
-            profile(resource_value=resources(cpus_per_task=16), label="first"),
-            view=view,
-            retry={"task-0"},
-        )
-
-
-def test_foreign_and_stale_views_fail_before_external_contact(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    first = Campaign.open(tmp_path / "first", tasks(1))
-    second = Campaign.open(tmp_path / "second", tasks(1))
-    foreign = first.inspect(scheduler=False)
-    stale = second.inspect(scheduler=False)
-    second.seal()
-    contacted = False
-
-    def forbidden(*_args: object, **_kwargs: object) -> object:
-        nonlocal contacted
-        contacted = True
-        raise AssertionError
-
-    monkeypatch.setattr(_slurm, "_run_ssh", forbidden)
-    with pytest.raises(PlanError, match="another campaign"):
-        second.plan(profile(), view=foreign)
-    with pytest.raises(PlanError, match="stale"):
-        second.plan(profile(), view=stale)
-    assert not contacted
-
-
-def test_plan_round_trip_restores_exact_evidence_without_probe_or_scheduler(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    view = campaign.inspect(lambda _: False, scheduler=False)
-    plan = campaign.plan(profile(label="lane"), view=view)
-    document = plan_document(plan)
-
-    monkeypatch.setattr(
-        Campaign,
-        "inspect",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("probe reran")),
-    )
-    restored = restore_plan(campaign, copy.deepcopy(document))
-
-    assert plan_document(restored) == document
-    assert restored.profile.label == "lane"
-    assert restored.selected_task_keys == ("task-0",)
-
-
-def test_plan_codec_rejects_changed_frozen_view(tmp_path: Path) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    document = plan_document(campaign.plan(profile(), view=campaign.inspect(scheduler=False)))
-    changed = copy.deepcopy(document)
-    changed["view"]["tasks"][0]["result"] = "VALID"
-
-    with pytest.raises(PlanError):
-        restore_plan(campaign, changed)
-
-    malformed_number = copy.deepcopy(document)
-    malformed_number["view"]["revision"] = True
-    with pytest.raises(PlanError):
-        restore_plan(campaign, malformed_number)
-
-
-def test_restored_plan_label_is_retained_by_submitted_attempt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    path = tmp_path / "campaign"
-    campaign = Campaign.open(path, tasks(1))
-    label = "cpu lane 🚀\t"
-    plan = campaign.plan(profile(label=label), view=campaign.inspect(scheduler=False))
-    restored = restore_plan(campaign, plan_document(plan))
-    contacted: list[tuple[tuple[str, ...], bytes]] = []
-
-    def accept_label(_target: SlurmTarget, argv: tuple[str, ...], script: bytes) -> _slurm.Result:
-        contacted.append((argv, script))
-        return _slurm.Result(0, b"42\n", b"")
-
-    monkeypatch.setattr(
-        _slurm,
-        "_run_ssh",
-        accept_label,
-    )
-
-    campaign.submit(restored)
-
-    state = json.loads((path / "campaign.json").read_text())
-    assert state["attempts"][0]["profile_label"] == label
-    assert label not in " ".join(contacted[0][0])
-    assert label.encode() not in contacted[0][1]
-
-
-def test_result_aware_submit_reprobes_selected_tasks_and_aborts_changed_result(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    plan = campaign.plan(profile(), view=campaign.inspect(lambda _: False, scheduler=False))
-    contacted = False
-
-    def forbidden(*_args: object, **_kwargs: object) -> object:
-        nonlocal contacted
-        contacted = True
-        raise AssertionError
-
-    monkeypatch.setattr(_slurm, "_run_ssh", forbidden)
-    with pytest.raises(PlanError, match="result probe"):
-        campaign.submit(plan)
     with pytest.raises(PlanError, match="ineligible"):
-        campaign.submit(plan, probe=lambda _: True)
-    assert not contacted
+        campaign.submit(restored, probe=probe)
+    assert visited == ["task-1", "task-2"]
+    assert campaign.inspect(scheduler=False).attempts == ()
 
 
-def test_scheduler_only_submit_needs_no_probe(
+def test_reprobe_and_scheduler_refresh_then_atomic_revision_claim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    plan = campaign.plan(profile(), view=campaign.inspect(scheduler=False))
-    monkeypatch.setattr(
-        _slurm,
-        "_run_ssh",
-        lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
-    )
+    from test_campaign import profile, tasks
 
-    assert campaign.submit(plan)[0].job_id == 42
+    from servatus import Campaign, PlanError, _slurm
 
+    campaign = Campaign.create(tmp_path / "campaign", tasks(1), appendable=True)
+    plan = campaign.plan(profile(), lambda _: False)
+    contacted = []
+    monkeypatch.setattr(_slurm, "_run_ssh", lambda *_: contacted.append(True))
 
-def test_submit_rechecks_each_allocation_before_its_sbatch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(2))
-    planning_probe_calls: list[str] = []
-
-    def planning_probe(task: Task) -> bool:
-        planning_probe_calls.append(task.key)
+    def probe(_task):
+        campaign.append(tasks(2)[1:])
         return False
 
-    view = campaign.inspect(planning_probe, scheduler=False)
-    plan = campaign.plan(
-        profile(target(max_tasks_per_allocation=1)),
-        view=view,
-        tasks_per_allocation=1,
-    )
-    events: list[str] = []
-
-    def submit_probe(task: Task) -> bool:
-        events.append(f"probe:{task.key}")
-        return False
-
-    def submit(_target: object, _argv: object, _script: object) -> _slurm.Result:
-        events.append("sbatch")
-        return _slurm.Result(0, f"{40 + events.count('sbatch')}\n".encode(), b"")
-
-    monkeypatch.setattr(_slurm, "_run_ssh", submit)
-    campaign.submit(plan, probe=submit_probe)
-
-    assert planning_probe_calls == ["task-0", "task-1"]
-    assert events == ["probe:task-0", "sbatch", "probe:task-1", "sbatch"]
-
-
-def test_submit_does_not_reprobe_valid_excluded_tasks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(2))
-    view = campaign.inspect(lambda task: task.key == "task-0", scheduler=False)
-    plan = campaign.plan(profile(), view=view)
-    probed: list[str] = []
-
-    def probe(task: Task) -> bool:
-        probed.append(task.key)
-        return False
-
-    monkeypatch.setattr(
-        _slurm,
-        "_run_ssh",
-        lambda *_args, **_kwargs: _slurm.Result(0, b"42\n", b""),
-    )
-    campaign.submit(plan, probe=probe)
-
-    assert plan.excluded_task_keys == ("task-0",)
-    assert probed == ["task-1"]
-
-
-def test_submit_scheduler_refresh_aborts_changed_retry_eligibility(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    accept(monkeypatch, campaign)
-    monkeypatch.setattr(_slurm, "query_attempts", observations(AllocationState.SUCCEEDED))
-    plan = campaign.plan(profile(), view=campaign.inspect(), retry={"task-0"})
-    monkeypatch.setattr(_slurm, "query_attempts", observations(AllocationState.RUNNING))
-    contacted = False
-
-    def forbidden(*_args: object, **_kwargs: object) -> object:
-        nonlocal contacted
-        contacted = True
-        raise AssertionError
-
-    monkeypatch.setattr(_slurm, "_run_ssh", forbidden)
-
-    with pytest.raises(PlanError, match="active"):
-        campaign.submit(plan)
-    assert not contacted
-
-
-def test_submit_reprobes_then_refreshes_scheduler_and_rereads_before_sbatch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
-    accept(monkeypatch, campaign)
-    monkeypatch.setattr(_slurm, "query_attempts", observations(AllocationState.SUCCEEDED))
-    plan = campaign.plan(
-        profile(),
-        view=campaign.inspect(lambda _: False),
-        retry={"task-0"},
-    )
-    events: list[str] = []
-
-    def probe(_task: Task) -> bool:
-        events.append("probe")
-        return False
-
-    def mutate_during_refresh(
-        _target: SlurmTarget, queries: tuple[_slurm._AttemptQuery, ...]
-    ) -> tuple[_slurm.SchedulerObservation, ...]:
-        events.append("scheduler")
-        campaign.seal()
-        return observations(AllocationState.SUCCEEDED)(_target, queries)
-
-    def forbidden(*_args: object, **_kwargs: object) -> object:
-        events.append("sbatch")
-        raise AssertionError
-
-    monkeypatch.setattr(_slurm, "query_attempts", mutate_during_refresh)
-    monkeypatch.setattr(_slurm, "_run_ssh", forbidden)
-
-    with pytest.raises(PlanError, match="changed during submission freshness"):
+    with pytest.raises(PlanError, match="changed"):
         campaign.submit(plan, probe=probe)
-    assert events == ["probe", "scheduler"]
+    assert contacted == []
+    assert not campaign.inspect(scheduler=False).attempts
+
+
+def test_reprobe_change_after_first_acceptance_returns_unattempted_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from test_campaign import profile, tasks
+
+    from servatus import Campaign, _slurm
+
+    campaign = Campaign.create(tmp_path / "campaign", tasks(2))
+    plan = campaign.plan(profile(), lambda _: False, tasks_per_allocation=1)
+    monkeypatch.setattr(_slurm, "_run_ssh", lambda *_: _slurm.Result(0, b"42\n", b""))
+    result = campaign.submit(plan, probe=lambda task: task.key == "task-1")
+    assert len(result.receipts) == 1
+    assert result.unresolved == () and result.stop_reason
+    assert result.unattempted == plan.allocations[1:]
+
+
+@pytest.mark.parametrize("retained", [False, True])
+def test_all_prior_attempts_govern_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retained: bool
+) -> None:
+    from test_campaign import profile, tasks
+
+    from servatus import Campaign, PlanError, _slurm
+
+    campaign = Campaign.create(tmp_path / "campaign", tasks(1))
+    monkeypatch.setattr(_slurm, "_run_ssh", lambda *_: _slurm.Result(0, b"42\n", b""))
+    first = campaign.submit(campaign.plan(profile())).receipts[0]
+
+    def observe(_target, queries):
+        return tuple(
+            _slurm.SchedulerObservation(
+                _slurm.AllocationState.UNKNOWN
+                if query.allocation_id == first.allocation_id
+                else _slurm.AllocationState.SUCCEEDED,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                retained,
+            )
+            for query in queries
+        )
+
+    monkeypatch.setattr(_slurm, "query_attempts", observe)
+    if retained:
+        with pytest.raises(PlanError, match="active"):
+            campaign.plan(profile(), retry=("task-0",), allow_duplicate_risk=("task-0",))
+        assert not campaign.inspect().quiescent
+    else:
+        with pytest.raises(PlanError, match="acknowledgement"):
+            campaign.plan(profile(), retry=("task-0",))
+        campaign.submit(
+            campaign.plan(profile(), retry=("task-0",), allow_duplicate_risk=("task-0",))
+        )
+        with pytest.raises(PlanError, match="acknowledgement"):
+            campaign.plan(profile(), retry=("task-0",))
+        assert not campaign.inspect().quiescent
+
+
+@pytest.mark.parametrize("changed", ["digest", "revision", "selected_task_keys", "probe_required"])
+def test_external_plan_rejects_changed_decision(tmp_path: Path, changed: str) -> None:
+    from test_campaign import profile, tasks
+
+    from servatus import Campaign, PlanError, plan_document, restore_plan
+
+    campaign = Campaign.create(tmp_path / "campaign", tasks(1))
+    document = plan_document(campaign.plan(profile()))
+    document[changed] = {
+        "digest": "a" * 64,
+        "revision": True,
+        "selected_task_keys": ["foreign"],
+        "probe_required": "yes",
+    }[changed]
+    with pytest.raises(PlanError):
+        restore_plan(campaign, document)
+
+
+def test_task_key_contract_roundtrips_and_rejects_nul(tmp_path: Path) -> None:
+    from test_campaign import profile
+
+    from servatus import Campaign, Task, plan_document, restore_plan
+
+    campaign = Campaign.create(tmp_path / "campaign", (Task("line\n計算", (), b"\0\xff"),))
+    plan = campaign.plan(profile())
+    assert restore_plan(campaign, plan_document(plan)) == plan
+    with pytest.raises(ConfigurationError, match="NUL"):
+        Task("bad\0key", (), b"")
+
+
+@pytest.mark.parametrize("state", ["SUCCEEDED", "FAILED", "CANCELLED"])
+def test_terminal_work_requires_explicit_retry_and_valid_results_are_excluded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    from test_campaign import profile, tasks
+
+    from servatus import Campaign, PlanError, _slurm
+
+    campaign = Campaign.create(tmp_path / "campaign", tasks(1))
+    monkeypatch.setattr(_slurm, "_run_ssh", lambda *_: _slurm.Result(0, b"42\n", b""))
+    campaign.submit(campaign.plan(profile()))
+    monkeypatch.setattr(
+        _slurm,
+        "query_attempts",
+        lambda _route, queries: tuple(
+            _slurm.SchedulerObservation(
+                _slurm.AllocationState(state), None, None, None, None, None, None
+            )
+            for _ in queries
+        ),
+    )
+    assert campaign.plan(profile()).excluded_task_keys == ("task-0",)
+    assert campaign.plan(profile(), retry=("task-0",)).selected_task_keys == ("task-0",)
+    assert campaign.plan(profile(), lambda _: True).excluded_task_keys == ("task-0",)
+    with pytest.raises(PlanError, match="valid"):
+        campaign.plan(profile(), lambda _: True, retry=("task-0",))

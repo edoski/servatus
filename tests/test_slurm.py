@@ -10,7 +10,7 @@ from servatus import Campaign, JobReceipt, ReconciliationError, ResourceRequest,
 
 
 def script_for(tmp_path: Path, request: ResourceRequest) -> str:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(1))
+    campaign = Campaign.create(tmp_path / "campaign", tasks(1), appendable=True)
     return (
         campaign.plan(
             profile(
@@ -19,10 +19,9 @@ def script_for(tmp_path: Path, request: ResourceRequest) -> str:
                     max_gpus_per_allocation=request.gpus_per_task,
                 ),
                 request,
-            ),
-            view=campaign.inspect(scheduler=False),
+            )
         )
-        ._allocations[0]
+        .allocations[0]
         .script.decode()
     )
 
@@ -46,23 +45,20 @@ def test_two_gpu_script_starts_one_exact_process(tmp_path: Path) -> None:
 
 
 def test_multitask_script_starts_all_siblings_before_waiting(tmp_path: Path) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(4))
-    plan = campaign.plan(profile(), view=campaign.inspect(scheduler=False))
-    script = plan._allocations[0].script.decode()
+    campaign = Campaign.create(tmp_path / "campaign", tasks(4), appendable=True)
+    plan = campaign.plan(profile())
+    script = plan.allocations[0].script.decode()
     assert script.count("/opt/slurm/bin/srun --exclusive") == 4
     assert script.index("pid_4=$!") < script.index('wait "$pid_1"')
     assert 'exit "$status"' in script
 
 
-def test_job_id_logs_preserve_zero_based_combined_allocation_and_slot_shape(
-    tmp_path: Path,
-) -> None:
-    campaign = Campaign.open(tmp_path / "campaign", tasks(2))
-    plan = campaign.plan(profile(), view=campaign.inspect(scheduler=False))
-    argv = plan._allocations[0].argv
-    allocation_id = plan._allocations[0].allocation_id
-    script = plan._allocations[0].script.decode()
-
+def test_job_id_logs_preserve_zero_based_combined_allocation_and_slot_shape(tmp_path: Path) -> None:
+    campaign = Campaign.create(tmp_path / "campaign", tasks(2), appendable=True)
+    plan = campaign.plan(profile())
+    argv = plan.allocations[0].argv
+    allocation_id = plan.allocations[0].allocation_id
+    script = plan.allocations[0].script.decode()
     assert f"--output=/cluster/logs/project/{allocation_id}-%j.out" in argv
     assert f"--error=/cluster/logs/project/{allocation_id}-%j.out" in argv
     for slot in range(2):
@@ -75,16 +71,16 @@ def test_job_id_logs_preserve_zero_based_combined_allocation_and_slot_shape(
 
 def test_binary_payload_is_embedded_before_acceptance_without_raw_bytes(tmp_path: Path) -> None:
     payload = b"line one\n\x00\xffline two"
-    campaign = Campaign.open(tmp_path / "campaign", (Task("binary", ("run",), payload),))
-    plan = campaign.plan(profile(), view=campaign.inspect(scheduler=False))
-    script = plan._allocations[0].script
+    campaign = Campaign.create(
+        tmp_path / "campaign", (Task("binary", ("run",), payload),), appendable=True
+    )
+    plan = campaign.plan(profile())
+    script = plan.allocations[0].script
     assert base64.b64encode(payload) in script
     assert payload not in script
 
 
-def test_local_ssh_environment_drops_scheduler_overrides(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_local_ssh_environment_drops_scheduler_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SBATCH_PARTITION", "hostile")
     monkeypatch.setenv("SLURM_CONF", "/hostile")
     monkeypatch.setenv("UNRELATED", "hostile")
@@ -105,8 +101,7 @@ def test_local_ssh_environment_drops_scheduler_overrides(
 
 
 @pytest.mark.parametrize(
-    ("output", "expected"),
-    [(b"42\n", (42, None)), (b"42;cluster-a\n", (42, "cluster-a"))],
+    ("output", "expected"), [(b"42\n", (42, None)), (b"42;cluster-a\n", (42, "cluster-a"))]
 )
 def test_parse_receipt(output: bytes, expected: tuple[int, str | None]) -> None:
     assert _slurm.parse_receipt(output) == expected
@@ -123,9 +118,7 @@ def test_parse_receipt_rejects_unproved_identity(output: bytes) -> None:
         _slurm.parse_receipt(output)
 
 
-def test_identity_query_accepts_absent_accounting_comment(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_identity_query_accepts_absent_accounting_comment(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = 0
 
     def query(*args: object, **kwargs: object) -> _slurm.Result:
@@ -150,26 +143,14 @@ def test_identity_query_accepts_absent_accounting_comment(
     ("squeue", "sacct"),
     [
         (b"", b""),
-        (
-            b"42|servatus-abc|servatus-abc\n",
-            b"43|servatus-abc|servatus-abc|alpha\n",
-        ),
+        (b"42|servatus-abc|servatus-abc\n", b"43|servatus-abc|servatus-abc|alpha\n"),
         (b"42|wrong|wrong\n", b""),
-        (
-            b"42|servatus-abc|servatus-abc\n",
-            b"42|servatus-abc|wrong-identity|alpha\n",
-        ),
+        (b"42|servatus-abc|servatus-abc\n", b"42|servatus-abc|wrong-identity|alpha\n"),
         (b"42|servatus-abc|servatus-abc\n43|wrong|wrong\n", b""),
         (b"42|servatus-abc|servatus-abc\nmalformed\n", b""),
         (b"42|servatus-abc|servatus-abc\n0|servatus-abc|servatus-abc\n", b""),
-        (
-            b"42|servatus-abc|servatus-abc\n",
-            b"42|servatus-abc||alpha\n43|wrong||alpha\n",
-        ),
-        (
-            b"42|servatus-abc|servatus-abc\n",
-            b"42|servatus-abc||alpha\nmalformed\n",
-        ),
+        (b"42|servatus-abc|servatus-abc\n", b"42|servatus-abc||alpha\n43|wrong||alpha\n"),
+        (b"42|servatus-abc|servatus-abc\n", b"42|servatus-abc||alpha\nmalformed\n"),
         (b"42| servatus-abc |servatus-abc\n", b""),
         (b"42|servatus-abc| servatus-abc \n", b""),
         (b"", b"42|servatus-abc| N/A |alpha\n"),
@@ -181,9 +162,7 @@ def test_identity_query_leaves_unproved_results_ambiguous(
 ) -> None:
     outputs = iter((squeue, sacct))
     monkeypatch.setattr(
-        _slurm,
-        "_run_ssh",
-        lambda *args, **kwargs: _slurm.Result(0, next(outputs), b""),
+        _slurm, "_run_ssh", lambda *args, **kwargs: _slurm.Result(0, next(outputs), b"")
     )
     with pytest.raises(ReconciliationError):
         _slurm.query_identity(

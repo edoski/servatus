@@ -3,45 +3,46 @@
 Servatus uses a small generic vocabulary:
 
 - **Task:** one stable opaque key, argument vector, and byte payload.
-- **Campaign:** one ordered Task roster and its durable submission history; `open` authors an exact
-  roster or ordered suffix while the roster is open, `seal` ends authoring irreversibly, and `load`
-  reopens existing state without authoring it.
-- **Roster phase:** `OPEN` permits exact ordered suffixes and execution; `SEALED` permits execution
-  but no roster change.
-- **Resource request:** one homogeneous per-Task CPU, MiB, whole-GPU, and wall-time requirement.
-- **Target:** one concrete SSH/Slurm/Apptainer route with conservative request ceilings.
-- **Profile:** one immutable nonbinding label plus a complete Target and Resource request; exact
-  resolved values, not the label, own Campaign compatibility.
-- **Plan:** one immutable decision over an exact Campaign view, including roster and attempt
-  projection, observations, selection, retry and duplicate-risk choices, Profile, and allocations;
-  its canonical document restores without external observation and must regenerate byte-for-byte.
+- **Campaign:** one ordered Task roster and its durable Attempt history. `create` authors a fixed
+  roster, or an appendable one when requested; `load` reopens it; `append` registers only new Tasks;
+  and `seal` ends authoring irreversibly.
+- **Resource request:** one homogeneous per-Task CPU, MiB, whole-GPU, and wall-time requirement for
+  one plan. Each Attempt retains the request used for its submission.
+- **Target:** one concrete SSH/Slurm/Apptainer route with conservative request ceilings. Every
+  Attempt retains its original route for observation, recovery, and diagnostics.
+- **Profile:** one nonbinding label plus a complete Target and Resource request.
+- **Plan:** one compact reviewed decision bound to a Campaign revision: execution configuration,
+  selected allocations, retry choices, result-probe requirement, and an integrity digest.
+- **Excluded task:** work withheld by the eligibility policy.
+- **Deferred task:** eligible work beyond the plan's bounded allocation batch.
 - **Allocation:** one single-node Slurm job containing concurrent exact Task steps.
-- **Attempt:** one durable allocation record written before possible scheduler acceptance; it owns
-  ordered Task, retry, and duplicate-risk keys, Campaign revision, selected Profile label, lineage,
-  plan and script digests, exact command, allocation totals, query window, and one unresolved,
-  accepted, or not-submitted outcome whose revision preserves mutation chronology.
-- **Intent:** the durably synced unresolved Attempt written before possible scheduler acceptance.
-- **Receipt:** a positive Slurm job identity proving scheduler acceptance, not completion; its Task
-  keys come from the immutable intent.
-- **Result probe:** one ephemeral synchronous caller function that validates the canonical result
-  for one opaque Task as valid, missing, or invalid without exposing its schema to Servatus.
-- **Allocation evidence:** one transient time-stamped scheduler observation normalized to queued,
-  running, succeeded, failed, cancelled, or unknown; an original accounting record anchors any
-  strictly later requeue incarnations, and its receipt remains owned by Attempt evidence.
-- **Campaign view:** one immutable revision-bound projection containing every Attempt, current Task
-  execution and result evidence, readiness, and quiescence without persisting observations.
-- **Operational record:** schema-versioned canonical JSON bytes projected from one exact Campaign
-  view and its durable Attempt lineage, with retry and attempt digests over the redacted immutable
-  choices and intent; redacted but identifying, read-only, and never automatically published.
-- **Log snapshot:** one transient time-stamped bounded binary suffix from the allocation or packed
-  Task log of one exact accepted Attempt; it is diagnostic evidence with no lifecycle authority.
+- **Attempt:** one durable allocation record with its exact execution configuration, Task keys,
+  retry choices, intent timestamp and revision, and unresolved, accepted, or
+  not-submitted outcome. Reconciliation windows derive from the timestamp; outcome revisions
+  preserve actual mutation chronology.
+- **Intent:** the synced unresolved Attempt recorded before scheduler contact.
+- **Receipt:** a positive Slurm job identity proving acceptance, not completion; its Task keys come
+  from the durable intent.
+- **Submit result:** structured receipts and unresolved or unattempted allocations from one reviewed
+  batch. A receipt observed but not durably recorded is distinguished from confirmed receipts.
+- **Result probe:** an ephemeral synchronous caller function that validates a canonical result for
+  one opaque Task without exposing the application schema to Servatus.
+- **Allocation evidence:** transient scheduler evidence normalized to queued, running, succeeded,
+  failed, cancelled, or unknown. Exact retained-work evidence blocks retry; anchored accounting
+  establishes terminal evidence and identifies later requeue incarnations.
+- **Campaign view:** one transient revision-bound projection of all Attempts, current Task
+  execution and result evidence, readiness, and quiescence. Planning collects its own observations.
+- **Operational record:** a redacted JSON diagnostic projection of Campaign identity, roster,
+  Attempt chronology, receipts, and normalized scheduler evidence. It is identifying,
+  nonauthoritative, and never automatically published.
+- **Log snapshot:** a transient bounded binary suffix from an accepted Attempt's allocation or Task
+  log. It has no lifecycle authority.
 - **Result readiness:** the sealed roster has valid immutable caller results for every Task.
 - **Quiescence:** scheduler evidence was requested, every accepted Attempt is proven terminal, and
-  no acceptance remains unresolved; it is independent from result readiness.
-- **Duplicate-risk acknowledgement:** one explicit recorded operator decision allowing retry when
-  accepted scheduler evidence is unknown; it never claims the older attempt stopped.
-- **Validation result:** one immutable, time-specific result from bounded Slurm `--test-only`
-  validation of an authoritative Campaign plan.
+  no acceptance remains unresolved. It is independent from result readiness.
+- **Duplicate-risk acknowledgement:** an explicit operator decision allowing retry when accepted
+  scheduler evidence is unknown. It never claims that earlier work stopped.
+- **Validation result:** time-specific bounded Slurm `--test-only` validation of a current plan.
 - **Ambiguous allocation:** an intent without a receipt or explicit operator resolution.
 - **Destination:** the application-owned canonical path. It is immutable once published.
 - **Workspace:** stable, identity-bound owner-only private state retained when resumable work fails;

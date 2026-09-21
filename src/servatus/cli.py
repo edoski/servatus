@@ -8,16 +8,15 @@ from typing import cast
 
 from ._campaign import (
     Campaign,
-    JobReceipt,
-    Profile,
-    Task,
-    campaign_view_document,
     plan_document,
     restore_plan,
     sensitive_script_document,
+    submit_document,
     validation_document,
 )
 from ._errors import ServatusError
+from ._model import JobReceipt, Profile, Task, decode_json
+from ._observation import campaign_view_document
 from ._workspace import publish_file
 
 
@@ -25,9 +24,15 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="servatus", description="Durable Slurm work campaigns")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    plan = commands.add_parser("plan", help="build an evidence-bound immutable plan")
-    plan.add_argument("tasks", type=Path)
-    plan.add_argument("--campaign", type=Path, required=True)
+    create = commands.add_parser("create", help="create a fixed or appendable campaign")
+    create.add_argument("campaign", type=Path)
+    create.add_argument("tasks", type=Path)
+    create.add_argument("--appendable", action="store_true")
+    append = commands.add_parser("append", help="append new tasks to an open roster")
+    append.add_argument("campaign", type=Path)
+    append.add_argument("tasks", type=Path)
+    plan = commands.add_parser("plan", help="review one bounded submission batch")
+    plan.add_argument("campaign", type=Path)
     plan.add_argument("--output", type=Path, required=True)
     plan.add_argument("--profile", metavar="NAME")
     plan.add_argument("--tasks-per-allocation", type=int)
@@ -127,8 +132,12 @@ def _load_tasks(path: Path) -> tuple[Task, ...]:
 
 def _read_json(path: Path) -> object:
     try:
-        return json.loads(path.read_bytes())
-    except (OSError, json.JSONDecodeError) as error:
+        with path.open("rb") as source:
+            data = source.read(256 * 1024 * 1024 + 1)
+        if len(data) > 256 * 1024 * 1024:
+            raise ValueError("plan document is too large")
+        return decode_json(data)
+    except (OSError, ValueError, UnicodeDecodeError) as error:
         raise ServatusError(f"cannot read plan document: {path}") from error
 
 
@@ -152,15 +161,21 @@ def _receipt_json(receipt: JobReceipt) -> dict[str, object]:
     }
 
 
-def _run(arguments: argparse.Namespace) -> None:
+def _run(arguments: argparse.Namespace) -> int:
     command = cast(str, arguments.command)
-    if command == "plan":
-        campaign = Campaign.open(arguments.campaign, _load_tasks(arguments.tasks))
+    if command == "create":
+        Campaign.create(
+            arguments.campaign, _load_tasks(arguments.tasks), appendable=arguments.appendable
+        )
+        print(json.dumps({"created": True, "sealed": not arguments.appendable}))
+    elif command == "append":
+        Campaign.load(arguments.campaign).append(_load_tasks(arguments.tasks))
+        print(json.dumps({"appended": True}))
+    elif command == "plan":
+        campaign = Campaign.load(arguments.campaign)
         profile = Profile.load(Path.cwd() / "SERVATUS.toml", name=arguments.profile)
-        view = campaign.inspect()
         plan = campaign.plan(
             profile,
-            view=view,
             retry=arguments.retry,
             allow_duplicate_risk=arguments.allow_duplicate_risk,
             tasks_per_allocation=arguments.tasks_per_allocation,
@@ -182,8 +197,9 @@ def _run(arguments: argparse.Namespace) -> None:
         print(json.dumps(validation_document(results), sort_keys=True))
     elif command == "submit":
         campaign = Campaign.load(arguments.campaign)
-        receipts = campaign.submit(restore_plan(campaign, _read_json(arguments.plan)))
-        print(json.dumps([_receipt_json(receipt) for receipt in receipts], sort_keys=True))
+        result = campaign.submit(restore_plan(campaign, _read_json(arguments.plan)))
+        print(json.dumps(submit_document(result), sort_keys=True))
+        return 1 if result.stop_reason else 0
     elif command == "seal":
         Campaign.load(arguments.campaign).seal()
         print(json.dumps({"sealed": True}, sort_keys=True))
@@ -210,12 +226,14 @@ def _run(arguments: argparse.Namespace) -> None:
         )
         print(json.dumps({"allocation_id": arguments.allocation_id, "resolved": True}))
 
+    return 0
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     try:
         arguments = parser.parse_args(argv)
-        _run(arguments)
+        return _run(arguments)
     except ServatusError as error:
         parser.error(str(error))
     return 0

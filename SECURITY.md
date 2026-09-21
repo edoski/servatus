@@ -63,19 +63,25 @@ GPU isolation. Batch payload files use owner-only temporary storage and are remo
 finish or a handled interruption. Uncatchable termination can leave scratch residue; compute-node
 scratch lifecycle remains site policy.
 
-Canonical plan files retain exact target/resource values, scheduler observations, job identities,
-and Task keys. They exclude Task arguments and stdin but are still private operational data. Store
+Plan files retain resolved target/resource values, allocation identities, Task keys, and explicit
+retry choices. They exclude Task arguments and stdin but remain private operational data. Store
 them owner-only; the CLI publishes with mode `0600` and refuses overwrite. Unknown accepted work is
-replayed only after a separate explicit duplicate-execution-risk acknowledgement.
+retried only after a separate explicit duplicate-execution-risk acknowledgement. Every historical
+Attempt keeps its original execution route; changing the next plan's profile does not erase earlier
+work or its safety constraints.
 
-Canonical operational records redact Task arguments, stdin, scripts, target values, raw scheduler
-details, result evidence, and application outputs. Redaction is not anonymity or a secrecy
-guarantee: Task keys, allocation identities, Profile labels, lineage digests, and Slurm Job IDs may
-identify work. Attempt and retry digests hash only the record's redacted immutable intent and retry
-choices, but remain identifying correlators. `Campaign.record()` returns bytes without publishing
-them. Keep records and the owner-only Campaign state private unless a separate review approves a
-narrower projection; Campaign state retains the complete Task arguments and stdin required for
-retry.
+Operational records redact Task arguments, stdin, scripts, target values, raw scheduler details,
+result evidence, and application outputs. Redaction is not anonymity or a secrecy guarantee: Task
+keys, allocation identities, Profile labels, and Slurm Job IDs may identify work. Records are
+nonauthoritative diagnostics. `Campaign.record()` returns bytes without publishing them. Keep
+records and owner-only Campaign state private unless a separate review approves a narrower
+projection; state retains complete Task arguments and stdin needed for retry.
+
+Submission syncs unresolved intent before possible scheduler acceptance. Local validation happens
+before that claim; a failure after launch does not prove rejection. A structured partial result
+distinguishes confirmed receipts, unresolved work, unattempted allocations, and a receipt observed
+but not durably recorded. Reconcile uncertain acceptance before retrying. Process interruption can
+propagate after durable intent and requires the same conservative recovery.
 
 Campaign log snapshots are sensitive, untrusted binary data. They may contain credentials,
 research data, terminal control sequences, or other hostile output. Never render them directly in

@@ -39,7 +39,7 @@ class ConfigurationError(CampaignError):
 
 
 class TaskConflict(CampaignError):
-    """A campaign was reopened with changed tasks."""
+    """Campaign state or roster authoring violates its contract."""
 
 
 class PlanError(CampaignError):
@@ -48,10 +48,6 @@ class PlanError(CampaignError):
 
 class SubmissionError(CampaignError):
     """Slurm did not return a valid acceptance receipt."""
-
-
-class AmbiguousSubmission(SubmissionError):
-    """Slurm acceptance cannot be proved safe to replay."""
 
 
 class ReconciliationError(CampaignError):

@@ -2,7 +2,7 @@
 
 Run resumable work through Slurm and atomically publish validated outputs.
 
-Servatus 0.8.0 combines durable publication with the native Slurm Campaign interface below.
+Servatus 0.9.0 provides a native Slurm campaign interface and durable POSIX publication.
 
 ```sh
 pip install servatus
@@ -10,45 +10,47 @@ pip install servatus
 
 ## Campaigns
 
-A Campaign owns an ordered roster of opaque tasks. While open, reopening with the exact sequence is
-idempotent and reopening with that exact prefix plus a nonempty suffix durably registers the new
-tasks. Sealing ends authoring irreversibly. Removing, reordering, or changing any registered task
-fails. Planning is local and deterministic. Submission records durable intent before contacting
-Slurm, records the acceptance afterward, and stops on an ambiguous missing receipt rather than
-risking duplicate work.
+A Campaign owns an ordered roster of opaque tasks and its durable execution history. Create a fixed
+roster, load its execution profile, and review a plan before submitting:
 
 ```python
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from servatus import Campaign, Profile, Task
 
-campaign = Campaign.open(
-    Path("state/training"),
+campaign = Campaign.create(
+    Path("training-state"),
     [Task("candidate-0", ("train", "--candidate", "0"), b'{"seed": 7}\n')],
 )
-campaign.seal()  # Seal fixed rosters; appendable campaigns may execute while still open.
 profile = Profile.load(Path("SERVATUS.toml"), name="research")
-view = campaign.inspect()  # Scheduler-only unless an application result probe is supplied.
-plan = campaign.plan(profile, view=view)
-# Review plan.allocations and plan.digest, then submit explicitly:
-# validation = campaign.validate(plan)  # Optional, time-specific Slurm --test-only check.
-receipts = campaign.submit(plan)
-# Later processes reopen the durable roster without resupplying Tasks:
-campaign = Campaign.load(Path("state/training"))
+plan = campaign.plan(profile)
+# Review plan.allocations and plan.digest before submitting.
+# validation = campaign.validate(plan)  # Optional Slurm --test-only check.
+result = campaign.submit(plan)
+# Later processes load the durable roster without resupplying Tasks:
+campaign = Campaign.load(Path("training-state"))
 ```
+
+Creation seals the roster by default. Use `appendable=True` when more work will arrive, then call
+`campaign.append(new_tasks)` with only the new suffix. Registered task keys, arguments, bytes, and
+order never change. `campaign.tasks` returns the immutable authored tuple. `campaign.seal()` ends
+authoring irreversibly and is idempotent. Append and seal advance the revision and invalidate older
+plans; an appendable campaign may execute before sealing.
 
 `ResourceRequest` has no defaults. CPU and MiB memory are positive, GPUs are a nonnegative whole
 count, and time uses canonical `[days-]hours:minutes:seconds`. One request applies to every Task in
-one Campaign. CPU-only, one-GPU, and one-process whole-multi-GPU tasks are supported. A project uses
-separate Campaigns for different resource shapes.
+a plan. A later plan may use a different target or resource request; each Attempt retains its
+original resolved configuration. The application owns whether changing an image or work root
+preserves Task meaning; storing a path does not pin its contents. CPU-only, one-GPU, and
+one-process whole-multi-GPU tasks are supported.
 
-The request retains the authored wall time for provenance. Plans and `sbatch` show Slurm's effective
-limit, rounded upward once to whole minutes. The same rounding is applied before comparing a request
-with the target ceiling; packed task count never multiplies wall time.
+The request retains authored wall time. Plans and `sbatch` use Slurm's effective limit, rounded
+upward once to whole minutes. The same rounding applies before comparing a request with the target
+ceiling; packed task count never multiplies wall time.
 
-`SERVATUS.toml` is one repository-owned document containing one or more complete named execution
-profiles. Its root contains exactly `profiles` and optional `default_profile`. Every profile is
-validated even when it is not selected, and an explicit name overrides the default.
+`SERVATUS.toml` contains named execution profiles and an optional `default_profile`. An explicit
+name overrides the default. Unknown keys and malformed TOML are rejected throughout the document;
+only the selected profile's resource and target values undergo semantic validation.
 
 ```toml
 default_profile = "research"
@@ -78,77 +80,66 @@ gpus_per_task = 1
 time_limit = "3-00:00:00"
 ```
 
-Unknown keys, counted GRES, relative remote paths, unsafe site tokens, controls, booleans used as
-integers, unlimited/zero resources, incomplete profiles, and conflicting GPU settings are rejected.
+The selected profile rejects counted GRES, relative remote paths, unsafe site tokens, controls,
+booleans used as integers, unlimited/zero resources, incomplete values, and conflicting GPU settings.
 Profiles do not inherit, merge, search parent directories, consult environment variables, or use a
-global store. The label is nonbinding provenance; exact resolved target and resource values own
-Campaign compatibility. A target is a user-side mistake guard, not cluster authorization. Every
-listed partition must fit one truthful conservative envelope.
+global store. Labels are provenance; resolved values govern execution. A target is a user-side
+mistake guard, not cluster authorization. Every listed partition must fit one truthful conservative
+envelope.
 
-The planner preserves authored order and uses the fewest balanced groups allowed by every declared
-ceiling. An allocation containing `n` Tasks requests exactly `n*C` CPUs, `n*M` MiB, and `n*G` GPUs;
-time remains `T`. A caller may lower packing with `tasks_per_allocation`, but a cap above feasible
-capacity is rejected rather than clamped. Servatus never rounds up to node capacity.
+The planner preserves authored order and uses balanced groups within every declared ceiling. An
+allocation containing `n` Tasks requests exactly `n*C` CPUs, `n*M` MiB, and `n*G` GPUs; time remains
+`T`. A caller may lower packing with `tasks_per_allocation`, but a cap above feasible capacity is
+rejected. Servatus never rounds requests up to node capacity. Each reviewed batch contains at most
+`max_allocations_per_submit` allocations. The plan exposes `deferred_task_keys` for eligible work
+beyond that batch and `excluded_task_keys` for work withheld by the eligibility policy. Neither is
+silently submitted.
 
-`Campaign.tasks` returns the immutable authored Task tuple. Append-only growth is allowed only while
-the roster is open and preserves target/resource lineage plus every accepted, ambiguous,
-not-submitted, and retry attempt. Append and seal each increment Campaign revision, so older plans
-become stale. Execution remains valid while open. `Campaign.seal()` is atomic and idempotent; a
-sealed Campaign accepts only an exact-roster reopen.
+`campaign.plan(profile, probe=None, retry=(), allow_duplicate_risk=(), tasks_per_allocation=None)`
+collects current evidence itself. Valid application results are excluded. Never-accepted missing or
+unobserved Tasks are eligible. Unresolved acceptance and active or held work block retry. Terminal
+accepted work requires explicit retry; unknown accepted work also requires explicit duplicate-risk
+acknowledgement. Every historical Attempt participates in this decision, using its original route.
 
-Each accepted or explicitly not-submitted outcome records its mutation revision. This preserves
-actual chronology when an older ambiguous Attempt is resolved after newer disjoint work.
+A plan is a compact reviewed decision bound to a Campaign revision. It stores selected allocations,
+resolved execution configuration, retry choices, whether a result probe is required, and one
+integrity digest. `plan_document()` and `restore_plan()` provide its cross-process codec; restoration
+performs no scheduler or probe calls. Transient observations remain outside the serialized plan.
+Task arguments and stdin remain in private Campaign state, outside the plan document. Campaign
+and plan documents use schema 5; unsupported schemas are rejected without migration.
 
-Planning consumes one exact revision-bound `CampaignView`. Valid results are excluded.
-Never-accepted missing or unobserved Tasks are selected. Accepted active work and ambiguous
-acceptance are withheld. Terminal accepted work requires explicit retry; unknown accepted work also
-requires explicit duplicate-execution-risk acknowledgement. Any older active or unknown accepted
-attempt still governs retry safety.
+Before each allocation, submission refreshes relevant scheduler evidence and, for result-aware
+plans, probes its selected Tasks again. Supply the probe as `campaign.submit(plan, probe=probe)`.
+Submission checks local command bounds before claiming work, atomically records durable intent,
+then contacts Slurm outside the state lock. Unresolved intent conservatively blocks duplicate work.
 
-The current development line uses Campaign schema 4 and plan schema 4. Campaign schema 3 is rejected
-without migration; create a new Campaign when upgrading. Loading a plan regenerates it from its
-typed frozen view without probing or scheduler contact and requires identical canonical bytes.
-
-Each allocation runs one concurrent
-`srun --exclusive --exact --nodes=1 --ntasks=1` step per Task. Each step receives its exact CPU,
-MiB, and whole-GPU request and starts the target's immutable Apptainer image from `work_root`.
-CPU-only work emits no GRES or `--nv`. Servatus never emits job-level exclusivity, overlap, all
-memory, manual CUDA indices, ranks, or raw scheduler flags. GPU steps explicitly forward the
-step-local `CUDA_VISIBLE_DEVICES` to Apptainer and use `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
-Missing step visibility fails the step. Slurm's site configuration still owns device isolation.
-
-Slurm writes combined allocation stdout/stderr to
-`log_root/<allocation_id>-%j.out` and each combined task stream to
-`log_root/<allocation_id>-%j-<zero-based-slot>.out`. Slurm expands `%j` after assigning the job ID;
-the immutable allocation identity prevents reused job numbers from aliasing attempts.
-
-Actual simultaneous placement depends on truthful resource requests and site CPU/GRES topology.
-Servatus does not silently inflate CPU requests, disable binding, or expose raw scheduler flags.
-
-Task arguments and byte-exact stdin are embedded in the complete batch script before `sbatch`
-acceptance. Before starting siblings, the batch decodes every payload into checked, owner-only
-files under a private `${TMPDIR:-/tmp}` directory. Workers may close stdin early. The batch waits
-for every started sibling, aggregates failures, and removes the files after completion or handled
-interruption. The compute node needs writable scratch space and standard POSIX tools; no remote
-Python runtime is required. Task inputs are excluded from ordinary plan and inspection output,
-but are not secrets: cluster
-administrators and accounting systems may be able to inspect them. Scheduler names expose only a
-random Servatus allocation identity.
+`submit()` returns a structured `SubmitResult`: `receipts` contains confirmed receipts,
+`unresolved` contains uncertain submissions, and `unattempted` contains reviewed allocations left
+untouched when an operational failure or concurrent change stops the batch. `stop_reason` explains
+the stop, or is `None` when the whole batch completes. If Slurm accepts work but receipt persistence
+fails, the receipt appears as `observed_receipt` on the corresponding unresolved submission,
+separately from durably recorded receipts. Save that evidence and reconcile before retrying.
+`KeyboardInterrupt` and `SystemExit` propagate while preserving durable intent. A concurrent append
+or seal stops further submission from the old plan but cannot discard an already observed receipt. Recording an
+identical receipt is idempotent; conflicting outcomes fail.
 
 ### CLI
 
-The Python interface is authoritative. The CLI task JSONL adapter has exactly `key`, string-array
-`args`, and `stdin_file` per line:
+The task JSONL adapter accepts exactly `key`, string-array `args`, and `stdin_file` per line.
+Relative input paths resolve against the JSONL file's parent.
 
 ```sh
-servatus plan TASKS.jsonl --campaign STATE_DIR --output PLAN.json --tasks-per-allocation 4
-servatus plan TASKS.jsonl --campaign STATE_DIR --output RETRY.json --retry task-0
+servatus create STATE_DIR TASKS.jsonl
+# For a growing roster, create with --appendable, then append only new Tasks:
+servatus create GROWING_STATE INITIAL.jsonl --appendable
+servatus append GROWING_STATE NEW_TASKS.jsonl
+servatus seal GROWING_STATE
+
+servatus plan STATE_DIR --profile research --output PLAN.json --tasks-per-allocation 4
+servatus plan STATE_DIR --profile research --output RETRY.json --retry task-0
 # Unknown accepted work requires the separate duplicate-risk acknowledgement:
-servatus plan TASKS.jsonl --campaign STATE_DIR --output RISKY.json \
+servatus plan STATE_DIR --profile research --output RISKY.json \
   --retry task-0 --allow-duplicate-risk task-0
-# Explicit sensitive diagnostic; prints complete scripts, arguments, and payloads:
-servatus plan TASKS.jsonl --campaign STATE_DIR --output PLAN.json --show-scripts
-servatus seal STATE_DIR
 servatus validate STATE_DIR PLAN.json
 servatus submit STATE_DIR PLAN.json
 servatus status STATE_DIR
@@ -158,135 +149,101 @@ servatus resolve STATE_DIR ALLOCATION_ID --job-id 1234 --cluster alpha
 servatus resolve STATE_DIR ALLOCATION_ID --not-submitted
 ```
 
-To extend an open Campaign through the CLI, pass the complete previously registered JSONL prefix
-followed by the new suffix. Supplying only the suffix, changing the prefix, or extending after
-`servatus seal` fails closed. Relative `stdin_file` paths resolve against `TASKS.jsonl`'s parent.
-The CLI loads exactly `Path.cwd() / "SERVATUS.toml"`; `--profile NAME` overrides its declared
-default. It never accepts a configuration path or searches a parent directory.
+Planning loads exactly `Path.cwd() / "SERVATUS.toml"`; `--profile NAME` overrides its declared
+default. The CLI never searches a parent directory or accepts a configuration path. Planning does
+not create or extend Campaign state. `PLAN.json` is published owner-only without overwrite.
+Complete scripts, arguments, and payloads require the explicit sensitive `--show-scripts` diagnostic.
+`validate` makes serial `sbatch --test-only` calls for distinct allocation shapes. Validation is
+time-specific and does not submit or mutate state. `submit` prints the full structured outcome and
+returns exit status 1 when the batch stops early; a completed batch returns 0.
 
-`PLAN.json` is published owner-only and never overwrites an existing path. It contains task keys,
-requested resources, effective allocation totals, target values,
-exact nonsecret `sbatch` arguments, allocation identities, and digests—not task arguments or stdin.
-Complete scripts are shown only by the warning-bearing `--show-scripts` diagnostic. `validate`
-makes one serial `sbatch --test-only` call per distinct allocation shape and prints each stable
-shape/script digest plus the controller response. Its answer is time-specific and does not submit
-or mutate campaign state.
+An intent without a receipt is ambiguous. `reconcile` uses that Attempt's original target and
+bounded scheduler queries, adopting only an exact matching Servatus identity. Otherwise an operator
+must explicitly resolve the Attempt as accepted or not submitted. Retry never erases earlier
+Attempts. Cancellation uses the site's normal `scancel` command and applies to the packed allocation;
+it does not prove application completion or enable retry automatically.
 
-An intent without a receipt is ambiguous. `reconcile` uses the Campaign's validated target lineage
-for one bounded `squeue`/`sacct` query and adopts only one exact Servatus identity. Otherwise an
-operator must resolve it explicitly as accepted or not submitted. Retry is explicit through
-`Campaign.plan(..., retry={...})`; prior receipts remain in history. CLI `status` reports the
-scheduler-only Campaign view as JSON. There is no legacy acceptance-only summary or caller-built
-completed set.
+### Execution and inspection
 
-### Inspection
+Each allocation runs concurrent `srun --exclusive --exact --nodes=1 --ntasks=1` steps, one per Task.
+Each step receives its exact CPU, MiB, and whole-GPU request and starts the target's immutable
+Apptainer image from `work_root`. CPU-only work emits no GRES or `--nv`. GPU steps forward Slurm's
+step-local `CUDA_VISIBLE_DEVICES` into Apptainer with `CUDA_DEVICE_ORDER=PCI_BUS_ID`; missing
+visibility fails the step. Servatus emits no job-level exclusivity, overlap, manual CUDA indices,
+ranks, or raw scheduler flags. Site configuration owns isolation and simultaneous placement.
 
-`Campaign.inspect()` returns one immutable, revision-bound view of the complete attempt history,
-current allocation evidence, and optional caller-owned result evidence:
+Arguments and byte-exact stdin are embedded in the batch script before acceptance. Before starting
+siblings, the batch decodes every payload into checked, owner-only files under private
+`${TMPDIR:-/tmp}` storage. Workers may close stdin early. The batch waits for every started sibling,
+aggregates failures, and removes payload files after completion or handled interruption. Compute
+nodes need writable scratch and standard POSIX tools; no remote Python runtime is required. Inputs
+are not secrets: cluster administrators and accounting systems may inspect them.
+
+Slurm writes combined allocation stdout/stderr to `log_root/<allocation_id>-%j.out` and each task's
+combined stream to `log_root/<allocation_id>-%j-<zero-based-slot>.out`. Slurm expands `%j`; the
+immutable allocation identity prevents reused job numbers from aliasing Attempts.
+
+`campaign.inspect()` returns transient, time-stamped, revision-bound diagnostics over all Attempts,
+current task execution, and optional caller-owned results:
 
 ```python
 def result_exists(task: Task) -> bool:
-    path = Path("results") / task.key
-    return path.is_file()
+    # Validate an immutable or version-addressed canonical result here.
+    return (Path("results") / task.key).is_file()
 
 
 view = campaign.inspect(result_exists)
-```
-
-The plain synchronous probe runs exactly once per Task outside the Campaign lock. It returns `True`
-only after validating one immutable or version-addressed canonical result, returns `False` for a
-missing or incomplete result, and raises for invalid or untrustworthy content. Servatus stores
-neither the probe nor its answer and never interprets an application schema. Omitting the probe
-marks results unobserved. `scheduler=False` makes no scheduler call and explicitly leaves scheduler
-evidence unobserved:
-
-```python
 result_view = campaign.inspect(result_exists, scheduler=False)
 ```
 
-Scheduler inspection returns durable Attempt order while batching up to 16 distinct jobs per
-cluster into `squeue` and `sacct --duplicates` requests. Reused job numbers are queried separately.
-Responses are matched by job number and immutable allocation-derived name; queue rows must also
-repeat the exact allocation comment. Accounting rows may omit the comment, as some sites do.
-Exactly one accounting record inside each Attempt's submission window anchors its original job;
-strictly later records identify requeue incarnations. Conflicting identities or histories fail
-closed. Exact positive queue evidence blocks retry even when accounting has no anchor or reports
-a later terminal sample. Held/requeued work, including `SPECIAL_EXIT`, remains retained work.
-Terminal evidence requires anchored accounting, and retained work cannot establish quiescence.
+The synchronous probe runs once per Task outside the lock. Return `True` only for a validated
+canonical result, `False` for missing or incomplete content, and raise for invalid or untrustworthy
+content. Servatus stores neither callback nor answers. Omitting the probe leaves results
+unobserved; `scheduler=False` leaves scheduler evidence unobserved and makes no scheduler calls.
 
-Every SSH operation, including submission, validation, reconciliation, inspection, and logs, has a
-30-second deadline and drains stdout/stderr concurrently. Local failures kill and reap the SSH child
-and close its streams. Commands permit at most 32 arguments, 16 KiB of complete command text,
-4 KiB per source field, and 1 MiB per output stream. Scheduler responses permit at most 128 lines
-per batch. Commands run with a fixed C locale and UTC timezone. Submission command bounds are
-checked before durable intent; a failure after launch still leaves conservative acceptance ambiguity.
-A failed command, timeout, overflow, malformed row, unrelated identity, or ambiguous accounting
-history aborts inspection without partial evidence.
+Inspection batches at most 16 distinct jobs per target/cluster into bounded `squeue` and
+`sacct --duplicates` requests; reused job numbers are queried separately. Rows must match job number
+and immutable allocation name. Queue rows also need the exact allocation comment; accounting may
+omit it where site policy does. An original accounting record within the submission window anchors
+later requeue incarnations. Contradictory identity or history fails closed. Positive queue evidence
+blocks retry even when accounting has no anchor or reports a later terminal sample. Held/requeued
+work, including `SPECIAL_EXIT`, is retained work and cannot prove quiescence.
 
-Allocation states normalize to `QUEUED`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, or
-`UNKNOWN`. Packed Tasks share their allocation evidence. Every Attempt remains visible, while the
-latest accepted Attempt owns a Task's current execution projection and unresolved acceptance
-dominates that projection. `results_ready` means the roster is sealed and every result probe was
-valid. `quiescent` independently requires requested scheduler evidence, no unresolved acceptance,
-and terminal evidence for every accepted Attempt. Valid results can therefore be ready while Slurm
-accounting is unknown. Inspection is transient, time-stamped, redacted, and read-only; a concurrent
-Campaign revision change rejects the view.
+Every SSH operation has a 30-second deadline and concurrently drains stdout/stderr. Local failures
+kill and reap the child and close its streams. Commands permit at most 32 arguments, 16 KiB of
+command text, 4 KiB per source field, and 1 MiB per output stream. Scheduler responses permit at most
+128 lines per batch. Commands use a fixed C locale and UTC timezone. Timeout, overflow, malformed
+rows, unrelated identities, and ambiguous accounting abort inspection without partial evidence.
 
-A plan freezes the exact Campaign revision, roster and attempt projection, result and scheduler
-observations, selection, retry and duplicate-risk choices, profile label and resolved values, and
-allocations. `plan_document()` and `restore_plan()` provide its canonical cross-process codec.
-Duplicate-risk warnings derive from the frozen acknowledgement keys rather than a second serialized
-field.
-Before each allocation submission, `Campaign.submit()` rereads Campaign state, reprobes only its
-selected Tasks when the plan was result-aware, refreshes relevant accepted Attempts, rereads state,
-and aborts changed eligibility before recording intent or calling `sbatch`. Pass the same probe as
-`submit(plan, probe=result_exists)` for result-aware plans. Scheduler-only plans need no probe.
+Allocation states normalize to `QUEUED`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, or `UNKNOWN`.
+Packed Tasks share allocation evidence. The latest accepted Attempt owns current execution, while
+unresolved acceptance dominates it. `results_ready` requires a sealed roster and valid results for
+every Task. Independently, `quiescent` requires scheduler evidence, no unresolved acceptance, and
+terminal evidence for every accepted Attempt. A valid application result never proves a job stopped.
+A concurrent Campaign revision change rejects inspection.
 
-`Campaign.read_log(allocation_id, task_key=None, max_bytes=65_536)` returns one immutable
-`LogSnapshot` containing the latest bounded suffix of an accepted Attempt's combined binary log.
-Omit `task_key` for the allocation wrapper or supply a Task from that exact Attempt; Servatus derives
-the accepted job ID, packed slot, target, and path. The byte limit must be from 1 byte through 1 MiB,
-and `truncated` reports whether the remote read found one extra byte. Empty content is valid.
-
-Log reads use one fixed bounded OpenSSH operation outside the Campaign lock. Missing, unreadable,
-unavailable, overflowing, or otherwise untrustworthy logs raise a redacted `ObservationError`
-without partial bytes. Log content is sensitive, untrusted binary data and may contain terminal
-control sequences. Do not print it directly to a terminal; redirect `servatus logs` to a private
-file or use a safe binary viewer. Log content never enters Campaign state or views and cannot affect
-result readiness, quiescence, planning, retry, reconciliation, or application validity. The remote log
-namespace remains controlled by the same cluster account; Servatus does not prove a stable remote
-inode or authenticate content after Slurm writes the derived path.
+`campaign.read_log(allocation_id, task_key=None, max_bytes=65_536)` returns a bounded binary
+`LogSnapshot` from the accepted Attempt's original route and derived log path. The maximum is
+1 MiB; `truncated` reports whether more bytes exist. Remote failures raise a redacted
+`ObservationError` without partial bytes. Logs are sensitive, untrusted data: redirect CLI output
+to a private file or use a safe binary viewer. They have no authority over result validity, retry,
+readiness, or quiescence. Servatus does not authenticate content in the account-owned remote log
+namespace.
 
 ### Operational record
 
-`Campaign.record(view)` returns schema-1 canonical JSON bytes for one exact revision-bound view. A
-stale, foreign, or altered view is rejected. The call is read-only and never publishes the bytes:
+`campaign.record(view)` returns a redacted JSON projection for current diagnostics without writing
+or publishing it:
 
 ```python
 view = campaign.inspect()
-record = campaign.record(view)
-Path("private/campaign-record.json").write_bytes(record)
+Path("private/campaign-record.json").write_bytes(campaign.record(view))
 ```
 
-The record contains its observation time and scheduler-observation mode; Campaign identity,
-revision, sealed state, roster digest, and ordered Task keys; and ordered Attempt provenance. Each
-Attempt retains its Profile label, Task/retry/duplicate-risk keys, target and resource lineage
-digests, allocation shape, attempt/retry/plan/script digests, acceptance or resolution revision,
-receipt Job ID and cluster, and normalized scheduler state, exit code, timestamps, and observation
-time. The retry digest hashes the canonical ordered retry and duplicate-risk keys. The attempt digest
-hashes the canonical immutable redacted intent: allocation identity, Campaign revision, Profile
-label, ordered Task keys, retry digest, lineage digests, allocation shape, and plan/script digests.
-
-Task arguments, stdin, per-Task digests, complete scripts, `sbatch` arguments, target values,
-environment, raw scheduler states and reasons, result evidence, logs, checkpoints, metrics, and
-application outputs are excluded. The record changes only with fields included in that projection.
-It is redacted, not anonymous or secret-safe: Task keys, allocation identities, and Slurm Job IDs
-can identify work. Keep Campaign state and operational records private unless a separate review
-approves a narrower publication projection.
-
-Servatus does not cancel jobs in V1. Use the receipt with the site's normal `scancel` command.
-Cancellation applies to the packed allocation, does not prove application completion, and does not
-enable retry automatically.
+The record contains Campaign identity and revision, roster keys, Attempt chronology, selected
+Profile labels, allocation shapes, receipts, and normalized scheduler evidence. It is diagnostic
+data, not execution authority. Task arguments, stdin, scripts, target values, logs, result evidence,
+and application outputs are excluded. Keys and job identities still identify work; keep records private.
 
 ## Publication
 
@@ -406,8 +363,9 @@ filesystem with stable cross-client inode identities. See [SECURITY.md](SECURITY
   synced. Every durable read validates the complete snapshot. One tagged Attempt outcome prevents
   an allocation from being both accepted and resolved as not submitted; its revision preserves
   delayed-resolution chronology.
-- Intent preserves the normalized route, guardrails, requested resources, exact allocation totals,
-  and reviewed nonsecret `sbatch` command before external acceptance.
+- Intent preserves the original route, guardrails, requested resources, ordered Task keys, and
+  explicit revision and timestamp before external acceptance. Allocation totals, commands, and
+  reconciliation windows derive from those values.
 - A destination is absent or one complete regular file or directory. Native commits and the Linux
   regular-file fallback never overwrite an existing entry. An already-present destination is
   rejected before its callback; the commit remains no-replace against later races. The Linux
@@ -438,10 +396,10 @@ for the exact fallback and live-acceptance envelope.
 ## Non-goals
 
 Servatus is not an ML framework, scheduler plugin, daemon, security boundary, experiment tracker,
-DAG engine, secrets manager, or transfer/image-deployment tool. V1 has no Submitit or runtime Python
-dependency, plugin/backend abstraction, local executor, arrays, heterogeneous tasks, multi-node
-ranks, MPI/torchrun, fractional/shared GPUs, queue-aware packing, automatic retry, background
-polling, cancellation/requeue, raw Slurm/environment passthrough, serialized probes, application
+DAG engine, secrets manager, or transfer/image-deployment tool. It has no Submitit or remote Python
+dependency, plugin/backend abstraction, local executor, arrays, heterogeneous resources within one
+allocation, multi-node ranks, MPI/torchrun, fractional/shared GPUs, queue-aware packing, automatic
+retry, background polling, cancellation/requeue, raw Slurm/environment passthrough, serialized probes, application
 schemas, log parsing/following/caching, compatibility shims, or cross-filesystem copy fallback.
 
 See the [context glossary](docs/CONTEXT.md) and [architecture decisions](docs/adr/README.md) for the

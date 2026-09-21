@@ -2,73 +2,46 @@
 
 Status: accepted
 
-Servatus V1 supports one concrete lane: an unprivileged workstation invokes OpenSSH, absolute Slurm
-executables, and one immutable Apptainer image. A Campaign freezes each registered opaque task,
-permits only an exact append-only suffix while its roster is open, and seals authoring
-irreversibly. Append, seal, and submission mutations preserve prior order, bytes, resource lineage,
-and every attempt. Campaign owns deterministic balanced single-node allocations, complete scripts,
-and durable submission records, and fails closed when scheduler acceptance is ambiguous.
+Servatus supports one concrete lane: an unprivileged workstation invokes OpenSSH, absolute Slurm
+executables, and one immutable Apptainer image. Campaign owns balanced single-node allocations,
+complete scripts, and durable submission records. Application meaning and result validity remain
+with the caller. ADR 0005 defines the current Campaign state and public workflow.
 
-One immutable Profile supplies a nonbinding label plus complete target guardrails and requested
-resources. Durable compatibility binds only to exact resolved target/resource values. Each Attempt
-adds the selected label, ordered Task, explicit-retry, and duplicate-risk keys, its Campaign
-revision, lineage digests, plan and script digests, exact effective allocation totals, the
-nonsecret `sbatch` argument vector, its reconciliation window, and one unresolved, accepted, or
-not-submitted outcome. Resolved outcomes record their mutation revision so delayed resolution stays
-ordered after intervening disjoint attempts. Job names derive from allocation identity; receipts
-remain public projections of accepted Attempt outcomes.
-
-Public plan files redact task arguments and payloads but retain private operational evidence. A
-loaded plan parses its frozen revision-bound Campaign view, selection, retry/override decisions,
-Profile, and allocations, regenerates the immutable plan without external observation, and requires
-identical canonical bytes. Presentation warnings derive from recorded duplicate-risk keys rather
-than another canonical field. Complete script display remains an explicit sensitive diagnostic.
-Authored wall time remains provenance while planned and submitted time reflects Slurm's one-time
-upward minute rounding.
-
-Campaign schema 4 and plan schema 4 are a clean break. Schema-3 Campaign state is rejected without
-migration. Every bounded owner-only state read validates the complete atomic snapshot; one tagged
-Attempt outcome removes the former parallel receipt and negative-resolution authorities.
-Outcome revisions preserve atomic mutation order independently from the Attempt's intent order.
-Internally typed mutations are encoded directly rather than decoded again immediately before the
-atomic write.
-
-`Campaign.open` registers an authored roster; `Campaign.load` reopens an existing one.
-`Campaign.tasks` exposes the immutable authored tuple, and `Campaign.seal()` atomically and
-idempotently ends suffix authoring. Execution is valid in both roster phases.
-`Campaign.plan` requires one exact current Campaign view. Valid results are excluded; never-accepted
-missing/unobserved Tasks are selected; ambiguity and active accepted work are withheld; terminal
-accepted work requires explicit retry; and unknown accepted work also requires a recorded
-duplicate-risk acknowledgement. Every accepted Attempt matters, so older active or unknown work
-cannot be hidden by a newer Attempt. `Campaign.validate` first proves that a plan belongs to the
-current Campaign revision, then issues bounded time-specific `sbatch --test-only` calls.
-`Campaign.inspect()` remains the scheduler-observation operation; CLI `status` renders its view and
-replaces the old acceptance-only summary. Reconciliation reconstructs its target from validated
-immutable lineage, so callers cannot supply a second route.
-
-Before every allocation's mutating `sbatch`, submission rereads local state, reprobes only selected
-Tasks for result-aware plans, refreshes relevant accepted scheduler evidence, rereads state, and
-compares current eligibility with the frozen decision. It then durably records intent and contacts
-Slurm. Revisions created by earlier allocations are carried through the same submission call.
-
-The package invokes stable command-line seams directly. Submitit is prior art, not a dependency:
-its cluster-local Python callable and post-acceptance pickle transport do not fit the workstation
-SSH boundary or the requirement that every accepted job already own its complete payload. There is
-no scheduler adapter or plugin interface until a second proven production lane requires one.
+The package invokes stable command-line seams directly. A cluster-local Python callable and
+post-acceptance pickle transport do not fit the workstation SSH boundary or the requirement that
+accepted work already owns its complete payload. There is no scheduler adapter or plugin interface
+without a second proven production lane.
 
 Allocation resources equal the sum of concurrent exact child steps. Servatus never infers node
 capacity, escalates an explicit request, emits job-level exclusivity, or accepts raw Slurm options.
-Target limits prevent user mistakes but do not replace cluster policy. Application completion and
-the meaning of every task remain with the caller.
+Authored wall time remains provenance; planned and submitted time reflects Slurm's one-time upward
+minute rounding. Target limits prevent user mistakes but do not replace cluster policy.
+
+Each allocation starts concurrent `srun --exclusive --exact --nodes=1 --ntasks=1` steps. GPU steps
+forward step-local `CUDA_VISIBLE_DEVICES` into Apptainer and set `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
+Missing visibility fails the step; site configuration remains responsible for device isolation.
+Before launching siblings, the batch checks decoding of all binary payloads into owner-only scratch
+files. It waits for every started sibling and cleans scratch after completion or handled
+interruption. No remote Python runtime is required.
 
 Allocation stdout/stderr share `log_root/<allocation_id>-%j.out`; each task's stdout/stderr share
 `log_root/<allocation_id>-%j-<zero-based-slot>.out`. Slurm expands `%j` after acceptance, while the
-immutable allocation identity prevents reused job numbers from aliasing distinct Attempts without
-post-acceptance plan mutation.
+immutable allocation identity prevents reused job numbers from aliasing distinct Attempts.
 
-## Production acceptance
+Every SSH operation has a bounded command, output, and deadline. Stream draining is concurrent;
+local failures kill and reap the child and close its streams. Scheduler commands use fixed C locale
+and UTC timezone. Submission checks deterministic command bounds before durable intent, while
+failures after launch preserve acceptance ambiguity.
 
-On 2026-08-10, candidate `0c454bd38da4f3d5b0ba4f0777b708f8a2eb011c` passed the live gate as
+Inspection batches by original Attempt route and cluster, matching immutable allocation identities.
+Positive queue evidence remains authoritative evidence of retained work even without an accounting
+anchor. Terminal evidence requires anchored accounting. Held or requeued work, including
+`SPECIAL_EXIT`, cannot establish quiescence or permit retry.
+
+## Recorded production acceptance
+
+The following evidence concerns the tested candidate and site, not a live acceptance of every later
+release. On 2026-08-10, candidate `0c454bd38da4f3d5b0ba4f0777b708f8a2eb011c` passed the live gate as
 an unprivileged user-side client on Slurm 23.11.4. The site used `select/cons_tres` with
 `CR_CPU_MEMORY`, task cgroup and affinity plugins, `/usr/bin/ssh`, Slurm commands under `/usr/bin`,
 and `/usr/bin/apptainer`. Bounded validation and jobs 44592–44595 proved CPU-only, one-GPU,

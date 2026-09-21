@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 from ._errors import ObservationError, ReconciliationError
 
 if TYPE_CHECKING:
-    from ._campaign import ResourceRequest, SlurmTarget, Task
+    from ._model import ResourceRequest, SlurmTarget, Task
 
 
 @dataclass(frozen=True, slots=True)
