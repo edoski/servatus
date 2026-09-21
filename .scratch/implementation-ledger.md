@@ -25,6 +25,17 @@ worker /root/implement_campaign owns product changes. /root/draft_campaign_docs 
 documentation drafts for that worker to integrate; it never edits the checkout.
 Final integration: pending.
 
+Slice 3 implementation fdfd67830a9e0fe49c03e669420f6d937c5aa7cb; 454 passed, 1 skipped;
+all static/build/installed wheel+sdist gates passed. Reviewer /root/review_campaign rejected head:
+Standards P2: submit/validate redundantly roundtrip typed plans through external codec.
+Spec P2: first refresh/claim operational failure raises instead of returning complete unattempted
+outcome. Same implementer correcting; preserve upfront invalid/stale errors and interruption
+propagation. Review correction delta only once committed.
+Correction 12aacc87c3075b772320d1b10e4f8252e613c752 closes both findings; same reviewer GREEN LIGHT
+Standards 0, Spec 0; three focused correction tests independently passed. Worker final gates:
+455 passed, 1 skipped, all static/build/installed wheel+sdist checks pass. One correction round.
+All product slices now GREEN LIGHT. Final integration onto original main and artifact cleanup next.
+
 Slice 1 implementation 898ab90df9ce00951e34f1925123141f57780997; reviewer /root/review_execution
 reviewing aa33964...898ab90 with separate Standards/Spec agents. Worker gates: 509 passed, 1 skipped;
 Ruff, Pyright, Vulture, builds and installed smokes passed.
