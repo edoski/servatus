@@ -460,6 +460,7 @@ class AllocationEvidence:
     started_at: str | None
     ended_at: str | None
     observed_at: datetime
+    retained: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -706,6 +707,7 @@ def _allocation_evidence_dict(value: AllocationEvidence | None) -> dict[str, obj
         "started_at": value.started_at,
         "ended_at": value.ended_at,
         "observed_at": _timestamp_text(value.observed_at),
+        "retained": value.retained,
     }
 
 
@@ -1010,6 +1012,7 @@ class Campaign:
                     observation.started_at,
                     observation.ended_at,
                     scheduler_observed_at,
+                    observation.retained,
                 )
             )
             evidence = AttemptEvidence(
@@ -1066,7 +1069,9 @@ class Campaign:
             scheduler
             and not ambiguous
             and all(
-                attempt.allocation is not None and attempt.allocation.state in terminal
+                attempt.allocation is not None
+                and attempt.allocation.state in terminal
+                and not attempt.allocation.retained
                 for attempt in attempts
                 if attempt.acceptance is AcceptanceState.ACCEPTED
             )
@@ -1209,6 +1214,10 @@ class Campaign:
                 allocation_id,
                 effective_time_limit,
             )
+            try:
+                _slurm.preflight(profile.target, (*argv, "--test-only"))
+            except ObservationError as error:
+                raise PlanError(str(error)) from error
             public = PlannedAllocation(
                 task_keys=tuple(task.key for task in group),
                 cpus=len(group) * profile.resources.cpus_per_task,
@@ -1263,6 +1272,11 @@ class Campaign:
         result_aware = any(task.result is not ResultState.UNOBSERVED for task in plan._view.tasks)
         if result_aware and plan._allocations and probe is None:
             raise PlanError("result-aware submission requires the planning result probe")
+        for allocation in plan._allocations:
+            try:
+                _slurm.preflight(plan._profile.target, allocation.argv)
+            except ObservationError as error:
+                raise PlanError(str(error)) from error
         expected_revision = plan._state_revision
         receipts: list[JobReceipt] = []
         for allocation in plan._allocations[: plan._profile.target.max_allocations_per_submit]:
@@ -1450,6 +1464,8 @@ class Campaign:
         states_by_key: dict[str, list[AllocationState]] = {key: [] for key in selected}
         for (attempt, _query), observation in zip(relevant_queries, observations, strict=True):
             for key in selected & set(cast(list[str], attempt["task_keys"])):
+                if observation.retained:
+                    raise PlanError(f"task {key!r} became active before submission")
                 states_by_key[key].append(observation.state)
         active = {AllocationState.QUEUED, AllocationState.RUNNING}
         retries = set(plan._retry)
@@ -1712,7 +1728,9 @@ def _verify_view(state: dict[str, object], view: CampaignView, task_keys: tuple[
         view.scheduler_observed
         and not ambiguous
         and all(
-            attempt.allocation is not None and attempt.allocation.state in terminal
+            attempt.allocation is not None
+            and attempt.allocation.state in terminal
+            and not attempt.allocation.retained
             for attempt in view.attempts
             if attempt.acceptance is AcceptanceState.ACCEPTED
         )
@@ -1762,7 +1780,9 @@ def _select_tasks(
         )
         if len(states) != len(accepted):
             raise PlanError("accepted attempt lacks scheduler evidence")
-        if any(state in active for state in states):
+        if any(state in active for state in states) or any(
+            attempt.allocation is not None and attempt.allocation.retained for attempt in accepted
+        ):
             if task.key in retries:
                 raise PlanError(f"active task {task.key!r} cannot be retried")
             excluded.append(task.key)
@@ -2482,6 +2502,7 @@ def _view_from_dict(value: object) -> CampaignView:
                     "started_at",
                     "ended_at",
                     "observed_at",
+                    "retained",
                 }:
                     raise PlanError("plan allocation evidence is invalid")
                 observed = _plan_timestamp(
@@ -2501,6 +2522,7 @@ def _view_from_dict(value: object) -> CampaignView:
                     _optional_plan_string(allocation_values["started_at"], name="start time"),
                     _optional_plan_string(allocation_values["ended_at"], name="end time"),
                     observed,
+                    _plan_bool(allocation_values["retained"], name="retained work"),
                 )
             attempts.append(
                 AttemptEvidence(

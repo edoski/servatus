@@ -54,7 +54,11 @@ Resolved values from repository-owned `SERVATUS.toml` are editable user-side gua
 enforcement boundary. Profile labels are nonbinding provenance. Slurm remains
 authoritative for identity, admission, isolation, allocation, accounting, and billing. Servatus
 clears the remote command environment and supplies only a fixed path, C locale, and UTC timezone;
-local scheduler or timezone overrides are not forwarded.
+local scheduler or timezone overrides are not forwarded. GPU steps explicitly forward Slurm's
+step-local visibility into Apptainer, with PCI bus ordering; this is not a replacement for site
+GPU isolation. Batch payload files use owner-only temporary storage and are removed after siblings
+finish or a handled interruption. Uncatchable termination can leave scratch residue; compute-node
+scratch lifecycle remains site policy.
 
 Canonical plan files retain exact target/resource values, scheduler observations, job identities,
 and Task keys. They exclude Task arguments and stdin but are still private operational data. Store

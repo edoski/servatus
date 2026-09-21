@@ -6,6 +6,7 @@ import re
 import selectors
 import shlex
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -50,6 +51,7 @@ class SchedulerObservation:
     reason: str | None
     started_at: str | None
     ended_at: str | None
+    retained: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,7 +93,8 @@ class _AttemptQuery:
         return f"servatus-{self.allocation_id}"
 
 
-_MAX_QUERY_ARGC = 16
+_MAX_QUERY_ARGC = 32
+_MAX_QUERY_JOBS = 16
 _MAX_QUERY_ARG_BYTES = 16 * 1024
 _MAX_QUERY_FIELD_BYTES = 4096
 _MAX_QUERY_LINES = 128
@@ -100,7 +103,18 @@ _SSH_TIMEOUT_SECONDS = 30.0
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _SITE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
-_QUEUED_STATES = frozenset({"PENDING", "CONFIGURING", "REQUEUED", "RESIZING"})
+_QUEUED_STATES = frozenset(
+    {
+        "PENDING",
+        "CONFIGURING",
+        "REQUEUED",
+        "RESIZING",
+        "REQUEUE_HOLD",
+        "REQUEUE_FED",
+        "RESV_DEL_HOLD",
+        "SPECIAL_EXIT",
+    }
+)
 _RUNNING_STATES = frozenset(
     {"RUNNING", "COMPLETING", "SIGNALING", "STAGE_OUT", "SUSPENDED", "STOPPED"}
 )
@@ -113,7 +127,6 @@ _FAILED_STATES = frozenset(
         "FAILED",
         "NODE_FAIL",
         "OUT_OF_MEMORY",
-        "SPECIAL_EXIT",
         "TIMEOUT",
     }
 )
@@ -125,11 +138,36 @@ def render_script(
     tasks: tuple[Task, ...],
     allocation_id: str,
 ) -> bytes:
-    lines = ["#!/bin/sh", "set -u", "status=0"]
+    lines = [
+        "#!/bin/sh",
+        "set -u",
+        "umask 077",
+        "status=0",
+        "pids=",
+        'scratch=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/servatus.XXXXXXXXXX") || exit 1',
+        '[ -n "$scratch" ] && [ -d "$scratch" ] || exit 1',
+        'cleanup() { saved=$?; trap - 0; /bin/rm -rf -- "$scratch" || saved=1; exit "$saved"; }',
+        "trap cleanup 0",
+        "interrupt() { trap '' HUP INT TERM; "
+        'pids="$pids ${!:-}"; '
+        'for pid in $pids; do kill "$pid" 2>/dev/null || :; done; '
+        'for pid in $pids; do wait "$pid" 2>/dev/null || :; done; exit 1; }',
+        "trap interrupt HUP INT TERM",
+        "export SLURM_EXPORT_ENV=ALL",
+    ]
+    for slot, task in enumerate(tasks):
+        payload = base64.b64encode(task.stdin).decode("ascii")
+        lines.extend(
+            (
+                f"if ! /usr/bin/base64 -d > \"$scratch/{slot}\" <<'SERVATUS_PAYLOAD'",
+                payload,
+                "SERVATUS_PAYLOAD",
+                "then exit 1; fi",
+            )
+        )
     srun = target.slurm_bin / "srun"
     for slot, task in enumerate(tasks):
         process = slot + 1
-        payload = base64.b64encode(task.stdin).decode("ascii")
         step = [
             str(srun),
             "--exclusive",
@@ -155,13 +193,26 @@ def render_script(
             str(target.work_root),
         ]
         if resources.gpus_per_task:
-            container.append("--nv")
-        container.extend((str(target.image), *task.args))
-        lines.append(
-            f"printf %s {shlex.quote(payload)} | /usr/bin/base64 -d | "
-            f"{shlex.join((*step, *container))} &"
-        )
+            container.extend(("--nv", "--env", "CUDA_DEVICE_ORDER=PCI_BUS_ID"))
+            wrapper = (
+                ': "${CUDA_VISIBLE_DEVICES:?Slurm did not set step GPU visibility}"; '
+                f"exec {shlex.join(container)} "
+                '--env "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES" "$@"'
+            )
+            command = (
+                *step,
+                "/bin/sh",
+                "-c",
+                wrapper,
+                "servatus-gpu",
+                str(target.image),
+                *task.args,
+            )
+        else:
+            command = (*step, *container, str(target.image), *task.args)
+        lines.append(f'{shlex.join(command)} < "$scratch/{slot}" &')
         lines.append(f"pid_{process}=$!")
+        lines.append(f'pids="$pids $pid_{process}"')
     for index in range(1, len(tasks) + 1):
         lines.append(f'if ! wait "$pid_{index}"; then status=1; fi')
     lines.extend(('exit "$status"', ""))
@@ -212,82 +263,83 @@ def _ssh_environment() -> dict[str, str]:
     return environment
 
 
+def preflight(target: SlurmTarget, argv: tuple[str, ...]) -> None:
+    """Reject deterministic local command failures before persisting submission intent."""
+    _bounded_ssh_command(target, argv)
+
+
 def _run_ssh(target: SlurmTarget, argv: tuple[str, ...], stdin: bytes) -> Result:
-    completed = subprocess.run(
-        ["ssh", "-T", "-o", "BatchMode=yes", target.host, _remote_command(argv)],
-        input=stdin,
-        capture_output=True,
-        check=False,
-        env=_ssh_environment(),
-    )
-    return Result(completed.returncode, completed.stdout, completed.stderr)
+    return _run_bounded_ssh(target, argv, stdin=stdin)
 
 
 def _run_bounded_ssh(
     target: SlurmTarget,
     argv: tuple[str, ...],
     *,
+    stdin: bytes = b"",
     max_stdout_bytes: int = _MAX_QUERY_OUTPUT_BYTES,
 ) -> Result:
     command = _bounded_ssh_command(target, argv)
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=_ssh_environment(),
-    )
-    assert process.stdout is not None
-    assert process.stderr is not None
-    streams = (process.stdout, process.stderr)
-    selector = selectors.DefaultSelector()
-    stdout_descriptor = process.stdout.fileno()
-    stderr_descriptor = process.stderr.fileno()
-    buffers = {stdout_descriptor: bytearray(), stderr_descriptor: bytearray()}
-    limits = {
-        stdout_descriptor: max_stdout_bytes,
-        stderr_descriptor: _MAX_QUERY_OUTPUT_BYTES,
-    }
-    try:
-        for stream in streams:
-            os.set_blocking(stream.fileno(), False)
-            selector.register(stream, selectors.EVENT_READ)
-        deadline = time.monotonic() + _SSH_TIMEOUT_SECONDS
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired("ssh", _SSH_TIMEOUT_SECONDS)
-            events = selector.select(remaining)
-            if not events:
-                raise subprocess.TimeoutExpired("ssh", _SSH_TIMEOUT_SECONDS)
-            for key, _ in events:
-                descriptor = key.fd
-                buffer = buffers[descriptor]
-                limit = limits[descriptor]
-                chunk = os.read(
-                    descriptor,
-                    min(65536, limit + 1 - len(buffer)),
-                )
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                buffer.extend(chunk)
-                if len(buffer) > limit:
-                    raise ObservationError("scheduler query output exceeds its byte bound")
-        returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
-        return Result(
-            returncode,
-            bytes(buffers[stdout_descriptor]),
-            bytes(buffers[stderr_descriptor]),
+    with tempfile.TemporaryFile() as source:
+        source.write(stdin)
+        source.seek(0)
+        process = subprocess.Popen(
+            command,
+            stdin=source,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_ssh_environment(),
         )
-    except BaseException:
-        process.kill()
-        process.wait()
-        raise
-    finally:
-        selector.close()
-        for stream in streams:
-            stream.close()
+        selector: selectors.BaseSelector | None = None
+        try:
+            assert process.stdout is not None
+            assert process.stderr is not None
+            selector = selectors.DefaultSelector()
+            stdout_descriptor = process.stdout.fileno()
+            stderr_descriptor = process.stderr.fileno()
+            buffers = {stdout_descriptor: bytearray(), stderr_descriptor: bytearray()}
+            limits = {
+                stdout_descriptor: max_stdout_bytes,
+                stderr_descriptor: _MAX_QUERY_OUTPUT_BYTES,
+            }
+            for stream in (process.stdout, process.stderr):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ)
+            deadline = time.monotonic() + _SSH_TIMEOUT_SECONDS
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired("ssh", _SSH_TIMEOUT_SECONDS)
+                events = selector.select(remaining)
+                if not events:
+                    raise subprocess.TimeoutExpired("ssh", _SSH_TIMEOUT_SECONDS)
+                for key, _ in events:
+                    descriptor = key.fd
+                    buffer = buffers[descriptor]
+                    limit = limits[descriptor]
+                    chunk = os.read(descriptor, min(65536, limit + 1 - len(buffer)))
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    buffer.extend(chunk)
+                    if len(buffer) > limit:
+                        raise ObservationError("SSH output exceeds its byte bound")
+            returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            return Result(
+                returncode, bytes(buffers[stdout_descriptor]), bytes(buffers[stderr_descriptor])
+            )
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+        finally:
+            try:
+                if selector is not None:
+                    selector.close()
+            finally:
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
 
 
 def _bounded_ssh_command(target: SlurmTarget, argv: tuple[str, ...]) -> tuple[str, ...]:
@@ -299,7 +351,7 @@ def _bounded_ssh_command(target: SlurmTarget, argv: tuple[str, ...]) -> tuple[st
         or any(len(value.encode("utf-8")) > _MAX_QUERY_FIELD_BYTES for value in fields)
         or sum(len(value.encode("utf-8")) + 1 for value in command) > _MAX_QUERY_ARG_BYTES
     ):
-        raise ObservationError("observation command exceeds its argument bounds")
+        raise ObservationError("SSH command exceeds its argument bounds")
     return command
 
 
@@ -346,58 +398,55 @@ def query_attempts(
     target: SlurmTarget,
     attempts: tuple[_AttemptQuery, ...],
 ) -> tuple[SchedulerObservation, ...]:
-    observations: list[SchedulerObservation] = []
+    groups: dict[str | None, list[_AttemptQuery]] = {}
     for attempt in attempts:
-        active = _query_active(target, attempt)
-        history = _query_accounting(target, attempt)
-        observations.append(_combine_observations(active, history))
-    return tuple(observations)
+        groups.setdefault(attempt.cluster, []).append(attempt)
+    observations: dict[str, SchedulerObservation] = {}
+    for group in groups.values():
+        batch: list[_AttemptQuery] = []
+        for attempt in group:
+            if len(batch) == _MAX_QUERY_JOBS or any(
+                item.job_id == attempt.job_id for item in batch
+            ):
+                observations.update(_query_batch(target, tuple(batch)))
+                batch = []
+            batch.append(attempt)
+        if batch:
+            observations.update(_query_batch(target, tuple(batch)))
+    return tuple(observations[attempt.allocation_id] for attempt in attempts)
 
 
-def _query_active(
+def _query_batch(
     target: SlurmTarget,
-    attempt: _AttemptQuery,
-) -> _ActiveJob | None:
+    attempts: tuple[_AttemptQuery, ...],
+) -> dict[str, SchedulerObservation]:
+    by_job = {str(attempt.job_id): attempt for attempt in attempts}
+    job_ids = ",".join(by_job)
+    cluster = attempts[0].cluster
+    route = "--local" if cluster is None else f"--clusters={cluster}"
     result = _run_observation(
         target,
         (
             str(target.slurm_bin / "squeue"),
             "--noheader",
             "--jobs",
-            str(attempt.job_id),
-            "--local" if attempt.cluster is None else f"--clusters={attempt.cluster}",
+            job_ids,
+            route,
             "--format=%i|%j|%k|%V|%T|%r|%S|%e",
         ),
     )
-    if _missing_active_job(result):
-        return None
-    if result.returncode != 0 or result.stderr:
-        raise ObservationError("scheduler observation was unavailable")
-    rows = _output_lines(result.stdout)
-    if len(rows) > 1:
-        raise ObservationError("scheduler query returned conflicting evidence")
-    if not rows:
-        return None
-    fields = _decoded_fields(rows[0], 8)
-    job_id_raw, name, comment = fields[:3]
-    submitted, state, reason, started, ended = _normalized_fields(*fields[3:])
-    _validate_job_evidence(job_id_raw, state, attempt)
-    if not _active_identity_matches(name, comment, attempt.identity):
-        raise ObservationError("scheduler query returned unrelated evidence")
-    submitted_at = _required_timestamp(submitted)
-    return _ActiveJob(
-        submitted_at,
-        state,
-        _optional_field(reason),
-        _timestamp(started),
-        _timestamp(ended),
-    )
-
-
-def _query_accounting(
-    target: SlurmTarget,
-    attempt: _AttemptQuery,
-) -> _AccountingHistory | None:
+    active: dict[str, _ActiveJob] = {}
+    if not _missing_active_job(result):
+        if result.returncode != 0 or result.stderr:
+            raise ObservationError("scheduler observation was unavailable")
+        for line in _output_lines(result.stdout):
+            fields = _decoded_fields(line, 8)
+            attempt = by_job.get(fields[0])
+            if attempt is None:
+                raise ObservationError("scheduler query returned unrelated evidence")
+            if attempt.allocation_id in active:
+                raise ObservationError("scheduler query returned conflicting evidence")
+            active[attempt.allocation_id] = _parse_active_row(fields, attempt)
     result = _run_observation(
         target,
         (
@@ -407,19 +456,51 @@ def _query_accounting(
             "--allocations",
             "--duplicates",
             "--jobs",
-            str(attempt.job_id),
+            job_ids,
             "--name",
-            attempt.identity,
+            ",".join(attempt.identity for attempt in attempts),
             "--starttime",
-            attempt.window_start,
-            "--local" if attempt.cluster is None else f"--clusters={attempt.cluster}",
+            min(attempt.window_start for attempt in attempts),
+            route,
             "--format=JobIDRaw%64,Cluster%256,JobName%256,Comment%256,Submit%32,"
             "State%256,ExitCode%32,Reason%4096,Start%32,End%32",
         ),
     )
     if result.returncode != 0 or result.stderr:
         raise ObservationError("scheduler observation was unavailable")
-    rows = tuple(_parse_accounting_row(line, attempt) for line in _output_lines(result.stdout))
+    accounting: dict[str, list[_AccountingJob]] = {item.allocation_id: [] for item in attempts}
+    for line in _output_lines(result.stdout):
+        fields = _decoded_fields(line, 10)
+        attempt = by_job.get(fields[0])
+        if attempt is None:
+            raise ObservationError("scheduler query returned unrelated evidence")
+        accounting[attempt.allocation_id].append(_parse_accounting_row(fields, attempt))
+    return {
+        attempt.allocation_id: _combine_observations(
+            active.get(attempt.allocation_id),
+            _accounting_history(tuple(accounting[attempt.allocation_id]), attempt),
+        )
+        for attempt in attempts
+    }
+
+
+def _parse_active_row(fields: tuple[str, ...], attempt: _AttemptQuery) -> _ActiveJob:
+    job_id_raw, name, comment = fields[:3]
+    submitted, state, reason, started, ended = _normalized_fields(*fields[3:])
+    _validate_job_evidence(job_id_raw, state, attempt)
+    if not _active_identity_matches(name, comment, attempt.identity):
+        raise ObservationError("scheduler query returned unrelated evidence")
+    submitted_at = _required_timestamp(submitted)
+    if submitted_at < attempt.window_start:
+        raise ObservationError("scheduler query returned unrelated evidence")
+    return _ActiveJob(
+        submitted_at, state, _optional_field(reason), _timestamp(started), _timestamp(ended)
+    )
+
+
+def _accounting_history(
+    rows: tuple[_AccountingJob, ...], attempt: _AttemptQuery
+) -> _AccountingHistory | None:
     if not rows:
         return None
     anchor_indexes = [
@@ -483,8 +564,7 @@ def _normalized_fields(*values: str) -> tuple[str, ...]:
     return tuple(value.strip(" ") for value in values)
 
 
-def _parse_accounting_row(line: bytes, attempt: _AttemptQuery) -> _AccountingJob:
-    fields = _decoded_fields(line, 10)
+def _parse_accounting_row(fields: tuple[str, ...], attempt: _AttemptQuery) -> _AccountingJob:
     (
         job_id,
         cluster_raw,
@@ -597,14 +677,26 @@ def _combine_observations(
     history: _AccountingHistory | None,
 ) -> SchedulerObservation:
     accounting = None if history is None else history.latest
-    if history is None:
-        active = None
-    elif active is not None and (
-        active.submitted_at < history.original_submitted_at
-        or active.submitted_at < history.latest.submitted_at
+    if (
+        history is not None
+        and active is not None
+        and (
+            active.submitted_at < history.original_submitted_at
+            or active.submitted_at < history.latest.submitted_at
+        )
     ):
         raise ObservationError("scheduler sources returned conflicting evidence")
+    retained = (
+        active is not None
+        and _normalize_state(active.state)
+        not in {AllocationState.SUCCEEDED, AllocationState.FAILED, AllocationState.CANCELLED}
+    ) or (
+        accounting is not None
+        and _normalize_state(accounting.state) in {AllocationState.QUEUED, AllocationState.RUNNING}
+    )
     primary = active or accounting
+    if history is None and not retained:
+        primary = None
     if primary is None:
         return SchedulerObservation(
             AllocationState.UNKNOWN,
@@ -654,6 +746,7 @@ def _combine_observations(
         primary.reason or (None if accounting is None else accounting.reason),
         primary.started_at or (None if accounting is None else accounting.started_at),
         primary.ended_at or (None if accounting is None else accounting.ended_at),
+        retained,
     )
 
 
@@ -704,7 +797,7 @@ def query_identity(
         ),
         b"",
     )
-    if squeue.returncode != 0 or sacct.returncode != 0:
+    if squeue.returncode != 0 or sacct.returncode != 0 or squeue.stderr or sacct.stderr:
         raise ReconciliationError("scheduler identity query was unavailable")
 
     candidates: dict[int, set[str | None]] = {}

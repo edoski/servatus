@@ -113,7 +113,9 @@ Each allocation runs one concurrent
 `srun --exclusive --exact --nodes=1 --ntasks=1` step per Task. Each step receives its exact CPU,
 MiB, and whole-GPU request and starts the target's immutable Apptainer image from `work_root`.
 CPU-only work emits no GRES or `--nv`. Servatus never emits job-level exclusivity, overlap, all
-memory, manual CUDA indices, ranks, or raw scheduler flags.
+memory, manual CUDA indices, ranks, or raw scheduler flags. GPU steps explicitly forward the
+step-local `CUDA_VISIBLE_DEVICES` to Apptainer and use `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
+Missing step visibility fails the step. Slurm's site configuration still owns device isolation.
 
 Slurm writes combined allocation stdout/stderr to
 `log_root/<allocation_id>-%j.out` and each combined task stream to
@@ -124,7 +126,12 @@ Actual simultaneous placement depends on truthful resource requests and site CPU
 Servatus does not silently inflate CPU requests, disable binding, or expose raw scheduler flags.
 
 Task arguments and byte-exact stdin are embedded in the complete batch script before `sbatch`
-acceptance. They are excluded from ordinary plan and inspection output, but are not secrets: cluster
+acceptance. Before starting siblings, the batch decodes every payload into checked, owner-only
+files under a private `${TMPDIR:-/tmp}` directory. Workers may close stdin early. The batch waits
+for every started sibling, aggregates failures, and removes the files after completion or handled
+interruption. The compute node needs writable scratch space and standard POSIX tools; no remote
+Python runtime is required. Task inputs are excluded from ordinary plan and inspection output,
+but are not secrets: cluster
 administrators and accounting systems may be able to inspect them. Scheduler names expose only a
 random Servatus allocation identity.
 
@@ -197,22 +204,24 @@ evidence unobserved:
 result_view = campaign.inspect(result_exists, scheduler=False)
 ```
 
-Scheduler inspection follows durable Attempt order. Each accepted Attempt gets one server-side
-single-job `squeue` request and one `sacct --duplicates` request bound to its allocation-derived job
-name. Queue rows must also repeat the exact allocation comment. Accounting rows may repeat that
-comment or omit it, as some Slurm sites do; a different nonempty comment is unrelated evidence.
-Exactly one accounting record submitted inside the reconciliation window anchors the original job.
-Strictly later records with the same immutable identity are its requeue incarnations, and the unique
-latest incarnation owns accounting evidence. Distinct Attempts remain distinct even if Slurm reuses
-the same job ID and cluster. The native single-job invalid-ID response means only that no active row
-exists, so accounting is still queried; without an accounting anchor, even an exact active row
-reports `UNKNOWN`.
+Scheduler inspection returns durable Attempt order while batching up to 16 distinct jobs per
+cluster into `squeue` and `sacct --duplicates` requests. Reused job numbers are queried separately.
+Responses are matched by job number and immutable allocation-derived name; queue rows must also
+repeat the exact allocation comment. Accounting rows may omit the comment, as some sites do.
+Exactly one accounting record inside each Attempt's submission window anchors its original job;
+strictly later records identify requeue incarnations. Conflicting identities or histories fail
+closed. Exact positive queue evidence blocks retry even when accounting has no anchor or reports
+a later terminal sample. Held/requeued work, including `SPECIAL_EXIT`, remains retained work.
+Terminal evidence requires anchored accounting, and retained work cannot establish quiescence.
 
-Each SSH command has a 30-second deadline. Local and remote argument vectors have at most 16
-arguments, 16 KiB of complete command text, 1 MiB per output stream, 128 lines, and 4 KiB per source
-field. Scheduler commands run with a fixed C locale and UTC timezone. A failed command, timeout,
-overflow, malformed or partial row, unrelated Attempt identity, or ambiguous accounting history
-aborts the whole inspection.
+Every SSH operation, including submission, validation, reconciliation, inspection, and logs, has a
+30-second deadline and drains stdout/stderr concurrently. Local failures kill and reap the SSH child
+and close its streams. Commands permit at most 32 arguments, 16 KiB of complete command text,
+4 KiB per source field, and 1 MiB per output stream. Scheduler responses permit at most 128 lines
+per batch. Commands run with a fixed C locale and UTC timezone. Submission command bounds are
+checked before durable intent; a failure after launch still leaves conservative acceptance ambiguity.
+A failed command, timeout, overflow, malformed row, unrelated identity, or ambiguous accounting
+history aborts inspection without partial evidence.
 
 Allocation states normalize to `QUEUED`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, or
 `UNKNOWN`. Packed Tasks share their allocation evidence. Every Attempt remains visible, while the
