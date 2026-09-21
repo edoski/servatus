@@ -164,7 +164,7 @@ class Campaign:
         )
 
     def submit(self, plan: SubmissionPlan, *, probe: ResultProbe | None = None) -> SubmitResult:
-        plan = restore_plan(self, plan_document(plan))
+        self._preflight_plan(plan)
         if plan.probe_required and probe is None and plan.allocations:
             raise PlanError("result-aware submission requires a result probe")
         expected_revision = plan.revision
@@ -218,8 +218,6 @@ class Campaign:
                             "intent persistence failed; inspect campaign",
                         )
             except Exception as error:
-                if not receipts:
-                    raise
                 return SubmitResult(
                     tuple(receipts),
                     (),
@@ -267,8 +265,19 @@ class Campaign:
                 )
         return SubmitResult(tuple(receipts), (), (), None)
 
+    def _preflight_plan(self, plan: SubmissionPlan, *, validation: bool = False) -> None:
+        state = self._store.read()
+        if state.campaign_id != plan.campaign_id or state.revision != plan.revision:
+            raise PlanError("plan is stale or foreign")
+        for allocation in plan.allocations:
+            argv = (*allocation.argv, "--test-only") if validation else allocation.argv
+            try:
+                _slurm.preflight(plan.profile.target, argv)
+            except ObservationError as error:
+                raise PlanError(str(error)) from error
+
     def validate(self, plan: SubmissionPlan) -> tuple[ValidationResult, ...]:
-        plan = restore_plan(self, plan_document(plan))
+        self._preflight_plan(plan, validation=True)
         seen: set[int] = set()
         results: list[ValidationResult] = []
         for allocation in plan.allocations:

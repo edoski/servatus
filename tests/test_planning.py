@@ -163,8 +163,9 @@ def test_saved_plan_roundtrip_requires_no_observation_and_retains_reprobe(
         visited.append(task.key)
         return True
 
-    with pytest.raises(PlanError, match="ineligible"):
-        campaign.submit(restored, probe=probe)
+    outcome = campaign.submit(restored, probe=probe)
+    assert outcome.stop_reason and outcome.unattempted == restored.allocations
+    assert outcome.receipts == outcome.unresolved == ()
     assert visited == ["task-1", "task-2"]
     assert campaign.inspect(scheduler=False).attempts == ()
 
@@ -174,7 +175,7 @@ def test_reprobe_and_scheduler_refresh_then_atomic_revision_claim(
 ) -> None:
     from test_campaign import profile, tasks
 
-    from servatus import Campaign, PlanError, _slurm
+    from servatus import Campaign, _slurm
 
     campaign = Campaign.create(tmp_path / "campaign", tasks(1), appendable=True)
     plan = campaign.plan(profile(), lambda _: False)
@@ -185,8 +186,9 @@ def test_reprobe_and_scheduler_refresh_then_atomic_revision_claim(
         campaign.append(tasks(2)[1:])
         return False
 
-    with pytest.raises(PlanError, match="changed"):
-        campaign.submit(plan, probe=probe)
+    outcome = campaign.submit(plan, probe=probe)
+    assert outcome.stop_reason and outcome.unattempted == plan.allocations
+    assert outcome.receipts == outcome.unresolved == ()
     assert contacted == []
     assert not campaign.inspect(scheduler=False).attempts
 
@@ -308,3 +310,26 @@ def test_terminal_work_requires_explicit_retry_and_valid_results_are_excluded(
     assert campaign.plan(profile(), lambda _: True).excluded_task_keys == ("task-0",)
     with pytest.raises(PlanError, match="valid"):
         campaign.plan(profile(), lambda _: True, retry=("task-0",))
+
+
+def test_first_refresh_failure_reports_complete_unattempted_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from test_campaign import profile, tasks
+
+    from servatus import Campaign, _slurm
+
+    campaign = Campaign.create(tmp_path / "campaign", tasks(2))
+    plan = campaign.plan(profile(), lambda _: False, tasks_per_allocation=1)
+    contacted = []
+    monkeypatch.setattr(_slurm, "_run_ssh", lambda *_: contacted.append(True))
+
+    def unavailable(_task):
+        raise OSError("result volume unavailable")
+
+    outcome = campaign.submit(plan, probe=unavailable)
+    assert outcome.receipts == outcome.unresolved == ()
+    assert outcome.unattempted == plan.allocations
+    assert outcome.stop_reason and "OSError" in outcome.stop_reason
+    assert contacted == []
+    assert campaign.inspect(scheduler=False).attempts == ()
