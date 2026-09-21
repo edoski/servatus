@@ -20,7 +20,10 @@ reviewer /root/review_filesystem running fixed review. Worker gates: 514 passed,
 Ruff, Pyright, Vulture, builds, installed workflows/entrypoints pass.
 Slice 2 GREEN LIGHT: reviewer Standards 0, Spec 0; independent focused 113 passed, 1 skipped.
 No correction round required.
-Slice 3: next. Final integration: pending.
+Slice 3: implementing from 966613f5f93126571bfb205faa1e81aec0a73d94;
+worker /root/implement_campaign owns product changes. /root/draft_campaign_docs produces off-repo
+documentation drafts for that worker to integrate; it never edits the checkout.
+Final integration: pending.
 
 Slice 1 implementation 898ab90df9ce00951e34f1925123141f57780997; reviewer /root/review_execution
 reviewing aa33964...898ab90 with separate Standards/Spec agents. Worker gates: 509 passed, 1 skipped;
