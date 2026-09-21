@@ -20,6 +20,15 @@ the campaign revision, with one useful integrity digest. Inspect remains ephemer
 attempts count toward retry safety; each is observed on its own original route. Only selected profile
 semantics need validation, while whole TOML syntax and unknown-key validation remain strict.
 
+Concrete workflow: Campaign.create(path, tasks, appendable=False), Campaign.load(path), and
+campaign.append(new_tasks). Append accepts only the new suffix. Campaign.plan(profile, probe=None,
+retry=(), allow_duplicate_risk=(), tasks_per_allocation=None) gathers its own current evidence;
+remove the need to authenticate a caller-built CampaignView. inspect remains independent diagnostics.
+Saved result-aware plans retain probe_required so restoring them cannot lose the re-probe obligation.
+Submission interruption by KeyboardInterrupt/SystemExit still propagates, preserving durable intent;
+ordinary operational failures return complete structured partial outcomes. Include an observed but
+not durably recorded receipt separately when persistence fails after Slurm acceptance.
+
 Planning limits its batch to max_allocations_per_submit and exposes deferred tasks. Submit attempts
 the entire reviewed batch and reports receipts plus unresolved/unattempted work when interrupted by
 an operational failure or concurrent change. Keep conservative submission ambiguity and explicit

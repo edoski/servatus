@@ -12,4 +12,11 @@ Campaign decision: explicit create/load/append/seal, fixed roster default; attem
 compact plans and bounded planned batches, structured partial outcomes; clean schema/API replacement.
 No deployment or external service action authorized by this implementation run.
 
-Slice 1: pending. Slice 2: pending. Slice 3: pending. Final integration: pending.
+Slice 1: implementing; baseline aa339641948323395545a8850adcb10cc6d24d27;
+worker /root/implement_execution. Independent read-only campaign design: /root/design_campaign.
+Slice 2: pending. Slice 3: pending. Final integration: pending.
+
+Read-only campaign design complete: four internal responsibilities (typed model/codecs, store,
+observation/policy, orchestration). Plan gathers evidence internally; view authenticity protocol
+removed. create uses appendable=False by default; append receives new suffix. Partial outcomes
+distinguish observed-but-not-durable receipt. Interruptions propagate. These choices added to spec.
