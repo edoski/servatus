@@ -27,9 +27,12 @@ preserved as cleanup residue and cannot turn committed publication into apparent
 The hidden Workspace container is its lifecycle trust root. Servatus requires the container, its
 work directory, lifecycle lock, and identity file to belong to the effective user with no group or
 world permissions, and reverifies them through pinned descriptors. Initialization syncs the private
-hierarchy before identity becomes authoritative. Cleanup walks only the pinned tree without
-following links, reverifies every name binding, and preserves a moved or substituted root as cleanup
-residue. Arbitrary code running as the same Unix account can rename and recreate the complete trust
+hierarchy and its parent before identity becomes authoritative; no fsync runs under shared parent
+coordination. Entry rechecks root and child destination absence after acquiring lifecycle leases.
+Cleanup requires trusted quiescent writers, walks only the pinned tree without following links,
+checks name bindings before descriptor-relative removal, and preserves a moved or substituted root
+as cleanup residue. These checks do not make inspection and unlink atomic against a concurrent
+same-account namespace writer. Arbitrary code running as the same Unix account can rename and recreate the complete trust
 root and is outside this unprivileged library's threat model. Keep destination parents private and
 treat workers and builders as trusted code.
 

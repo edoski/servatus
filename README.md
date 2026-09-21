@@ -390,7 +390,10 @@ with parent as workspace:
 `child()` accepts one safe leaf and opaque identity. Different children may run concurrently; the
 same child and parent finalization remain exclusive and nonblocking. A failed child retains only
 its resumable private work, while a published child becomes immutable input under the parent work.
-Servatus does not track expected children, readiness, dependencies, or application completion.
+Servatus checks destination absence again after acquiring lifecycle leases, before exposing private
+work. Initialization syncs the private hierarchy and its parent before committing the identity,
+without holding shared parent coordination during synchronization. Servatus does not track expected
+children, readiness, dependencies, or application completion.
 
 The owner-only hidden Workspace container is the lifecycle trust root. Servatus pins and rechecks
 its entries without following links; unsafe substitution is preserved and reported as pending
@@ -415,7 +418,7 @@ filesystem with stable cross-client inode identities. See [SECURITY.md](SECURITY
 - Disposable stage names are not synced merely by creation. Files and directories are synced before
   commit; publication returns only after the parent is synced. Failure or interruption after rename
   can leave a complete visible destination whose directory durability is not yet proven.
-- Builders and writers must be quiescent when they return. Servatus verifies pathname/inode
+- Builders and writers must be quiescent when they return and throughout private cleanup. Servatus verifies pathname/inode
   identity and syncs content, but does not detect or exclude concurrent content writers.
 - Builder failures expose no destination. Resumable work remains; disposable stages are removed.
 - Successful workspace publication exactly removes its pinned private tree. A moved, substituted,

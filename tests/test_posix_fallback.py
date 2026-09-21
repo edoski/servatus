@@ -44,7 +44,6 @@ def _directory_fallback_worker(
 ) -> None:
     parent_fd = _posix.open_directory(Path(parent))
     try:
-        expected_parent = os.fstat(parent_fd)
         expected_source = os.stat(source, dir_fd=parent_fd, follow_symlinks=False)
         start.recv()
         try:
@@ -52,7 +51,6 @@ def _directory_fallback_worker(
                 parent_fd,
                 source,
                 destination,
-                expected_parent,
                 expected_source,
             )
         except DestinationExists:
@@ -519,7 +517,6 @@ def test_directory_fallback_is_absent_or_complete_for_readers(tmp_path: Path) ->
             parent_fd,
             "stage",
             "result",
-            os.fstat(parent_fd),
             source.stat(follow_symlinks=False),
         )
         assert seen_complete.wait(5)
@@ -571,7 +568,6 @@ def test_directory_fallback_releases_dedicated_lock_by_close(
             parent_fd,
             "stage",
             "result",
-            os.fstat(parent_fd),
             source.stat(follow_symlinks=False),
         )
         os.fstat(parent_fd)
@@ -601,44 +597,6 @@ def test_directory_fallback_rejects_source_substitution(
 
     assert not (tmp_path / "result").exists()
     assert (tmp_path / "moved-stage/value").read_text() == "ours"
-
-
-def test_fallback_rejects_parent_descriptor_substitution(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(sys, "platform", "linux")
-    original = tmp_path / "original"
-    replacement = tmp_path / "replacement"
-    original.mkdir()
-    replacement.mkdir()
-    source = original / "stage"
-    source.write_text("complete")
-    os.link(source, replacement / "stage")
-    parent_fd = _posix.open_directory(original)
-
-    def substitute(parent_fd: int, source: str, destination: str) -> None:
-        del source, destination
-        replacement_fd = _posix.open_directory(replacement)
-        try:
-            os.dup2(replacement_fd, parent_fd)
-        finally:
-            os.close(replacement_fd)
-        raise _posix._NoreplaceUnavailable
-
-    monkeypatch.setattr(_posix, "_linux_rename_noreplace", substitute)
-    try:
-        with pytest.raises(UnsafePublication, match="parent"):
-            _posix.commit_noreplace(
-                parent_fd,
-                "stage",
-                "result",
-                source.stat(follow_symlinks=False),
-            )
-    finally:
-        os.close(parent_fd)
-
-    assert not (original / "result").exists()
-    assert not (replacement / "result").exists()
 
 
 def test_native_noreplace_remains_the_fast_path(

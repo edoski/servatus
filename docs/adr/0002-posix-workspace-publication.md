@@ -13,14 +13,14 @@ commit remains authoritative against a later race.
 
 Linux first uses `renameat2(RENAME_NOREPLACE)` and macOS uses descriptor-relative
 `renameatx_np(RENAME_EXCL)`. Linux falls back only when the native call reports `EINVAL`, `ENOSYS`,
-or `EOPNOTSUPP`, after re-verifying the pinned parent and exact source inode. A regular file is
+or `EOPNOTSUPP`, after verifying the exact source inode relative to the pinned parent. A regular file is
 installed with a same-parent hard link, which remains kernel-exclusive, then the exact stage is
 removed; both parent-directory changes are synced. If stage removal reports failure after the source
 name disappeared, Servatus retries the parent sync before reporting cleanup pending. It never removes
 a source found under a substituted inode.
 
 A directory fallback requires an owner-controlled parent and an exclusive advisory `flock` on its
-pinned descriptor. Under that lock Servatus re-verifies the parent and source, checks the destination
+pinned descriptor. Under that lock Servatus rechecks parent ownership and permissions and the source inode, checks the destination
 is absent, performs a descriptor-relative rename, and verifies the published inode. Servatus then
 closes the dedicated lock handle before syncing the parent, so an unbounded remote directory sync
 cannot retain the distributed lock or convoy independent destinations. Publication returns only
@@ -60,10 +60,13 @@ parent-synced publication. Its container, work directory, lifecycle lock, and id
 owned by the effective user and expose no group or world permissions. Its private identity record
 stores the exact container, lock, and work inode pins. Live opens enforce local type, device, and
 pathname identity. Before first identity commit, Servatus syncs the lock and work entries, their
-container, and the container's parent; a durable identity is not synced again merely on reopen.
+container, and the container's parent, outside shared parent coordination. A durable identity is not
+synced again merely on reopen. Entry checks destination absence after acquiring lifecycle leases.
 Cleanup opens the expected root, walks and removes entries relative to pinned directory descriptors
 without following links, reverifies each name binding, and removes the root only while it still
-names the expected inode. A moved, substituted, or unremovable tree remains as cleanup residue. If
+names the expected inode. Regular files are unlinked directly after their name/inode check; cleanup
+does not create extra hard links or exclude concurrent namespace mutation. The caller must keep the
+tree quiescent. A moved, substituted, or unremovable tree remains as cleanup residue. If
 fallback identity installation commits but stage removal or its durability cannot be proved, the
 installed identity remains valid and Servatus warns that private cleanup remains pending. Every
 public committed publication with stage, Workspace, or retained-tree residue returns

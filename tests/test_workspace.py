@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
 import stat
@@ -1206,6 +1207,9 @@ def test_workspace_syncs_new_private_hierarchy_before_identity_commit(
         assert lock_key in synced_entries
         assert work_key in synced_entries
         assert container_key in synced_entries
+        parent = tmp_path.stat()
+        parent_key = (parent.st_dev, parent.st_ino)
+        assert synced_entries.index(parent_key) > synced_entries.index(container_key)
         internal_sync = max(synced_entries.index(lock_key), synced_entries.index(work_key))
         assert synced_entries.index(container_key) > internal_sync
         outcome = real_commit(parent_fd, source, destination, expected_source)
@@ -1221,25 +1225,94 @@ def test_workspace_syncs_new_private_hierarchy_before_identity_commit(
     assert committed_parent is not None
 
 
-def test_workspace_initialization_does_not_sync_shared_parent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("child", [False, True])
+def test_workspace_initialization_syncs_parent_without_coordination_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, child: bool
 ) -> None:
-    parent = tmp_path.stat(follow_symlinks=False)
-    parent_key = (parent.st_dev, parent.st_ino)
-    synced: list[tuple[int, int]] = []
+    root = Workspace(tmp_path / "result", identity=b"request")
+    if child:
+        with root:
+            pass
+    workspace = root.child("trial", identity=b"trial") if child else root
+    parent = workspace.path.parent.parent
+    parent_entry = parent.stat()
+    synced_parent = False
     real_sync = _posix.sync_descriptor
 
-    def record_sync(descriptor: int) -> None:
-        entry = os.fstat(descriptor)
-        synced.append((entry.st_dev, entry.st_ino))
+    def check_sync(descriptor: int) -> None:
+        nonlocal synced_parent
+        if _posix.same_entry(os.fstat(descriptor), parent_entry):
+            lock_fd = _posix.open_directory(parent)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                synced_parent = True
+            finally:
+                os.close(lock_fd)
         real_sync(descriptor)
 
-    monkeypatch.setattr(_posix, "sync_descriptor", record_sync)
-
-    with Workspace(tmp_path / "result", identity=b"request"):
+    monkeypatch.setattr(_posix, "sync_descriptor", check_sync)
+    with workspace:
         pass
+    assert synced_parent
 
-    assert parent_key not in synced
+
+@pytest.mark.parametrize("child", [False, True])
+def test_workspace_parent_sync_failure_prevents_identity_and_allows_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, child: bool
+) -> None:
+    root = Workspace(tmp_path / "result", identity=b"request")
+    if child:
+        with root:
+            pass
+    workspace = root.child("trial", identity=b"trial") if child else root
+    parent_entry = workspace.path.parent.parent.stat()
+    real_sync = _posix.sync_descriptor
+
+    def fail_parent_sync(descriptor: int) -> None:
+        if _posix.same_entry(os.fstat(descriptor), parent_entry):
+            raise OSError("injected parent sync failure")
+        real_sync(descriptor)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(_posix, "sync_descriptor", fail_parent_sync)
+        with pytest.raises(OSError, match="parent sync failure"), workspace:
+            pytest.fail("undurable work was exposed")
+    assert not (workspace.path.parent / ".identity").exists()
+    with workspace:
+        (workspace.path / "checkpoint").write_text("resumed")
+    assert (workspace.path.parent / ".identity").is_file()
+    assert (workspace.path / "checkpoint").read_text() == "resumed"
+
+
+@pytest.mark.parametrize("race", ["root", "child", "root-before-child"])
+def test_workspace_entry_rejects_publication_before_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, race: str
+) -> None:
+    destination = tmp_path / "result"
+    root = Workspace(destination, identity=b"root")
+    child = race != "root"
+    canonical = root.path / "trial" if race == "child" else destination
+    late = root.child("trial", identity=b"trial") if child else root
+    real_open = _workspace._open_level
+    published = False
+
+    def interleave(
+        parent_fd: int, container_name: str, identity: bytes, target: Path, lock_mode: int
+    ) -> _workspace._WorkspaceLevel:
+        nonlocal published
+        if target == canonical and not published:
+            published = True
+            other_root = Workspace(destination, identity=b"root")
+            other = other_root.child("trial", identity=b"trial") if race == "child" else other_root
+            with other:
+                other.publish(lambda draft: (draft.path / "value").write_text("canonical"))
+        return real_open(parent_fd, container_name, identity, target, lock_mode)
+
+    monkeypatch.setattr(_workspace, "_open_level", interleave)
+    with pytest.raises(DestinationExists), late:
+        pytest.fail("redundant private work was exposed")
+    assert published
+    assert (canonical / "value").read_text() == "canonical"
 
 
 def test_workspace_reopen_does_not_sync_unchanged_container(

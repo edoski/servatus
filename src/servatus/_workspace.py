@@ -8,7 +8,7 @@ import stat
 import warnings
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from . import _posix
@@ -152,64 +152,94 @@ def publish_file(destination: Path, write: Callable[[Path], None]) -> Publicatio
     return _publication_result(outcome.destination, cleanup_pending=outcome.cleanup_pending)
 
 
+@dataclass(frozen=True, slots=True)
+class _WorkspaceLocation:
+    destination: Path
+    identity: bytes
+    root: _WorkspaceLocation | None = None
+
+    @property
+    def parent(self) -> Path:
+        return self.destination.parent
+
+    @property
+    def container_name(self) -> str:
+        return _container_name(self.destination.name)
+
+    @property
+    def path(self) -> Path:
+        return self.parent / self.container_name / "work"
+
+
+@dataclass(slots=True)
+class _WorkspaceSession:
+    parent_fd: int = -1
+    root_level: _WorkspaceLevel | None = None
+    level: _WorkspaceLevel = field(default_factory=_WorkspaceLevel)
+    entered: bool = False
+    published: bool = False
+
+
 class Workspace:
     def __init__(self, destination: Path, *, identity: bytes) -> None:
         parent, destination_name = _posix.normalize_destination(destination)
-        self._root_parent = parent
-        self._root_destination_name = destination_name
-        self._root_container_name = _container_name(destination_name)
-        self._root_identity = _identity_digest(identity)
-        self._child_name: str | None = None
-        self._destination = parent / destination_name
-        self._parent = parent
-        self._container_name = self._root_container_name
-        self._identity = self._root_identity
-        self._initialize_state()
-
-    def _initialize_state(self) -> None:
-        self._stable_parent_fd = -1
-        self._root_level: _WorkspaceLevel | None = None
-        self._level = _WorkspaceLevel()
-        self._entered = False
-        self._published = False
+        self._location = _WorkspaceLocation(parent / destination_name, _identity_digest(identity))
+        self._session = _WorkspaceSession()
 
     def child(self, name: str, *, identity: bytes) -> Workspace:
-        if self._child_name is not None:
+        if self._location.root is not None:
             raise UnsafePublication("child workspaces cannot contain child workspaces")
         _posix.validate_leaf(name)
-        child = object.__new__(Workspace)
-        child._root_parent = self._root_parent
-        child._root_destination_name = self._root_destination_name
-        child._root_container_name = self._root_container_name
-        child._root_identity = self._root_identity
-        child._child_name = name
-        child._parent = self.path
-        child._destination = child._parent / name
-        child._container_name = _container_name(name)
-        child._identity = _identity_digest(identity)
-        child._initialize_state()
+        child = Workspace(self._location.destination, identity=identity)
+        child._location = _WorkspaceLocation(
+            self.path / name, child._location.identity, self._location
+        )
         return child
 
     def __enter__(self) -> Workspace:
-        if self._entered:
+        if self._session.entered:
             raise RuntimeError("workspace is already entered")
         _posix.require_supported_platform()
-        self._stable_parent_fd = _posix.open_directory(self._root_parent)
+        location = self._location
+        root = location.root or location
+        session = self._session = _WorkspaceSession()
+        session.parent_fd = _posix.open_directory(root.parent)
         try:
-            _posix.ensure_directory_path(self._root_parent, self._stable_parent_fd)
-            _posix.ensure_absent(
-                self._stable_parent_fd,
-                self._root_destination_name,
-                self._root_parent / self._root_destination_name,
-            )
-            if self._child_name is None:
-                self._enter_root()
+            _posix.ensure_directory_path(root.parent, session.parent_fd)
+            _posix.ensure_absent(session.parent_fd, root.destination.name, root.destination)
+            if location.root is None:
+                session.level = _open_level(
+                    session.parent_fd,
+                    location.container_name,
+                    location.identity,
+                    location.destination,
+                    fcntl.LOCK_EX,
+                )
             else:
-                self._enter_child()
+                session.root_level = _open_level(
+                    session.parent_fd,
+                    root.container_name,
+                    root.identity,
+                    root.destination,
+                    fcntl.LOCK_SH,
+                )
+                session.level = _open_level(
+                    session.root_level.work_fd,
+                    location.container_name,
+                    location.identity,
+                    location.destination,
+                    fcntl.LOCK_EX,
+                )
+            self._verify_live()
+            _posix.ensure_absent(session.parent_fd, root.destination.name, root.destination)
+            if session.root_level is not None:
+                _posix.ensure_absent(
+                    session.root_level.work_fd, location.destination.name, location.destination
+                )
         except BaseException:
             self._close()
             raise
-        self._entered = True
+        session.entered = True
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -217,19 +247,20 @@ class Workspace:
 
     @property
     def path(self) -> Path:
-        return self._parent / self._container_name / "work"
+        return self._location.path
 
     def publish(self, build: Callable[[Draft], None]) -> Publication:
-        if not self._entered or self._level.container_entry is None:
+        session = self._session
+        location = self._location
+        if not session.entered or session.level.container_entry is None:
             raise RuntimeError("workspace must be entered before publication")
-        if self._published:
+        if session.published:
             raise RuntimeError("workspace has already published")
         self._verify_live()
-        publication_parent_fd = self._publication_parent_fd()
         outcome = _posix.publication_attempt_at(
-            self._parent,
-            publication_parent_fd,
-            self._destination.name,
+            location.parent,
+            self._publication_parent_fd(),
+            location.destination.name,
             _build_draft(build),
         )
         cleanup_pending = outcome.cleanup_pending
@@ -237,84 +268,49 @@ class Workspace:
             self._cleanup_published()
         except Exception:
             cleanup_pending = True
-        self._published = True
+        session.published = True
         return _publication_result(outcome.destination, cleanup_pending=cleanup_pending)
 
-    def _enter_root(self) -> None:
-        self._level = _open_level(
-            self._stable_parent_fd,
-            self._root_container_name,
-            self._identity,
-            self._destination,
-            fcntl.LOCK_EX,
-        )
-        self._verify_live()
-
-    def _enter_child(self) -> None:
-        assert self._child_name is not None
-        root_destination = self._root_parent / self._root_destination_name
-        self._root_level = _open_level(
-            self._stable_parent_fd,
-            self._root_container_name,
-            self._root_identity,
-            root_destination,
-            fcntl.LOCK_SH,
-        )
-        _posix.ensure_absent(self._root_level.work_fd, self._child_name, self._destination)
-        self._level = _open_level(
-            self._root_level.work_fd,
-            self._container_name,
-            self._identity,
-            self._destination,
-            fcntl.LOCK_EX,
-        )
-        self._verify_live()
-
     def _publication_parent_fd(self) -> int:
-        if self._child_name is None:
-            return self._stable_parent_fd
-        assert self._root_level is not None
-        return self._root_level.work_fd
+        session = self._session
+        if session.root_level is None:
+            return session.parent_fd
+        return session.root_level.work_fd
 
     def _verify_live(self) -> None:
-        _posix.ensure_directory_path(self._root_parent, self._stable_parent_fd)
-        if self._child_name is None:
-            _verify_level(self._stable_parent_fd, self._root_container_name, self._level)
-        else:
-            assert self._root_level is not None
-            _verify_level(self._stable_parent_fd, self._root_container_name, self._root_level)
+        location = self._location
+        session = self._session
+        root = location.root or location
+        _posix.ensure_directory_path(root.parent, session.parent_fd)
+        if session.root_level is not None:
+            _verify_level(session.parent_fd, root.container_name, session.root_level)
             _verify_identity(
-                self._root_level.container_fd,
-                self._root_identity,
-                self._root_parent / self._root_destination_name,
-                self._root_level,
+                session.root_level.container_fd, root.identity, root.destination, session.root_level
             )
-            _verify_level(self._root_level.work_fd, self._container_name, self._level)
+        _verify_level(self._publication_parent_fd(), location.container_name, session.level)
         _verify_identity(
-            self._level.container_fd,
-            self._identity,
-            self._destination,
-            self._level,
+            session.level.container_fd, location.identity, location.destination, session.level
         )
 
     def _cleanup_published(self) -> None:
-        assert self._level.container_entry is not None
+        assert self._session.level.container_entry is not None
         self._verify_live()
         _posix.remove_tree_at(
             self._publication_parent_fd(),
-            self._container_name,
-            self._level.container_entry,
+            self._location.container_name,
+            self._session.level.container_entry,
         )
 
     def _close(self) -> None:
-        _close_level(self._level)
-        if self._root_level is not None:
-            _close_level(self._root_level)
-        self._entered = False
-        if self._stable_parent_fd >= 0:
+        session = self._session
+        _close_level(session.level)
+        if session.root_level is not None:
+            _close_level(session.root_level)
+        session.entered = False
+        if session.parent_fd >= 0:
             with suppress(OSError):
-                os.close(self._stable_parent_fd)
-            self._stable_parent_fd = -1
+                os.close(session.parent_fd)
+            session.parent_fd = -1
 
 
 def _container_name(destination_name: str) -> str:
@@ -376,6 +372,7 @@ def _open_level(
             )
             level.lock_fd, level.lock_entry = _open_lock(level.container_fd)
             _acquire_lifecycle(level.lock_fd, lock_mode, destination)
+            _posix.ensure_absent(parent_fd, destination.name, destination)
             level.work_fd, level.work_entry = _posix.make_directory_at(level.container_fd, "work")
         _verify_level(parent_fd, container_name, level)
         _bind_identity(parent_fd, level.container_fd, identity, destination, level)
@@ -412,10 +409,10 @@ def _bind_identity(
 
 
 def _sync_workspace_initialization(parent_fd: int, level: _WorkspaceLevel) -> None:
-    del parent_fd
     _posix.sync_descriptor(level.lock_fd)
     _posix.sync_descriptor(level.work_fd)
     _posix.sync_descriptor(level.container_fd)
+    _posix.sync_descriptor(parent_fd)
 
 
 def _initialize_identity(

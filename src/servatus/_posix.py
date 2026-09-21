@@ -261,12 +261,10 @@ def commit_noreplace(
     destination: str,
     expected_source: os.stat_result,
 ) -> _CommitOutcome:
-    expected_parent = os.fstat(parent_fd)
     if sys.platform.startswith("linux"):
         try:
             _linux_rename_noreplace(parent_fd, source, destination)
         except _NoreplaceUnavailable:
-            _verify_fallback_parent(parent_fd, expected_parent)
             current_source = _verified_source(parent_fd, source, expected_source)
             if stat.S_ISREG(current_source.st_mode):
                 return _link_file_noreplace(parent_fd, source, destination, current_source)
@@ -275,7 +273,6 @@ def commit_noreplace(
                     parent_fd,
                     source,
                     destination,
-                    expected_parent,
                     current_source,
                 )
                 sync_descriptor(parent_fd)
@@ -304,15 +301,8 @@ def _verified_source(
     return current
 
 
-def _verify_fallback_parent(parent_fd: int, expected: os.stat_result) -> os.stat_result:
+def _verify_owner_controlled_parent(parent_fd: int) -> None:
     current = os.fstat(parent_fd)
-    if not same_entry(current, expected):
-        raise UnsafePublication("publication parent changed before fallback")
-    return current
-
-
-def _verify_owner_controlled_parent(parent_fd: int, expected: os.stat_result) -> None:
-    current = _verify_fallback_parent(parent_fd, expected)
     if current.st_uid != os.geteuid() or current.st_mode & 0o022:
         raise UnsafePublication("fallback requires an owner-controlled publication parent")
 
@@ -368,7 +358,6 @@ def _locked_directory_noreplace(
     parent_fd: int,
     source: str,
     destination: str,
-    expected_parent: os.stat_result,
     expected_source: os.stat_result,
 ) -> None:
     try:
@@ -376,12 +365,13 @@ def _locked_directory_noreplace(
     except OSError as error:
         raise UnsupportedPlatform("publication parent lock is unavailable") from error
     try:
-        _verify_fallback_parent(lock_fd, expected_parent)
+        if not same_entry(os.fstat(lock_fd), os.fstat(parent_fd)):
+            raise UnsafePublication("publication parent lock refers to another directory")
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
         except OSError as error:
             raise UnsupportedPlatform("publication parent lock is unavailable") from error
-        _verify_owner_controlled_parent(parent_fd, expected_parent)
+        _verify_owner_controlled_parent(parent_fd)
         _verified_source(parent_fd, source, expected_source)
         try:
             os.stat(destination, dir_fd=parent_fd, follow_symlinks=False)
@@ -520,55 +510,8 @@ def _remove_nondirectory_entry(
     name: str,
     expected: os.stat_result,
 ) -> None:
-    if stat.S_ISREG(expected.st_mode):
-        _pin_and_remove_regular_file(parent_fd, name, expected)
-        return
     ensure_entry(parent_fd, name, expected)
     os.unlink(name, dir_fd=parent_fd)
-
-
-def _pin_and_remove_regular_file(
-    parent_fd: int,
-    name: str,
-    expected: os.stat_result,
-) -> None:
-    pin = ""
-    for _ in range(128):
-        candidate = f".servatus-cleanup-{os.urandom(12).hex()}"
-        try:
-            os.link(
-                name,
-                candidate,
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
-        except FileExistsError:
-            continue
-        except OSError as error:
-            raise UnsafePublication(f"cleanup file could not be pinned: {name}") from error
-        pin = candidate
-        break
-    if not pin:
-        raise UnsafePublication("could not allocate a cleanup file pin")
-    try:
-        pinned = os.stat(pin, dir_fd=parent_fd, follow_symlinks=False)
-    except OSError as error:
-        raise UnsafePublication(f"cleanup file pin is unavailable: {name}") from error
-    try:
-        if not same_entry(pinned, expected):
-            raise UnsafePublication(f"cleanup file changed before pin: {name}")
-        ensure_entry(parent_fd, name, expected)
-        os.unlink(name, dir_fd=parent_fd)
-        ensure_entry(parent_fd, pin, pinned)
-        os.unlink(pin, dir_fd=parent_fd)
-    except BaseException as error:
-        try:
-            ensure_entry(parent_fd, pin, pinned)
-            os.unlink(pin, dir_fd=parent_fd)
-        except Exception as cleanup_error:
-            error.add_note(f"Servatus could not remove cleanup file pin: {cleanup_error}")
-        raise
 
 
 def remove_file_at(parent_fd: int, name: str, expected: os.stat_result) -> None:
