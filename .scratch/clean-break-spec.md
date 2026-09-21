@@ -28,6 +28,9 @@ Saved result-aware plans retain probe_required so restoring them cannot lose the
 Submission interruption by KeyboardInterrupt/SystemExit still propagates, preserving durable intent;
 ordinary operational failures return complete structured partial outcomes. Include an observed but
 not durably recorded receipt separately when persistence fails after Slurm acceptance.
+CLI uses consistent state-first positional arguments: create STATE TASKS [--appendable],
+append STATE TASKS, plan STATE --profile NAME --output PLAN. Other state operations retain their
+state-first shape. No old --campaign flag aliases.
 
 Planning limits its batch to max_allocations_per_submit and exposes deferred tasks. Submit attempts
 the entire reviewed batch and reports receipts plus unresolved/unattempted work when interrupted by
