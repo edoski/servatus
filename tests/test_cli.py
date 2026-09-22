@@ -111,9 +111,19 @@ def test_cli_profile_is_explicit_and_never_searches_parents(
     monkeypatch.chdir(child)
     with pytest.raises(SystemExit):
         main(["plan", str(campaign_path), "--output", str(child / "plan.json")])
-    monkeypatch.chdir(tmp_path)
     output = tmp_path / "plan.json"
-    main(["plan", str(campaign_path), "--profile", "alias", "--output", str(output)])
+    main(
+        [
+            "plan",
+            str(campaign_path),
+            "--profile",
+            "alias",
+            "--output",
+            str(output),
+            "--config",
+            str(tmp_path / "SERVATUS.toml"),
+        ]
+    )
     assert json.loads(output.read_bytes())["profile"]["label"] == "alias"
 
 
@@ -168,3 +178,20 @@ def test_cli_logs_are_exact_binary_and_errors_are_redacted(
         main(["logs", str(campaign_path), "abc"])
     output = capsysbinary.readouterr()
     assert output.out == b"" and b"campaign log is unavailable" in output.err
+
+
+def test_cli_argument_only_tasks_need_no_input_file(tmp_path: Path) -> None:
+    task_file = tmp_path / "tasks.jsonl"
+    task_file.write_text(json.dumps({"key": "one", "args": ["run"]}) + "\n")
+    campaign_path = tmp_path / "campaign"
+    assert main(["create", str(campaign_path), str(task_file)]) == 0
+    task = Campaign.load(campaign_path).tasks[0]
+    assert task.args == ("run",) and task.stdin == b""
+
+
+@pytest.mark.parametrize("stdin_file", [None, 0, ""])
+def test_cli_explicit_input_path_must_be_valid(tmp_path: Path, stdin_file: object) -> None:
+    task_file = tmp_path / "tasks.jsonl"
+    task_file.write_text(json.dumps({"key": "one", "args": [], "stdin_file": stdin_file}) + "\n")
+    with pytest.raises(SystemExit):
+        main(["create", str(tmp_path / "campaign"), str(task_file)])

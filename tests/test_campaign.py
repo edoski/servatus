@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from subprocess import CalledProcessError
 
 import pytest
 
@@ -13,6 +14,7 @@ from servatus import (
     Profile,
     ResourceRequest,
     SlurmTarget,
+    SubmissionError,
     Task,
     _campaign,
     _slurm,
@@ -290,7 +292,10 @@ def test_receipt_survives_unrelated_authoring_and_stops_stale_batch(
         return _slurm.Result(0, b"42;alpha\n", b"")
 
     monkeypatch.setattr(_slurm, "_run_ssh", submit)
-    result = campaign.submit(plan)
+    with pytest.raises(SubmissionError) as caught:
+        campaign.submit(plan)
+    result = caught.value.result
+    assert result is not None
     assert len(contacted) == len(result.receipts) == 1
     assert result.unresolved == () and result.stop_reason
     assert result.unattempted == plan.allocations[1:]
@@ -339,10 +344,22 @@ def test_partial_submission_reports_every_allocation(
             return _slurm.Result(0, b"42\n", b"")
         if failure == "transport":
             raise OSError("lost transport")
-        return _slurm.Result(1 if failure == "nonzero" else 0, b"not a receipt", b"")
+        return _slurm.Result(1 if failure == "nonzero" else 0, b"not a receipt", b"site rejection")
 
     monkeypatch.setattr(_slurm, "_run_ssh", submit)
-    result = campaign.submit(plan)
+    with pytest.raises(SubmissionError) as caught:
+        campaign.submit(plan)
+    result = caught.value.result
+    assert result is not None
+    assert caught.value.__cause__ is not None
+    if failure == "transport":
+        assert str(caught.value.__cause__) == "lost transport"
+    elif failure == "nonzero":
+        assert isinstance(caught.value.__cause__, CalledProcessError)
+        assert caught.value.__cause__.returncode == 1
+        assert caught.value.__cause__.stdout == b"not a receipt"
+        assert caught.value.__cause__.stderr == b"site rejection"
+        assert "site rejection" not in str(caught.value)
     assert [item.job_id for item in result.receipts] == [42]
     assert result.unresolved[0].allocation_id == plan.allocations[1].allocation_id
     assert result.unresolved[0].observed_receipt is None
@@ -386,7 +403,12 @@ def test_observed_receipt_survives_a_failed_durable_receipt_write(
 
     monkeypatch.setattr(_store.Transaction, "commit", failing)
     monkeypatch.setattr(_slurm, "_run_ssh", lambda *_: _slurm.Result(0, b"42;alpha\n", b""))
-    result = campaign.submit(plan)
+    with pytest.raises(SubmissionError) as caught:
+        campaign.submit(plan)
+    result = caught.value.result
+    assert result is not None
+    assert isinstance(caught.value.__cause__, OSError)
+    assert str(caught.value.__cause__) == "disk unavailable"
     assert result.receipts == ()
     assert result.unresolved[0].observed_receipt.job_id == 42
     assert campaign.inspect(scheduler=False).attempts[0].acceptance.value == "UNRESOLVED"
@@ -436,25 +458,24 @@ def test_retry_can_change_resources_while_history_keeps_original_routes(
     assert str(logs[1][1]).startswith("/new/logs/")
 
 
-def test_redacted_record_is_a_simple_current_diagnostic(
+def test_redacted_snapshot_remains_serializable_after_campaign_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import json
-
-    from servatus import ObservationError
 
     campaign = Campaign.create(
         tmp_path / "campaign", (Task("one", ("sensitive",), b"secret"),), appendable=True
     )
     monkeypatch.setattr(_slurm, "_run_ssh", lambda *_: _slurm.Result(0, b"42\n", b""))
     campaign.submit(planning(campaign))
-    view = campaign.inspect(lambda _: True)
-    record = campaign.record(view)
+    view = campaign.inspect()
+    record = view.to_json()
     assert all(secret not in record for secret in (b"sensitive", b"secret", b"login.example.edu"))
     assert json.loads(record)["attempts"][0]["receipt"]["job_id"] == 42
     campaign.seal()
-    with pytest.raises(ObservationError):
-        campaign.record(view)
+    assert view.to_json() == record
+    assert json.loads(record)["sealed"] is False
+    assert campaign.inspect(scheduler=False).sealed
 
 
 def test_last_receipt_completes_batch_despite_unrelated_append(
@@ -470,3 +491,75 @@ def test_last_receipt_completes_batch_despite_unrelated_append(
     result = campaign.submit(planning(campaign))
     assert len(result.receipts) == 1 and result.stop_reason is None
     assert result.unattempted == () and result.unresolved == ()
+
+
+def test_handle_probe_is_used_for_inspection_planning_and_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    found: set[str] = set()
+    calls: list[str] = []
+
+    def probe(task: Task) -> bool:
+        calls.append(task.key)
+        return task.key in found
+
+    path = tmp_path / "campaign"
+    campaign = Campaign.create(path, tasks(1), probe=probe)
+    assert campaign.inspect(scheduler=False).tasks[0].result.value == "MISSING"
+    plan = planning(campaign)
+    assert plan.probe_required
+    found.add("task-0")
+    with pytest.raises(SubmissionError) as caught:
+        campaign.submit(plan)
+    assert isinstance(caught.value.__cause__, PlanError)
+    assert caught.value.result.unattempted == plan.allocations
+    assert campaign.inspect(scheduler=False).attempts == ()
+    assert len(calls) == 4
+    loaded = Campaign.load(path, probe=probe)
+    assert loaded.inspect(scheduler=False).tasks[0].result.value == "VALID"
+
+
+def test_handle_probe_is_honored_for_a_plan_created_without_one(tmp_path: Path) -> None:
+    path = tmp_path / "campaign"
+    plan = planning(Campaign.create(path, tasks(1)))
+    loaded = Campaign.load(path, probe=lambda _: True)
+    with pytest.raises(SubmissionError) as caught:
+        loaded.submit(plan)
+    assert isinstance(caught.value.__cause__, PlanError)
+    assert caught.value.result.unattempted == plan.allocations
+    assert loaded.inspect(scheduler=False).attempts == ()
+
+
+def test_saved_result_aware_plan_requires_probe_on_loaded_handle(tmp_path: Path) -> None:
+    path = tmp_path / "campaign"
+    plan = planning(Campaign.create(path, tasks(1), probe=lambda _: False))
+    loaded = Campaign.load(path)
+    restored = _campaign.restore_plan(loaded, _campaign.plan_document(plan))
+    with pytest.raises(PlanError, match="result probe"):
+        loaded.submit(restored)
+    assert loaded.inspect(scheduler=False).attempts == ()
+
+
+def test_retry_acknowledgement_survives_improved_scheduler_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = Campaign.create(tmp_path / "campaign", tasks(1))
+    monkeypatch.setattr(_slurm, "_run_ssh", lambda *_: _slurm.Result(0, b"42\n", b""))
+    campaign.submit(planning(campaign))
+    state = _slurm.AllocationState.UNKNOWN
+
+    def observe(_target, queries):
+        return tuple(
+            _slurm.SchedulerObservation(state, state.value, None, None, None, None, None)
+            for _ in queries
+        )
+
+    monkeypatch.setattr(_slurm, "query_attempts", observe)
+    with pytest.raises(PlanError, match="acknowledgement"):
+        planning(campaign, retry=("task-0",))
+    plan = planning(campaign, retry=("task-0",), allow_duplicate_risk=("task-0",))
+    state = _slurm.AllocationState.FAILED
+    result = campaign.submit(plan)
+    assert len(result.receipts) == 1
+    with pytest.raises(PlanError, match="explicitly retried"):
+        planning(campaign, allow_duplicate_risk=("task-0",))

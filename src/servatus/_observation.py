@@ -1,7 +1,6 @@
 # pyright: reportPrivateUsage=false
 from __future__ import annotations
 
-from dataclasses import asdict
 from datetime import UTC, datetime
 
 from . import _slurm
@@ -139,19 +138,6 @@ def observe(
     )
 
 
-def campaign_view_document(view: CampaignView) -> dict[str, object]:
-    value = asdict(view)
-    value["observed_at"] = view.observed_at.isoformat()
-    for task in value["tasks"]:
-        at = task["result_observed_at"]
-        task["result_observed_at"] = None if at is None else at.isoformat()
-    for attempt in value["attempts"]:
-        allocation = attempt["allocation"]
-        if allocation is not None:
-            allocation["observed_at"] = allocation["observed_at"].isoformat()
-    return value
-
-
 def select_tasks(
     view: CampaignView,
     retry: tuple[str, ...],
@@ -159,10 +145,12 @@ def select_tasks(
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     retries = set(retry)
     acknowledged = set(duplicate_risk)
+    known = {task.key for task in view.tasks}
+    if acknowledged - (retries & known):
+        raise PlanError("duplicate-risk acknowledgement requires an explicitly retried Task key")
     active = {AllocationState.QUEUED, AllocationState.RUNNING}
     selected: list[str] = []
     excluded: list[str] = []
-    used_acknowledgements: set[str] = set()
     accepted_by_task: dict[str, list[AttemptEvidence]] = {task.key: [] for task in view.tasks}
     for attempt in view.attempts:
         if attempt.acceptance is AcceptanceState.ACCEPTED:
@@ -204,19 +192,10 @@ def select_tasks(
         if task.key not in retries:
             excluded.append(task.key)
             continue
-        if AllocationState.UNKNOWN in states:
-            if task.key not in acknowledged:
-                raise PlanError(
-                    f"unknown task {task.key!r} retry requires duplicate-risk acknowledgement"
-                )
-            used_acknowledgements.add(task.key)
-        elif task.key in acknowledged:
+        if AllocationState.UNKNOWN in states and task.key not in acknowledged:
             raise PlanError(
-                f"duplicate-risk acknowledgement for {task.key!r} has no unknown attempt"
+                f"unknown task {task.key!r} retry requires duplicate-risk acknowledgement"
             )
         selected.append(task.key)
 
-    unused = acknowledged - used_acknowledgements
-    if unused:
-        raise PlanError("duplicate-risk acknowledgement does not match unknown accepted work")
     return tuple(selected), tuple(excluded)

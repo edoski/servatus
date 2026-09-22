@@ -8,8 +8,8 @@ import json
 import os
 import re
 import tomllib
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Sequence
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
@@ -82,8 +82,8 @@ def _absolute_path(value: object, *, name: str) -> PurePosixPath:
     if not isinstance(raw, str):
         raise ConfigurationError(f"{name} must be an absolute POSIX path")
     path = PurePosixPath(raw)
-    if _CONTROL.search(raw) or not path.is_absolute() or ".." in path.parts or raw != str(path):
-        raise ConfigurationError(f"{name} must be a normalized absolute POSIX path")
+    if _CONTROL.search(raw) or not path.is_absolute() or ".." in path.parts:
+        raise ConfigurationError(f"{name} must be an absolute POSIX path without parent traversal")
     return path
 
 
@@ -99,25 +99,29 @@ def _read_toml(path: Path) -> dict[str, object]:
 @dataclass(frozen=True, slots=True)
 class Task:
     key: str
-    args: tuple[str, ...]
-    stdin: bytes
+    args: Sequence[str]
+    stdin: bytes = b""
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, str) or not self.key or "\0" in self.key:
             raise ConfigurationError("Task.key must be a nonempty string without NUL")
-        if not isinstance(self.args, tuple) or any(not isinstance(arg, str) for arg in self.args):
-            raise ConfigurationError("Task.args must be a tuple of strings")
+        if isinstance(self.args, (str, bytes, bytearray)) or not isinstance(self.args, Sequence):
+            raise ConfigurationError("Task.args must be a sequence of strings")
+        args = tuple(self.args)
+        if any(not isinstance(arg, str) for arg in args):
+            raise ConfigurationError("Task.args must be a sequence of strings")
+        object.__setattr__(self, "args", args)
         if any("\0" in arg for arg in self.args):
             raise ConfigurationError("Task.args cannot contain NUL")
         if not isinstance(self.stdin, bytes):
             raise ConfigurationError("Task.stdin must be bytes")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ResourceRequest:
     cpus_per_task: int
     memory_mib_per_task: int
-    gpus_per_task: int
+    gpus_per_task: int = 0
     time_limit: str
 
     _KEYS: ClassVar[frozenset[str]] = frozenset(
@@ -131,7 +135,7 @@ class ResourceRequest:
         _duration_seconds(self.time_limit, name="time_limit")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class SlurmTarget:
     host: str
     slurm_bin: PurePosixPath
@@ -139,18 +143,18 @@ class SlurmTarget:
     image: PurePosixPath
     work_root: PurePosixPath
     log_root: PurePosixPath
-    partitions: tuple[str, ...]
-    account: str | None
-    qos: str | None
-    constraint: str | None
-    gpu_gres: str | None
+    partitions: Sequence[str]
+    account: str | None = None
+    qos: str | None = None
+    constraint: str | None = None
+    gpu_gres: str | None = None
     max_tasks_per_allocation: int
     max_cpus_per_allocation: int
     max_memory_mib_per_allocation: int
     max_gpus_per_allocation: int
     max_time_limit: str
-    max_allocations_per_submit: int
-    max_script_bytes: int
+    max_allocations_per_submit: int = 1
+    max_script_bytes: int = 1024 * 1024
 
     _REQUIRED: ClassVar[frozenset[str]] = frozenset(
         {
@@ -166,20 +170,30 @@ class SlurmTarget:
             "max_memory_mib_per_allocation",
             "max_gpus_per_allocation",
             "max_time_limit",
+        }
+    )
+    _OPTIONAL: ClassVar[frozenset[str]] = frozenset(
+        {
+            "account",
+            "qos",
+            "constraint",
+            "gpu_gres",
             "max_allocations_per_submit",
             "max_script_bytes",
         }
     )
-    _OPTIONAL: ClassVar[frozenset[str]] = frozenset({"account", "qos", "constraint", "gpu_gres"})
 
     def __post_init__(self) -> None:
         _safe_token(self.host, name="host")
         for name in ("slurm_bin", "apptainer", "image", "work_root", "log_root"):
             object.__setattr__(self, name, _absolute_path(getattr(self, name), name=name))
         _configuration(
-            isinstance(self.partitions, tuple) and bool(self.partitions),
-            "partitions must be a nonempty tuple",
+            isinstance(self.partitions, Sequence)
+            and not isinstance(self.partitions, str)
+            and bool(self.partitions),
+            "partitions must be a nonempty sequence of strings",
         )
+        object.__setattr__(self, "partitions", tuple(self.partitions))
         for partition in self.partitions:
             _safe_token(partition, name="partition")
         _configuration(
@@ -217,7 +231,7 @@ def _resource_from_values(mapping: dict[str, object]) -> ResourceRequest:
     return ResourceRequest(
         cpus_per_task=cast(int, mapping["cpus_per_task"]),
         memory_mib_per_task=cast(int, mapping["memory_mib_per_task"]),
-        gpus_per_task=cast(int, mapping["gpus_per_task"]),
+        gpus_per_task=cast(int, mapping.get("gpus_per_task", 0)),
         time_limit=cast(str, mapping["time_limit"]),
     )
 
@@ -227,7 +241,7 @@ def _profile_resources(values: object) -> ResourceRequest:
         raise ConfigurationError("resources must be a table")
     mapping = cast(dict[str, object], values)
     unknown = mapping.keys() - ResourceRequest._KEYS
-    missing = ResourceRequest._KEYS - mapping.keys()
+    missing = ResourceRequest._KEYS - {"gpus_per_task"} - mapping.keys()
     if unknown:
         raise ConfigurationError(f"unknown resource keys: {', '.join(sorted(unknown))}")
     if missing:
@@ -256,8 +270,8 @@ def _target_from_values(mapping: dict[str, object]) -> SlurmTarget:
         max_memory_mib_per_allocation=cast(int, mapping["max_memory_mib_per_allocation"]),
         max_gpus_per_allocation=cast(int, mapping["max_gpus_per_allocation"]),
         max_time_limit=cast(str, mapping["max_time_limit"]),
-        max_allocations_per_submit=cast(int, mapping["max_allocations_per_submit"]),
-        max_script_bytes=cast(int, mapping["max_script_bytes"]),
+        max_allocations_per_submit=cast(int, mapping.get("max_allocations_per_submit", 1)),
+        max_script_bytes=cast(int, mapping.get("max_script_bytes", 1024 * 1024)),
     )
 
 
@@ -318,6 +332,8 @@ class Profile:
             if default not in tables:
                 raise ConfigurationError("default_profile does not name a declared profile")
         selected = name if name is not None else cast(str | None, default)
+        if selected is None and len(tables) == 1:
+            selected = next(iter(tables))
         if selected is None:
             raise ConfigurationError("profile selection is required")
         _nonempty_string(selected, name="profile name")
@@ -466,7 +482,7 @@ class SubmissionPlan:
         if not self.duplicate_risk_task_keys:
             return ()
         return (
-            "duplicate execution risk accepted for unknown prior work: "
+            "duplicate execution risk accepted for retries: "
             + ", ".join(self.duplicate_risk_task_keys),
         )
 
@@ -532,6 +548,19 @@ class CampaignView:
     observed_at: datetime
     results_ready: bool
     quiescent: bool
+
+    def to_json(self) -> bytes:
+        """Serialize diagnostic evidence without execution configuration or task payloads."""
+        value = asdict(self)
+        value["observed_at"] = self.observed_at.isoformat()
+        for task in value["tasks"]:
+            at = task["result_observed_at"]
+            task["result_observed_at"] = None if at is None else at.isoformat()
+        for attempt in value["attempts"]:
+            allocation = attempt["allocation"]
+            if allocation is not None:
+                allocation["observed_at"] = allocation["observed_at"].isoformat()
+        return canonical(value)
 
 
 @dataclass(frozen=True, slots=True)

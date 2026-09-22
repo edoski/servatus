@@ -14,9 +14,8 @@ from ._campaign import (
     submit_document,
     validation_document,
 )
-from ._errors import ServatusError
+from ._errors import ServatusError, SubmissionError
 from ._model import JobReceipt, Profile, Task, decode_json
-from ._observation import campaign_view_document
 from ._workspace import publish_file
 
 
@@ -35,6 +34,7 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("campaign", type=Path)
     plan.add_argument("--output", type=Path, required=True)
     plan.add_argument("--profile", metavar="NAME")
+    plan.add_argument("--config", type=Path, default=Path("SERVATUS.toml"), metavar="PATH")
     plan.add_argument("--tasks-per-allocation", type=int)
     plan.add_argument(
         "--retry",
@@ -107,10 +107,14 @@ def _load_tasks(path: Path) -> tuple[Task, ...]:
         try:
             raw = cast(object, json.loads(line))
             if not isinstance(raw, dict):
-                raise ValueError("expected key, args, and stdin_file")
+                raise ValueError("expected key, args, and optional stdin_file")
             mapping = cast(dict[str, object], raw)
-            if set(mapping) != {"key", "args", "stdin_file"}:
-                raise ValueError("expected key, args, and stdin_file")
+            if not {"key", "args"} <= mapping.keys() or mapping.keys() - {
+                "key",
+                "args",
+                "stdin_file",
+            }:
+                raise ValueError("expected key, args, and optional stdin_file")
             args = mapping["args"]
             if not isinstance(args, list):
                 raise ValueError("args must be an array of strings")
@@ -119,12 +123,16 @@ def _load_tasks(path: Path) -> tuple[Task, ...]:
                 if not isinstance(value, str):
                     raise ValueError("args must be an array of strings")
                 typed_args.append(value)
-            stdin_file = Path(cast(str, mapping["stdin_file"]))
-            if not stdin_file.is_absolute():
-                stdin_file = path.parent / stdin_file
-            values.append(
-                Task(cast(str, mapping["key"]), tuple(typed_args), stdin_file.read_bytes())
-            )
+            payload = b""
+            if "stdin_file" in mapping:
+                filename = mapping["stdin_file"]
+                if not isinstance(filename, str) or not filename:
+                    raise ValueError("stdin_file must be a nonempty path")
+                stdin_file = Path(filename)
+                if not stdin_file.is_absolute():
+                    stdin_file = path.parent / stdin_file
+                payload = stdin_file.read_bytes()
+            values.append(Task(cast(str, mapping["key"]), typed_args, payload))
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise ServatusError(f"invalid task file line {line_number}") from error
     return tuple(values)
@@ -173,7 +181,7 @@ def _run(arguments: argparse.Namespace) -> int:
         print(json.dumps({"appended": True}))
     elif command == "plan":
         campaign = Campaign.load(arguments.campaign)
-        profile = Profile.load(Path.cwd() / "SERVATUS.toml", name=arguments.profile)
+        profile = Profile.load(arguments.config, name=arguments.profile)
         plan = campaign.plan(
             profile,
             retry=arguments.retry,
@@ -197,15 +205,21 @@ def _run(arguments: argparse.Namespace) -> int:
         print(json.dumps(validation_document(results), sort_keys=True))
     elif command == "submit":
         campaign = Campaign.load(arguments.campaign)
-        result = campaign.submit(restore_plan(campaign, _read_json(arguments.plan)))
+        try:
+            result = campaign.submit(restore_plan(campaign, _read_json(arguments.plan)))
+        except SubmissionError as error:
+            if error.result is None:
+                raise
+            print(json.dumps(submit_document(error.result), sort_keys=True))
+            print(str(error), file=sys.stderr)
+            return 1
         print(json.dumps(submit_document(result), sort_keys=True))
-        return 1 if result.stop_reason else 0
     elif command == "seal":
         Campaign.load(arguments.campaign).seal()
         print(json.dumps({"sealed": True}, sort_keys=True))
     elif command == "status":
         view = Campaign.load(arguments.campaign).inspect()
-        print(json.dumps(campaign_view_document(view), sort_keys=True))
+        print(view.to_json().decode("utf-8"))
     elif command == "logs":
         snapshot = Campaign.load(arguments.campaign).read_log(
             arguments.allocation_id,

@@ -9,6 +9,7 @@ from test_campaign import resources, target
 from servatus import (
     ConfigurationError,
     Profile,
+    SubmissionError,
 )
 
 
@@ -87,7 +88,7 @@ def test_profile_rejects_only_empty_or_nonstr_labels(label: object) -> None:
     [
         "",
         "profiles = {}\n",
-        profile_text(default=None),
+        profile_text(default=None, second=True),
         profile_text(default="missing"),
         "extra = true\n" + profile_text(),
         profile_text().replace("cpus_per_task = 2\n", ""),
@@ -145,8 +146,10 @@ def test_saved_plan_roundtrip_requires_no_observation_and_retains_reprobe(
 
     from servatus import Campaign, PlanError, _slurm, plan_document, restore_plan
 
-    campaign = Campaign.create(tmp_path / "campaign", tasks(3))
-    plan = campaign.plan(profile(), lambda task: task.key == "task-0")
+    campaign = Campaign.create(
+        tmp_path / "campaign", tasks(3), probe=lambda task: task.key == "task-0"
+    )
+    plan = campaign.plan(profile())
     document = json.loads(json.dumps(plan_document(plan)))
 
     def unexpected(*_args):
@@ -156,14 +159,16 @@ def test_saved_plan_roundtrip_requires_no_observation_and_retains_reprobe(
     restored = restore_plan(campaign, document)
     assert restored == plan and restored.probe_required
     with pytest.raises(PlanError, match="probe"):
-        campaign.submit(restored)
+        Campaign.load(tmp_path / "campaign").submit(restored)
     visited = []
 
     def probe(task):
         visited.append(task.key)
         return True
 
-    outcome = campaign.submit(restored, probe=probe)
+    with pytest.raises(SubmissionError) as caught:
+        Campaign.load(tmp_path / "campaign", probe=probe).submit(restored)
+    outcome = caught.value.result
     assert outcome.stop_reason and outcome.unattempted == restored.allocations
     assert outcome.receipts == outcome.unresolved == ()
     assert visited == ["task-1", "task-2"]
@@ -177,8 +182,10 @@ def test_reprobe_and_scheduler_refresh_then_atomic_revision_claim(
 
     from servatus import Campaign, _slurm
 
-    campaign = Campaign.create(tmp_path / "campaign", tasks(1), appendable=True)
-    plan = campaign.plan(profile(), lambda _: False)
+    campaign = Campaign.create(
+        tmp_path / "campaign", tasks(1), appendable=True, probe=lambda _: False
+    )
+    plan = campaign.plan(profile())
     contacted = []
     monkeypatch.setattr(_slurm, "_run_ssh", lambda *_: contacted.append(True))
 
@@ -186,7 +193,9 @@ def test_reprobe_and_scheduler_refresh_then_atomic_revision_claim(
         campaign.append(tasks(2)[1:])
         return False
 
-    outcome = campaign.submit(plan, probe=probe)
+    with pytest.raises(SubmissionError) as caught:
+        Campaign.load(tmp_path / "campaign", probe=probe).submit(plan)
+    outcome = caught.value.result
     assert outcome.stop_reason and outcome.unattempted == plan.allocations
     assert outcome.receipts == outcome.unresolved == ()
     assert contacted == []
@@ -200,10 +209,12 @@ def test_reprobe_change_after_first_acceptance_returns_unattempted_batch(
 
     from servatus import Campaign, _slurm
 
-    campaign = Campaign.create(tmp_path / "campaign", tasks(2))
-    plan = campaign.plan(profile(), lambda _: False, tasks_per_allocation=1)
+    campaign = Campaign.create(tmp_path / "campaign", tasks(2), probe=lambda _: False)
+    plan = campaign.plan(profile(), tasks_per_allocation=1)
     monkeypatch.setattr(_slurm, "_run_ssh", lambda *_: _slurm.Result(0, b"42\n", b""))
-    result = campaign.submit(plan, probe=lambda task: task.key == "task-1")
+    with pytest.raises(SubmissionError) as caught:
+        Campaign.load(tmp_path / "campaign", probe=lambda task: task.key == "task-1").submit(plan)
+    result = caught.value.result
     assert len(result.receipts) == 1
     assert result.unresolved == () and result.stop_reason
     assert result.unattempted == plan.allocations[1:]
@@ -307,9 +318,10 @@ def test_terminal_work_requires_explicit_retry_and_valid_results_are_excluded(
     )
     assert campaign.plan(profile()).excluded_task_keys == ("task-0",)
     assert campaign.plan(profile(), retry=("task-0",)).selected_task_keys == ("task-0",)
-    assert campaign.plan(profile(), lambda _: True).excluded_task_keys == ("task-0",)
+    campaign = Campaign.load(tmp_path / "campaign", probe=lambda _: True)
+    assert campaign.plan(profile()).excluded_task_keys == ("task-0",)
     with pytest.raises(PlanError, match="valid"):
-        campaign.plan(profile(), lambda _: True, retry=("task-0",))
+        campaign.plan(profile(), retry=("task-0",))
 
 
 def test_first_refresh_failure_reports_complete_unattempted_batch(
@@ -319,17 +331,21 @@ def test_first_refresh_failure_reports_complete_unattempted_batch(
 
     from servatus import Campaign, _slurm
 
-    campaign = Campaign.create(tmp_path / "campaign", tasks(2))
-    plan = campaign.plan(profile(), lambda _: False, tasks_per_allocation=1)
+    campaign = Campaign.create(tmp_path / "campaign", tasks(2), probe=lambda _: False)
+    plan = campaign.plan(profile(), tasks_per_allocation=1)
     contacted = []
     monkeypatch.setattr(_slurm, "_run_ssh", lambda *_: contacted.append(True))
 
     def unavailable(_task):
         raise OSError("result volume unavailable")
 
-    outcome = campaign.submit(plan, probe=unavailable)
+    with pytest.raises(SubmissionError) as caught:
+        Campaign.load(tmp_path / "campaign", probe=unavailable).submit(plan)
+    assert isinstance(caught.value.__cause__, OSError)
+    assert "result volume unavailable" in str(caught.value.__cause__)
+    outcome = caught.value.result
     assert outcome.receipts == outcome.unresolved == ()
     assert outcome.unattempted == plan.allocations
-    assert outcome.stop_reason and "OSError" in outcome.stop_reason
+    assert outcome.stop_reason
     assert contacted == []
     assert campaign.inspect(scheduler=False).attempts == ()

@@ -1,3 +1,11 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ._model import SubmitResult
+
+
 class ServatusError(Exception):
     """Base class for Servatus contract failures."""
 
@@ -47,7 +55,11 @@ class PlanError(CampaignError):
 
 
 class SubmissionError(CampaignError):
-    """Slurm did not return a valid acceptance receipt."""
+    """Submission stopped; result preserves any partial or uncertain acceptance."""
+
+    def __init__(self, message: str, *, result: SubmitResult | None = None) -> None:
+        super().__init__(message)
+        self.result = result
 
 
 class ReconciliationError(CampaignError):

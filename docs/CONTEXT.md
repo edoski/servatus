@@ -24,24 +24,25 @@ Servatus uses a small generic vocabulary:
 - **Receipt:** a positive Slurm job identity proving acceptance, not completion; its Task keys come
   from the durable intent.
 - **Submit result:** structured receipts and unresolved or unattempted allocations from one reviewed
-  batch. A receipt observed but not durably recorded is distinguished from confirmed receipts.
+  batch, returned on completion or carried by `SubmissionError` when submission stops.
+  A receipt observed but not durably recorded is distinguished from confirmed receipts.
 - **Result probe:** an ephemeral synchronous caller function that validates a canonical result for
-  one opaque Task without exposing the application schema to Servatus.
+  one opaque Task, bound to a Campaign handle without exposing the application schema to Servatus.
 - **Allocation evidence:** transient scheduler evidence normalized to queued, running, succeeded,
   failed, cancelled, or unknown. Exact retained-work evidence blocks retry; anchored accounting
   establishes terminal evidence and identifies later requeue incarnations.
 - **Campaign view:** one transient revision-bound projection of all Attempts, current Task
-  execution and result evidence, readiness, and quiescence. Planning collects its own observations.
-- **Operational record:** a redacted JSON diagnostic projection of Campaign identity, roster,
-  Attempt chronology, receipts, and normalized scheduler evidence. It is identifying,
-  nonauthoritative, and never automatically published.
+  execution and result evidence, readiness, and quiescence. It exports directly to JSON without
+  execution configuration or task payloads; scheduler text and labels may still be private.
+  Export does not consult current state. Planning collects its own observations.
 - **Log snapshot:** a transient bounded binary suffix from an accepted Attempt's allocation or Task
   log. It has no lifecycle authority.
 - **Result readiness:** the sealed roster has valid immutable caller results for every Task.
 - **Quiescence:** scheduler evidence was requested, every accepted Attempt is proven terminal, and
   no acceptance remains unresolved. It is independent from result readiness.
 - **Duplicate-risk acknowledgement:** an explicit operator decision allowing retry when accepted
-  scheduler evidence is unknown. It never claims that earlier work stopped.
+  scheduler evidence is unknown; permission remains valid if that evidence becomes terminal.
+  It never claims that earlier work stopped.
 - **Validation result:** time-specific bounded Slurm `--test-only` validation of a current plan.
 - **Ambiguous allocation:** an intent without a receipt or explicit operator resolution.
 - **Destination:** the application-owned canonical path. It is immutable once published.

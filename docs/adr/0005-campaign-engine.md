@@ -10,7 +10,8 @@ compatibility decoder. Remote work and application callbacks run outside store l
 ## Authoring and configuration
 
 `Campaign.create(path, tasks, appendable=False)` creates a sealed fixed roster by default.
-`Campaign.load(path)` only opens existing state. For an appendable roster, `campaign.append(tasks)`
+`Campaign.load(path)` only opens existing state. Both accept an optional `probe` bound to the
+handle for inspection, planning, and submission; callbacks are never serialized. For an appendable roster, `campaign.append(tasks)`
 accepts only a new ordered suffix and `campaign.seal()` irreversibly ends authoring. Registered
 Tasks never change. Append and seal advance revision; execution is valid before sealing.
 
@@ -19,16 +20,21 @@ Every Attempt retains those resolved values. Later plans may change routes or re
 rewriting historical Attempts; observation, reconciliation, and log reads use each original route.
 `SERVATUS.toml` has named profiles and an optional default. TOML syntax and unknown keys are checked
 throughout the document, while semantic validation concerns only the selected profile. There is no
-inheritance, environment fallback, parent-directory search, or global configuration store.
+inheritance, environment fallback, parent-directory search, or global configuration store. A sole
+profile selects itself. Target and resource constructors are keyword-only, absent site settings
+default to `None`, GPU requests default to zero, and task stdin defaults to empty bytes. Argument
+and partition sequences freeze to tuples. Task/resource/time ceilings remain explicit for packing;
+submission and script bounds default to one allocation and 1 MiB without additional policy objects.
 
 ## Planning and submission
 
-`Campaign.plan(profile, probe=None, retry=(), allow_duplicate_risk=(), tasks_per_allocation=None)`
+`Campaign.plan(profile, retry=(), allow_duplicate_risk=(), tasks_per_allocation=None)`
 collects current evidence and applies one eligibility policy. Valid results are excluded.
 Never-accepted missing or unobserved Tasks are eligible. Unresolved acceptance withholds affected
 work. Every accepted Attempt participates in retry safety: active or held work blocks retry;
 terminal work requires explicit retry; unknown work additionally requires duplicate-risk
-acknowledgement. The allocation cap bounds the reviewed batch, with excess eligible work explicitly
+acknowledgement. Permission remains valid when uncertainty decreases to known terminal work.
+Acknowledgement must belong to an explicitly retried known Task. The allocation cap bounds the reviewed batch, with excess eligible work explicitly
 deferred and ineligible work explicitly excluded.
 
 A plan records Campaign identity and revision, selected allocations and execution configuration,
@@ -38,8 +44,8 @@ observation, and preserves the obligation to re-probe result-aware work. Inspect
 separate transient diagnostic projection.
 
 Before each allocation, submission refreshes relevant accepted Attempts and probes selected Tasks
-when required. The shared policy checks eligibility, then an atomic transaction verifies that revision and syncs
-unresolved intent.
+when a probe is bound to the handle; a result-aware plan requires one. The shared policy checks
+eligibility, then an atomic transaction verifies that revision and syncs unresolved intent.
 Local deterministic rendering and command validation happen before the claim. Scheduler contact
 then happens outside the lock. Each Attempt stores explicit intent and outcome revisions; delayed
 resolution preserves actual chronology without inventing unrecorded history.
@@ -50,16 +56,18 @@ stale plan. An identical receipt is idempotent; a conflicting outcome fails. Unc
 never proves rejection, and unresolved overlapping work blocks submission.
 
 Submission attempts the complete reviewed batch unless an operational failure or concurrent change
-stops it. `SubmitResult` preserves confirmed receipts and identifies unresolved and unattempted
-allocations. An accepted receipt whose persistence failed is reported separately as observed
+stops it. Completed submission returns `SubmitResult`; operational failure raises `SubmissionError`
+with the partial result and original chained cause. The result preserves confirmed receipts and
+identifies unresolved and unattempted allocations. Invalid plans fail directly before submission.
+An accepted receipt whose persistence failed is reported separately as observed
 but not durable. `KeyboardInterrupt` and `SystemExit` propagate, leaving durable intent available
 for recovery. Reconciliation and explicit accepted/not-submitted resolution preserve the same
 Attempt history; no automatic retry hides ambiguity.
 
 ## Observation and diagnostics
 
-`Campaign.inspect(probe=None, scheduler=True)` projects all Attempts and current Task evidence at
-one revision. The optional synchronous probe runs once per Task and validates an immutable or
+`Campaign.inspect(scheduler=True)` projects all Attempts and current Task evidence at
+one revision. The handle's optional synchronous probe runs once per Task and validates an immutable or
 version-addressed canonical result. Answers are never persisted. Scheduler observation uses bounded
 native calls on each Attempt's original route, with the identity, accounting-window, and retained
 queue-evidence rules in ADR 0003. Incoherent scheduler evidence or concurrent Campaign mutation
@@ -76,13 +84,15 @@ slot under the store lock, then performs a bounded binary suffix read outside th
 raise a redacted `ObservationError` without partial bytes. Log content never enters lifecycle state
 or decisions. The remote log namespace remains account-controlled and unauthenticated.
 
-`Campaign.record(view)` returns a redacted JSON diagnostic projection without mutation or
-publication. It retains identity, revision, roster keys, Attempt chronology, Profile labels,
-allocation shapes, receipts, and normalized scheduler evidence. Task bytes, scripts, resolved
-target values, raw scheduler details, results, logs, and application outputs are excluded. The
-record remains identifying operational data and has no execution authority.
+`CampaignView.to_json()` serializes the self-contained diagnostic snapshot, including task result
+states, observation timestamps, and scheduler-provided diagnostic text. Serialization does not reread
+Campaign state; snapshots remain exportable after append or seal. Execution configuration, task
+arguments and bytes, scripts, log content, and application output contents are excluded. Scheduler
+text and identifying labels may themselves contain private information, so snapshots remain private
+diagnostic data with no execution authority.
 
 The CLI mirrors explicit authoring through `create`, `append`, and `seal`; `plan` loads existing
-state and reads only cwd `SERVATUS.toml`. `validate`, `submit`, `status`, `logs`, `reconcile`, and
+state and reads cwd `SERVATUS.toml` unless `--config PATH` selects another file. Task JSONL accepts
+optional `stdin_file`, with empty stdin when omitted. `validate`, `submit`, `status`, `logs`, `reconcile`, and
 `resolve` use the same Campaign authority. Publication and Workspace ownership remain defined by
 ADRs 0001, 0002, and 0004.

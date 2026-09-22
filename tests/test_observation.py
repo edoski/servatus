@@ -20,6 +20,7 @@ from servatus import (
     PlanError,
     ResultState,
     SlurmTarget,
+    SubmissionError,
     Task,
     _campaign,
     _slurm,
@@ -518,7 +519,8 @@ def test_result_only_inspection_is_read_only_and_derives_sealed_readiness(tmp_pa
             return plain.is_file()
         return json.loads(structured.read_text()) == {"complete": True}
 
-    view = campaign.inspect(probe, scheduler=False)
+    campaign = Campaign.load(tmp_path / "campaign", probe=probe)
+    view = campaign.inspect(scheduler=False)
     assert calls == ["plain", "structured"]
     assert view.sealed
     assert view.results_ready
@@ -539,10 +541,12 @@ def test_probe_states_are_distinct_and_invalid_aborts_without_partial_view(tmp_p
         ResultState.UNOBSERVED,
         ResultState.UNOBSERVED,
     ]
-    assert [
-        item.result
-        for item in campaign.inspect(lambda task: task.key == "task-0", scheduler=False).tasks
-    ] == [ResultState.VALID, ResultState.MISSING, ResultState.MISSING]
+    campaign = Campaign.load(tmp_path / "campaign", probe=lambda task: task.key == "task-0")
+    assert [item.result for item in campaign.inspect(scheduler=False).tasks] == [
+        ResultState.VALID,
+        ResultState.MISSING,
+        ResultState.MISSING,
+    ]
     calls: list[str] = []
 
     def invalid(task: Task) -> bool:
@@ -551,8 +555,9 @@ def test_probe_states_are_distinct_and_invalid_aborts_without_partial_view(tmp_p
             raise ValueError("present result is corrupt")
         return True
 
+    campaign = Campaign.load(tmp_path / "campaign", probe=invalid)
     with pytest.raises(ValueError, match="corrupt"):
-        campaign.inspect(invalid, scheduler=False)
+        campaign.inspect(scheduler=False)
     assert calls == ["task-0", "task-1"]
 
 
@@ -671,7 +676,8 @@ def test_active_scheduler_row_wins_a_legitimate_accounting_transition_and_packed
         )
 
     monkeypatch.setattr(_slurm, "_run_bounded_ssh", query)
-    view = campaign.inspect(lambda _task: True)
+    campaign = Campaign.load(tmp_path / "campaign", probe=lambda _task: True)
+    view = campaign.inspect()
     allocation = view.attempts[0].allocation
     assert allocation is not None
     assert view.attempts[0].receipt == receipt
@@ -769,7 +775,8 @@ def test_result_only_view_skips_scheduler_and_valid_results_survive_unknown_acco
         "_run_bounded_ssh",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("scheduler contacted")),
     )
-    result_only = campaign.inspect(lambda _task: True, scheduler=False)
+    campaign = Campaign.load(tmp_path / "campaign", probe=lambda _task: True)
+    result_only = campaign.inspect(scheduler=False)
     assert result_only.results_ready
     assert not result_only.scheduler_observed
     assert result_only.attempts[0].allocation is None
@@ -777,7 +784,7 @@ def test_result_only_view_skips_scheduler_and_valid_results_survive_unknown_acco
     monkeypatch.setattr(
         _slurm, "_run_bounded_ssh", lambda *_args, **_kwargs: _slurm.Result(0, b"", b"")
     )
-    observed = campaign.inspect(lambda _task: True)
+    observed = campaign.inspect()
     assert observed.results_ready
     assert observed.attempts[0].allocation is not None
     assert observed.attempts[0].allocation.state is AllocationState.UNKNOWN
@@ -965,7 +972,10 @@ def test_inspection_and_reconciliation_force_utc_despite_local_timezone(
     monkeypatch.setattr(
         _slurm, "_run_ssh", lambda *_args, **_kwargs: _slurm.Result(1, b"", b"lost reply")
     )
-    assert ambiguous.submit(planning(ambiguous)).unresolved
+    with pytest.raises(SubmissionError) as failure:
+        ambiguous.submit(planning(ambiguous))
+    assert failure.value.result is not None
+    assert failure.value.result.unresolved
     allocation_id = ambiguous.inspect(scheduler=False).attempts[-1].allocation_id
     reconcile_identity = f"servatus-{allocation_id}"
     monkeypatch.setattr(_slurm, "_run_ssh", real_run_ssh)
@@ -1048,7 +1058,10 @@ def test_unresolved_acceptance_dominates_task_projection(
     monkeypatch.setattr(
         _slurm, "_run_ssh", lambda *_args, **_kwargs: _slurm.Result(1, b"", b"lost")
     )
-    assert campaign.submit(planning(campaign, retry={"task-0"})).unresolved
+    with pytest.raises(SubmissionError) as failure:
+        campaign.submit(planning(campaign, retry={"task-0"}))
+    assert failure.value.result is not None
+    assert failure.value.result.unresolved
     view = campaign.inspect()
     assert len(view.attempts) == 2
     assert view.tasks[0].acceptance_ambiguous
@@ -1075,8 +1088,9 @@ def test_campaign_revision_change_after_probe_or_scheduler_observation_is_stale(
         probe_campaign.append(tasks(2)[1:])
         return True
 
+    probe_campaign = Campaign.load(tmp_path / "probe", probe=mutate_probe)
     with pytest.raises(ObservationError, match="changed"):
-        probe_campaign.inspect(mutate_probe, scheduler=False)
+        probe_campaign.inspect(scheduler=False)
     scheduler_campaign = Campaign.create(tmp_path / "scheduler", tasks(1), appendable=True)
     accept(monkeypatch, scheduler_campaign, [42])
     mutated = False
@@ -1154,7 +1168,10 @@ def test_foreign_unaccepted_and_unrelated_log_inputs_fail_before_ssh(
         campaign.read_log("foreign")
     assert not contacted
     monkeypatch.setattr(_slurm, "_run_ssh", lambda *_args, **_kwargs: _slurm.Result(1, b"", b""))
-    assert campaign.submit(planning(campaign)).unresolved
+    with pytest.raises(SubmissionError) as failure:
+        campaign.submit(planning(campaign))
+    assert failure.value.result is not None
+    assert failure.value.result.unresolved
     unresolved = campaign.inspect(scheduler=False).attempts[-1].allocation_id
     with pytest.raises(ObservationError):
         campaign.read_log(unresolved)
@@ -1304,10 +1321,11 @@ def test_blocked_log_read_releases_campaign_lock_and_does_not_change_campaign_fa
     monkeypatch.setattr(
         _slurm, "_run_bounded_ssh", lambda *_args, **_kwargs: _slurm.Result(0, b"read-again", b"")
     )
-    before_view = extended.inspect(lambda _task: True, scheduler=False)
+    observed_campaign = Campaign.load(campaign_path, probe=lambda _task: True)
+    before_view = observed_campaign.inspect(scheduler=False)
     before_plan = planning(extended)
     extended.read_log(first.allocation_id)
-    after_view = extended.inspect(lambda _task: True, scheduler=False)
+    after_view = observed_campaign.inspect(scheduler=False)
     after_plan = planning(extended)
     assert state_path.read_bytes() == final_state
     assert (before_view.results_ready, before_view.quiescent) == (

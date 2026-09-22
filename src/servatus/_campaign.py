@@ -6,6 +6,7 @@ from collections.abc import Collection, Sequence
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from subprocess import CalledProcessError
 from typing import Self
 
 from . import _slurm
@@ -40,7 +41,6 @@ from ._model import (
     _integer,
     _safe_token,
     boolean,
-    canonical,
     digest,
     effective_time_limit,
     identifier,
@@ -56,11 +56,19 @@ from ._store import Store
 
 
 class Campaign:
-    def __init__(self, store: Store) -> None:
+    def __init__(self, store: Store, *, probe: ResultProbe | None = None) -> None:
         self._store = store
+        self._probe = probe
 
     @classmethod
-    def create(cls, path: Path, tasks: Sequence[Task], *, appendable: bool = False) -> Self:
+    def create(
+        cls,
+        path: Path,
+        tasks: Sequence[Task],
+        *,
+        appendable: bool = False,
+        probe: ResultProbe | None = None,
+    ) -> Self:
         frozen = _tasks(tasks)
         if type(appendable) is not bool:
             raise ConfigurationError("appendable must be bool")
@@ -76,11 +84,11 @@ class Campaign:
                     None if appendable else 0,
                 )
             )
-        return cls(store)
+        return cls(store, probe=probe)
 
     @classmethod
-    def load(cls, path: Path) -> Self:
-        return cls(Store.load(path))
+    def load(cls, path: Path, *, probe: ResultProbe | None = None) -> Self:
+        return cls(Store.load(path), probe=probe)
 
     @property
     def tasks(self) -> tuple[Task, ...]:
@@ -115,9 +123,9 @@ class Campaign:
                     replace(state, revision=state.revision + 1, sealed_revision=state.revision + 1)
                 )
 
-    def inspect(self, probe: ResultProbe | None = None, *, scheduler: bool = True) -> CampaignView:
+    def inspect(self, *, scheduler: bool = True) -> CampaignView:
         state = self._store.read()
-        view = observe(state, probe, scheduler=scheduler)
+        view = observe(state, self._probe, scheduler=scheduler)
         if (
             after := self._store.read()
         ).campaign_id != state.campaign_id or after.revision != state.revision:
@@ -127,7 +135,6 @@ class Campaign:
     def plan(
         self,
         profile: Profile,
-        probe: ResultProbe | None = None,
         *,
         retry: Collection[str] = (),
         allow_duplicate_risk: Collection[str] = (),
@@ -137,7 +144,7 @@ class Campaign:
         known = tuple(task.key for task in state.tasks)
         retries = _selection(retry, known, "retry")
         ack = _selection(allow_duplicate_risk, known, "duplicate risk")
-        view = observe(state, probe)
+        view = observe(state, self._probe)
         if (
             after := self._store.read()
         ).campaign_id != state.campaign_id or after.revision != state.revision:
@@ -160,23 +167,22 @@ class Campaign:
             tuple(key for key in retries if key in selected),
             tuple(key for key in ack if key in selected),
             capacity,
-            probe is not None,
+            self._probe is not None,
         )
 
-    def submit(self, plan: SubmissionPlan, *, probe: ResultProbe | None = None) -> SubmitResult:
+    def submit(self, plan: SubmissionPlan) -> SubmitResult:
         self._preflight_plan(plan)
-        if plan.probe_required and probe is None and plan.allocations:
+        if plan.probe_required and self._probe is None and plan.allocations:
             raise PlanError("result-aware submission requires a result probe")
         expected_revision = plan.revision
         receipts: list[JobReceipt] = []
         for index, allocation in enumerate(plan.allocations):
+            intent_started = False
             try:
                 state = self._store.read()
                 if state.campaign_id != plan.campaign_id or state.revision != expected_revision:
                     raise PlanError("campaign changed before submission freshness check")
-                view = observe(
-                    state, probe if plan.probe_required else None, task_keys=allocation.task_keys
-                )
+                view = observe(state, self._probe, task_keys=allocation.task_keys)
                 retries = tuple(key for key in plan.retry_task_keys if key in allocation.task_keys)
                 ack = tuple(
                     key for key in plan.duplicate_risk_task_keys if key in allocation.task_keys
@@ -202,47 +208,56 @@ class Campaign:
                         datetime.now(UTC),
                     )
                     # Commit can fail after replacement. Recovery must inspect this intent.
-                    try:
-                        tx.commit(
-                            replace(
-                                current,
-                                revision=attempt.intent_revision,
-                                attempts=current.attempts + (attempt,),
-                            )
+                    intent_started = True
+                    tx.commit(
+                        replace(
+                            current,
+                            revision=attempt.intent_revision,
+                            attempts=current.attempts + (attempt,),
                         )
-                    except Exception:
-                        return SubmitResult(
-                            tuple(receipts),
-                            (UnresolvedSubmission(allocation.allocation_id, allocation.task_keys),),
-                            plan.allocations[index + 1 :],
-                            "intent persistence failed; inspect campaign",
-                        )
+                    )
             except Exception as error:
-                return SubmitResult(
-                    tuple(receipts),
-                    (),
-                    plan.allocations[index:],
-                    f"submission stopped before next intent: {type(error).__name__}",
+                reason = (
+                    "intent persistence failed; inspect campaign"
+                    if intent_started
+                    else "submission stopped before next intent"
                 )
+                partial = SubmitResult(
+                    tuple(receipts),
+                    (UnresolvedSubmission(allocation.allocation_id, allocation.task_keys),)
+                    if intent_started
+                    else (),
+                    plan.allocations[index + 1 :] if intent_started else plan.allocations[index:],
+                    reason,
+                )
+                raise SubmissionError(reason, result=partial) from error
             try:
                 result = _slurm._run_ssh(plan.profile.target, allocation.argv, allocation.script)
                 if result.returncode != 0:
-                    raise SubmissionError("no acceptance receipt")
+                    raise CalledProcessError(
+                        result.returncode,
+                        allocation.argv,
+                        output=result.stdout,
+                        stderr=result.stderr,
+                    )
                 job_id, cluster = _slurm.parse_receipt(result.stdout)
                 receipt = JobReceipt(
                     allocation.allocation_id, job_id, cluster, allocation.task_keys
                 )
-            except Exception:
-                return SubmitResult(
+            except Exception as error:
+                reason = "scheduler acceptance is unresolved"
+                partial = SubmitResult(
                     tuple(receipts),
                     (UnresolvedSubmission(allocation.allocation_id, allocation.task_keys),),
                     plan.allocations[index + 1 :],
-                    "scheduler acceptance is unresolved",
+                    reason,
                 )
+                raise SubmissionError(reason, result=partial) from error
             try:
                 revision, outcome_revision = self._complete(attempt.allocation_id, receipt)
-            except Exception:
-                return SubmitResult(
+            except Exception as error:
+                reason = "receipt persistence failed; acceptance observed"
+                partial = SubmitResult(
                     tuple(receipts),
                     (
                         UnresolvedSubmission(
@@ -250,19 +265,17 @@ class Campaign:
                         ),
                     ),
                     plan.allocations[index + 1 :],
-                    "receipt persistence failed; acceptance observed",
+                    reason,
                 )
+                raise SubmissionError(reason, result=partial) from error
             receipts.append(receipt)
             expected_revision = attempt.intent_revision + 1
             if index + 1 < len(plan.allocations) and (
                 revision != expected_revision or outcome_revision != expected_revision
             ):
-                return SubmitResult(
-                    tuple(receipts),
-                    (),
-                    plan.allocations[index + 1 :],
-                    "campaign changed during submission",
-                )
+                reason = "campaign changed during submission"
+                partial = SubmitResult(tuple(receipts), (), plan.allocations[index + 1 :], reason)
+                raise SubmissionError(reason, result=partial)
         return SubmitResult(tuple(receipts), (), (), None)
 
     def _preflight_plan(self, plan: SubmissionPlan, *, validation: bool = False) -> None:
@@ -289,7 +302,14 @@ class Campaign:
                 plan.profile.target, (*allocation.argv, "--test-only"), allocation.script
             )
             if result.returncode != 0:
-                raise SubmissionError("Slurm rejected time-specific validation")
+                raise SubmissionError(
+                    "Slurm rejected time-specific validation"
+                ) from CalledProcessError(
+                    result.returncode,
+                    (*allocation.argv, "--test-only"),
+                    output=result.stdout,
+                    stderr=result.stderr,
+                )
             results.append(
                 ValidationResult(
                     count,
@@ -384,48 +404,6 @@ class Campaign:
         path = _slurm._log_path(target.log_root, allocation_id, attempt.receipt.job_id, slot)
         content, truncated = _slurm.read_log_suffix(target, path, max_bytes)
         return LogSnapshot(content, truncated, datetime.now(UTC))
-
-    def record(self, view: CampaignView) -> bytes:
-        state = self._store.read()
-        if view.campaign_id != state.campaign_id or view.revision != state.revision:
-            raise ObservationError("operational record view is stale or foreign")
-        observations = {item.allocation_id: item.allocation for item in view.attempts}
-        return canonical(
-            {
-                "campaign_id": state.campaign_id,
-                "revision": state.revision,
-                "sealed": state.sealed,
-                "task_keys": [task.key for task in state.tasks],
-                "attempts": [
-                    {
-                        "allocation_id": item.allocation_id,
-                        "task_keys": list(item.task_keys),
-                        "profile_label": item.profile.label,
-                        "allocation": {
-                            "task_count": len(item.task_keys),
-                            "cpus": len(item.task_keys) * item.profile.resources.cpus_per_task,
-                            "memory_mib": len(item.task_keys)
-                            * item.profile.resources.memory_mib_per_task,
-                            "gpus": len(item.task_keys) * item.profile.resources.gpus_per_task,
-                            "time_limit": effective_time_limit(item.profile.resources.time_limit),
-                        },
-                        "retry_task_keys": list(item.retry_task_keys),
-                        "duplicate_risk_task_keys": list(item.duplicate_risk_task_keys),
-                        "intent_revision": item.intent_revision,
-                        "outcome_revision": item.outcome_revision,
-                        "acceptance": item.acceptance.value,
-                        "receipt": None if item.receipt is None else receipt_document(item.receipt),
-                        "execution": observation.state.value
-                        if (observation := observations.get(item.allocation_id)) is not None
-                        else None,
-                        "retained": observation.retained
-                        if (observation := observations.get(item.allocation_id)) is not None
-                        else None,
-                    }
-                    for item in state.attempts
-                ],
-            }
-        )
 
 
 def _tasks(tasks: Sequence[Task]) -> tuple[Task, ...]:
