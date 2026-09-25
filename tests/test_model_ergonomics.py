@@ -40,6 +40,28 @@ def test_task_rejects_invalid_argument_sequences(args: object) -> None:
         Task("task", args)
 
 
+def test_task_freezes_environment_sorted_by_name_and_defaults_to_empty() -> None:
+    env = {"ZED": "1", "ALPHA": "a,b c"}
+    task = Task("task", (), env=env)
+    env["ADDED"] = "later"
+    assert list(task.env.items()) == [("ALPHA", "a,b c"), ("ZED", "1")]
+    assert task == Task("task", (), b"", {"ALPHA": "a,b c", "ZED": "1"})
+    assert hash(task) == hash(Task("task", (), env={"ALPHA": "a,b c", "ZED": "1"}))
+    assert task != Task("task", ())
+    assert Task("task", ()).env == {}
+    with pytest.raises(TypeError):
+        task.env["ADDED"] = "later"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "env",
+    [[("A", "1")], "A=1", {"1A": "x"}, {"A-B": "x"}, {"": "x"}, {"A": 1}, {"A": "x\0"}, {1: "x"}],
+)
+def test_task_rejects_non_identifier_or_non_string_environment(env: object) -> None:
+    with pytest.raises(ConfigurationError, match="Task.env"):
+        Task("task", (), env=env)
+
+
 def test_target_freezes_partition_sequence() -> None:
     partitions = ["cpu"]
     value = target(partitions=partitions)

@@ -2,7 +2,7 @@
 
 Run resumable work through Slurm and atomically publish validated outputs.
 
-Servatus 0.10.0 provides a native Slurm campaign interface and durable POSIX publication.
+Servatus 0.11.0 provides a native Slurm campaign interface and durable POSIX publication.
 
 ```sh
 pip install servatus
@@ -76,15 +76,43 @@ gpus_per_task = 1
 time_limit = "3-00:00:00"
 ```
 
+Optional document-level `[target]` and `[resources]` tables supply defaults that each profile's own
+tables override per key. A profile that adds nothing is an empty table, and a key cannot be unset
+by a profile, only replaced:
+
+```toml
+[target]
+host = "login.example.edu"
+# Shared site settings and ceilings follow.
+max_gpus_per_allocation = 0
+
+[resources]
+cpus_per_task = 8
+memory_mib_per_task = 32768
+time_limit = "1-00:00:00"
+
+[profiles.cpu]
+
+[profiles.a100.target]
+partitions = ["a100"]
+gpu_gres = "gpu:a100"
+max_gpus_per_allocation = 4
+
+[profiles.a100.resources]
+gpus_per_task = 1
+```
+
 The selected profile rejects counted GRES, relative remote paths, unsafe site tokens, controls,
 booleans used as integers, unlimited/zero resources, incomplete values, and conflicting GPU settings.
-Profiles do not inherit, merge, search parent directories, consult environment variables, or use a
-global store. Labels are provenance; resolved values govern execution. A target is a user-side
-mistake guard, not cluster authorization. Every listed partition must fit one truthful conservative
-envelope. `SlurmTarget` uses keyword arguments; `account`, `qos`, `constraint`, and `gpu_gres`
-default to `None`. Harmless path separators and `.` components normalize on input; parent traversal
-is rejected. Task arguments and partition names accept sequences and are frozen internally.
-`Task.stdin` defaults to empty bytes.
+Unknown keys are rejected in every table; only the selected profile's merged values undergo semantic
+validation. Profiles do not inherit from each other, search parent directories, consult environment
+variables, or use a global store. Labels are provenance; resolved values govern execution. A target
+is a user-side mistake guard, not cluster authorization. Every listed partition must fit one
+truthful conservative envelope. `SlurmTarget` uses keyword arguments; `account`, `qos`,
+`constraint`, and `gpu_gres` default to `None`. Harmless path separators and `.` components
+normalize on input; parent traversal is rejected. Task arguments and partition names accept
+sequences and are frozen internally. `Task.stdin` defaults to empty bytes. `Task.env` accepts a
+mapping of environment names to string values, frozen and sorted by name; it defaults to empty.
 
 Submission defaults to one allocation per reviewed batch and a 1 MiB script limit. Set
 `max_allocations_per_submit` or `max_script_bytes` on the target to override these bounds.
@@ -108,8 +136,8 @@ A plan is a compact reviewed decision bound to a Campaign revision. It stores se
 resolved execution configuration, retry choices, whether a result probe is required, and one
 integrity digest. `plan_document()` and `restore_plan()` provide its cross-process codec; restoration
 performs no scheduler or probe calls. Transient observations remain outside the serialized plan.
-Task arguments and stdin remain in private Campaign state, outside the plan document. Campaign
-and plan documents use schema 5; unsupported schemas are rejected without migration.
+Task arguments, environment, and stdin remain in private Campaign state, outside the plan document.
+Campaign and plan documents use schema 6; unsupported schemas are rejected without migration.
 
 Bind a result probe with `Campaign.create(..., probe=probe)` or `Campaign.load(..., probe=probe)`.
 The handle uses it consistently for inspection, planning, and submission. Callbacks are never
@@ -144,8 +172,9 @@ identical receipt is idempotent; conflicting outcomes fail.
 
 ### CLI
 
-The task JSONL adapter requires `key` and string-array `args`; `stdin_file` is optional.
-Omitting it supplies empty stdin. Relative input paths resolve against the JSONL file's parent.
+The task JSONL adapter requires `key` and string-array `args`; `stdin_file` and `env` are optional.
+Omitting `stdin_file` supplies empty stdin, and relative input paths resolve against the JSONL
+file's parent. `env` is an object mapping environment names to string values.
 
 ```sh
 servatus create STATE_DIR TASKS.jsonl
@@ -186,9 +215,10 @@ it does not prove application completion or enable retry automatically.
 
 Each allocation runs concurrent `srun --exclusive --exact --nodes=1 --ntasks=1` steps, one per Task.
 Each step receives its exact CPU, MiB, and whole-GPU request and starts the target's immutable
-Apptainer image from `work_root`. CPU-only work emits no GRES or `--nv`. GPU steps forward Slurm's
-step-local `CUDA_VISIBLE_DEVICES` into Apptainer with `CUDA_DEVICE_ORDER=PCI_BUS_ID`; missing
-visibility fails the step. Servatus emits no job-level exclusivity, overlap, manual CUDA indices,
+Apptainer image from `work_root` with a clean environment plus the Task's declared `env` entries as
+`--env NAME=VALUE`. CPU-only work emits no GRES or `--nv`. GPU steps then forward Slurm's
+step-local `CUDA_VISIBLE_DEVICES` into Apptainer with `CUDA_DEVICE_ORDER=PCI_BUS_ID` after the Task
+environment; missing visibility fails the step. Servatus emits no job-level exclusivity, overlap, manual CUDA indices,
 ranks, or raw scheduler flags. Site configuration owns isolation and simultaneous placement.
 
 Arguments and byte-exact stdin are embedded in the batch script before acceptance. Before starting
@@ -417,7 +447,8 @@ Servatus is not an ML framework, scheduler plugin, daemon, security boundary, ex
 DAG engine, secrets manager, or transfer/image-deployment tool. It has no Submitit or remote Python
 dependency, plugin/backend abstraction, local executor, arrays, heterogeneous resources within one
 allocation, multi-node ranks, MPI/torchrun, fractional/shared GPUs, queue-aware packing, automatic
-retry, background polling, cancellation/requeue, raw Slurm/environment passthrough, serialized probes, application
+retry, background polling, cancellation/requeue, raw Slurm options or submitting-environment
+passthrough, serialized probes, application
 schemas, log parsing/following/caching, compatibility shims, or cross-filesystem copy fallback.
 
 See the [context glossary](docs/CONTEXT.md) and [architecture decisions](docs/adr/README.md) for the

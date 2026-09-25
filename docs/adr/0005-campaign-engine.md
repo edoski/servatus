@@ -4,7 +4,7 @@ Status: accepted
 
 Campaign owns generic execution lifecycle facts. Applications own Task meaning, result schemas,
 aggregate validation, and publication. One typed persisted state and explicit atomic transactions
-own the roster and Attempt history. Campaign and plan documents use schema 5 with no migration or
+own the roster and Attempt history. Campaign and plan documents use schema 6 with no migration or
 compatibility decoder. Remote work and application callbacks run outside store locks.
 
 ## Authoring and configuration
@@ -18,12 +18,14 @@ Tasks never change. Append and seal advance revision; execution is valid before 
 A Profile supplies a nonbinding label, Target, and homogeneous Resource request for one plan.
 Every Attempt retains those resolved values. Later plans may change routes or resources without
 rewriting historical Attempts; observation, reconciliation, and log reads use each original route.
-`SERVATUS.toml` has named profiles and an optional default. TOML syntax and unknown keys are checked
-throughout the document, while semantic validation concerns only the selected profile. There is no
-inheritance, environment fallback, parent-directory search, or global configuration store. A sole
-profile selects itself. Target and resource constructors are keyword-only, absent site settings
-default to `None`, GPU requests default to zero, and task stdin defaults to empty bytes. Argument
-and partition sequences freeze to tuples. Task/resource/time ceilings remain explicit for packing;
+`SERVATUS.toml` has named profiles, an optional default, and optional document-level `[target]` and
+`[resources]` tables whose keys every profile's own tables override. TOML syntax and unknown keys
+are checked throughout the document, while semantic validation concerns only the selected profile's
+merged values. There is no profile-to-profile inheritance, environment fallback, parent-directory
+search, or global configuration store. A sole profile selects itself. Target and resource
+constructors are keyword-only, absent site settings default to `None`, GPU requests default to
+zero, and task stdin and environment default to empty. Argument and partition sequences freeze to
+tuples; the environment freezes to a mapping sorted by name. Task/resource/time ceilings remain explicit for packing;
 submission and script bounds default to one allocation and 1 MiB without additional policy objects.
 
 ## Planning and submission
@@ -93,6 +95,6 @@ diagnostic data with no execution authority.
 
 The CLI mirrors explicit authoring through `create`, `append`, and `seal`; `plan` loads existing
 state and reads cwd `SERVATUS.toml` unless `--config PATH` selects another file. Task JSONL accepts
-optional `stdin_file`, with empty stdin when omitted. `validate`, `submit`, `status`, `logs`, `reconcile`, and
+optional `stdin_file` and `env`, with empty stdin and environment when omitted. `validate`, `submit`, `status`, `logs`, `reconcile`, and
 `resolve` use the same Campaign authority. Publication and Workspace ownership remain defined by
 ADRs 0001, 0002, and 0004.

@@ -2,7 +2,7 @@
 
 Servatus uses a small generic vocabulary:
 
-- **Task:** one stable opaque key, argument vector, and byte payload.
+- **Task:** one stable opaque key, argument vector, environment mapping, and byte payload.
 - **Campaign:** one ordered Task roster and its durable Attempt history. `create` authors a fixed
   roster, or an appendable one when requested; `load` reopens it; `append` registers only new Tasks;
   and `seal` ends authoring irreversibly.
@@ -10,7 +10,8 @@ Servatus uses a small generic vocabulary:
   one plan. Each Attempt retains the request used for its submission.
 - **Target:** one concrete SSH/Slurm/Apptainer route with conservative request ceilings. Every
   Attempt retains its original route for observation, recovery, and diagnostics.
-- **Profile:** one nonbinding label plus a complete Target and Resource request.
+- **Profile:** one nonbinding label plus a complete Target and Resource request, resolved from the
+  profile's own tables over optional document-level defaults.
 - **Plan:** one compact reviewed decision bound to a Campaign revision: execution configuration,
   selected allocations, retry choices, result-probe requirement, and an integrity digest.
 - **Excluded task:** work withheld by the eligibility policy.

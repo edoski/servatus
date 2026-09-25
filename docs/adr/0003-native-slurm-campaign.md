@@ -17,8 +17,9 @@ capacity, escalates an explicit request, emits job-level exclusivity, or accepts
 Authored wall time remains provenance; planned and submitted time reflects Slurm's one-time upward
 minute rounding. Target limits prevent user mistakes but do not replace cluster policy.
 
-Each allocation starts concurrent `srun --exclusive --exact --nodes=1 --ntasks=1` steps. GPU steps
-forward step-local `CUDA_VISIBLE_DEVICES` into Apptainer and set `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
+Each allocation starts concurrent `srun --exclusive --exact --nodes=1 --ntasks=1` steps. Apptainer
+runs with a clean environment plus each Task's declared `env` entries. GPU steps then forward
+step-local `CUDA_VISIBLE_DEVICES` into Apptainer and set `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
 Missing visibility fails the step; site configuration remains responsible for device isolation.
 Before launching siblings, the batch checks decoding of all binary payloads into owner-only scratch
 files. It waits for every started sibling and cleans scratch after completion or handled

@@ -195,3 +195,29 @@ def test_cli_explicit_input_path_must_be_valid(tmp_path: Path, stdin_file: objec
     task_file.write_text(json.dumps({"key": "one", "args": [], "stdin_file": stdin_file}) + "\n")
     with pytest.raises(SystemExit):
         main(["create", str(tmp_path / "campaign"), str(task_file)])
+
+
+def test_cli_task_environment_is_declared_per_line_and_persists(tmp_path: Path) -> None:
+    task_file = tmp_path / "tasks.jsonl"
+    task_file.write_text(
+        json.dumps({"key": "one", "args": ["run"], "env": {"OMP_NUM_THREADS": "4"}})
+        + "\n"
+        + json.dumps({"key": "two", "args": ["run"]})
+        + "\n"
+    )
+    campaign_path = tmp_path / "campaign"
+    assert main(["create", str(campaign_path), str(task_file)]) == 0
+    first, second = Campaign.load(campaign_path).tasks
+    assert dict(first.env) == {"OMP_NUM_THREADS": "4"} and second.env == {}
+
+
+@pytest.mark.parametrize("env", [["A=1"], "A=1", {"1A": "x"}, {"A": 1}, None])
+def test_cli_task_environment_must_map_identifiers_to_strings(
+    tmp_path: Path, env: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    task_file = tmp_path / "tasks.jsonl"
+    task_file.write_text(json.dumps({"key": "one", "args": [], "env": env}) + "\n")
+    with pytest.raises(SystemExit):
+        main(["create", str(tmp_path / "campaign"), str(task_file)])
+    assert "invalid task file line 1" in capsys.readouterr().err
+    assert not (tmp_path / "campaign").exists()

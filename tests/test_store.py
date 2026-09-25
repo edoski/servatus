@@ -26,6 +26,7 @@ from servatus import Campaign, TaskConflict, _slurm, _store
         "outcome_revision",
         "acceptance",
         "capacity",
+        "environment",
     ],
 )
 def test_external_state_is_strict_and_reference_checked(
@@ -60,6 +61,8 @@ def test_external_state_is_strict_and_reference_checked(
         attempt["outcome_revision"] = 1
     elif mutation == "capacity":
         attempt["profile"]["resources"]["cpus_per_task"] = 1000
+    elif mutation == "environment":
+        state["tasks"][0]["env"] = {"1A": "x"}
     else:
         attempt["acceptance"] = "NOT_SUBMITTED"
     state_path.write_text(json.dumps(state))

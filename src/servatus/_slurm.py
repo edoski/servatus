@@ -192,6 +192,8 @@ def render_script(
             "--pwd",
             str(target.work_root),
         ]
+        for name, value in task.env.items():
+            container.extend(("--env", f"{name}={value}"))
         if resources.gpus_per_task:
             container.extend(("--nv", "--env", "CUDA_DEVICE_ORDER=PCI_BUS_ID"))
             wrapper = (

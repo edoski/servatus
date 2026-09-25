@@ -49,6 +49,82 @@ def labeled_profile_text(label: str) -> str:
     )
 
 
+def shared_profile_text() -> str:
+    return (
+        'default_profile = "cpu"\n'
+        "[target]\n"
+        'host = "login.example.edu"\n'
+        'slurm_bin = "/opt/slurm/bin"\n'
+        'apptainer = "/usr/bin/apptainer"\n'
+        'image = "/images/shared.sif"\n'
+        'work_root = "/work"\n'
+        'log_root = "/logs"\n'
+        'partitions = ["cpu"]\n'
+        "max_tasks_per_allocation = 4\n"
+        "max_cpus_per_allocation = 16\n"
+        "max_memory_mib_per_allocation = 8192\n"
+        "max_gpus_per_allocation = 0\n"
+        'max_time_limit = "1-00:00:00"\n'
+        "[resources]\n"
+        "cpus_per_task = 2\n"
+        "memory_mib_per_task = 1024\n"
+        'time_limit = "00:10:00"\n'
+        "[profiles.cpu]\n"
+        "[profiles.gpu.target]\n"
+        'partitions = ["gpu"]\n'
+        'gpu_gres = "gpu:a100"\n'
+        "max_gpus_per_allocation = 4\n"
+        "[profiles.gpu.resources]\n"
+        "gpus_per_task = 1\n"
+    )
+
+
+def test_profiles_override_document_defaults_per_key(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    path = tmp_path / "SERVATUS.toml"
+    path.write_text(shared_profile_text())
+    cpu = Profile.load(path)
+    gpu = Profile.load(path, "gpu")
+    assert cpu.label == "cpu" and gpu.label == "gpu"
+    assert cpu.target.partitions == ("cpu",) and cpu.target.gpu_gres is None
+    assert gpu.target.partitions == ("gpu",) and gpu.target.gpu_gres == "gpu:a100"
+    assert gpu.target.max_gpus_per_allocation == 4
+    assert replace(gpu.target, partitions=("cpu",), gpu_gres=None, max_gpus_per_allocation=0) == (
+        cpu.target
+    )
+    assert cpu.resources.gpus_per_task == 0
+    assert gpu.resources == replace(cpu.resources, gpus_per_task=1)
+
+
+def test_overridden_document_defaults_are_not_validated(tmp_path: Path) -> None:
+    path = tmp_path / "SERVATUS.toml"
+    path.write_text(
+        shared_profile_text().replace('host = "login.example.edu"', 'host = "invalid host"')
+        + "[profiles.fixed.target]\n"
+        'host = "login.example.edu"\n'
+    )
+    assert Profile.load(path, "fixed").target.host == "login.example.edu"
+    with pytest.raises(ConfigurationError, match="host"):
+        Profile.load(path)
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        shared_profile_text().replace("[target]", "[target]\nmisspelled = 1"),
+        shared_profile_text().replace("[resources]", "[resources]\nmisspelled = 1"),
+        shared_profile_text().replace('host = "login.example.edu"\n', ""),
+        shared_profile_text().replace("[target]\n", "target = 1\n[unused]\n"),
+    ],
+)
+def test_document_defaults_are_checked_like_profile_tables(tmp_path: Path, contents: str) -> None:
+    path = tmp_path / "SERVATUS.toml"
+    path.write_text(contents)
+    with pytest.raises(ConfigurationError):
+        Profile.load(path)
+
+
 def test_profile_loads_the_explicit_complete_lane(tmp_path: Path) -> None:
     path = tmp_path / "SERVATUS.toml"
     path.write_text(profile_text())

@@ -79,20 +79,38 @@ def test_generated_steps_preserve_binary_input_argv_and_step_gpu_selection(
     output = tmp_path / "payload"
     args = (str(output), "read", "a b", "'quoted'", '"double"', "$(touch not-executed)", "", "λ")
     payload = bytes(range(256)) * 4096
+    env = {"WORKER_NOTE": "a,b 'c' \"d\" $HOME λ", "OMP_NUM_THREADS": "4"}
     script = _slurm.render_script(
-        route, resources(gpus_per_task=gpus), (Task("t", args, payload),), "abc"
+        route, resources(gpus_per_task=gpus), (Task("t", args, payload, env),), "abc"
     )
     result = run_script(script, scratch, CUDA_VISIBLE_DEVICES="allocation-wide")
     assert result.returncode == 0, result.stderr
     assert output.read_bytes() == payload
     actual_args, environment = json.loads(output.with_suffix(".json").read_text())
     assert actual_args == list(args)
-    assert environment == (
-        {"CUDA_VISIBLE_DEVICES": "GPU-step-2,GPU-step-7", "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}
-        if gpus
-        else {}
-    )
+    assert environment == {
+        **env,
+        **(
+            {"CUDA_VISIBLE_DEVICES": "GPU-step-2,GPU-step-7", "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}
+            if gpus
+            else {}
+        ),
+    }
     assert list(scratch.iterdir()) == []
+
+
+def test_task_environment_precedes_servatus_gpu_variables() -> None:
+    task = Task("t", ("run",), env={"OMP_NUM_THREADS": "4", "CUDA_VISIBLE_DEVICES": "manual"})
+    script = _slurm.render_script(target(), resources(gpus_per_task=1), (task,), "abc").decode()
+    line = next(line for line in script.splitlines() if "apptainer" in line)
+    markers = (
+        "--env CUDA_VISIBLE_DEVICES=manual",
+        "--env OMP_NUM_THREADS=4",
+        "--nv --env CUDA_DEVICE_ORDER=PCI_BUS_ID",
+        '--env "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"',
+    )
+    positions = [line.index(marker) for marker in markers]
+    assert positions == sorted(positions)
 
 
 def test_successful_worker_may_close_large_input_early(tmp_path: Path) -> None:

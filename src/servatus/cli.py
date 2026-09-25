@@ -14,8 +14,8 @@ from ._campaign import (
     submit_document,
     validation_document,
 )
-from ._errors import ServatusError, SubmissionError
-from ._model import JobReceipt, Profile, Task, decode_json
+from ._errors import ConfigurationError, ServatusError, SubmissionError
+from ._model import Profile, Task, decode_json, receipt_document
 from ._workspace import publish_file
 
 
@@ -107,14 +107,15 @@ def _load_tasks(path: Path) -> tuple[Task, ...]:
         try:
             raw = cast(object, json.loads(line))
             if not isinstance(raw, dict):
-                raise ValueError("expected key, args, and optional stdin_file")
+                raise ValueError("expected key, args, and optional stdin_file and env")
             mapping = cast(dict[str, object], raw)
             if not {"key", "args"} <= mapping.keys() or mapping.keys() - {
                 "key",
                 "args",
                 "stdin_file",
+                "env",
             }:
-                raise ValueError("expected key, args, and optional stdin_file")
+                raise ValueError("expected key, args, and optional stdin_file and env")
             args = mapping["args"]
             if not isinstance(args, list):
                 raise ValueError("args must be an array of strings")
@@ -132,9 +133,14 @@ def _load_tasks(path: Path) -> tuple[Task, ...]:
                 if not stdin_file.is_absolute():
                     stdin_file = path.parent / stdin_file
                 payload = stdin_file.read_bytes()
-            values.append(Task(cast(str, mapping["key"]), typed_args, payload))
-        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
-            raise ServatusError(f"invalid task file line {line_number}") from error
+            env = mapping.get("env", {})
+            if not isinstance(env, dict):
+                raise ValueError("env must be an object of strings")
+            values.append(
+                Task(cast(str, mapping["key"]), typed_args, payload, cast(dict[str, str], env))
+            )
+        except (OSError, TypeError, ValueError, ConfigurationError) as error:
+            raise ServatusError(f"invalid task file line {line_number}: {error}") from error
     return tuple(values)
 
 
@@ -158,15 +164,6 @@ def _write_json(path: Path, value: object) -> None:
         stage.write_bytes(encoded)
 
     publish_file(path, write)
-
-
-def _receipt_json(receipt: JobReceipt) -> dict[str, object]:
-    return {
-        "allocation_id": receipt.allocation_id,
-        "job_id": receipt.job_id,
-        "cluster": receipt.cluster,
-        "task_keys": list(receipt.task_keys),
-    }
 
 
 def _run(arguments: argparse.Namespace) -> int:
@@ -230,7 +227,7 @@ def _run(arguments: argparse.Namespace) -> int:
     elif command == "reconcile":
         campaign = Campaign.load(arguments.campaign)
         receipt = campaign.reconcile(arguments.allocation_id)
-        print(json.dumps(_receipt_json(receipt), sort_keys=True))
+        print(json.dumps(receipt_document(receipt), sort_keys=True))
     elif command == "resolve":
         campaign = Campaign.load(arguments.campaign)
         campaign.resolve(
@@ -250,4 +247,3 @@ def main(argv: list[str] | None = None) -> int:
         return _run(arguments)
     except ServatusError as error:
         parser.error(str(error))
-    return 0

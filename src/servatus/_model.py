@@ -8,20 +8,22 @@ import json
 import os
 import re
 import tomllib
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import ClassVar, Self, cast
 
 from ._errors import ConfigurationError
 from ._slurm import AllocationState
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _GRES = re.compile(r"gpu(?::[A-Za-z0-9][A-Za-z0-9._-]*)?\Z")
 _DURATION = re.compile(r"(?:(0|[1-9][0-9]*)-)?([0-9]{2}):([0-5][0-9]):([0-5][0-9])\Z")
 
@@ -101,6 +103,7 @@ class Task:
     key: str
     args: Sequence[str]
     stdin: bytes = b""
+    env: Mapping[str, str] = field(default_factory=dict[str, str])
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, str) or not self.key or "\0" in self.key:
@@ -115,6 +118,17 @@ class Task:
             raise ConfigurationError("Task.args cannot contain NUL")
         if not isinstance(self.stdin, bytes):
             raise ConfigurationError("Task.stdin must be bytes")
+        if not isinstance(self.env, Mapping):
+            raise ConfigurationError("Task.env must map environment names to strings")
+        for name, value in cast(Mapping[object, object], self.env).items():
+            if not isinstance(name, str) or _ENV_NAME.fullmatch(name) is None:
+                raise ConfigurationError("Task.env names must be identifiers")
+            if not isinstance(value, str) or "\0" in value:
+                raise ConfigurationError("Task.env values must be strings without NUL")
+        object.__setattr__(self, "env", MappingProxyType(dict(sorted(self.env.items()))))
+
+    def __hash__(self) -> int:
+        return hash((self.key, self.args, self.stdin, tuple(self.env.items())))
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -236,15 +250,8 @@ def _resource_from_values(mapping: dict[str, object]) -> ResourceRequest:
     )
 
 
-def _profile_resources(values: object) -> ResourceRequest:
-    if not isinstance(values, dict):
-        raise ConfigurationError("resources must be a table")
-    mapping = cast(dict[str, object], values)
-    unknown = mapping.keys() - ResourceRequest._KEYS
-    missing = ResourceRequest._KEYS - {"gpus_per_task"} - mapping.keys()
-    if unknown:
-        raise ConfigurationError(f"unknown resource keys: {', '.join(sorted(unknown))}")
-    if missing:
+def _profile_resources(mapping: dict[str, object]) -> ResourceRequest:
+    if missing := ResourceRequest._KEYS - {"gpus_per_task"} - mapping.keys():
         raise ConfigurationError(f"missing resource keys: {', '.join(sorted(missing))}")
     return _resource_from_values(mapping)
 
@@ -275,18 +282,34 @@ def _target_from_values(mapping: dict[str, object]) -> SlurmTarget:
     )
 
 
-def _profile_target(values: object) -> SlurmTarget:
-    if not isinstance(values, dict):
-        raise ConfigurationError("target must be a table")
-    mapping = cast(dict[str, object], values)
-    allowed = SlurmTarget._REQUIRED | SlurmTarget._OPTIONAL
-    unknown = mapping.keys() - allowed
-    missing = SlurmTarget._REQUIRED - mapping.keys()
-    if unknown:
-        raise ConfigurationError(f"unknown target keys: {', '.join(sorted(unknown))}")
-    if missing:
+def _profile_target(mapping: dict[str, object]) -> SlurmTarget:
+    if missing := SlurmTarget._REQUIRED - mapping.keys():
         raise ConfigurationError(f"missing target keys: {', '.join(sorted(missing))}")
     return _target_from_values(mapping)
+
+
+_SECTIONS: tuple[tuple[str, frozenset[str]], ...] = (
+    ("target", SlurmTarget._REQUIRED | SlurmTarget._OPTIONAL),
+    ("resources", ResourceRequest._KEYS),
+)
+
+
+def _section_tables(mapping: dict[str, object], owner: str) -> dict[str, dict[str, object]]:
+    tables: dict[str, dict[str, object]] = {}
+    for section, allowed in _SECTIONS:
+        raw = mapping.get(section)
+        if raw is None:
+            tables[section] = {}
+            continue
+        if not isinstance(raw, dict):
+            raise ConfigurationError(f"{section} in {owner} must be a table")
+        table = cast(dict[str, object], raw)
+        if unknown := table.keys() - allowed:
+            raise ConfigurationError(
+                f"unknown {section} keys in {owner}: {', '.join(sorted(unknown))}"
+            )
+        tables[section] = table
+    return tables
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,14 +326,14 @@ class Profile:
     @classmethod
     def load(cls, path: Path, name: str | None = None) -> Self:
         document = _read_toml(path)
-        if document.keys() - {"profiles", "default_profile"}:
-            unknown = document.keys() - {"profiles", "default_profile"}
+        if unknown := document.keys() - {"profiles", "default_profile", "target", "resources"}:
             raise ConfigurationError(f"unknown profile document keys: {', '.join(sorted(unknown))}")
+        defaults = _section_tables(document, "the document")
         profiles = document.get("profiles")
         if not isinstance(profiles, dict) or not profiles:
             raise ConfigurationError("profiles must be a nonempty table")
 
-        tables: dict[str, dict[str, object]] = {}
+        tables: dict[str, dict[str, dict[str, object]]] = {}
         for label, raw in cast(dict[str, object], profiles).items():
             _nonempty_string(label, name="profile label")
             if not isinstance(raw, dict):
@@ -318,14 +341,7 @@ class Profile:
             mapping = cast(dict[str, object], raw)
             if mapping.keys() - {"target", "resources"}:
                 raise ConfigurationError(f"unknown profile keys in {label!r}")
-            for section, allowed in (
-                ("target", SlurmTarget._REQUIRED | SlurmTarget._OPTIONAL),
-                ("resources", ResourceRequest._KEYS),
-            ):
-                table = mapping.get(section)
-                if isinstance(table, dict) and cast(dict[str, object], table).keys() - allowed:
-                    raise ConfigurationError(f"unknown {section} keys in {label!r}")
-            tables[label] = mapping
+            tables[label] = _section_tables(mapping, f"profile {label!r}")
         default = document.get("default_profile")
         if default is not None:
             _nonempty_string(default, name="default_profile")
@@ -339,11 +355,11 @@ class Profile:
         _nonempty_string(selected, name="profile name")
         if selected not in tables:
             raise ConfigurationError(f"profile {selected!r} is not declared")
-        mapping = tables[selected]
+        merged = {
+            section: {**defaults[section], **tables[selected][section]} for section, _ in _SECTIONS
+        }
         return cls(
-            selected,
-            _profile_target(mapping.get("target")),
-            _profile_resources(mapping.get("resources")),
+            selected, _profile_target(merged["target"]), _profile_resources(merged["resources"])
         )
 
 
@@ -682,6 +698,7 @@ def state_document(state: State) -> dict[str, object]:
                 "key": item.task.key,
                 "args": list(item.task.args),
                 "stdin": base64.b64encode(item.task.stdin).decode("ascii"),
+                "env": dict(item.task.env),
                 "revision": item.revision,
             }
             for item in state.roster
@@ -719,7 +736,7 @@ def decode_state(value: object) -> State:
         raise ValueError("invalid seal revision")
     roster: list[RegisteredTask] = []
     for item in array(obj["tasks"]):
-        raw = object_fields(item, {"key", "args", "stdin", "revision"})
+        raw = object_fields(item, {"key", "args", "stdin", "env", "revision"})
         args = array(raw["args"])
         if any(not isinstance(arg, str) for arg in args):
             raise ValueError("invalid task arguments")
@@ -729,7 +746,10 @@ def decode_state(value: object) -> State:
             payload = base64.b64decode(raw["stdin"], validate=True)
         except (ValueError, binascii.Error) as error:
             raise ValueError("invalid task stdin") from error
-        task = Task(string(raw["key"]), tuple(cast(list[str], args)), payload)
+        if not isinstance(raw["env"], dict):
+            raise ValueError("invalid task environment")
+        env = cast(dict[str, str], raw["env"])
+        task = Task(string(raw["key"]), tuple(cast(list[str], args)), payload, env)
         introduced = integer(raw["revision"])
         if introduced > revision or (roster and introduced < roster[-1].revision):
             raise ValueError("invalid task revision")
