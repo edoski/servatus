@@ -295,11 +295,13 @@ class Workspace:
     def _cleanup_published(self) -> None:
         assert self._session.level.container_entry is not None
         self._verify_live()
-        _posix.remove_tree_at(
-            self._publication_parent_fd(),
-            self._location.container_name,
-            self._session.level.container_entry,
-        )
+        parent_fd = self._publication_parent_fd()
+        with _coordinate(parent_fd):
+            _posix.remove_tree_at(
+                parent_fd,
+                self._location.container_name,
+                self._session.level.container_entry,
+            )
 
     def _close(self) -> None:
         session = self._session
