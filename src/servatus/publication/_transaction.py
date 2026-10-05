@@ -141,17 +141,20 @@ def _link_contents(
                 inside.add(_key(into.entry))
                 _link_contents(state, child, into, inside)
             return
-        try:
-            os.link(
-                name, name, src_dir_fd=directory.fd, dst_dir_fd=target.fd, follow_symlinks=False
-            )
-        except OSError as error:
-            raise _link_error(error, name, name) from error
-        try:
-            target.expect(name, entry)  # the linked inode is exactly the one inspected
-        except UnsafeFilesystem as error:
-            _withdraw(state, target, name, f"{name} was substituted during linking", error)
-            raise
+        # Holding the inspected file open keeps its inode number from being reused, so the
+        # post-link check below cannot be fooled by a substitute that recycles the number.
+        with directory.open(name, directory=False, expected=entry) as pinned:
+            try:
+                os.link(
+                    name, name, src_dir_fd=directory.fd, dst_dir_fd=target.fd, follow_symlinks=False
+                )
+            except OSError as error:
+                raise _link_error(error, name, name) from error
+            try:
+                target.expect(name, pinned.entry)  # the linked inode is exactly the one inspected
+            except UnsafeFilesystem as error:
+                _withdraw(state, target, name, f"{name} was substituted during linking", error)
+                raise
 
     _fs.walk(source, visit)
 
