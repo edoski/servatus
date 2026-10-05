@@ -122,7 +122,7 @@ def test_full_lifecycle_through_the_real_scheduler() -> None:
     assert scheduler.tail(path, 64) == (b"\x00log tail\xff", False)
     scheduler.cancel(allocation(1), job)  # already finished: nothing to cancel
     assert fake.job(job).state == "COMPLETED"
-    assert fake.count("sbatch") == 3
+    assert (fake.count("ping"), fake.count("sbatch")) == (1, 2)
     assert fake.calls[0] == ("/opt/slurm/bin/sbatch", "--version")
 
 
@@ -138,6 +138,22 @@ def test_failed_submission_creates_no_job() -> None:
     assert harness.fake.jobs == ()
     with pytest.raises(ReconciliationError, match="0 jobs"):
         harness.scheduler.identify(allocation(1), INTENT)
+
+
+def test_the_ping_has_its_own_control_key() -> None:
+    harness = Harness()
+    harness.fake.fail_next("sbatch")
+    harness.fake.lose_next_reply("sbatch")
+    assert harness.scheduler.ping() == "slurm 23.11.4"  # neither control is consumed
+    harness.fake.fail_next("ping", Completed(127, b"", b"sbatch: not found\n"))
+    with pytest.raises(Unavailable, match="exit status 127"):
+        harness.scheduler.ping()
+    harness.fake.lose_next_reply("ping")
+    with pytest.raises(Unavailable, match="reply from ping was lost"):
+        harness.scheduler.ping()
+    with pytest.raises(Unavailable, match="injected failure of sbatch"):
+        harness.submit(allocation(1))
+    assert (harness.fake.count("ping"), harness.fake.count("sbatch")) == (3, 1)
 
 
 def test_lost_submission_reply_is_recoverable_by_identity() -> None:

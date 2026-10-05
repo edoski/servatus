@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import itertools
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
 from ..errors import ConfigurationError, EvidenceConflict, ReconciliationError
-from ._config import TOKEN
+from ._config import CONTROL, TOKEN
 
 
 class AllocationState(StrEnum):
@@ -88,7 +88,11 @@ class StepEvidence:
 
 @dataclass(frozen=True, slots=True)
 class Observation:
-    """Everything observed for one accepted allocation; ``steps`` is indexed by slot."""
+    """Everything observed for one accepted allocation.
+
+    ``steps`` has one entry per slot (``None`` when that Task's step was not found), or is empty
+    when the step query itself failed, so step evidence is unavailable rather than absent.
+    """
 
     allocation: SchedulerEvidence
     steps: tuple[StepEvidence | None, ...] = ()
@@ -107,12 +111,11 @@ WINDOW = timedelta(hours=1)
 MAX_REPLY_LINES = 4096
 MAX_FIELD_BYTES = 4096
 MISSING_JOBS_STDERR = b"slurm_load_jobs error: Invalid job id specified\n"
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _DECIMAL = re.compile(r"[1-9][0-9]*\Z")
 _STEP_ID = re.compile(r"([1-9][0-9]*)\.[0-9]+\Z")
 _SLOT = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 _EXIT_CODE = re.compile(r"[0-9]+:[0-9]+\Z")
-_RECEIPT = re.compile(rb"([1-9][0-9]*)(?:;([A-Za-z0-9][A-Za-z0-9._-]*))?\n?\Z")
+_RECEIPT = re.compile(rb"([1-9][0-9]*)(?:;(%s))?\n?\Z" % TOKEN.pattern.removesuffix(r"\Z").encode())
 _NULL = frozenset({"", "None", "Unknown", "N/A"})
 FOREIGN_JOB = "job number is held by a foreign job"
 
@@ -203,28 +206,17 @@ class Expectation:
 
 
 @dataclass(frozen=True, slots=True)
-class ActiveRow:
-    """One ``squeue`` row for a queried job."""
+class Row:
+    """One ``squeue`` row, or one ``sacct --allocations --duplicates`` row (one incarnation), of
+    a queried job. Queue rows carry no exit code or cluster."""
 
     submitted_at: str
     state: str
     reason: str | None
     started_at: str | None
     ended_at: str | None
-    foreign: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class AccountingRow:
-    """One ``sacct --allocations --duplicates`` row: one incarnation of a queried job."""
-
-    cluster: str | None
-    submitted_at: str
-    state: str
-    exit_code: str | None
-    reason: str | None
-    started_at: str | None
-    ended_at: str | None
+    exit_code: str | None = None
+    cluster: str | None = None
     foreign: bool = False
 
 
@@ -247,41 +239,32 @@ def reply_fields(line: bytes, count: int) -> tuple[str, ...]:
         fields = tuple(field.decode("utf-8") for field in raw)
     except UnicodeDecodeError:
         raise EvidenceConflict("scheduler row is malformed") from None
-    if any(_CONTROL.search(field) for field in fields):
+    if any(CONTROL.search(field) for field in fields):
         raise EvidenceConflict("scheduler row is malformed")
     return fields
 
 
-def _optional(value: str) -> str | None:
-    value = value.strip(" ")
+def _value(raw: str) -> str | None:
+    """A field without padding; Slurm's placeholders for nothing become None."""
+    value = raw.strip(" ")
     return None if value in _NULL else value
 
 
-def _timestamp(value: str) -> str | None:
-    value = value.strip(" ")
-    if value in _NULL:
-        return None
-    try:
-        parsed = datetime.strptime(value, TIMESTAMP_FORMAT)
-    except ValueError:
-        raise EvidenceConflict("scheduler timestamp is malformed") from None
-    if parsed.strftime(TIMESTAMP_FORMAT) != value:
-        raise EvidenceConflict("scheduler timestamp is malformed")
+def _timestamp(raw: str) -> str | None:
+    value = _value(raw)
+    if value is not None:
+        try:
+            parsed = datetime.strptime(value, TIMESTAMP_FORMAT)
+        except ValueError:
+            raise EvidenceConflict("scheduler timestamp is malformed") from None
+        if parsed.strftime(TIMESTAMP_FORMAT) != value:
+            raise EvidenceConflict("scheduler timestamp is malformed")
     return value
 
 
-def _required_timestamp(value: str) -> str:
-    timestamp = _timestamp(value)
-    if timestamp is None:
-        raise EvidenceConflict("scheduler submit time is missing")
-    return timestamp
-
-
-def _exit_code(value: str) -> str | None:
-    value = value.strip(" ")
-    if value in _NULL:
-        return None
-    if _EXIT_CODE.fullmatch(value) is None:
+def _exit_code(raw: str) -> str | None:
+    value = _value(raw)
+    if value is not None and _EXIT_CODE.fullmatch(value) is None:
         raise EvidenceConflict("scheduler exit code is malformed")
     return value
 
@@ -316,75 +299,78 @@ def is_missing_reply(returncode: int, stdout: bytes, stderr: bytes, cluster: str
         return False
 
 
+def _rows(
+    lines: Sequence[bytes],
+    expected: Mapping[int, Expectation],
+    count: int,
+    row: Callable[[str, tuple[str, ...]], Row],
+) -> dict[int, list[Row]]:
+    """Rows by queried job number, in reply order; ``row`` gets the identity and other fields."""
+    rows: dict[int, list[Row]] = {job: [] for job in expected}
+    for line in lines:
+        fields = reply_fields(line, count)
+        job = _job_number(fields[0], expected)
+        rows[job].append(row(expected[job].identity, fields[1:]))
+    return rows
+
+
+def _row(
+    sample: Sequence[str], *, foreign: bool, exit_code: str = "", cluster: str | None = None
+) -> Row:
+    """A row from its Submit, State, Reason, Start, and End fields."""
+    submitted, state, reason, started, ended = sample
+    if (submitted_at := _timestamp(submitted)) is None:
+        raise EvidenceConflict("scheduler submit time is missing")
+    times = (_timestamp(started), _timestamp(ended))
+    return Row(
+        submitted_at, _state(state), _value(reason), *times, _exit_code(exit_code), cluster, foreign
+    )
+
+
 def parse_active(
     output: bytes, expected: Mapping[int, Expectation], cluster: str | None
-) -> dict[int, list[ActiveRow]]:
+) -> dict[int, list[Row]]:
     """Parse ``squeue --format=%i|%j|%k|%V|%T|%r|%S|%e`` rows by job number.
 
     Queue rows must carry the exact allocation identity as both name and comment; a row that does
     not is marked ``foreign`` (the job number was reused) and confined to its allocation.
     """
-    rows: dict[int, list[ActiveRow]] = {job: [] for job in expected}
-    for line in _without_cluster_banner(reply_lines(output), cluster):
-        job_id, name, comment, submitted, state, reason, started, ended = reply_fields(line, 8)
-        job = _job_number(job_id, expected)
-        identity = expected[job].identity
-        rows[job].append(
-            ActiveRow(
-                _required_timestamp(submitted),
-                _state(state),
-                _optional(reason),
-                _timestamp(started),
-                _timestamp(ended),
-                foreign=name != identity or comment != identity,
-            )
-        )
-    return rows
+
+    def row(identity: str, fields: tuple[str, ...]) -> Row:
+        name, comment, *sample = fields
+        return _row(sample, foreign=name != identity or comment != identity)
+
+    return _rows(_without_cluster_banner(reply_lines(output), cluster), expected, 8, row)
 
 
 def parse_accounting(
     output: bytes, expected: Mapping[int, Expectation], cluster: str | None
-) -> dict[int, list[AccountingRow]]:
+) -> dict[int, list[Row]]:
     """Parse ``sacct`` allocation rows (JobIDRaw, Cluster, JobName, Comment, Submit, State,
     ExitCode, Reason, Start, End) by job number, in reply order.
 
     The name must be the exact allocation identity; sites may omit the comment from accounting.
     A row with another identity is marked ``foreign`` and confined to its allocation.
     """
-    rows: dict[int, list[AccountingRow]] = {job: [] for job in expected}
-    for line in reply_lines(output):
-        fields = reply_fields(line, 10)
-        job_id, row_cluster, name, comment = fields[:4]
-        submitted, state, exit_code, reason, started, ended = fields[4:]
-        job = _job_number(job_id, expected)
-        identity = expected[job].identity
-        foreign = name != identity or (comment != identity and comment not in _NULL)
-        found = None if row_cluster in _NULL else row_cluster
-        if (found is not None and TOKEN.fullmatch(found) is None) or (
-            cluster is not None and found != cluster
+
+    def row(identity: str, fields: tuple[str, ...]) -> Row:
+        found, name, comment, submitted, state, exit_code, reason, started, ended = fields
+        found_cluster = None if found in _NULL else found
+        if (found_cluster is not None and TOKEN.fullmatch(found_cluster) is None) or (
+            cluster is not None and found_cluster != cluster
         ):
             raise EvidenceConflict("scheduler returned evidence from an unrelated cluster")
-        rows[job].append(
-            AccountingRow(
-                found,
-                _required_timestamp(submitted),
-                _state(state),
-                _exit_code(exit_code),
-                _optional(reason),
-                _timestamp(started),
-                _timestamp(ended),
-                foreign=foreign,
-            )
-        )
-    return rows
+        foreign = name != identity or (comment != identity and comment not in _NULL)
+        sample = (submitted, state, reason, started, ended)
+        return _row(sample, foreign=foreign, exit_code=exit_code, cluster=found_cluster)
+
+    return _rows(reply_lines(output), expected, 10, row)
 
 
 # --- Combination -----------------------------------------------------------------------------
 
 
-def _problem(
-    message: str, queue: ActiveRow | None, latest: AccountingRow | None
-) -> SchedulerEvidence:
+def _problem(message: str, queue: Row | None, latest: Row | None) -> SchedulerEvidence:
     return SchedulerEvidence(
         AllocationState.UNKNOWN,
         raw_state=None if queue is None else queue.state,
@@ -394,12 +380,29 @@ def _problem(
     )
 
 
-def _unfinished(state: str) -> bool:
-    return not normalize_state(state).terminal
+def _contradiction(
+    expectation: Expectation, active: Sequence[Row], history: Sequence[Row]
+) -> str | None:
+    """Why one allocation's rows cannot all describe it, apart from the incarnation check."""
+    if len(active) > 1:
+        return "squeue returned several rows for one job"
+    if history:
+        anchor = history[0]
+        if not expectation.window_start <= anchor.submitted_at <= expectation.window_end:
+            return "accounting history starts outside the submission window"
+        for earlier, later in itertools.pairwise(history):
+            if later.submitted_at <= earlier.submitted_at or later.cluster != anchor.cluster:
+                return "accounting requeue history is not ordered"
+    if active and (
+        active[0].submitted_at < expectation.window_start
+        or (history and active[0].submitted_at < history[0].submitted_at)
+    ):
+        return "queue row predates the allocation's submission"
+    return None
 
 
 def combine(
-    expectation: Expectation, active: Sequence[ActiveRow], history: Sequence[AccountingRow]
+    expectation: Expectation, active: Sequence[Row], history: Sequence[Row]
 ) -> SchedulerEvidence:
     """Combine one allocation's queue rows and accounting history into one evidence value.
 
@@ -410,29 +413,14 @@ def combine(
     alone is ``UNKNOWN``. Contradictions, and rows from a foreign job holding this job number,
     yield ``UNKNOWN`` with ``problem`` set.
     """
-    if any(row.foreign for row in active) or any(row.foreign for row in history):
+    if any(row.foreign for row in (*active, *history)):
         return SchedulerEvidence(AllocationState.UNKNOWN, retained=True, problem=FOREIGN_JOB)
     latest = history[-1] if history else None
     queue = active[0] if active else None
-    if len(active) > 1:
-        return _problem("squeue returned several rows for one job", queue, latest)
-    if history:
-        anchor = history[0]
-        if not expectation.window_start <= anchor.submitted_at <= expectation.window_end:
-            return _problem(
-                "accounting history starts outside the submission window", queue, latest
-            )
-        for earlier, later in itertools.pairwise(history):
-            if later.submitted_at <= earlier.submitted_at or later.cluster != anchor.cluster:
-                return _problem("accounting requeue history is not ordered", queue, latest)
-    if queue is not None and (
-        queue.submitted_at < expectation.window_start
-        or (history and queue.submitted_at < history[0].submitted_at)
-    ):
-        return _problem("queue row predates the allocation's submission", queue, latest)
-    retained = (queue is not None and _unfinished(queue.state)) or (
-        latest is not None and _unfinished(latest.state)
-    )
+    if (message := _contradiction(expectation, active, history)) is not None:
+        return _problem(message, queue, latest)
+    samples = [row for row in (queue, latest) if row is not None]
+    retained = any(not normalize_state(row.state).terminal for row in samples)
     if latest is None:
         if queue is None:
             return SchedulerEvidence(AllocationState.UNKNOWN)
@@ -445,7 +433,7 @@ def combine(
             ended_at=queue.ended_at,
             retained=retained,
         )
-    primary: ActiveRow | AccountingRow = latest
+    primary = latest
     if queue is not None and queue.submitted_at > latest.submitted_at:
         primary = queue  # accounting has not recorded the newest incarnation yet
     elif queue is not None and queue.submitted_at == latest.submitted_at:
@@ -467,7 +455,7 @@ def combine(
     )
 
 
-def _same_incarnation(queue: ActiveRow, latest: AccountingRow) -> ActiveRow | AccountingRow | None:
+def _same_incarnation(queue: Row, latest: Row) -> Row | None:
     if state_base(queue.state) == state_base(latest.state):
         return queue
     queue_state, accounting_state = normalize_state(queue.state), normalize_state(latest.state)
@@ -519,9 +507,13 @@ def parse_steps(
 # --- Identity --------------------------------------------------------------------------------
 
 
-def parse_identity(squeue: bytes, sacct: bytes, identity: str) -> JobRef:
-    """Prove exactly one job for ``identity`` from ``squeue --format=%i|%j|%k`` and ``sacct
-    --format=JobIDRaw,JobName,Comment,Cluster`` replies, else raise ``ReconciliationError``."""
+def parse_identity(squeue: bytes, sacct: bytes, identity: str) -> tuple[JobRef, ...]:
+    """Every job carrying ``identity`` in ``squeue --format=%i|%j|%k`` and ``sacct
+    --format=JobIDRaw,JobName,Comment,Cluster`` replies, in job-number order.
+
+    An empty result proves absence. Malformed or unrelated rows, and one job number reported on
+    several clusters, raise ``ReconciliationError``: such replies prove nothing.
+    """
     candidates: dict[int, set[str | None]] = {}
     try:
         for line in reply_lines(squeue):
@@ -538,15 +530,13 @@ def parse_identity(squeue: bytes, sacct: bytes, identity: str) -> JobRef:
             candidates.setdefault(_candidate(job_id), set()).add(cluster or None)
     except EvidenceConflict as error:
         raise ReconciliationError(f"scheduler identity evidence is malformed: {error}") from None
-    if len(candidates) != 1:
-        raise ReconciliationError(
-            f"scheduler evidence shows {len(candidates)} jobs named {identity}, not exactly one"
-        )
-    ((job_id, clusters),) = candidates.items()
-    known = {cluster for cluster in clusters if cluster is not None}
-    if len(known) > 1:
-        raise ReconciliationError("scheduler returned conflicting cluster identities")
-    return JobRef(job_id, next(iter(known), None))
+    jobs: list[JobRef] = []
+    for job_id, clusters in sorted(candidates.items()):
+        known = {cluster for cluster in clusters if cluster is not None}
+        if len(known) > 1:
+            raise ReconciliationError("scheduler returned conflicting cluster identities")
+        jobs.append(JobRef(job_id, next(iter(known), None)))
+    return tuple(jobs)
 
 
 def _candidate(value: str) -> int:

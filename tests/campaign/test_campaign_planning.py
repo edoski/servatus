@@ -12,7 +12,7 @@ import pytest
 from campaign_world import Probe, World, cpu_profile, jobs
 from support.builders import profile, resources, target
 
-from servatus.campaign import Completed, Hold, Profile, Retry, Task
+from servatus.campaign import AllocationState, Completed, Hold, Profile, Retry, Task
 from servatus.errors import (
     ConfigurationError,
     DestinationExists,
@@ -88,30 +88,35 @@ def test_batch_cap_defers_eligible_tasks_and_keeps_retry_intent(world: World) ->
     capped = cpu_profile(max_allocations_per_submit=2)
     plan = campaign.plan(capped, tasks_per_allocation=3)
     assert [len(item.task_keys) for item in plan.allocations] == [3, 3]
-    assert plan.selected == keys(*range(6)) and plan.deferred == keys(*range(6, 11))
+    assert plan.decision.selected == keys(*range(6)) and plan.decision.deferred == keys(
+        *range(6, 11)
+    )
     assert any("deferred" in warning for warning in plan.warnings)
     campaign.submit(plan)
-    assert campaign.plan(capped, tasks_per_allocation=3).selected == keys(*range(6, 11))
+    assert campaign.plan(capped, tasks_per_allocation=3).decision.selected == keys(*range(6, 11))
 
     for job in (1000, 1001):
+        world.fake.start(job)
         world.fake.finish(job, "FAILED", exit_code="1:0")
     single = cpu_profile(max_allocations_per_submit=1)
     retry = campaign.plan(single, retry=Retry.FAILED, tasks_per_allocation=2)
-    assert retry.selected == keys(0, 1)
-    assert retry.deferred == keys(*range(2, 11))
-    assert retry.retry == keys(*range(6))  # deferred retries stay visible
+    assert retry.decision.selected == keys(0, 1)
+    assert retry.decision.deferred == keys(*range(2, 11))
+    assert retry.decision.retry == keys(*range(6))  # deferred retries stay visible
     campaign.submit(retry)
     following = campaign.plan(single, retry=Retry.FAILED, tasks_per_allocation=2)
-    assert following.selected == keys(2, 3)
-    assert following.held["task-0"] is Hold.ACTIVE
+    assert following.decision.selected == keys(2, 3)
+    assert following.decision.held["task-0"] is Hold.ACTIVE
     explicit = campaign.plan(single, retry=keys(*range(6)), tasks_per_allocation=2)
-    assert explicit.selected == keys(2, 3) and explicit.held["task-1"] is Hold.ACTIVE
+    assert (
+        explicit.decision.selected == keys(2, 3) and explicit.decision.held["task-1"] is Hold.ACTIVE
+    )
 
 
 def test_unbounded_targets_plan_everything(world: World) -> None:
     campaign = world.create(jobs(9))
     plan = campaign.plan(cpu_profile(), tasks_per_allocation=1)
-    assert len(plan.allocations) == 9 and plan.deferred == ()
+    assert len(plan.allocations) == 9 and plan.decision.deferred == ()
 
 
 # --- Eligibility -------------------------------------------------------------------------------
@@ -124,7 +129,9 @@ def test_fresh_only_plans_never_contact_historical_routes(world: World) -> None:
     world.wire.down.add("old.example.edu")
     calls, routes = world.scheduler_calls(), len(world.wire.hosts)
     plan = campaign.plan(cpu_profile(host="new.example.edu"))
-    assert plan.selected == ("task-1",) and dict(plan.held) == {"task-0": Hold.SUBMITTED}
+    assert plan.decision.selected == ("task-1",) and dict(plan.decision.held) == {
+        "task-0": Hold.SUBMITTED
+    }
     assert world.scheduler_calls() == calls and len(world.wire.hosts) == routes
     with pytest.raises(Unavailable, match="Connection refused"):
         campaign.plan(cpu_profile(host="new.example.edu"), retry=["task-0"])
@@ -146,8 +153,8 @@ def test_every_hold_reason_is_reported(world: World) -> None:
         campaign.submit(campaign.plan(cpu_profile(), retry=["task-5"]))
 
     bulk = campaign.plan(cpu_profile(), retry=Retry.FAILED)
-    assert bulk.selected == ("task-2",)
-    assert dict(bulk.held) == {
+    assert bulk.decision.selected == ("task-2",)
+    assert dict(bulk.decision.held) == {
         "task-0": Hold.ACTIVE,
         "task-1": Hold.VALID,
         "task-3": Hold.UNOBSERVABLE,
@@ -155,10 +162,10 @@ def test_every_hold_reason_is_reported(world: World) -> None:
         "task-5": Hold.UNRESOLVED,
     }
     only = campaign.plan(cpu_profile(), retry=["task-0", "task-2"], only=["task-0", "task-2"])
-    assert only.selected == ("task-2",) and only.held["task-0"] is Hold.ACTIVE
-    assert only.held["task-4"] is Hold.NOT_REQUESTED
+    assert only.decision.selected == ("task-2",) and only.decision.held["task-0"] is Hold.ACTIVE
+    assert only.decision.held["task-4"] is Hold.NOT_REQUESTED
     incomplete = campaign.plan(cpu_profile(), retry=Retry.INCOMPLETE)
-    assert incomplete.selected == ("task-2", "task-4")
+    assert incomplete.decision.selected == ("task-2", "task-4")
 
 
 @pytest.mark.parametrize(
@@ -179,7 +186,7 @@ def test_explicit_retries_are_refused_with_every_reason(
     with pytest.raises(PlanRefused, match=message):
         campaign.plan(cpu_profile(), retry=retry, allow_duplicate_risk=acknowledged)
     plan = campaign.plan(cpu_profile(), retry=["task-0"], allow_duplicate_risk=["task-0"])
-    assert plan.duplicate_risk == ("task-0",) and plan.warnings
+    assert plan.decision.duplicate_risk == ("task-0",) and plan.warnings
 
 
 def test_valid_results_are_never_retried(world: World) -> None:
@@ -195,7 +202,7 @@ def test_selector_shapes_and_probe_requirements_are_checked(world: World) -> Non
     campaign = world.create(jobs(1))
     with pytest.raises(ConfigurationError, match="retry must be a collection"):
         campaign.plan(cpu_profile(), retry="task-0")
-    with pytest.raises(ConfigurationError, match="only must contain only strings"):
+    with pytest.raises(ConfigurationError, match="only must contain only Task key strings"):
         campaign.plan(cpu_profile(), only=[1])  # pyright: ignore[reportArgumentType]
     with pytest.raises(ConfigurationError, match="Retry.INCOMPLETE needs a result probe"):
         campaign.plan(cpu_profile(), retry=Retry.INCOMPLETE)
@@ -249,7 +256,7 @@ def test_saved_plans_are_compact_private_and_round_trip_without_observation(worl
 def test_plans_of_the_same_state_have_distinct_identities(world: World) -> None:
     campaign = world.create(jobs(2))
     first, second = campaign.plan(cpu_profile()), campaign.plan(cpu_profile())
-    assert first.selected == second.selected
+    assert first.decision.selected == second.decision.selected
     assert first.allocations[0].allocation_id != second.allocations[0].allocation_id
     assert first.digest != second.digest
 
@@ -312,3 +319,34 @@ def test_validate_checks_each_distinct_shape_without_recording(world: World) -> 
     (rejected, _) = campaign.validate(plan)
     assert not rejected.accepted and rejected.scheduler_stderr == rejection
     assert campaign.status(scheduler=False).attempts == () and world.fake.jobs == ()
+
+
+@pytest.mark.parametrize(
+    "steps", [Completed(1, b"", b"sacct: error: timeout\n"), Completed(0, b"", b"")]
+)
+def test_failed_retry_never_resubmits_a_packed_task_whose_own_outcome_is_unknown(
+    world: World, steps: Completed
+) -> None:
+    """A packed allocation fails after one Task's step succeeded. Without that step's evidence
+    (the step query fails or finds nothing) the Task may have succeeded: never bulk-retry it."""
+    campaign = world.create(jobs(2))
+    campaign.submit(campaign.plan(cpu_profile()))
+    world.fake.start(1000)
+    world.fake.finish_step(1000, 0, "COMPLETED")
+    world.fake.finish(1000, "FAILED", exit_code="1:0")
+
+    def without_steps() -> None:
+        world.wire.on("sacct", lambda _argv: None)  # allocation history answers normally
+        world.wire.on("sacct", lambda _argv: steps)
+
+    without_steps()
+    status = campaign.status()
+    assert [task.execution for task in status.tasks] == [AllocationState.UNKNOWN] * 2
+    without_steps()
+    bulk = campaign.plan(cpu_profile(), retry=Retry.FAILED)
+    assert bulk.decision.selected == ()
+    assert dict(bulk.decision.held) == {"task-0": Hold.UNOBSERVABLE, "task-1": Hold.UNOBSERVABLE}
+    without_steps()
+    with pytest.raises(PlanRefused, match="needs a duplicate-risk acknowledgement: 'task-0'"):
+        campaign.plan(cpu_profile(), retry=["task-0"])
+    assert campaign.plan(cpu_profile(), retry=Retry.FAILED).decision.selected == ("task-1",)

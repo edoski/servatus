@@ -8,7 +8,16 @@ from pathlib import Path
 import pytest
 from campaign_world import Probe, World, cpu_profile, jobs
 
-from servatus.campaign import AllocationState, Campaign, Hold, ResultState, Retry, Task
+from servatus.campaign import (
+    AllocationState,
+    Campaign,
+    Hold,
+    ResultState,
+    Retry,
+    Task,
+    ping,
+    to_document,
+)
 from servatus.errors import (
     Busy,
     ConfigurationError,
@@ -23,11 +32,40 @@ def keys(count: int, prefix: str = "task") -> tuple[str, ...]:
     return tuple(f"{prefix}-{index}" for index in range(count))
 
 
+def test_ping_and_documents_for_results(world: World) -> None:
+    target = cpu_profile().target
+    assert ping(target, connect=world.wire) == "slurm 23.11.4"
+    with pytest.raises(ConfigurationError, match="ping needs a Target"):
+        ping("login.example.edu", connect=world.wire)  # pyright: ignore[reportArgumentType]
+    world.wire.down.add(target.host)
+    with pytest.raises(Unavailable, match="Connection refused"):
+        ping(target, connect=world.wire)
+    world.wire.down.clear()
+    campaign = world.create(jobs(1))
+    result = campaign.submit(campaign.plan(cpu_profile()))
+    assert to_document(result) == {
+        "receipts": [
+            {
+                "allocation_id": result.receipts[0].allocation_id,
+                "job": {"job_id": 1000, "cluster": None},
+                "task_keys": ["task-0"],
+            }
+        ],
+        "unresolved": [],
+        "unattempted": [],
+        "stop_reason": None,
+    }
+
+
 def test_sweep_from_creation_through_failure_retry_and_saved_plans(world: World) -> None:
     probe = Probe()
     campaign = world.create(jobs(6), probe=probe)
     plan = campaign.plan(cpu_profile())
-    assert plan.selected == keys(6) and dict(plan.held) == {} and plan.deferred == ()
+    assert (
+        plan.decision.selected == keys(6)
+        and dict(plan.decision.held) == {}
+        and plan.decision.deferred == ()
+    )
     assert [item.task_keys for item in plan.allocations] == [keys(6)[:3], keys(6)[3:]]
     result = campaign.submit(plan)
     assert result.complete and result.unresolved == result.unattempted == ()
@@ -49,8 +87,8 @@ def test_sweep_from_creation_through_failure_retry_and_saved_plans(world: World)
     assert status.tasks[4].exit_code == "1:0"
 
     retry = campaign.plan(cpu_profile(), retry=Retry.FAILED)
-    assert retry.selected == retry.retry == ("task-4",)
-    assert dict(retry.held) == {
+    assert retry.decision.selected == retry.decision.retry == ("task-4",)
+    assert dict(retry.decision.held) == {
         **dict.fromkeys(keys(4), Hold.VALID),
         "task-5": Hold.SUBMITTED,
     }
@@ -60,16 +98,19 @@ def test_sweep_from_creation_through_failure_retry_and_saved_plans(world: World)
     world.fake.finish(1002)
 
     incomplete = campaign.plan(cpu_profile(), retry=Retry.INCOMPLETE)
-    assert incomplete.selected == ("task-4", "task-5")
+    assert incomplete.decision.selected == ("task-4", "task-5")
     probe.valid.update({"task-4", "task-5"})
     final = campaign.status()
     assert final.results_ready and final.quiescent
-    assert campaign.plan(cpu_profile(), retry=Retry.FAILED).selected == ()
+    assert campaign.plan(cpu_profile(), retry=Retry.FAILED).decision.selected == ()
 
 
 def test_probe_is_called_once_per_operation_with_only_the_tasks_that_matter(world: World) -> None:
     probe = Probe()
     campaign = world.create(jobs(3), probe=probe)
+    campaign.plan(cpu_profile(), only=["task-1"])
+    assert probe.calls == [("task-1",)]  # only the requested Tasks can change the decision
+    probe.calls.clear()
     plan = campaign.plan(cpu_profile())
     assert probe.calls == [keys(3)]
     campaign.submit(plan)
@@ -77,8 +118,9 @@ def test_probe_is_called_once_per_operation_with_only_the_tasks_that_matter(worl
     campaign.status()
     assert probe.calls[2:] == [keys(3)]
     calls = len(probe.calls)
-    assert campaign.plan(cpu_profile()).selected == ()
+    assert campaign.plan(cpu_profile()).decision.selected == ()
     assert len(probe.calls) == calls  # accepted work without a retry request is not probed
+    world.fake.start(1000)
     world.fake.finish(1000, "FAILED", exit_code="1:0")
     campaign.plan(cpu_profile(), retry=["task-1"])
     assert probe.calls[-1] == ("task-1",)
@@ -185,7 +227,7 @@ def test_requeue_within_the_submission_window_does_not_wedge_the_task(world: Wor
     world.fake.finish(1000, "FAILED", exit_code="1:0")
     status = campaign.status()
     assert status.tasks[0].execution is AllocationState.FAILED and status.quiescent
-    assert campaign.plan(cpu_profile(), retry=Retry.FAILED).selected == ("task-0",)
+    assert campaign.plan(cpu_profile(), retry=Retry.FAILED).decision.selected == ("task-0",)
 
 
 def test_latest_accepted_attempt_projects_the_task_but_quiescence_uses_all(world: World) -> None:

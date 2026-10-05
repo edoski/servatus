@@ -70,13 +70,19 @@ Key facts:
 - `Target(... host: str | None = None, container: Apptainer | None = None, ...)`. `host=None`
   runs scheduler commands locally (login node). `container=None` runs each Task's absolute
   `args[0]` directly. `max_allocations_per_submit=None` means no batch cap (default).
-- `Apptainer(executable, image, binds=())`, binds `SRC[:DST[:ro|rw]]`.
+- `Apptainer(executable, image, binds=())`, binds `SRC[:DST[:ro|rw]]`; `image` cannot contain
+  `:` (Apptainer reads URIs). `Target` rejects `%` in `log_root` (Slurm filename patterns) and
+  `,`/`:` in `work_root` (container binds).
 - `Profile(label, target, resources)`, `Profile.load(path, *, name=None)`; TOML target keys are
   the Target field names minus `container`, plus `apptainer`, `image`, `binds`.
 - `JobRef(job_id, cluster=None)`; `AllocationState` with `.active` / `.terminal`;
-  `SchedulerEvidence(... retained, problem)`; `StepEvidence`; `Observation(allocation, steps)`.
+  `SchedulerEvidence(... retained, problem)`; `StepEvidence`; `Observation(allocation, steps)`
+  where `steps` has one entry per slot (`None`: step not found) or is empty when the step query
+  failed (step evidence unavailable).
 - `State` validates its full invariant (linear) on construction. Transitions:
-  `create`, `append`, `seal`, `record_intent -> (State, Attempt)`, `record_outcome` (idempotent
+  `create`, `append`, `seal`, `record_intent -> (State, Attempt)`,
+  `correct_outcome(state, allocation_id, job)` (replaces a NOT_SUBMITTED outcome with acceptance
+  at a new revision; `Conflict` when later Attempts name its Tasks), `record_outcome` (idempotent
   on identical repeat, `Conflict` on conflict, `NotFound` for unknown allocation).
   `encode(state) -> bytes`, `decode(bytes) -> State` (`CorruptState` on any defect).
 
@@ -84,6 +90,8 @@ Key facts:
 
 `servatus`: `__version__`, `Campaign`, `Task`, `Resources`, `Target`, `Apptainer`, `Profile`,
 `Retry`, `publish`, `publish_file`, `Workspace`, `Draft`, `Publication`, `ServatusError`.
+`servatus.campaign` also exports `ping(target, *, connect=None) -> str` (the `sbatch --version`
+check) and `to_document(value) -> object` (codec-encoded JSON-compatible data for results).
 `servatus.errors`: the hierarchy. `servatus.campaign` and `servatus.publication`: full surfaces.
 `servatus.testing`: `FakeScheduler`.
 
@@ -112,16 +120,26 @@ class Campaign:
     def submit(self, plan) -> SubmitResult         # SubmissionInterrupted(result=...) on stop
     def reconcile(self, allocation_id) -> Receipt
     def mark_accepted(self, allocation_id, job_id: int, *, cluster=None) -> Receipt
-    def mark_not_submitted(self, allocation_id) -> None
+    def mark_not_submitted(self, allocation_id) -> None   # needs Slurm's proof of absence
     def cancel(self, *, tasks=None, allocations=None) -> tuple[Receipt, ...]
     def read_log(self, *, task=None, allocation=None, max_bytes=65_536) -> LogSnapshot
 
 class Plan:   # decision + derived allocations + digest
-    campaign_id, revision, profile, selected, held: Mapping[str, Hold], deferred,
-    retry, duplicate_risk, tasks_per_allocation, probe_required, allocations, digest, warnings
-    def to_json(self) -> bytes
+    decision: Decision        # campaign_id, revision, nonce, profile, selected, held, deferred,
+                              # retry, duplicate_risk, tasks_per_allocation, probe_required
+    allocations, digest, warnings
+    def to_json(self) -> bytes                     # canonical, no trailing newline
     def save(self, path: StrPath) -> None          # owner-only (0600), never overwrites
 ```
+
+`mark_accepted` records a job for an unresolved allocation; for an allocation recorded as not
+submitted it asks the original target and records the job (via `correct_outcome`) only when
+`identify` proves exactly that job. `mark_not_submitted` first runs `Scheduler.find` on the
+original target: any matching job raises `Conflict` (use `reconcile`/`mark-accepted`), a failed
+query raises `Unavailable`, untrustworthy replies raise `ReconciliationError`; only proven
+absence records NOT_SUBMITTED. `cancel` attempts every selected allocation and raises
+`Unavailable` naming the cancelled and the failed ones. A receipt commit that fails but is
+durable is reported as a receipt.
 
 Renames from 0.11: `SlurmTarget`->`Target`, `ResourceRequest`->`Resources`,
 `SubmissionPlan`->`Plan`, `JobReceipt`->`Receipt`, `ValidationResult`->`ShapeCheck`,
@@ -170,8 +188,10 @@ and `/tmp/servatus-proto.ShnG0l/tests/fake_scheduler.py`.
   discarded; a missing marker is `Unavailable`. `Local()`: same scrubbed env, no shell.
   `connect(target)` returns `Ssh(target.host)` or `Local()`. All spawn/timeout/overflow/exit
   failures surface as `Unavailable` (one error boundary). Bounds: 30 s deadline, 32 args,
-  16 KiB command, 4 KiB per field, 1 MiB per stream; `check_command(argv)` is pure and raises
-  `ConfigurationError`.
+  16 KiB command, 4 KiB per field, 1 MiB per stream; `_script.check_command(argv)` is pure and
+  raises `ConfigurationError`. The ssh client environment passes only `HOME`, `LOGNAME`, `USER`,
+  `SSH_AUTH_SOCK`, `KRB5CCNAME`, and `KRB5_CONFIG`. Once the child exits, the runner reads what
+  is buffered and stops waiting for EOF (a ControlPersist master may hold stderr open).
 - Script: no scratch dir, no `mktemp`/`base64`/`rm`. Each step's stdin is a single-quoted
   `printf` literal piped into `srun` (printable ASCII verbatim, `\ooo` otherwise). Env passed as
   `APPTAINERENV_NAME=<shlex-quoted>` assignments (Apptainer) or `env -i ... NAME=VALUE` (direct),
@@ -182,6 +202,8 @@ and `/tmp/servatus-proto.ShnG0l/tests/fake_scheduler.py`.
   `servatus-<allocation_id>-<slot>` (`srun --job-name`). `signal_before_end` emits
   `--signal=USR1@<seconds>`. Interrupt trap kills only recorded pids (no `${!:-}`). Waits all,
   aggregates failure. Direct launcher requires absolute `args[0]` (`ConfigurationError`).
+  Apptainer steps use `apptainer exec` (never the image runscript) and need nonempty args;
+  a relative `args[0]` resolves on the container's PATH.
 - Evidence: single state table; add `EXPEDITING` (queued); `REVOKED` is not listed (UNKNOWN,
   retained). Requeue history: only the first sacct row must fall in the submission window; later
   rows need strictly increasing Submit. squeue/sacct disagreement within one incarnation prefers
@@ -189,16 +211,19 @@ and `/tmp/servatus-proto.ShnG0l/tests/fake_scheduler.py`.
   contradictions become a per-attempt `problem` (UNKNOWN, retained) instead of aborting.
   Identity violations (unrelated job ids/names) still raise `EvidenceConflict`.
 - Step evidence: one extra `sacct` query (no `--allocations`) maps step rows named
-  `servatus-<id>-<slot>` to `StepEvidence`; failures there degrade to `None`, never abort.
+  `servatus-<id>-<slot>` to `StepEvidence`; failures there leave `steps` empty (unavailable),
+  never abort.
 - `Scheduler(transport, slurm_bin)` methods: `ping() -> str` (sbatch --version),
   `submit(argv, script) -> JobRef`, `test_only(argv, script) -> (accepted, stdout, stderr)`,
-  `observe(queries) -> dict[allocation_id, Observation]`, `identify(allocation_id, intent_at)
-  -> JobRef` (`ReconciliationError` unless exactly one), `tail(path, max_bytes) -> (bytes,
+  `observe(queries) -> dict[allocation_id, Observation]`, `find(allocation_id, intent_at) ->
+  tuple[JobRef, ...]` (every matching job; empty proves absence), `identify(allocation_id,
+  intent_at) -> JobRef` (`ReconciliationError` unless exactly one), `tail(path, max_bytes) -> (bytes,
   truncated)`, `cancel(allocation_id, job)`. Batch <= 16 jobs per query; reused job numbers
   separately; grouped by cluster.
 - `servatus.testing.FakeScheduler`: callable as `connect`, in-memory job table answering the
   exact argv issued above, with controls `start`, `finish`, `finish_step`, `requeue`, `forget`,
-  `fail_next`, `lose_next_reply`, plus call counting.
+  `fail_next`, `lose_next_reply`, plus call counting. Controls and `count` key commands by
+  basename, except the `sbatch --version` check, whose key is `"ping"`.
 
 ### CORE (`_store.py`, `_status.py`, `_policy.py`)
 Start from `/tmp/servatus-review.awHnf7/` (memo store) and
@@ -210,13 +235,18 @@ Start from `/tmp/servatus-review.awHnf7/` (memo store) and
   failures `UnsafeFilesystem`/`CorruptState`. Use a local atomic write for now; INTEGRATION
   switches it to `_fs.replace_file`.
 - `_status`: `ResultState` (UNOBSERVED, MISSING, VALID); `TaskStatus(key, result, current_allocation_id,
-  execution: AllocationState | None (step state if known), exit_code, unresolved)`;
+  execution: AllocationState | None, exit_code, unresolved)`. A Task's execution is its own step
+  when known, else the allocation's, except: UNKNOWN or contradictory (`problem`) allocation
+  evidence makes it UNKNOWN whatever the steps say, and a FAILED/CANCELLED allocation of several
+  Tasks without the Task's step makes it UNKNOWN (it may have succeeded). Exit codes accompany
+  terminal executions only;
   `AttemptStatus(allocation_id, task_keys, retry, duplicate_risk, profile_label, acceptance,
   job, intent_at, scheduler: SchedulerEvidence | None, steps)`; `Status(campaign_id, revision,
   sealed, observed_at, scheduler_observed, tasks, attempts, results_ready, quiescent)` with
   `counts() -> Mapping[str, int]` and `to_json() -> bytes` (`{"format": "servatus.status/1"}`).
   `project(state, observations, results, *, scheduler_observed, observed_at) -> Status`.
-- `_policy`: `Hold` (VALID, UNRESOLVED, ACTIVE, FINISHED, UNOBSERVABLE, NOT_REQUESTED);
+- `_policy`: `Hold` (VALID, UNRESOLVED, ACTIVE, SUBMITTED, UNOBSERVABLE, NOT_REQUESTED;
+  SUBMITTED: accepted work not selected for retry, its scheduler state not consulted);
   `Retry` (FAILED: terminal scheduler failure/cancel of the current attempt per step/allocation;
   INCOMPLETE: any terminal accepted Task without a VALID result, requires a probe).
   `decide(state, observations, results, *, retry, duplicate_risk, only) -> Selection(selected,
@@ -239,8 +269,11 @@ legacy modules/tests, behaviour tests over `FakeScheduler`, CLI tests.
   `record_outcome`. Stops raise `SubmissionInterrupted` with a complete `SubmitResult`.
 - Probes are called once per operation with the relevant Tasks.
 - CLI: subcommands with `set_defaults(run=...)`; exit 0 ok, 1 error, 2 usage (argparse only),
-  3 submission interrupted, 75 `Unavailable`/`Busy`; `servatus: error: ...` on stderr without
-  usage banner; human output by default, `--json` for machine output; `--version`.
+  3 submission interrupted, 75 `Unavailable`/`Busy`, 130 interrupted; `servatus: error: ...` on
+  stderr without usage banner, also for unexpected exceptions (`unexpected <type>: <message>`,
+  exit 1, never a traceback); human output by default, escaping every non-printable character;
+  `--json` for machine output built with `to_document` (receipts nest `job: {job_id,
+  cluster}`); `--version`. Task JSONL lines end at `\n` only.
   Commands: create, ensure, append, seal, plan (prints selected/held/deferred, `--retry KEY`,
   `--retry-failed`, `--retry-incomplete` n/a without probe so omit, `--allow-duplicate-risk`,
   `--only`, `--tasks-per-allocation`, `--output`, `--show-scripts`), validate, submit, status

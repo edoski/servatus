@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 from core_helpers import CAMPAIGN_ID, NOW, allocation_id, intend, reencode, roster, submit
-from support.builders import profile, target, tasks
+from support.builders import profile, resources, target, tasks
 
 from servatus.campaign import _codec
 from servatus.campaign._config import Profile, Task
@@ -20,6 +20,7 @@ from servatus.campaign._state import (
     RegisteredTask,
     State,
     append,
+    correct_outcome,
     create,
     decode,
     encode,
@@ -115,6 +116,32 @@ def test_outcome_is_idempotent_and_conflicts_are_rejected() -> None:
         state.attempt(allocation_id(99))
 
 
+def test_a_not_submitted_outcome_is_corrected_at_a_new_revision() -> None:
+    state, identity = submit(roster(2, appendable=True), ["task-0"], job=None)
+    state = append(state, [Task("late")])  # unrelated history in between is fine
+    corrected = correct_outcome(state, identity, JobRef(42))
+    attempt = corrected.attempt(identity)
+    assert attempt.acceptance is AcceptanceState.ACCEPTED and attempt.job == JobRef(42)
+    assert attempt.outcome_revision == corrected.revision == state.revision + 1
+    assert decode(encode(corrected)) == corrected
+    assert correct_outcome(corrected, identity, JobRef(42)) is corrected
+    with pytest.raises(Conflict, match="is not recorded as not submitted"):
+        correct_outcome(corrected, identity, JobRef(43))
+    pending, unresolved = intend(roster(1), ["task-0"])
+    with pytest.raises(Conflict, match="is not recorded as not submitted"):
+        correct_outcome(pending, unresolved, JobRef(42))
+    with pytest.raises(NotFound, match="unknown allocation"):
+        correct_outcome(state, allocation_id(99), JobRef(42))
+
+
+def test_a_not_submitted_outcome_followed_by_its_tasks_cannot_be_corrected() -> None:
+    state, identity = submit(roster(2), ["task-0", "task-1"], job=None)
+    state, _ = submit(state, ["task-0"])
+    state, later = intend(state, ["task-1"])
+    with pytest.raises(Conflict, match=f"later allocations .*, {later} already include"):
+        correct_outcome(state, identity, JobRef(42))
+
+
 def test_outcome_survives_unrelated_authoring() -> None:
     state, identity = intend(roster(1, appendable=True), ["task-0"])
     state = seal(append(state, [Task("late")]))
@@ -151,6 +178,27 @@ def _intent(state: State, **changes: Any) -> State:
             "attempt exceeds its target capacity",
         ),
         ({"profile": profile(target(max_time_limit="01:00:00"))}, "exceeds its target capacity"),
+        (  # 3 Tasks x 2 GPUs exceed 4 GPUs while every other ceiling fits
+            {
+                "task_keys": ("task-0", "task-1", "task-2"),
+                "profile": profile(resource_value=resources(gpus=2)),
+            },
+            "exceeds its target capacity",
+        ),
+        (
+            {
+                "task_keys": ("task-0", "task-1", "task-2"),
+                "profile": profile(resource_value=resources(cpus=64)),
+            },
+            "exceeds its target capacity",
+        ),
+        (
+            {
+                "task_keys": ("task-0", "task-1", "task-2"),
+                "profile": profile(resource_value=resources(memory_mib=131072)),
+            },
+            "exceeds its target capacity",
+        ),
     ],
 )
 def test_record_intent_rejects_invalid_attempts_as_conflicts(

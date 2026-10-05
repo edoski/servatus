@@ -247,6 +247,12 @@ def test_reply_line_bound_is_enforced() -> None:
         evidence(sacct=sacct_row() * 4097)
 
 
+def test_reply_field_bound_is_4096_bytes() -> None:
+    assert evidence(squeue_row(reason="r" * 4096)).reason == "r" * 4096
+    with pytest.raises(EvidenceConflict, match="malformed"):
+        evidence(squeue_row(reason="r" * 4097))
+
+
 def test_padded_state_and_time_fields_are_normalized() -> None:
     row = squeue_row(" RUNNING ", submit=f" {SUBMIT} ", start=" 2030-01-01T12:01:00 ")
     result = evidence(row)
@@ -301,6 +307,23 @@ def test_terminal_accounting_carries_exit_code_times_and_reason() -> None:
         started_at="2030-01-01T12:01:00",
         ended_at="2030-01-01T13:30:00",
     )
+
+
+def test_times_missing_from_the_chosen_row_come_from_accounting() -> None:
+    queue = squeue_row("COMPLETING")
+    history = sacct_row("RUNNING", start="2030-01-01T12:01:00", end="2030-01-01T12:09:00")
+    result = evidence(queue, history)
+    assert (result.raw_state, result.started_at, result.ended_at) == (
+        "COMPLETING",
+        "2030-01-01T12:01:00",
+        "2030-01-01T12:09:00",
+    )
+
+
+@pytest.mark.parametrize("cluster", [5, b"alpha", "two words"])
+def test_job_references_need_a_token_cluster(cluster: object) -> None:
+    with pytest.raises(ConfigurationError, match="cluster must be one safe site token"):
+        JobRef(1, cluster)  # pyright: ignore[reportArgumentType]
 
 
 @pytest.mark.parametrize(
@@ -490,16 +513,23 @@ def test_malformed_step_rows_raise_for_the_caller_to_degrade() -> None:
 def test_identity_accepts_absent_accounting_comment_and_adopts_cluster() -> None:
     squeue = f"42|{IDENTITY}|{IDENTITY}\n".encode()
     sacct = f"42|{IDENTITY}||alpha\n42|{IDENTITY}|{IDENTITY}|alpha\n".encode()
-    assert parse_identity(squeue, sacct, IDENTITY) == JobRef(42, "alpha")
-    assert parse_identity(b"", f"42|{IDENTITY}|N/A|\n".encode(), IDENTITY) == JobRef(42)
+    assert parse_identity(squeue, sacct, IDENTITY) == (JobRef(42, "alpha"),)
+    assert parse_identity(b"", f"42|{IDENTITY}|N/A|\n".encode(), IDENTITY) == (JobRef(42),)
+
+
+def test_identity_lists_every_job_or_proves_absence() -> None:
+    assert parse_identity(b"", b"", IDENTITY) == ()
+    squeue = f"43|{IDENTITY}|{IDENTITY}\n".encode()
+    sacct = f"42|{IDENTITY}|{IDENTITY}|alpha\n".encode()
+    assert parse_identity(squeue, sacct, IDENTITY) == (JobRef(42, "alpha"), JobRef(43))
 
 
 @pytest.mark.parametrize(
     ("squeue", "sacct", "message"),
     [
-        ("", "", "0 jobs"),
-        (f"42|{IDENTITY}|{IDENTITY}\n", f"43|{IDENTITY}|{IDENTITY}|alpha\n", "2 jobs"),
         ("42|wrong|wrong\n", "", "unrelated"),
+        (f"42|{IDENTITY}|wrong\n", "", "unrelated"),  # queue rows need both name and comment
+        (f"42|wrong|{IDENTITY}\n", "", "unrelated"),
         (f"42|{IDENTITY}|{IDENTITY}\n", f"42|{IDENTITY}|wrong-identity|alpha\n", "unrelated"),
         (f"42|{IDENTITY}|{IDENTITY}\nmalformed\n", "", "malformed"),
         (f"42|{IDENTITY}|{IDENTITY}\n0|{IDENTITY}|{IDENTITY}\n", "", "invalid job"),
@@ -511,7 +541,7 @@ def test_identity_accepts_absent_accounting_comment_and_adopts_cluster() -> None
         (f"42|{IDENTITY}|{IDENTITY}", "", "partial"),
     ],
 )
-def test_identity_that_is_not_exactly_one_proven_job_is_a_reconciliation_error(
+def test_untrustworthy_identity_replies_are_reconciliation_errors(
     squeue: str, sacct: str, message: str
 ) -> None:
     with pytest.raises(ReconciliationError, match=message):

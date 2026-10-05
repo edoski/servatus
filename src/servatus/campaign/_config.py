@@ -6,7 +6,7 @@ import dataclasses
 import os
 import re
 import tomllib
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path, PurePosixPath
@@ -21,7 +21,7 @@ PosixInput = str | PurePosixPath
 
 TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _HOST = re.compile(r"(?:[A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9._-]*\Z")
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _GRES = re.compile(r"gpu(?::(?![0-9]+\Z)[A-Za-z0-9][A-Za-z0-9._-]*)?\Z")
 RESERVED_ENV_PREFIX = "SERVATUS_"
@@ -50,6 +50,19 @@ def _text(value: object, name: str, *, empty: bool = False) -> str:
     return text
 
 
+def task_keys(value: object, name: str) -> tuple[str, ...]:
+    """A collection (not a single string) of Task key strings, as a tuple."""
+    _require(
+        isinstance(value, Collection) and not isinstance(value, (str, bytes)),
+        f"{name} must be a collection of Task keys",
+    )
+    items = tuple(cast(Collection[object], value))
+    _require(
+        all(isinstance(item, str) for item in items), f"{name} must contain only Task key strings"
+    )
+    return cast(tuple[str, ...], items)
+
+
 def _integer(value: object, name: str, *, minimum: int) -> int:
     if type(value) is not int or value < minimum:
         raise ConfigurationError(f"{name} must be an integer >= {minimum}")
@@ -66,12 +79,20 @@ def _optional_token(value: object, name: str) -> str | None:
     return None if value is None else _token(value, name)
 
 
+def _plain(path: PurePosixPath, name: str, forbidden: str, use: str) -> PurePosixPath:
+    """``path``, unless it contains a character that ``use`` would interpret."""
+    if found := sorted(set(forbidden) & set(str(path))):
+        shown = " or ".join(repr(character) for character in found)
+        raise ConfigurationError(f"{name} cannot contain {shown}: {use}")
+    return path
+
+
 def _absolute(value: object, name: str) -> PurePosixPath:
     _require(isinstance(value, (str, PurePosixPath)), f"{name} must be an absolute POSIX path")
     raw = _text(str(cast(PosixInput, value)), name)
     path = PurePosixPath(raw)
     _require(
-        _CONTROL.search(raw) is None and path.is_absolute() and ".." not in path.parts,
+        CONTROL.search(raw) is None and path.is_absolute() and ".." not in path.parts,
         f"{name} must be an absolute POSIX path without parent traversal or control characters",
     )
     return path
@@ -227,8 +248,10 @@ class Apptainer:
     def __init__(
         self, *, executable: PosixInput, image: PosixInput, binds: Iterable[str] = ()
     ) -> None:
+        container = _absolute(image, "image")
+        use = "Apptainer reads it as a URI such as docker://"
         object.__setattr__(self, "executable", _absolute(executable, "apptainer"))
-        object.__setattr__(self, "image", _absolute(image, "image"))
+        object.__setattr__(self, "image", _plain(container, "image", ":", use))
         object.__setattr__(self, "binds", tuple(_bind(item) for item in _strings(binds, "binds")))
 
 
@@ -299,18 +322,19 @@ class Target:
         _require((gpu_gres is None) == (gpus == 0), "gpu_gres and max_gpus_per_allocation conflict")
         values: dict[str, object] = {
             "slurm_bin": _absolute(slurm_bin, "slurm_bin"),
-            "work_root": _absolute(work_root, "work_root"),
-            "log_root": _absolute(log_root, "log_root"),
+            "work_root": _plain(
+                _absolute(work_root, "work_root"),
+                "work_root",
+                ",:",
+                "it is bound into containers as SOURCE:DESTINATION",
+            ),
+            "log_root": _plain(
+                _absolute(log_root, "log_root"),
+                "log_root",
+                "%",
+                "Slurm expands '%' patterns in output paths",
+            ),
             "partitions": frozen_partitions,
-            "max_tasks_per_allocation": _integer(
-                max_tasks_per_allocation, "max_tasks_per_allocation", minimum=1
-            ),
-            "max_cpus_per_allocation": _integer(
-                max_cpus_per_allocation, "max_cpus_per_allocation", minimum=1
-            ),
-            "max_memory_mib_per_allocation": _integer(
-                max_memory_mib_per_allocation, "max_memory_mib_per_allocation", minimum=1
-            ),
             "max_time_limit": whole_minutes(duration(max_time_limit, "max_time_limit")),
             "host": host,
             "container": container,
@@ -319,11 +343,17 @@ class Target:
             "constraint": _optional_token(constraint, "constraint"),
             "gpu_gres": gpu_gres,
             "max_gpus_per_allocation": gpus,
-            "max_allocations_per_submit": None
-            if max_allocations_per_submit is None
-            else _integer(max_allocations_per_submit, "max_allocations_per_submit", minimum=1),
-            "max_script_bytes": _integer(max_script_bytes, "max_script_bytes", minimum=1),
         }
+        positive = {
+            "max_tasks_per_allocation": max_tasks_per_allocation,
+            "max_cpus_per_allocation": max_cpus_per_allocation,
+            "max_memory_mib_per_allocation": max_memory_mib_per_allocation,
+            "max_allocations_per_submit": max_allocations_per_submit,
+            "max_script_bytes": max_script_bytes,
+        }
+        for name, item in positive.items():
+            optional = name == "max_allocations_per_submit" and item is None
+            values[name] = None if optional else _integer(item, name, minimum=1)
         for name, item in values.items():
             object.__setattr__(self, name, item)
 
@@ -366,7 +396,7 @@ class Profile:
                 document = cast(dict[str, object], tomllib.load(handle))
         except FileNotFoundError:
             raise NotFound(f"configuration file does not exist: {source}") from None
-        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        except (OSError, ValueError) as error:  # ValueError: undecodable, malformed, or NUL
             raise ConfigurationError(f"cannot read TOML configuration {source}: {error}") from None
         if unknown := document.keys() - {"profiles", "default_profile", "target", "resources"}:
             raise ConfigurationError(f"unknown document keys: {', '.join(sorted(unknown))}")
@@ -415,6 +445,10 @@ def _sections(mapping: dict[str, object], owner: str) -> dict[str, dict[str, obj
     return tables
 
 
+def _required(cls: type[Target] | type[Resources]) -> set[str]:
+    return {item.name for item in dataclasses.fields(cls) if item.default is dataclasses.MISSING}
+
+
 def _missing(values: Mapping[str, object], required: Iterable[str], section: str) -> None:
     if missing := sorted(set(required) - values.keys()):
         raise ConfigurationError(f"missing {section} keys: {', '.join(missing)}")
@@ -430,24 +464,11 @@ def _target(values: dict[str, object]) -> Target:
             image=cast(PosixInput, container_values["image"]),
             binds=cast(Iterable[str], container_values.get("binds", ())),
         )
-    _missing(
-        values,
-        (
-            "slurm_bin",
-            "work_root",
-            "log_root",
-            "partitions",
-            "max_tasks_per_allocation",
-            "max_cpus_per_allocation",
-            "max_memory_mib_per_allocation",
-            "max_time_limit",
-        ),
-        "target",
-    )
+    _missing(values, _required(Target) - {"container"}, "target")
     _require(isinstance(values["partitions"], list), "partitions must be an array of strings")
     return Target(container=container, **values)  # pyright: ignore[reportArgumentType]
 
 
 def _resources(values: dict[str, object]) -> Resources:
-    _missing(values, ("cpus", "memory_mib", "time_limit"), "resources")
+    _missing(values, _required(Resources), "resources")
     return Resources(**values)  # pyright: ignore[reportArgumentType]

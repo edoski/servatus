@@ -19,13 +19,15 @@ from ..errors import (
     Conflict,
     NotFound,
     PlanRefused,
+    ReconciliationError,
     StalePlan,
     SubmissionInterrupted,
+    Unavailable,
 )
-from ._config import Profile, StrPath, Target, Task
+from ._config import Profile, StrPath, Target, Task, task_keys
 from ._evidence import JobRef, Observation
 from ._plan import Decision, Plan, PlannedAllocation, build_plan, capacity, decode_decision
-from ._policy import Retry, decide, observation_scope
+from ._policy import Retry, decide, observation_scope, result_scope
 from ._remote import Transport
 from ._remote import connect as connect_target
 from ._results import (
@@ -43,6 +45,7 @@ from ._state import (
     Attempt,
     State,
     append,
+    correct_outcome,
     create,
     record_intent,
     record_outcome,
@@ -57,7 +60,6 @@ Connect = Callable[[Target], Transport]
 """Given a Target, return the Transport that reaches its scheduler."""
 Clock = Callable[[], datetime]
 
-MAX_LOG_BYTES = 1024 * 1024
 _ACCEPTED = AcceptanceState.ACCEPTED
 _PRIVATE = object()
 
@@ -66,13 +68,14 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _keys(value: object, name: str) -> tuple[str, ...]:
-    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
-        raise ConfigurationError(f"{name} must be a collection of strings")
-    items = tuple(cast(Iterable[object], value))
-    if any(not isinstance(item, str) for item in items):
-        raise ConfigurationError(f"{name} must contain only strings")
-    return cast(tuple[str, ...], items)
+def ping(target: Target, *, connect: Connect | None = None) -> str:
+    """Prove that ``target``'s scheduler answers; return its ``sbatch --version`` text.
+
+    ``connect`` defaults to ``servatus.campaign.connect``. Failures raise ``Unavailable``.
+    """
+    if not isinstance(target, Target):
+        raise ConfigurationError("ping needs a Target")
+    return Scheduler((connect or connect_target)(target), target.slurm_bin).ping()
 
 
 def _receipt(attempt: Attempt) -> Receipt:
@@ -88,22 +91,6 @@ def _merge(state: State, tasks: tuple[Task, ...]) -> State:
             raise Conflict(f"Task {task.key!r} differs from the registered Task with that key")
     unseen = [task for task in tasks if task.key not in known]
     return append(state, unseen) if unseen else state
-
-
-def _candidates(
-    state: State, retry: Retry | tuple[str, ...], only: tuple[str, ...] | None
-) -> tuple[Task, ...]:
-    """Tasks whose result can change the decision: never accepted, or eligible for retry."""
-    accepted = {
-        key for item in state.attempts if item.acceptance is _ACCEPTED for key in item.task_keys
-    }
-    explicit = None if isinstance(retry, Retry) else set(retry)
-    return tuple(
-        task
-        for task in state.tasks
-        if (only is None or task.key in only)
-        and (task.key not in accepted or explicit is None or task.key in explicit)
-    )
 
 
 def _interrupted(
@@ -238,10 +225,8 @@ class Campaign:
             raise ConfigurationError("scheduler must be a bool")
         state = self._store.read()
         results = self._results(state.tasks)
-        accepted = tuple(
-            item.allocation_id for item in state.attempts if item.acceptance is _ACCEPTED
-        )
-        observations = self._observe(state, accepted) if scheduler else {}
+        everything = (item.allocation_id for item in state.attempts)
+        observations = self._observe(state, everything) if scheduler else {}
         self._unchanged(state)
         return project(
             state, observations, results, scheduler_observed=scheduler, observed_at=self._time()
@@ -250,12 +235,11 @@ class Campaign:
     def read_log(
         self, *, task: str | None = None, allocation: str | None = None, max_bytes: int = 65_536
     ) -> LogSnapshot:
-        """The last ``max_bytes`` (1 B to 1 MiB) of an allocation log, or of one Task's step log.
+        """The last ``max_bytes`` (1 B to 1 MiB, checked before any contact) of an allocation
+        log, or of one Task's step log.
 
         ``task`` alone reads that Task's step log in its current accepted allocation.
         """
-        if type(max_bytes) is not int or not 1 <= max_bytes <= MAX_LOG_BYTES:
-            raise ConfigurationError(f"max_bytes must be an integer from 1 to {MAX_LOG_BYTES}")
         if task is None and allocation is None:
             raise ConfigurationError("read_log needs a task, an allocation, or both")
         state = self._store.read()
@@ -292,14 +276,14 @@ class Campaign:
         """
         if not isinstance(profile, Profile):
             raise ConfigurationError("profile must be a Profile")
-        chosen = retry if isinstance(retry, Retry) else _keys(retry, "retry")
-        acknowledged = _keys(allow_duplicate_risk, "allow_duplicate_risk")
-        scope = None if only is None else _keys(only, "only")
+        chosen = retry if isinstance(retry, Retry) else task_keys(retry, "retry")
+        acknowledged = task_keys(allow_duplicate_risk, "allow_duplicate_risk")
+        scope = None if only is None else task_keys(only, "only")
         if chosen is Retry.INCOMPLETE and self._probe is None:
             raise ConfigurationError("Retry.INCOMPLETE needs a result probe")
         cap = capacity(profile.target, profile.resources, tasks_per_allocation)
         state = self._store.read()
-        results = self._results(_candidates(state, chosen, scope))
+        results = self._results(result_scope(state, chosen, scope))
         observations = self._observe(state, observation_scope(state, chosen, scope))
         self._unchanged(state)
         selection = decide(
@@ -335,28 +319,21 @@ class Campaign:
         plan = self._verified(plan)
         if not plan.allocations:
             return ()
-        scheduler = self._scheduler(plan.profile.target)
-        checks: list[ShapeCheck] = []
-        seen: set[int] = set()
+        scheduler = self._scheduler(plan.decision.profile.target)
+        shapes: dict[int, PlannedAllocation] = {}
         for item in plan.allocations:
-            count = len(item.task_keys)
-            if count in seen:
-                continue
-            seen.add(count)
-            accepted, stdout, stderr = scheduler.test_only(item.argv, item.script)
-            checks.append(
-                ShapeCheck(
-                    count,
-                    item.cpus,
-                    item.memory_mib,
-                    item.gpus,
-                    item.time_limit,
-                    accepted,
-                    stdout,
-                    stderr,
-                )
+            shapes.setdefault(len(item.task_keys), item)
+        return tuple(
+            ShapeCheck(
+                count,
+                item.cpus,
+                item.memory_mib,
+                item.gpus,
+                item.time_limit,
+                *scheduler.test_only(item.argv, item.script),
             )
-        return tuple(checks)
+            for count, item in shapes.items()
+        )
 
     # --- Submission ---------------------------------------------------------------------------
 
@@ -369,26 +346,25 @@ class Campaign:
         unattempted allocations.
         """
         plan = self._verified(plan)
+        decision = plan.decision
         if not plan.allocations:
             return SubmitResult(())
-        if plan.probe_required and self._probe is None:
+        if decision.probe_required and self._probe is None:
             raise ConfigurationError(
                 "this plan was made with a result probe; submit it from a Campaign that has one"
             )
-        scheduler = self._scheduler(plan.profile.target)
+        scheduler = self._scheduler(decision.profile.target)
         scheduler.ping()
-        self._still_eligible(plan)
+        self._still_eligible(decision)
         receipts: list[Receipt] = []
-        expected = plan.revision
+        expected: int | None = decision.revision
         for index, item in enumerate(plan.allocations):
             later = plan.allocations[index + 1 :]
             unresolved = (UnresolvedSubmission(item.allocation_id, item.task_keys),)
             try:
-                expected = self._claim(plan, item, expected)
+                claimed = self._claim(decision, item, expected)
             except Exception as error:
-                if self._recorded(
-                    item.allocation_id
-                ):  # durable, though the commit reported failure
+                if self._recorded(item.allocation_id):  # durable, though the commit failed
                     stop = "recording the intent failed after it became durable"
                     raise _interrupted(stop, error, receipts, unresolved, later) from error
                 stop = "the next intent was not recorded"
@@ -399,11 +375,21 @@ class Campaign:
                 stop = "scheduler acceptance is unresolved"
                 raise _interrupted(stop, error, receipts, unresolved, later) from error
             try:
-                receipts.append(self._resolve(item.allocation_id, job))
+                state = self._resolve(item.allocation_id, job)
             except Exception as error:
+                if (receipt := self._durable_receipt(item.allocation_id, job)) is not None:
+                    receipts.append(receipt)
+                    stop = "recording the receipt failed after it became durable"
+                    raise _interrupted(stop, error, receipts, (), later) from error
                 stop = f"Slurm accepted job {job} but recording the receipt failed"
                 observed = UnresolvedSubmission(item.allocation_id, item.task_keys, job)
                 raise _interrupted(stop, error, receipts, (observed,), later) from error
+            attempt = state.attempt(item.allocation_id)
+            receipts.append(_receipt(attempt))
+            # Continue only if this receipt is the one change since the intent; any other
+            # change makes the next claim stale.
+            unchanged = attempt.outcome_revision == state.revision == claimed + 1
+            expected = state.revision if unchanged else None
         return SubmitResult(tuple(receipts))
 
     def reconcile(self, allocation_id: str) -> Receipt:
@@ -415,16 +401,50 @@ class Campaign:
             raise Conflict(f"allocation {allocation_id} is recorded as not submitted")
         target = attempt.profile.target
         job = self._scheduler(target).identify(allocation_id, attempt.intent_at)
-        return self._resolve(allocation_id, job)
+        return _receipt(self._resolve(allocation_id, job).attempt(allocation_id))
 
     def mark_accepted(
         self, allocation_id: str, job_id: int, *, cluster: str | None = None
     ) -> Receipt:
-        """Record a job the operator found for an unresolved allocation."""
-        return self._resolve(allocation_id, JobRef(job_id, cluster))
+        """Record a job the operator found for an unresolved allocation.
+
+        An allocation already recorded as not submitted is corrected only when its original
+        target proves that exactly this job carries the allocation's identity.
+        """
+        job = JobRef(job_id, cluster)
+        attempt = self._store.read().attempt(allocation_id)
+        if attempt.acceptance is not AcceptanceState.NOT_SUBMITTED:
+            return _receipt(self._resolve(allocation_id, job).attempt(allocation_id))
+        scheduler = self._scheduler(attempt.profile.target)
+        try:
+            found = scheduler.identify(allocation_id, attempt.intent_at)
+        except ReconciliationError as error:
+            found, detail = None, str(error)
+        else:
+            detail = f"Slurm holds job {found}"
+        if found != job:
+            raise Conflict(
+                f"allocation {allocation_id} is recorded as not submitted and Slurm does not "
+                f"prove job {job} for it ({detail})"
+            )
+        state = self._store.update(lambda current: correct_outcome(current, allocation_id, job))
+        return _receipt(state.attempt(allocation_id))
 
     def mark_not_submitted(self, allocation_id: str) -> None:
-        """Record that an unresolved allocation never reached Slurm."""
+        """Record that an unresolved allocation never reached Slurm, once Slurm proves it.
+
+        The original target is asked first. ``Conflict`` when any job carries the allocation's
+        identity (record it with ``reconcile`` or ``mark_accepted`` instead); a failed query
+        raises ``Unavailable`` and records nothing.
+        """
+        attempt = self._store.read().attempt(allocation_id)
+        if attempt.acceptance is AcceptanceState.UNRESOLVED:
+            scheduler = self._scheduler(attempt.profile.target)
+            if found := scheduler.find(allocation_id, attempt.intent_at):
+                raise Conflict(
+                    f"Slurm holds job {', '.join(map(str, found))} for allocation "
+                    f"{allocation_id}; record it with reconcile or mark-accepted instead"
+                )
         self._store.update(lambda state: record_outcome(state, allocation_id, None))
 
     def cancel(
@@ -435,8 +455,8 @@ class Campaign:
         ``tasks`` selects every accepted allocation of each Task. Returns the receipts of the
         allocations that were asked to stop; packed allocations stop all their Tasks.
         """
-        keys = () if tasks is None else _keys(tasks, "tasks")
-        identities = () if allocations is None else _keys(allocations, "allocations")
+        keys = () if tasks is None else task_keys(tasks, "tasks")
+        identities = () if allocations is None else task_keys(allocations, "allocations")
         if not keys and not identities:
             raise ConfigurationError("cancel needs Task keys or allocation ids")
         state = self._store.read()
@@ -455,13 +475,22 @@ class Campaign:
             chosen.update((item.allocation_id, _receipt(item)) for item in owned)
         observations = self._observe(state, tuple(chosen))
         cancelled: list[Receipt] = []
+        failed: list[str] = []
         for attempt in state.attempts:
             receipt = chosen.get(attempt.allocation_id)
             evidence = observations[attempt.allocation_id].allocation if receipt else None
             if receipt is None or (evidence and evidence.state.terminal and not evidence.retained):
                 continue
-            self._scheduler(attempt.profile.target).cancel(attempt.allocation_id, receipt.job)
-            cancelled.append(receipt)
+            scheduler = self._scheduler(attempt.profile.target)
+            try:
+                scheduler.cancel(attempt.allocation_id, receipt.job)
+            except Unavailable as error:
+                failed.append(f"{attempt.allocation_id} ({error})")
+            else:
+                cancelled.append(receipt)
+        if failed:
+            done = ", ".join(item.allocation_id for item in cancelled) or "none"
+            raise Unavailable(f"cancel failed for {'; '.join(failed)}; cancelled: {done}")
         return tuple(cancelled)
 
     # --- Internals ----------------------------------------------------------------------------
@@ -479,16 +508,11 @@ class Campaign:
         """Call the probe once for ``tasks``; without a probe every result is UNOBSERVED."""
         if self._probe is None or not tasks:
             return {}
-        valid = self._probe(tasks)
-        if isinstance(valid, (str, bytes)) or not isinstance(valid, Collection):
-            raise ConfigurationError("a result probe must return a collection of Task keys")
-        answered = tuple(cast(Collection[object], valid))
-        if any(not isinstance(key, str) for key in answered):
-            raise ConfigurationError("a result probe must return Task key strings")
-        return classify_results((task.key for task in tasks), cast(tuple[str, ...], answered))
+        return classify_results((task.key for task in tasks), self._probe(tasks))
 
     def _observe(self, state: State, allocation_ids: Iterable[str]) -> dict[str, Observation]:
-        """Observe accepted Attempts, one scheduler per original (host, slurm_bin) route."""
+        """Observe the accepted Attempts among ``allocation_ids``, one scheduler per original
+        (host, slurm_bin) route."""
         wanted = set(allocation_ids)
         routes: dict[tuple[str | None, PurePosixPath], tuple[Target, list[AttemptQuery]]] = {}
         for attempt in state.attempts:
@@ -525,14 +549,14 @@ class Campaign:
             raise ConfigurationError("the plan does not match its decision; plan again")
         return rebuilt
 
-    def _still_eligible(self, plan: Plan) -> None:
+    def _still_eligible(self, decision: Decision) -> None:
         """Probe and observe once for the planned Tasks; each must still be selected."""
         state = self._store.read()
-        if state.revision != plan.revision:
+        if state.revision != decision.revision:
             raise StalePlan("the campaign changed after planning; plan again")
-        keys = plan.selected
-        retry = tuple(key for key in plan.retry if key in keys)
-        risk = tuple(key for key in plan.duplicate_risk if key in keys)
+        keys = decision.selected
+        retry = tuple(key for key in decision.retry if key in keys)
+        risk = tuple(key for key in decision.duplicate_risk if key in keys)
         results = self._results(tuple(task for task in state.tasks if task.key in keys))
         observations = self._observe(state, observation_scope(state, retry, keys))
         try:
@@ -547,25 +571,28 @@ class Campaign:
             )
             raise StalePlan(f"planned Tasks are no longer eligible: {held}; plan again")
 
-    def _claim(self, plan: Plan, item: PlannedAllocation, expected: int) -> int:
-        """Record intent if the campaign is still at ``expected``; return the next expectation."""
+    def _claim(self, decision: Decision, item: PlannedAllocation, expected: int | None) -> int:
+        """Record intent if the campaign is still at ``expected``; return the committed revision.
+
+        ``expected`` is None once the campaign is known to have changed during submission.
+        """
         keys = item.task_keys
 
         def claim(state: State) -> State:
-            if state.revision != expected:
+            if expected is None or state.revision != expected:
                 raise StalePlan("the campaign changed during submission; plan again")
             changed, _ = record_intent(
                 state,
                 allocation_id=item.allocation_id,
                 task_keys=keys,
-                profile=plan.profile,
-                retry=tuple(key for key in keys if key in plan.retry),
-                duplicate_risk=tuple(key for key in keys if key in plan.duplicate_risk),
+                profile=decision.profile,
+                retry=tuple(key for key in keys if key in decision.retry),
+                duplicate_risk=tuple(key for key in keys if key in decision.duplicate_risk),
                 at=self._time(),
             )
             return changed
 
-        return self._store.update(claim).revision + 1
+        return self._store.update(claim).revision
 
     def _recorded(self, allocation_id: str) -> bool:
         """Whether an intent is durable; an unreadable campaign counts as recorded."""
@@ -574,6 +601,14 @@ class Campaign:
         except Exception:
             return True
 
-    def _resolve(self, allocation_id: str, job: JobRef) -> Receipt:
-        state = self._store.update(lambda current: record_outcome(current, allocation_id, job))
-        return _receipt(state.attempt(allocation_id))
+    def _durable_receipt(self, allocation_id: str, job: JobRef) -> Receipt | None:
+        """The receipt, if acceptance of ``job`` is durable though its commit reported failure."""
+        try:
+            attempt = self._store.read().attempt(allocation_id)
+        except Exception:
+            return None
+        return _receipt(attempt) if attempt.job == job else None
+
+    def _resolve(self, allocation_id: str, job: JobRef) -> State:
+        """Record acceptance of ``job``; return the committed state."""
+        return self._store.update(lambda state: record_outcome(state, allocation_id, job))

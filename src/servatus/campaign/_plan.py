@@ -10,7 +10,6 @@ can always be rebuilt and compared with what was reviewed.
 from __future__ import annotations
 
 import hashlib
-import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
@@ -20,20 +19,12 @@ from typing import cast
 from ..errors import ConfigurationError, StalePlan
 from ..publication import publish_file
 from . import _codec
-from ._config import Profile, Resources, StrPath, Target, Task
+from ._config import Profile, Resources, StrPath, Target, Task, task_keys
 from ._policy import Hold
-from ._remote import check_command
-from ._script import render_batch, sbatch_argv
-from ._state import AcceptanceState, State
+from ._script import check_command, render_batch, sbatch_argv
+from ._state import State
 
 PLAN_FORMAT = "servatus.plan/1"
-_HEX32 = re.compile(r"[0-9a-f]{32}\Z")
-_HEX64 = re.compile(r"[0-9a-f]{64}\Z")
-
-
-def _keys(value: tuple[str, ...], name: str) -> None:
-    if any(not isinstance(key, str) for key in value) or len(set(value)) != len(value):
-        raise ConfigurationError(f"plan {name} must be distinct Task keys")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -62,7 +53,7 @@ class Decision:
     def __post_init__(self) -> None:
         if not isinstance(self.profile, Profile):
             raise ConfigurationError("plan profile must be a Profile")
-        if _HEX32.fullmatch(self.nonce) is None or _HEX32.fullmatch(self.campaign_id) is None:
+        if not (_codec.is_hex(self.nonce, 32) and _codec.is_hex(self.campaign_id, 32)):
             raise ConfigurationError("plan identities must be 32 lowercase hexadecimal digits")
         if type(self.revision) is not int or self.revision < 0:
             raise ConfigurationError("plan revision must be a non-negative integer")
@@ -71,7 +62,9 @@ class Decision:
         if type(self.probe_required) is not bool:
             raise ConfigurationError("probe_required must be a bool")
         for name in ("selected", "deferred", "retry", "duplicate_risk"):
-            _keys(cast(tuple[str, ...], getattr(self, name)), name)
+            keys = task_keys(getattr(self, name), f"plan {name}")
+            if len(set(keys)) != len(keys):
+                raise ConfigurationError(f"plan {name} must be distinct Task keys")
         held = dict(self.held)
         if any(
             not isinstance(key, str) or not isinstance(hold, Hold) for key, hold in held.items()
@@ -96,7 +89,7 @@ class PlannedAllocation:
 
 @dataclass(frozen=True, slots=True)
 class Plan:
-    """A reviewed ``Decision`` plus its derived allocations and digest.
+    """A reviewed ``decision`` plus its derived allocations and digest.
 
     Scripts and argv contain Task arguments, environment, and stdin: treat them as sensitive.
     ``to_json`` and ``save`` write only the Decision and digest.
@@ -107,54 +100,13 @@ class Plan:
     digest: str
 
     @property
-    def campaign_id(self) -> str:
-        return self.decision.campaign_id
-
-    @property
-    def revision(self) -> int:
-        return self.decision.revision
-
-    @property
-    def profile(self) -> Profile:
-        return self.decision.profile
-
-    @property
-    def selected(self) -> tuple[str, ...]:
-        return self.decision.selected
-
-    @property
-    def held(self) -> Mapping[str, Hold]:
-        return self.decision.held
-
-    @property
-    def deferred(self) -> tuple[str, ...]:
-        return self.decision.deferred
-
-    @property
-    def retry(self) -> tuple[str, ...]:
-        return self.decision.retry
-
-    @property
-    def duplicate_risk(self) -> tuple[str, ...]:
-        return self.decision.duplicate_risk
-
-    @property
-    def tasks_per_allocation(self) -> int:
-        return self.decision.tasks_per_allocation
-
-    @property
-    def probe_required(self) -> bool:
-        return self.decision.probe_required
-
-    @property
     def warnings(self) -> tuple[str, ...]:
         notes: list[str] = []
-        if self.duplicate_risk:
-            keys = ", ".join(self.duplicate_risk)
-            notes.append(f"duplicate execution risk acknowledged for: {keys}")
-        if self.deferred:
+        if risk := self.decision.duplicate_risk:
+            notes.append(f"duplicate execution risk acknowledged for: {', '.join(risk)}")
+        if deferred := self.decision.deferred:
             notes.append(
-                f"{len(self.deferred)} eligible Tasks are deferred by max_allocations_per_submit; "
+                f"{len(deferred)} eligible Tasks are deferred by max_allocations_per_submit; "
                 "plan again after submitting"
             )
         return tuple(notes)
@@ -164,7 +116,7 @@ class Plan:
         document = cast(dict[str, object], _codec.dump(self.decision))
         document["format"] = PLAN_FORMAT
         document["digest"] = self.digest
-        return _codec.canonical(document) + b"\n"
+        return _codec.canonical(document)
 
     def save(self, path: StrPath) -> None:
         """Write ``to_json`` as a new owner-only (0600) file; never overwrites."""
@@ -184,7 +136,7 @@ def decode_decision(data: bytes) -> tuple[Decision, str]:
         if document.pop("format", None) != PLAN_FORMAT:
             raise _codec.CodecError(f"expected format {PLAN_FORMAT!r}")
         digest = document.pop("digest", None)
-        if not isinstance(digest, str) or _HEX64.fullmatch(digest) is None:
+        if not _codec.is_hex(digest, 64):
             raise _codec.CodecError("expected a 64-digit hexadecimal digest")
         return _codec.load(Decision, document), digest
     except (ValueError, TypeError, ConfigurationError) as error:
@@ -255,13 +207,7 @@ def _check(state: State, decision: Decision) -> None:
     if sorted(key for part in parts for key in part) != sorted(roster):
         raise ConfigurationError("plan Tasks do not partition the campaign roster")
     eligible = decision.selected + decision.deferred
-    accepted = {
-        key
-        for attempt in state.attempts
-        if attempt.acceptance is AcceptanceState.ACCEPTED
-        for key in attempt.task_keys
-    }
-    if set(decision.retry) != accepted.intersection(eligible):
+    if frozenset(decision.retry) != state.accepted_keys.intersection(eligible):
         raise ConfigurationError("plan retry keys disagree with accepted Campaign history")
     if not set(decision.duplicate_risk) <= set(decision.retry):
         raise ConfigurationError("plan duplicate-risk keys must be retried keys")

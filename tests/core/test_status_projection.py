@@ -8,7 +8,7 @@ from core_helpers import NOW, intend, observed, roster, step, submit
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from servatus.campaign._evidence import AllocationState, JobRef, Observation
+from servatus.campaign._evidence import AllocationState, JobRef, Observation, SchedulerEvidence
 from servatus.campaign._state import AcceptanceState, State, seal
 from servatus.campaign._status import (
     STATUS_FORMAT,
@@ -124,16 +124,51 @@ def test_step_evidence_overrides_allocation_evidence_per_task() -> None:
     evidence = observed(
         S.FAILED,
         exit_code="1:0",
-        steps=(step(S.SUCCEEDED, "0:0"), None),  # task-2 has no step entry at all
+        steps=(step(S.SUCCEEDED, "0:0"), step(S.FAILED, "2:0")),  # task-2 has no step entry
     )
     tasks = view(state, {identity: evidence}).tasks
     assert [(task.execution, task.exit_code) for task in tasks] == [
         (S.SUCCEEDED, "0:0"),
-        (S.FAILED, "1:0"),
-        (S.FAILED, "1:0"),
+        (S.FAILED, "2:0"),
+        (S.UNKNOWN, None),
     ]
-    assert task_execution(evidence, 0) == (S.SUCCEEDED, "0:0")
-    assert task_execution(evidence, 9) == (S.FAILED, "1:0")
+    assert task_execution(evidence, 0, 3) == (S.SUCCEEDED, "0:0")
+    assert task_execution(evidence, 9, 1) == (S.FAILED, "1:0")
+
+
+@pytest.mark.parametrize("state", [S.FAILED, S.CANCELLED])
+def test_a_failed_packed_allocation_without_the_task_step_is_unknown(state: S) -> None:
+    """The Task may have finished successfully before a sibling failed the allocation."""
+    packed, identity = submit(roster(2), ["task-0", "task-1"])
+    for steps in ((), (None, None)):
+        evidence = observed(state, exit_code="1:0", steps=steps)
+        tasks = view(packed, {identity: evidence}).tasks
+        assert [(task.execution, task.exit_code) for task in tasks] == [(S.UNKNOWN, None)] * 2
+    single, alone = submit(roster(1), ["task-0"])
+    (task,) = view(single, {alone: observed(state, exit_code="1:0")}).tasks
+    assert (task.execution, task.exit_code) == (state, "1:0")
+    succeeded = view(packed, {identity: observed(S.SUCCEEDED, exit_code="0:0")}).tasks
+    assert [task.execution for task in succeeded] == [S.SUCCEEDED] * 2
+
+
+def test_unknown_or_contradictory_allocations_ignore_step_evidence() -> None:
+    state, identity = submit(roster(1), ["task-0"])
+    steps = (step(S.SUCCEEDED, "0:0"),)
+    contradictory = Observation(
+        SchedulerEvidence(S.SUCCEEDED, exit_code="0:0", retained=True, problem="contradiction"),
+        steps,
+    )
+    for evidence in (observed(S.UNKNOWN, steps=steps), contradictory):
+        (task,) = view(state, {identity: evidence}).tasks
+        assert (task.execution, task.exit_code) == (S.UNKNOWN, None)
+
+
+@pytest.mark.parametrize("state", [S.QUEUED, S.RUNNING])
+def test_exit_codes_are_shown_only_for_terminal_executions(state: S) -> None:
+    packed, identity = submit(roster(2), ["task-0", "task-1"])
+    evidence = observed(state, exit_code="0:0", steps=(step(state, "0:0"), None))
+    tasks = view(packed, {identity: evidence}).tasks
+    assert [(task.execution, task.exit_code) for task in tasks] == [(state, None)] * 2
 
 
 def test_unobserved_accepted_work_has_no_execution_and_is_not_quiescent() -> None:
@@ -201,7 +236,7 @@ def test_counts_partition_tasks_by_result_and_execution() -> None:
     state, _ = submit(state, ["task-2"])
     state, _ = submit(state, ["task-3"], job=None)
     state, _ = intend(state, ["task-4"])
-    evidence = {first: observed(S.FAILED, steps=(step(S.SUCCEEDED), None))}
+    evidence = {first: observed(S.FAILED, steps=(step(S.SUCCEEDED), step(S.FAILED)))}
     results = {"task-0": ResultState.VALID, "task-1": ResultState.MISSING}
     counts = view(state, evidence, results).counts()
     assert dict(counts) == {

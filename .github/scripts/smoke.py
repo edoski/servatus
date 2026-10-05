@@ -106,9 +106,10 @@ def check_campaign(root: Path) -> None:
     assert all(check.accepted for check in campaign.validate(plan))
     result = campaign.submit(plan)
     assert result.complete and len(result.receipts) == 2, result
-    fake.finish(result.receipts[0].job.job_id, "FAILED", exit_code="1:0")
+    fake.start(result.receipts[0].job)
+    fake.finish(result.receipts[0].job, "FAILED", exit_code="1:0")
     assert campaign.status().counts()["failed"] == 2
-    assert campaign.plan(profile, retry=Retry.FAILED).selected == ("t0", "t1")
+    assert campaign.plan(profile, retry=Retry.FAILED).decision.selected == ("t0", "t1")
 
 
 def check_publication(root: Path) -> None:

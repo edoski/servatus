@@ -5,8 +5,9 @@ Projection rules:
 - The latest accepted Attempt containing a Task owns that Task's current execution. An
   unresolved Attempt (intent recorded, acceptance unknown) dominates instead: the Task is
   ``unresolved`` and its execution is unknown (``None``).
-- A Task's execution and exit code come from its own ``srun`` step when the observation has
-  that step, and from the allocation otherwise.
+- A Task's execution and exit code follow ``task_execution``: its own ``srun`` step when known,
+  else the allocation, except that UNKNOWN or contradictory allocation evidence, and a failed or
+  cancelled packed allocation without the Task's step, leave the Task UNKNOWN.
 - ``results_ready`` means the roster is sealed and every Task has a VALID result.
 - ``quiescent`` means the scheduler was observed, no acceptance is unresolved, and every
   accepted Attempt has terminal, non-retained allocation evidence. Scheduler completion says
@@ -23,6 +24,7 @@ from typing import cast
 
 from ..errors import ConfigurationError
 from . import _codec
+from ._config import task_keys
 from ._evidence import AllocationState, JobRef, Observation, SchedulerEvidence, StepEvidence
 from ._state import AcceptanceState, State
 
@@ -61,6 +63,7 @@ class AttemptStatus:
     steps: tuple[StepEvidence | None, ...]
 
 
+_UNATTRIBUTED = (AllocationState.FAILED, AllocationState.CANCELLED)
 _EXECUTION_COUNTS = ("unsubmitted", "unresolved", "accepted") + tuple(
     state.value.lower() for state in AllocationState
 )
@@ -118,21 +121,40 @@ class Status:
 def classify_results(keys: Iterable[str], valid: Collection[str]) -> dict[str, ResultState]:
     """Turn one probe answer for ``keys`` into result states. Unprobed Tasks stay UNOBSERVED."""
     asked = tuple(keys)
-    if isinstance(valid, (str, bytes)) or not isinstance(valid, Collection):
-        raise ConfigurationError("a result probe must return a collection of Task keys")
-    answered = set(valid)
+    answered = set(task_keys(valid, "a result probe answer"))
     if foreign := answered - set(asked):
         shown = ", ".join(sorted(map(repr, foreign)))
         raise ConfigurationError(f"result probe returned keys it was not asked about: {shown}")
     return {key: ResultState.VALID if key in answered else ResultState.MISSING for key in asked}
 
 
-def task_execution(observation: Observation, slot: int) -> tuple[AllocationState, str | None]:
-    """The Task in ``slot`` of an observed allocation: its step if known, else the allocation."""
-    step = observation.steps[slot] if slot < len(observation.steps) else None
+def task_execution(
+    observation: Observation, slot: int, task_count: int
+) -> tuple[AllocationState, str | None]:
+    """The Task in ``slot`` of an observed allocation of ``task_count`` Tasks.
+
+    Contradictory (``problem``) or UNKNOWN allocation evidence makes every Task UNKNOWN, whatever
+    its step says. Otherwise the Task's own step decides when known. Without one, a single-Task
+    allocation is the Task, and so is a successful allocation (its script fails when any step
+    does); but a failed or cancelled packed allocation says nothing about one Task, which may
+    have finished first, so the Task is UNKNOWN. Exit codes accompany terminal states only.
+    """
+    allocation = observation.allocation
+    if allocation.problem is not None or allocation.state is AllocationState.UNKNOWN:
+        return AllocationState.UNKNOWN, None
+    step = own_step(observation, slot)
     if step is not None:
-        return step.state, step.exit_code
-    return observation.allocation.state, observation.allocation.exit_code
+        state, exit_code = step.state, step.exit_code
+    elif task_count > 1 and allocation.state in _UNATTRIBUTED:
+        return AllocationState.UNKNOWN, None
+    else:
+        state, exit_code = allocation.state, allocation.exit_code
+    return state, exit_code if state.terminal else None
+
+
+def own_step(observation: Observation, slot: int) -> StepEvidence | None:
+    """The step evidence of the Task in ``slot``, when the step query found exactly one."""
+    return observation.steps[slot] if slot < len(observation.steps) else None
 
 
 def project(
@@ -149,7 +171,6 @@ def project(
         raise ConfigurationError("observed_at must be an aware UTC datetime")
     attempts: list[AttemptStatus] = []
     current: dict[str, tuple[AttemptStatus, int]] = {}
-    unresolved: set[str] = set()
     for attempt in state.attempts:
         accepted = attempt.acceptance is AcceptanceState.ACCEPTED
         observation = observations.get(attempt.allocation_id) if accepted else None
@@ -166,41 +187,20 @@ def project(
             steps=() if observation is None else observation.steps,
         )
         attempts.append(projected)
-        if attempt.acceptance is AcceptanceState.UNRESOLVED:
-            unresolved.update(attempt.task_keys)
         if attempt.acceptance is not AcceptanceState.NOT_SUBMITTED:
             # The State invariant makes an unresolved Attempt the last one naming its Tasks.
-            for slot, key in enumerate(attempt.task_keys):
-                current[key] = (projected, slot)
-    tasks: list[TaskStatus] = []
-    for task in state.tasks:
-        owner = current.get(task.key)
-        execution: AllocationState | None = None
-        exit_code: str | None = None
-        if owner is not None and owner[0].acceptance is AcceptanceState.ACCEPTED:
-            observation = observations.get(owner[0].allocation_id)
-            if observation is not None:
-                execution, exit_code = task_execution(observation, owner[1])
-        tasks.append(
-            TaskStatus(
-                key=task.key,
-                result=results.get(task.key, ResultState.UNOBSERVED),
-                current_allocation_id=None if owner is None else owner[0].allocation_id,
-                execution=execution,
-                exit_code=exit_code,
-                unresolved=task.key in unresolved,
-            )
-        )
-    quiescent = (
-        scheduler_observed
-        and not unresolved
-        and all(
+            current.update((key, (projected, slot)) for slot, key in enumerate(attempt.task_keys))
+    tasks = tuple(
+        _task_status(task.key, current.get(task.key), observations, results) for task in state.tasks
+    )
+    quiescent = scheduler_observed and all(
+        attempt.acceptance is AcceptanceState.NOT_SUBMITTED
+        or (
             attempt.scheduler is not None
             and attempt.scheduler.state.terminal
             and not attempt.scheduler.retained
-            for attempt in attempts
-            if attempt.acceptance is AcceptanceState.ACCEPTED
         )
+        for attempt in attempts
     )
     return Status(
         campaign_id=state.campaign_id,
@@ -208,8 +208,32 @@ def project(
         sealed=state.sealed,
         observed_at=observed_at,
         scheduler_observed=scheduler_observed,
-        tasks=tuple(tasks),
+        tasks=tasks,
         attempts=tuple(attempts),
         results_ready=state.sealed and all(task.result is ResultState.VALID for task in tasks),
         quiescent=quiescent,
+    )
+
+
+def _task_status(
+    key: str,
+    owner: tuple[AttemptStatus, int] | None,
+    observations: Mapping[str, Observation],
+    results: Mapping[str, ResultState],
+) -> TaskStatus:
+    """One Task, owned by the Attempt (and slot) that holds its current execution, if any."""
+    execution: AllocationState | None = None
+    exit_code: str | None = None
+    attempt, slot = owner if owner is not None else (None, 0)
+    accepted = attempt is not None and attempt.acceptance is AcceptanceState.ACCEPTED
+    observation = observations.get(attempt.allocation_id) if attempt and accepted else None
+    if attempt is not None and observation is not None:
+        execution, exit_code = task_execution(observation, slot, len(attempt.task_keys))
+    return TaskStatus(
+        key=key,
+        result=results.get(key, ResultState.UNOBSERVED),
+        current_allocation_id=None if attempt is None else attempt.allocation_id,
+        execution=execution,
+        exit_code=exit_code,
+        unresolved=attempt is not None and attempt.acceptance is AcceptanceState.UNRESOLVED,
     )

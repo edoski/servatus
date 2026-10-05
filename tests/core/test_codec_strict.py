@@ -13,7 +13,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from servatus.campaign import _codec
-from servatus.campaign._codec import FLATTEN, CodecError, key
+from servatus.campaign._codec import FLATTEN, CodecError
 
 
 class Color(Enum):
@@ -38,7 +38,7 @@ class Outer:
     color: Color
     items: tuple[int, ...]
     labels: Mapping[str, str]
-    renamed: int = field(metadata=key("other_name"))
+    renamed: int
     maybe: Inner | None = None
 
 
@@ -69,7 +69,7 @@ def dumped(**changes: object) -> dict[str, object]:
     return document
 
 
-def test_dump_flattens_renames_and_uses_canonical_scalars() -> None:
+def test_dump_flattens_and_uses_canonical_scalars() -> None:
     assert _codec.dump(outer()) == {
         "name": "ä",
         "count": 3,
@@ -81,7 +81,7 @@ def test_dump_flattens_renames_and_uses_canonical_scalars() -> None:
         "color": "blue",
         "items": [1, 2],
         "labels": {"z": "1", "a": "2"},
-        "other_name": 7,
+        "renamed": 7,
         "maybe": {"count": 1, "flag": False},
     }
 
@@ -134,7 +134,7 @@ def test_load_rejects_structural_and_noncanonical_values(
         _codec.load(Outer, dumped(**changes))
 
 
-@pytest.mark.parametrize("missing", ["name", "count", "other_name", "maybe"])
+@pytest.mark.parametrize("missing", ["name", "count", "renamed", "maybe"])
 def test_load_rejects_missing_keys_including_flattened_and_optional(missing: str) -> None:
     document = dumped()
     del document[missing]

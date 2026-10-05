@@ -1,7 +1,7 @@
 """Run rendered batch scripts under real local shells with stub ``srun`` and ``apptainer``.
 
 The stubs emulate only what the script relies on: ``srun`` sets step-local GPU visibility and
-executes the step command with the batch environment; ``apptainer run --cleanenv`` executes the
+executes the step command with the batch environment; ``apptainer exec --cleanenv`` executes the
 command with exactly the ``APPTAINERENV_`` variables. Nothing contacts Slurm or Apptainer.
 """
 
@@ -49,7 +49,7 @@ os.execv(args[0], args)
 APPTAINER = """#!{python}
 import json, os, sys
 args = sys.argv[1:]
-assert args.pop(0) == "run"
+assert args.pop(0) == "exec"
 flags = []
 while args[0].startswith("--"):
     flag = args.pop(0)

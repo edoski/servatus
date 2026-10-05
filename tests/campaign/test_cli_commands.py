@@ -113,7 +113,7 @@ def test_human_workflow_from_creation_to_status(cli: Cli) -> None:
     cli.fake.finish_step(1000, 1, "FAILED", exit_code="3:0")
     code, out, _ = cli("status", "state")
     assert code == 0
-    assert "one  UNOBSERVED  RUNNING    0:0" in out and "two  UNOBSERVED  FAILED     3:0" in out
+    assert "one  UNOBSERVED  RUNNING    -  " in out and "two  UNOBSERVED  FAILED     3:0" in out
     assert "counts: tasks 2, unobserved 2, running 1, failed 1" in out
     assert "next: servatus plan state --retry-failed --output PLAN.json" in out
     cli.fake.finish(1000)
@@ -134,11 +134,12 @@ def test_machine_output_for_every_data_command(cli: Cli) -> None:
     submitted = cli.json("submit", "state", "plan.json")
     assert submitted["complete"] is True and submitted["unresolved"] == []
     receipt = submitted["receipts"][0]
-    assert receipt["job_id"] == 1000 and receipt["task_keys"] == ["one", "two"]
+    assert receipt["job"] == {"job_id": 1000, "cluster": None}
+    assert receipt["task_keys"] == ["one", "two"]
     status = cli.json("status", "state")
     assert status["format"] == "servatus.status/1" and status["counts"]["queued"] == 2
     cancelled = cli.json("cancel", "state", "--task", "one")
-    assert [item["job_id"] for item in cancelled["cancelled"]] == [1000]
+    assert [item["job"]["job_id"] for item in cancelled["cancelled"]] == [1000]
     doctor = cli.json("doctor")
     assert doctor == {
         "profile": "cpu",
@@ -193,6 +194,71 @@ def test_duplicate_fields_and_unreadable_files_are_errors(cli: Cli) -> None:
     assert cli("status", "nowhere")[:2] == (1, "")
 
 
+def test_task_lines_end_only_at_newlines(cli: Cli) -> None:
+    # JSON allows raw U+2028, U+0085, and friends inside strings; they are not line breaks.
+    (cli.root / "odd.jsonl").write_text(
+        '{"key": "a b\x85c", "args": []}\r\n\n{"key": "d", "args": []}\n', newline=""
+    )
+    assert cli.json("create", "state", "odd.jsonl")["tasks"] == 2
+    assert [task.key for task in Campaign.open(cli.root / "state").tasks()] == [
+        "a b\x85c",
+        "d",
+    ]
+
+
+def test_runaway_nesting_is_an_input_error(cli: Cli) -> None:
+    (cli.root / "deep.jsonl").write_text("[" * 100_000 + "]" * 100_000 + "\n")
+    code, _, err = cli("create", "state", "deep.jsonl")
+    assert code == 1 and err.startswith("servatus: error: invalid task file deep.jsonl line 1")
+    cli("create", "state", "tasks.jsonl")
+    (cli.root / "deep.json").write_text('{"held": ' + "[" * 100_000 + "]" * 100_000 + "}")
+    code, _, err = cli("submit", "state", "deep.json")
+    assert code == 1 and err.startswith("servatus: error: invalid plan document")
+    assert err.count("\n") == 1
+
+
+def test_unexpected_failures_are_one_line_and_interrupts_exit_130(
+    cli: Cli, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cli("create", "state", "tasks.jsonl")
+
+    def broken(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("boom\x1b[2J")
+
+    monkeypatch.setattr(Campaign, "status", broken)
+    assert cli("status", "state") == (
+        1,
+        "",
+        "servatus: error: unexpected RuntimeError: boom\\x1b[2J\n",
+    )
+
+    def interrupted(*_args: object, **_kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(Campaign, "status", interrupted)
+    assert cli("status", "state") == (130, "", "servatus: error: interrupted\n")
+    code, _, err = cli("plan", "state", "--config", "bad\0name.toml")
+    assert code == 1 and err.startswith("servatus: error: cannot read TOML configuration")
+
+
+def test_human_output_escapes_untrusted_text(cli: Cli) -> None:
+    cli.tasks({"key": "evil\x1b[2J\r", "args": ["/bin/true"]}, name="evil.jsonl")
+    cli("create", "state", "evil.jsonl")
+    code, out, _ = cli("plan", "state", "--output", "plan.json")
+    assert code == 0 and "evil\\x1b[2J\\r" in out and "\x1b" not in out
+    cli.fake.fail_next("sbatch", Completed(1, b"", b"sbatch: error: \x1b]0;pwned\x07\n"))
+    code, out, _ = cli("validate", "state", "plan.json")
+    assert code == 1 and "sbatch: error: \\x1b]0;pwned\\x07" in out and "\x1b" not in out
+    code, out, err = cli("submit", "state", "plan.json")
+    assert code == 0 and "(evil\\x1b[2J\\r)" in out and "\x1b" not in out + err
+    code, out, _ = cli("status", "state")
+    assert code == 0 and "evil\\x1b[2J\\r  " in out and "\x1b" not in out
+    assert cli.json("status", "state")["tasks"][0]["key"] == "evil\x1b[2J\r"
+    cli.fake.fail_next("ping", Completed(0, b"slurm \x1b[31m23\n", b""))
+    code, out, _ = cli("doctor")
+    assert code == 0 and "sbatch: slurm \\x1b[31m23" in out
+
+
 @pytest.mark.parametrize("failure", ["missing_config", "bad_config", "occupied_output"])
 def test_planning_failures_never_author_the_campaign(cli: Cli, failure: str) -> None:
     cli("create", "state", "tasks.jsonl")
@@ -230,6 +296,7 @@ def test_plan_reports_holds_deferrals_and_scripts(cli: Cli) -> None:
     cli("create", "state", "tasks.jsonl")
     cli("plan", "state", "--output", "first.json")
     cli("submit", "state", "first.json")
+    cli.fake.start(1000)
     cli.fake.finish(1000, "FAILED", exit_code="1:0")
     code, out, err = cli(
         "plan", "state", "--retry", "one", "--show-scripts", "--tasks-per-allocation", "1"
@@ -248,7 +315,6 @@ def test_plan_reports_holds_deferrals_and_scripts(cli: Cli) -> None:
 def test_interrupted_submission_exits_3_and_recovery_commands_resolve_it(cli: Cli) -> None:
     cli("create", "state", "tasks.jsonl")
     cli("plan", "state", "--output", "plan.json", "--tasks-per-allocation", "1")
-    cli.fake.fail_next("sbatch", Completed(0, b"slurm 23.11.4\n", b""))
     cli.fake.fail_next("sbatch", Completed(1, b"", b"sbatch: error: Socket timed out\n"))
     code, out, err = cli("submit", "state", "plan.json", "--json")
     assert code == 3 and err.startswith("servatus: error: submission interrupted")
@@ -264,18 +330,17 @@ def test_interrupted_submission_exits_3_and_recovery_commands_resolve_it(cli: Cl
     )
 
     cli("plan", "state", "--output", "again.json")
-    cli.fake.lose_next_reply("sbatch")  # the ping's reply is lost
+    cli.fake.lose_next_reply("ping")
     code, _, err = cli("submit", "state", "again.json")
-    assert code == 75 and "reply from sbatch was lost" in err
+    assert code == 75 and "reply from ping was lost" in err
     assert Campaign.open(cli.root / "state").status(scheduler=False).revision == 2
 
-    cli.fake.fail_next("sbatch", Completed(0, b"slurm 23.11.4\n", b""))
     cli.fake.fail_next("sbatch", None)
     code, out, _ = cli("submit", "state", "again.json")
     assert code == 3 and "next: servatus reconcile state" in out
     pending = out.split("UNRESOLVED allocation ")[1].split()[0]
     accepted = cli.json("mark-accepted", "state", pending, "4242", "--cluster", "alpha")
-    assert accepted["accepted"][0]["cluster"] == "alpha"
+    assert accepted["accepted"][0]["job"] == {"job_id": 4242, "cluster": "alpha"}
     code, out, _ = cli("status", "state", "--offline")
     assert "next: servatus status state" in out
 
@@ -315,6 +380,9 @@ def test_cancel_needs_a_selector_and_doctor_reports_unavailable_clusters(cli: Cl
     assert code == 1 and "cancel needs Task keys or allocation ids" in err
     code, out, _ = cli("doctor")
     assert code == 0 and "sbatch: slurm 23.11.4" in out and "up to 4 Tasks" in out
-    cli.fake.fail_next("sbatch", Completed(127, b"", b"sbatch: not found\n"))
+    cli.fake.fail_next("ping", Completed(127, b"", b"sbatch: not found\n"))
     code, _, err = cli("doctor")
-    assert (code, err) == (75, "servatus: error: sbatch --version failed with exit status 127\n")
+    assert (code, err) == (
+        75,
+        "servatus: error: sbatch --version failed with exit status 127: sbatch: not found\n",
+    )

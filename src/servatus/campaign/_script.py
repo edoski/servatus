@@ -1,4 +1,5 @@
-"""Pure rendering of one allocation: names, log paths, the ``sbatch`` argv, and the batch script.
+"""Pure rendering of one allocation: names, log paths, the ``sbatch`` argv, and the batch script,
+plus ``check_command``, the deterministic bounds every scheduler command must meet.
 
 The batch script needs only a POSIX shell and its builtins on the compute node: no scratch files,
 no ``mktemp``, ``base64``, or ``rm``. Each Task becomes one exact ``srun`` step whose stdin is a
@@ -8,25 +9,60 @@ it to the allocation identity and slot.
 
 from __future__ import annotations
 
-import re
 import shlex
 from collections.abc import Sequence
 from datetime import timedelta
 from pathlib import PurePosixPath
 
 from ..errors import ConfigurationError
-from ._codec import format_duration
+from ._codec import format_duration, is_hex
 from ._config import Apptainer, Resources, Target, Task
 
-_ALLOCATION = re.compile(r"[0-9a-f]{24}\Z")
 # Printable ASCII is copied verbatim except printf's own metacharacters and the quote itself.
 _VERBATIM = frozenset(range(0x20, 0x7F)) - {ord("%"), ord("\\"), ord("'")}
 _ENV = "/usr/bin/env"
 _SHELL = "/bin/sh"
+MAX_ARGS = 32
+MAX_COMMAND_BYTES = 16 * 1024
+MAX_FIELD_BYTES = 4096
+
+
+def check_command(argv: Sequence[str]) -> tuple[str, ...]:
+    """Check the deterministic bounds of one command without running it.
+
+    At most 32 arguments (the first a nonempty program), 4 KiB per argument, and 16 KiB in total,
+    all UTF-8 text without NUL.
+    Raises ``ConfigurationError``, so callers can reject a command before recording any intent.
+    """
+    if isinstance(argv, (str, bytes)):
+        raise ConfigurationError("command must be a sequence of arguments")
+    fields = tuple(argv)
+    if not fields or any(not isinstance(field, str) for field in fields):
+        raise ConfigurationError("command must be a nonempty sequence of strings")
+    if not fields[0]:
+        raise ConfigurationError("command program must be nonempty")
+    if len(fields) > MAX_ARGS:
+        raise ConfigurationError(f"command exceeds its bound of {MAX_ARGS} arguments")
+    total = 0
+    for field in fields:
+        if "\0" in field:
+            raise ConfigurationError("command arguments cannot contain NUL")
+        try:
+            size = len(field.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise ConfigurationError("command arguments must be valid UTF-8 text") from None
+        if size > MAX_FIELD_BYTES:
+            raise ConfigurationError(
+                f"command argument exceeds its bound of {MAX_FIELD_BYTES} bytes"
+            )
+        total += size + 1
+    if total > MAX_COMMAND_BYTES:
+        raise ConfigurationError(f"command exceeds its bound of {MAX_COMMAND_BYTES} bytes")
+    return fields
 
 
 def _check_allocation(allocation_id: str) -> str:
-    if not isinstance(allocation_id, str) or _ALLOCATION.fullmatch(allocation_id) is None:
+    if not is_hex(allocation_id, 24):
         raise ConfigurationError("allocation_id must be 24 lowercase hexadecimal digits")
     return allocation_id
 
@@ -160,7 +196,12 @@ def _apptainer_step(
     allocation_id: str,
     slot: int,
 ) -> tuple[Sequence[str], str]:
-    run = [str(container.executable), "run", "--cleanenv"]
+    if not task.args:
+        raise ConfigurationError(
+            f"Task {task.key!r}: an Apptainer Task needs args; args[0] is the program to run "
+            "in the container (resolved on the container's PATH when relative)"
+        )
+    run = [str(container.executable), "exec", "--cleanenv"]
     for bind in (f"{target.work_root}:{target.work_root}", *container.binds):
         run.extend(("--bind", bind))
     run.extend(("--pwd", str(target.work_root)))

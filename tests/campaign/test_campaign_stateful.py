@@ -75,7 +75,7 @@ class CampaignMachine(RuleBasedStateMachine):
             )
         except PlanRefused:
             return
-        self.acknowledged.update(plan.duplicate_risk)
+        self.acknowledged.update(plan.decision.duplicate_risk)
         with contextlib.suppress(SubmissionInterrupted, Unavailable, StalePlan):
             self.campaign.submit(plan)
 

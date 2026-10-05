@@ -11,6 +11,9 @@ bounds as the real transport. Controls move jobs through their lifecycle and inj
     fake.start(1000)
     fake.finish(1000)
 
+Controls and ``count`` name commands by basename (``"sbatch"``, ``"squeue"``, ...), except the
+``sbatch --version`` connectivity check that precedes every submission, which is ``"ping"``: so
+``fail_next("sbatch")`` affects the next real submission, and ``fail_next("ping")`` the check.
 Commands Servatus never issues raise ``AssertionError`` so that drift fails tests loudly.
 """
 
@@ -22,9 +25,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 
-from .campaign._config import Target
-from .campaign._evidence import TIMESTAMP_FORMAT, JobRef, normalize_state
-from .campaign._remote import MAX_STREAM_BYTES, Completed, Transport, check_command
+from .campaign._config import Resources, Target
+from .campaign._evidence import MISSING_JOBS_STDERR, TIMESTAMP_FORMAT, JobRef, normalize_state
+from .campaign._remote import MAX_STREAM_BYTES, Completed, Transport
 from .campaign._scheduler import (
     SACCT_ALLOCATION_FORMAT,
     SACCT_IDENTITY_FORMAT,
@@ -32,11 +35,15 @@ from .campaign._scheduler import (
     SQUEUE_FORMAT,
     TAIL,
 )
+from .campaign._script import check_command, sbatch_argv
 from .errors import ConfigurationError, Unavailable
 
 __all__ = ["FakeJob", "FakeScheduler"]
 
-_MISSING = b"slurm_load_jobs error: Invalid job id specified\n"
+_SACCT_OPTIONS = frozenset(
+    ("--noheader", "--parsable2", "--allocations", "--duplicates", "--jobs", "--name")
+    + ("--starttime", "--endtime", "--local", "--clusters", "--format")
+)
 _VALUED = frozenset({"--jobs", "--name", "--starttime", "--endtime"})
 _LATEST = "9999-12-31T23:59:59"
 
@@ -86,6 +93,66 @@ class _Job:
     @property
     def latest(self) -> _Incarnation:
         return self.history[-1]
+
+
+def _key(argv: Sequence[str]) -> str:
+    """A command's control key: its basename, or ``ping`` for ``sbatch --version``."""
+    command = posixpath.basename(argv[0])
+    return "ping" if command == "sbatch" and tuple(argv[1:]) == ("--version",) else command
+
+
+def _step_rows(job: _Job) -> list[str]:
+    """``sacct`` step rows for the newest incarnation: allocation, batch, extern, then steps."""
+    recorded = job.latest.recorded
+    rows = [f"{job.job_id}|{job.name}|{recorded.state}|{recorded.exit_code}"]
+    if recorded.started_at is not None:
+        rows.append(f"{job.job_id}.batch|batch|{recorded.state}|0:0")
+        rows.append(f"{job.job_id}.extern|extern|{recorded.state}|0:0")
+    for slot, step in sorted(job.latest.steps.items()):
+        rows.append(f"{job.job_id}.{slot}|{job.name}-{slot}|{step.state}|{step.exit_code}")
+    return rows
+
+
+def _incarnations(
+    jobs: Sequence[_Job], options: Mapping[str, str | None]
+) -> list[tuple[_Job, _Incarnation]]:
+    """Incarnations of the named jobs that overlap the ``--starttime``/``--endtime`` window."""
+    names = set((options.get("--name") or "").split(","))
+    start, end = options.get("--starttime") or "", options.get("--endtime") or _LATEST
+    return [
+        (job, incarnation)
+        for job in jobs
+        if job.name in names
+        for incarnation in job.history
+        if not ((incarnation.recorded.ended_at or start) < start or incarnation.submitted_at > end)
+    ]
+
+
+def _sbatch_options() -> frozenset[str]:
+    """Every option ``sbatch_argv`` can emit, rendered for a request that uses them all."""
+    target = Target(
+        slurm_bin="/bin",
+        work_root="/work",
+        log_root="/logs",
+        partitions=("p",),
+        max_tasks_per_allocation=1,
+        max_cpus_per_allocation=1,
+        max_memory_mib_per_allocation=1,
+        max_time_limit="00:02:00",
+        account="a",
+        qos="q",
+        constraint="c",
+        gpu_gres="gpu",
+        max_gpus_per_allocation=1,
+    )
+    resources = Resources(
+        cpus=1, memory_mib=1, time_limit="00:02:00", gpus=1, signal_before_end="00:00:30"
+    )
+    argv = sbatch_argv(target, resources, 1, "0" * 24)
+    return frozenset(word.partition("=")[0] for word in argv[1:]) | {"--test-only"}
+
+
+_SBATCH_OPTIONS = _sbatch_options()
 
 
 def _lines(rows: Sequence[str]) -> bytes:
@@ -141,13 +208,14 @@ class FakeScheduler:
         """Answer one command exactly as the real transport and Slurm would."""
         fields = check_command(argv)
         self._calls.append(fields)
-        command = posixpath.basename(fields[0])
+        command = _key(fields)
         if queued := self._failures.get(command):
             reply = queued.pop(0)
             if reply is None:
                 raise Unavailable(f"FakeScheduler: injected failure of {command}")
             return reply
         handlers: Mapping[str, Callable[[tuple[str, ...], bytes], Completed]] = {
+            "ping": self._ping,
             "sbatch": self._sbatch,
             "squeue": self._squeue,
             "sacct": self._sacct,
@@ -172,8 +240,8 @@ class FakeScheduler:
         return tuple(self._calls)
 
     def count(self, command: str) -> int:
-        """How many times a command (by basename, such as ``"sbatch"``) was invoked."""
-        return sum(1 for call in self._calls if posixpath.basename(call[0]) == command)
+        """How many times a command (by key, such as ``"sbatch"`` or ``"ping"``) was invoked."""
+        return sum(1 for call in self._calls if _key(call) == command)
 
     @property
     def jobs(self) -> tuple[FakeJob, ...]:
@@ -256,7 +324,7 @@ class FakeScheduler:
         found.in_queue = found.accounted = False
 
     def fail_next(self, command: str, reply: Completed | None = None) -> None:
-        """Make the next ``command`` (basename) fail without acting.
+        """Make the next ``command`` (by key) fail without acting.
 
         With no ``reply`` the transport raises ``Unavailable``; otherwise ``reply`` is returned.
         Calls queue up in order.
@@ -264,7 +332,7 @@ class FakeScheduler:
         self._failures.setdefault(command, []).append(reply)
 
     def lose_next_reply(self, command: str) -> None:
-        """The next ``command`` takes effect, but its reply is lost (``Unavailable``)."""
+        """The next ``command`` (by key) takes effect, but its reply is lost (``Unavailable``)."""
         self._lost[command] = self._lost.get(command, 0) + 1
 
     def write_log(self, path: str | PurePosixPath, content: bytes) -> None:
@@ -333,33 +401,11 @@ class FakeScheduler:
             options["operands"] = " ".join(operands)
         return options
 
+    def _ping(self, _argv: tuple[str, ...], _stdin: bytes) -> Completed:
+        return Completed(0, f"{self._version}\n".encode(), b"")
+
     def _sbatch(self, argv: tuple[str, ...], stdin: bytes) -> Completed:
-        if argv[1:] == ("--version",):
-            return Completed(0, f"{self._version}\n".encode(), b"")
-        allowed = frozenset(
-            {
-                "--parsable",
-                "--export",
-                "--nodes",
-                "--ntasks",
-                "--cpus-per-task",
-                "--mem",
-                "--time",
-                "--partition",
-                "--chdir",
-                "--job-name",
-                "--comment",
-                "--output",
-                "--error",
-                "--account",
-                "--qos",
-                "--constraint",
-                "--gres",
-                "--signal",
-                "--test-only",
-            }
-        )
-        options = self._options(argv, allowed)
+        options = self._options(argv, _SBATCH_OPTIONS)
         required = ("--parsable", "--export", "--ntasks", "--job-name", "--comment")
         if "operands" in options or any(name not in options for name in required):
             raise AssertionError(f"FakeScheduler does not understand {argv!r}")
@@ -408,79 +454,41 @@ class FakeScheduler:
                     f"{_shown(live.ended_at, 'N/A')}"
                 )
         if not rows:
-            return Completed(1, banner.encode(), _MISSING)
+            return Completed(1, banner.encode(), MISSING_JOBS_STDERR)
         return Completed(0, banner.encode() + _lines(rows), b"")
 
     def _sacct(self, argv: tuple[str, ...], _stdin: bytes) -> Completed:
-        options = self._options(
-            argv,
-            frozenset(
-                {
-                    "--noheader",
-                    "--parsable2",
-                    "--allocations",
-                    "--duplicates",
-                    "--jobs",
-                    "--name",
-                    "--starttime",
-                    "--endtime",
-                    "--local",
-                    "--clusters",
-                    "--format",
-                }
-            ),
-        )
+        options = self._options(argv, _SACCT_OPTIONS)
         format_ = f"--format={options.get('--format')}"
-        start = options.get("--starttime") or ""
-        end = options.get("--endtime") or _LATEST
         wanted = (
             None
             if "--jobs" not in options
             else {int(item) for item in (options["--jobs"] or "").split(",")}
         )
-        names = set((options.get("--name") or "").split(","))
         jobs = [
             job
             for job in self._routed(options)
             if job.accounted and (wanted is None or job.job_id in wanted)
         ]
-        cluster = self._cluster or ""
-        rows: list[str] = []
+        history = "--allocations" in options and "--duplicates" in options
         if format_ == SACCT_STEP_FORMAT and "--allocations" not in options and wanted:
-            for job in jobs:
-                latest = job.latest
-                rows.append(
-                    f"{job.job_id}|{job.name}|{latest.recorded.state}|{latest.recorded.exit_code}"
-                )
-                if latest.recorded.started_at is not None:
-                    rows.append(f"{job.job_id}.batch|batch|{latest.recorded.state}|0:0")
-                    rows.append(f"{job.job_id}.extern|extern|{latest.recorded.state}|0:0")
-                for slot, step in sorted(latest.steps.items()):
-                    rows.append(
-                        f"{job.job_id}.{slot}|{job.name}-{slot}|{step.state}|{step.exit_code}"
-                    )
-            return Completed(0, _lines(rows), b"")
-        if "--allocations" not in options or "--duplicates" not in options:
+            rows = [row for job in jobs for row in _step_rows(job)]
+        elif format_ == SACCT_ALLOCATION_FORMAT and history and wanted is not None:
+            rows = [
+                f"{job.job_id}|{self._cluster or ''}|{job.name}|{job.comment}|"
+                f"{incarnation.submitted_at}|{recorded.state}|{recorded.exit_code}|"
+                f"{recorded.reason}|{_shown(recorded.started_at, 'Unknown')}|"
+                f"{_shown(recorded.ended_at, 'Unknown')}"
+                for job, incarnation in _incarnations(jobs, options)
+                for recorded in (incarnation.recorded,)
+            ]
+        elif format_ == SACCT_IDENTITY_FORMAT and history and wanted is None:
+            rows = [
+                f"{job.job_id}|{job.name}|{job.comment}|{self._cluster or ''}"
+                for job, _ in _incarnations(jobs, options)
+            ]
+        else:
             raise AssertionError(f"FakeScheduler does not understand {argv!r}")
-        for job in jobs:
-            if job.name not in names:
-                continue
-            for incarnation in job.history:
-                recorded = incarnation.recorded
-                ended = recorded.ended_at
-                if (ended is not None and ended < start) or incarnation.submitted_at > end:
-                    continue
-                if format_ == SACCT_ALLOCATION_FORMAT and wanted is not None:
-                    rows.append(
-                        f"{job.job_id}|{cluster}|{job.name}|{job.comment}|"
-                        f"{incarnation.submitted_at}|{recorded.state}|{recorded.exit_code}|"
-                        f"{recorded.reason}|{_shown(recorded.started_at, 'Unknown')}|"
-                        f"{_shown(ended, 'Unknown')}"
-                    )
-                elif format_ == SACCT_IDENTITY_FORMAT and wanted is None:
-                    rows.append(f"{job.job_id}|{job.name}|{job.comment}|{cluster}")
-                else:
-                    raise AssertionError(f"FakeScheduler does not understand {argv!r}")
         return Completed(0, _lines(rows), b"")
 
     def _scancel(self, argv: tuple[str, ...], _stdin: bytes) -> Completed:

@@ -7,18 +7,17 @@ Every method issues fixed, absolute argument vectors and parses replies with the
 
 from __future__ import annotations
 
-import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import PurePosixPath
 
-from ..errors import ConfigurationError, EvidenceConflict, Unavailable
+from ..errors import ConfigurationError, EvidenceConflict, ReconciliationError, Unavailable
+from ._config import CONTROL
 from ._evidence import (
     Expectation,
     JobRef,
     Observation,
-    StepEvidence,
     combine,
     is_missing_reply,
     parse_accounting,
@@ -41,7 +40,6 @@ SACCT_ALLOCATION_FORMAT = (
 SACCT_STEP_FORMAT = "--format=JobIDRaw%64,JobName%256,State%256,ExitCode%32"
 SACCT_IDENTITY_FORMAT = "--format=JobIDRaw,JobName,Comment,Cluster"
 _NOTHING_TO_CANCEL = (b"already completing or completed", b"Invalid job id specified")
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,21 +51,19 @@ class AttemptQuery:
     intent_at: datetime
     task_count: int
 
-    def __post_init__(self) -> None:
-        job_name(self.allocation_id)
-        if not isinstance(self.job, JobRef):
-            raise ConfigurationError("job must be a JobRef")
-        if not isinstance(self.intent_at, datetime) or self.intent_at.utcoffset() != timedelta(0):
-            raise ConfigurationError("intent_at must be an aware UTC datetime")
-        if type(self.task_count) is not int or self.task_count < 1:
-            raise ConfigurationError("task_count must be a positive integer")
-
 
 def _diagnostic(completed: Completed) -> str:
     """The first stderr line, bounded and printable, for operator-facing messages."""
     first = completed.stderr.decode("utf-8", "replace").strip().partition("\n")[0]
-    text = _CONTROL.sub("?", first)[:200]
+    text = CONTROL.sub("?", first)[:200]
     return f"exit status {completed.returncode}" + (f": {text}" if text else "")
+
+
+def _require_ok(completed: Completed, what: str, *, quiet: bool = True) -> Completed:
+    """``completed`` if it exited 0 (and, when ``quiet``, wrote nothing to stderr)."""
+    if completed.returncode != 0 or (quiet and completed.stderr):
+        raise Unavailable(f"{what} failed with {_diagnostic(completed)}")
+    return completed
 
 
 class Scheduler:
@@ -92,8 +88,7 @@ class Scheduler:
     def ping(self) -> str:
         """Prove the transport and Slurm client work: the ``sbatch --version`` text."""
         completed = self._transport.run((self._command("sbatch"), "--version"))
-        if completed.returncode != 0:
-            raise Unavailable(f"sbatch --version failed with {_diagnostic(completed)}")
+        _require_ok(completed, "sbatch --version", quiet=False)
         return completed.stdout.decode("utf-8", "replace").strip()
 
     def submit(self, argv: Sequence[str], script: bytes) -> JobRef:
@@ -102,8 +97,7 @@ class Scheduler:
         Any failure raises ``Unavailable``; the caller must treat acceptance as unresolved.
         """
         completed = self._transport.run(self._sbatch_request(argv), stdin=script)
-        if completed.returncode != 0:
-            raise Unavailable(f"sbatch failed with {_diagnostic(completed)}")
+        _require_ok(completed, "sbatch", quiet=False)
         try:
             return parse_receipt(completed.stdout)
         except EvidenceConflict:
@@ -164,92 +158,73 @@ class Scheduler:
         )
         if is_missing_reply(squeue.returncode, squeue.stdout, squeue.stderr, cluster):
             active = parse_active(b"", expected, cluster)
-        elif squeue.returncode != 0 or squeue.stderr:
-            raise Unavailable(f"squeue failed with {_diagnostic(squeue)}")
         else:
-            active = parse_active(squeue.stdout, expected, cluster)
-        sacct = self._transport.run(
-            (
-                self._command("sacct"),
-                "--noheader",
-                "--parsable2",
+            active = parse_active(_require_ok(squeue, "squeue").stdout, expected, cluster)
+        names = ",".join(item.identity for item in expected.values())
+        window = ("--starttime", earliest, route)
+        history = parse_accounting(
+            self._sacct(
                 "--allocations",
                 "--duplicates",
                 "--jobs",
                 jobs,
                 "--name",
-                ",".join(item.identity for item in expected.values()),
-                "--starttime",
-                earliest,
-                route,
+                names,
+                *window,
                 SACCT_ALLOCATION_FORMAT,
-            )
+            ),
+            expected,
+            cluster,
         )
-        if sacct.returncode != 0 or sacct.stderr:
-            raise Unavailable(f"sacct failed with {_diagnostic(sacct)}")
-        history = parse_accounting(sacct.stdout, expected, cluster)
-        steps = self._steps(expected, jobs, earliest, route)
+        try:  # step evidence is best effort: any failure leaves it unavailable
+            steps = parse_steps(self._sacct("--jobs", jobs, *window, SACCT_STEP_FORMAT), expected)
+        except (Unavailable, EvidenceConflict):
+            steps = None
         return {
             item.allocation_id: Observation(
                 combine(item, active[job], history[job]),
-                steps.get(job, (None,) * item.task_count),
+                () if steps is None else steps[job],
             )
             for job, item in expected.items()
         }
 
-    def _steps(
-        self, expected: dict[int, Expectation], jobs: str, earliest: str, route: str
-    ) -> dict[int, tuple[StepEvidence | None, ...]]:
-        """Per-step evidence, or nothing at all when the step query fails in any way."""
-        try:
-            completed = self._transport.run(
-                (
-                    self._command("sacct"),
-                    "--noheader",
-                    "--parsable2",
-                    "--jobs",
-                    jobs,
-                    "--starttime",
-                    earliest,
-                    route,
-                    SACCT_STEP_FORMAT,
-                )
-            )
-            if completed.returncode != 0 or completed.stderr:
-                return {}
-            return parse_steps(completed.stdout, expected)
-        except (Unavailable, EvidenceConflict):
-            return {}
+    def _sacct(self, *arguments: str) -> bytes:
+        """The checked stdout of ``sacct --noheader --parsable2 <arguments>``."""
+        argv = (self._command("sacct"), "--noheader", "--parsable2", *arguments)
+        return _require_ok(self._transport.run(argv), "sacct").stdout
 
     def identify(self, allocation_id: str, intent_at: datetime) -> JobRef:
-        """Find the one job Slurm holds for an unresolved allocation, else raise
-        ``ReconciliationError``; command failures raise ``Unavailable``."""
+        """The one job Slurm holds for an allocation, else ``ReconciliationError``."""
+        jobs = self.find(allocation_id, intent_at)
+        if len(jobs) != 1:
+            raise ReconciliationError(
+                f"scheduler evidence shows {len(jobs)} jobs named {job_name(allocation_id)}, "
+                "not exactly one"
+            )
+        return jobs[0]
+
+    def find(self, allocation_id: str, intent_at: datetime) -> tuple[JobRef, ...]:
+        """Every job carrying an allocation's identity: queued or running, or accounted near
+        ``intent_at``. Empty proves absence; command failures raise ``Unavailable`` and
+        untrustworthy replies ``ReconciliationError``."""
         identity = job_name(allocation_id)
         start, end = submission_window(intent_at)
         squeue = self._transport.run(
             (self._command("squeue"), "--noheader", "--name", identity, "--format=%i|%j|%k")
         )
-        if squeue.returncode != 0 or squeue.stderr:
-            raise Unavailable(f"squeue failed with {_diagnostic(squeue)}")
-        sacct = self._transport.run(
-            (
-                self._command("sacct"),
-                "--noheader",
-                "--parsable2",
-                "--allocations",
-                "--duplicates",
-                "--name",
-                identity,
-                "--starttime",
-                start,
-                "--endtime",
-                end,
-                SACCT_IDENTITY_FORMAT,
-            )
+        _require_ok(squeue, "squeue")
+        history = self._sacct(
+            "--allocations",
+            "--duplicates",
+            "--name",
+            identity,
+            "--starttime",
+            start,
+            "--endtime",
+            end,
+            SACCT_IDENTITY_FORMAT,
         )
-        if sacct.returncode != 0 or sacct.stderr:
-            raise Unavailable(f"sacct failed with {_diagnostic(sacct)}")
-        return parse_identity(squeue.stdout, sacct.stdout, identity)
+        return parse_identity(squeue.stdout, history, identity)
 
     def tail(self, path: PurePosixPath, max_bytes: int) -> tuple[bytes, bool]:
         """The last ``max_bytes`` of a remote file and whether earlier bytes exist.
@@ -259,7 +234,7 @@ class Scheduler:
         if type(max_bytes) is not int or not 1 <= max_bytes <= MAX_STREAM_BYTES:
             raise ConfigurationError(f"max_bytes must be an integer from 1 to {MAX_STREAM_BYTES}")
         text = str(path)
-        if not PurePosixPath(text).is_absolute() or _CONTROL.search(text):
+        if not PurePosixPath(text).is_absolute() or CONTROL.search(text):
             raise ConfigurationError("log path must be an absolute POSIX path")
         limit = max_bytes + 1
         try:

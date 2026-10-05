@@ -21,7 +21,7 @@ from scheduler_fixtures import (
 
 from servatus.campaign._evidence import AllocationState, JobRef, StepEvidence
 from servatus.campaign._remote import Completed
-from servatus.campaign._scheduler import AttemptQuery, Scheduler
+from servatus.campaign._scheduler import Scheduler
 from servatus.errors import (
     ConfigurationError,
     EvidenceConflict,
@@ -39,30 +39,6 @@ SACCT_FORMAT = (
 
 def scheduler(transport: Scripted) -> Scheduler:
     return Scheduler(transport, SLURM_BIN)
-
-
-# --- AttemptQuery ----------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("changes", "message"),
-    [
-        ({"allocation_id": "abc"}, "allocation_id"),
-        ({"intent_at": datetime(2030, 1, 1)}, "intent_at"),
-        ({"intent_at": datetime(2030, 1, 1, tzinfo=timezone(timedelta(hours=1)))}, "intent_at"),
-        ({"task_count": 0}, "task_count"),
-    ],
-)
-def test_attempt_query_rejects_invalid_values(changes: dict[str, object], message: str) -> None:
-    values: dict[str, object] = {
-        "allocation_id": ALLOCATION,
-        "job": JobRef(42),
-        "intent_at": INTENT,
-        "task_count": 1,
-    }
-    values.update(changes)
-    with pytest.raises(ConfigurationError, match=message):
-        AttemptQuery(**values)  # pyright: ignore[reportArgumentType]
 
 
 # --- observe ---------------------------------------------------------------------------------
@@ -263,11 +239,11 @@ def test_accounting_window_starts_at_the_earliest_intent_in_the_batch() -> None:
         Unavailable("timeout"),
     ],
 )
-def test_step_query_failures_degrade_to_no_step_evidence(steps: Completed | Unavailable) -> None:
+def test_step_query_failures_make_step_evidence_unavailable(steps: Completed | Unavailable) -> None:
     transport = Scripted().queue("squeue", MISSING).queue("sacct", ok(sacct_row("RUNNING")), steps)
     observed = scheduler(transport).observe([query(task_count=3)])[ALLOCATION]
     assert observed.allocation.state is AllocationState.RUNNING
-    assert observed.steps == (None, None, None)
+    assert observed.steps == ()
 
 
 def test_observe_rejects_duplicate_allocations_and_foreign_values() -> None:
