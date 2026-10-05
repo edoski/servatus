@@ -249,11 +249,11 @@ def _assess(
             continue
         allocation, step = observation.allocation, own_step(observation, slot)
         current, _ = task_execution(observation, slot, len(attempt.task_keys))
+        # The Task is current only in the allocation or its own step, so these cover it.
         active = (
             active
             or allocation.retained
             or allocation.state.active
-            or current.active
             or (step is not None and step.state.active)
         )
         unknown = unknown or AllocationState.UNKNOWN in (allocation.state, current)
