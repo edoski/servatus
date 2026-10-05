@@ -2,32 +2,46 @@ name: CI
 
 on:
   push:
+    branches: ["**"]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
 
 jobs:
   verify:
+    name: verify (${{ matrix.os }}, Python ${{ matrix.python }})
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
+        python: ["3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: macos-latest
+            python: "3.11"
+          - os: macos-latest
+            python: "3.14"
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
+          python-version: ${{ matrix.python }}
           enable-cache: true
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
       - run: uv sync --locked
-      - run: uv run pytest
+      - name: Test with coverage
+        run: uv run coverage run --source=src -m pytest && uv run coverage report --show-missing
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run pyright
       - run: uv run vulture
       - run: uv build
-      - run: uv run --isolated --no-project --with dist/*.whl python -c "import servatus"
-      - run: uv run --isolated --no-project --with dist/*.whl servatus --help
-      - run: uv run --isolated --no-project --with dist/*.whl python -m servatus --help
+      - name: Smoke-test the installed wheel
+        shell: bash
+        run: |
+          wheel="$(ls "$PWD"/dist/servatus-*.whl)"
+          script="$PWD/.github/scripts/smoke.py"
+          cd "$RUNNER_TEMP"
+          uv run --isolated --no-project --python "${{ matrix.python }}" --with "$wheel" \
+            python "$script" "$wheel"
