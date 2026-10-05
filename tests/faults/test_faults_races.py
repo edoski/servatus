@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
+import stat
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from servatus.errors import DestinationExists
+from servatus.errors import DestinationExists, Unavailable
 from servatus.publication import Workspace
 
 
@@ -52,3 +54,43 @@ def test_entry_rejects_publication_that_lands_before_the_lease(
         assert sorted(path.name for path in tmp_path.iterdir()) == ["result"]
     if race == "child":
         assert sorted(path.name for path in root.path.iterdir()) == ["trial"]
+
+
+@pytest.mark.parametrize("code", [errno.EBADF, errno.ENOLCK, errno.EOPNOTSUPP, errno.EINVAL])
+def test_workspace_coordination_falls_back_to_a_lock_file(
+    tmp_path: Path, syscalls: Any, code: int
+) -> None:
+    # NFS refuses `flock` on a read-only directory descriptor; coordination must still work.
+    def flock(real: Callable[[int, int], None], fd: int, operation: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(code, os.strerror(code))
+        real(fd, operation)
+
+    syscalls.wrap(fcntl, "flock", flock)
+    root = Workspace(tmp_path / "result", identity=b"root")
+    with root.child("trial", identity=b"trial") as child:
+        (child.path / "value").write_text("x")
+        child.publish(lambda draft: draft.link(child.path / "value", "value"))
+    with root as workspace:
+        workspace.publish(lambda draft: draft.link(root.path / "trial/value", "value"))
+
+    assert (tmp_path / "result/value").read_text() == "x"
+    assert sorted(path.name for path in tmp_path.iterdir()) == [".servatus.lock", "result"]
+    assert stat.S_IMODE((tmp_path / ".servatus.lock").stat().st_mode) == 0o600
+
+
+def test_other_directory_lock_failures_are_not_masked(tmp_path: Path, syscalls: Any) -> None:
+    def flock(real: Callable[[int, int], None], fd: int, operation: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        real(fd, operation)
+
+    syscalls.wrap(fcntl, "flock", flock)
+
+    with (
+        pytest.raises(Unavailable, match="Input/output error"),
+        Workspace(tmp_path / "result", identity=b"request"),
+    ):
+        pass
+
+    assert list(tmp_path.iterdir()) == []

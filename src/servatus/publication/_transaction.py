@@ -74,13 +74,11 @@ class Draft:
         state = self._live()
         source_path = _fs.fspath(source)
         *parents, name = _components(destination, allow_root=False)
-        with _directory(state, parents) as directory:
+        with _fs.Boundary(destination), _directory(state, parents) as directory:
             try:
                 os.link(source_path, name, dst_dir_fd=directory.fd, follow_symlinks=False)
-            except FileExistsError as error:
-                raise DestinationExists(f"draft path already exists: {destination}") from error
             except OSError as error:
-                raise _link_error(error, source_path) from error
+                raise _link_error(error, source_path, destination) from error
             try:
                 linked = os.stat(name, dir_fd=directory.fd, follow_symlinks=False)
             except OSError as error:
@@ -96,12 +94,17 @@ class Draft:
         """Hard-link every regular file under directory `source` into `destination`.
 
         Subdirectories are recreated; symlinks and special files are rejected. Every linked
-        entry must be the exact inode inspected in the source tree.
+        entry must be the exact inode inspected in the source tree. A source tree that contains
+        the draft itself (or the destination inside it) is a `ConfigurationError`.
         """
         state = self._live()
         parts = _components(destination, allow_root=True)
-        with _fs.open_path(source) as tree, _directory(state, parts) as target:
-            _link_contents(state, tree, target)
+        with (
+            _fs.Boundary(source),
+            _fs.open_path(source) as tree,
+            _directory(state, parts) as target,
+        ):
+            _link_contents(state, tree, target, {_key(state.stage.entry), _key(target.entry)})
 
     def _live(self) -> DraftState:
         if not self._state.live:
@@ -118,23 +121,32 @@ def _directory(state: DraftState, parts: list[str] | tuple[str, ...]) -> Generat
         yield current
 
 
-def _link_contents(state: DraftState, source: Pin, target: Pin) -> None:
+def _key(entry: os.stat_result) -> tuple[int, int]:
+    return entry.st_dev, entry.st_ino
+
+
+def _link_contents(
+    state: DraftState, source: Pin, target: Pin, inside: set[tuple[int, int]]
+) -> None:
+    """Mirror `source` into `target`; `inside` holds the draft directories it must not contain."""
+    if _key(source.entry) in inside:
+        raise ConfigurationError("link_tree source contains the draft it is linked into")
+
     def visit(directory: Pin, name: str, entry: os.stat_result) -> None:
         if stat.S_ISDIR(entry.st_mode):
             with (
                 directory.open(name, expected=entry) as child,
                 target.mkdir(name, exist_ok=True) as into,
             ):
-                _link_contents(state, child, into)
+                inside.add(_key(into.entry))
+                _link_contents(state, child, into, inside)
             return
         try:
             os.link(
                 name, name, src_dir_fd=directory.fd, dst_dir_fd=target.fd, follow_symlinks=False
             )
-        except FileExistsError as error:
-            raise DestinationExists(f"draft path already exists: {name}") from error
         except OSError as error:
-            raise _link_error(error, name) from error
+            raise _link_error(error, name, name) from error
         try:
             target.expect(name, entry)  # the linked inode is exactly the one inspected
         except UnsafeFilesystem as error:
@@ -168,10 +180,16 @@ def _components(destination: str | os.PathLike[str], *, allow_root: bool) -> tup
     return path.parts
 
 
-def _link_error(error: OSError, source: object) -> Exception:
+def _link_error(error: OSError, source: object, destination: object) -> Exception:
+    if error.errno == errno.EEXIST:
+        return DestinationExists(f"draft path already exists: {destination}")
+    if error.errno == errno.ENOENT:
+        return ConfigurationError(f"hard-link source does not exist: {source}")
+    if error.errno in {errno.EPERM, errno.EACCES, errno.ELOOP, errno.EISDIR}:
+        return UnsafeFilesystem(f"unsafe hard-link source: {source}")
     if error.errno == errno.EXDEV:
         return CrossDeviceError(f"hard-link source is on another filesystem: {source}")
-    return UnsafeFilesystem(f"unsafe hard-link source: {source}")
+    return _fs.os_error(error, f"hard link of {source}")
 
 
 # -- transaction -----------------------------------------------------------------------------
@@ -198,45 +216,44 @@ def transact(
     directory.verify_path(parent)
     directory.absent(name, parent / name)
     stage_name, stage = directory.unique(STAGE_PREFIX)
-    with stage:
+    with stage, ExitStack() as pins:
         try:
             umask = _fs.probe_umask(stage) if mode is None else 0
             member = build(parent / stage_name, stage)
             if member is None:
                 _fs.sync_tree(stage, 0o777 & ~umask if mode is None else mode)
-                directory.expect(stage_name, stage.entry)
-                directory.verify_path(parent)
-                _fs.commit(directory, stage_name, directory, name, stage.entry)
+                source, source_name, entry = directory, stage_name, stage.entry
             else:
-                with stage.open(member, directory=False) as payload:
-                    if payload.entry.st_nlink != 1:
-                        raise UnsafeFilesystem(f"published file must have one link: {name}")
-                    os.fchmod(payload.fd, 0o666 & ~umask if mode is None else mode)
-                    _fs.sync(payload.fd)
-                    stage.expect(member, payload.entry)
-                    directory.expect(stage_name, stage.entry)
-                    directory.verify_path(parent)
-                    _fs.commit(stage, member, directory, name, payload.entry)
+                payload = pins.enter_context(_payload(stage, member, name))
+                os.fchmod(payload.fd, 0o666 & ~umask if mode is None else mode)
+                _fs.sync(payload.fd)
+                source, source_name, entry = stage, member, payload.entry
+            directory.expect(stage_name, stage.entry)
+            directory.verify_path(parent)
+            _fs.commit(source, source_name, directory, name, entry)
         except BaseException as error:
-            if not _fs.discard(directory, stage_name, stage.entry, pinned=stage):
+            if not _fs.discard(directory, stage_name, stage):
                 error.add_note(f"Servatus could not remove the failed stage {parent / stage_name}")
             raise
-        clean = member is None or _fs.discard(directory, stage_name, stage.entry, pinned=stage)
+        clean = member is None or _fs.discard(directory, stage_name, stage)
     _fs.sync(directory.fd)  # the durability point; failure here leaves an unproven commit
     if retire is not None:
-        retired = _owner_only(retire.pin) and _fs.discard(
-            directory, retire.name, retire.pin.entry, pinned=retire.pin
-        )
-        clean = retired and _fs.try_sync(directory.fd) and clean
+        retired = _fs.succeeded(
+            lambda: _fs.require_owner_only(os.fstat(retire.pin.fd), "retirement source")
+        ) and _fs.discard(directory, retire.name, retire.pin)
+        clean = retired and _fs.succeeded(_fs.sync, directory.fd) and clean
     return clean
 
 
-def _owner_only(pin: Pin) -> bool:
-    try:
-        _fs.require_owner_only(os.fstat(pin.fd), "retirement source")
-    except Exception:
-        return False
-    return True
+def _payload(stage: Pin, member: str, name: str) -> Pin:
+    """Pin the writer's single-link regular file."""
+    if stage.lstat(member) is None:
+        raise ConfigurationError(f"the writer did not create the file to publish: {name}")
+    payload = stage.open(member, directory=False)
+    if payload.entry.st_nlink != 1:
+        payload.close()
+        raise UnsafeFilesystem(f"published file must have one link: {name}")
+    return payload
 
 
 @contextmanager
@@ -251,6 +268,8 @@ def _retirement(
         raise ConfigurationError(f"retirement source must be a destination sibling: {retire}")
     if retire_name == name:
         raise ConfigurationError(f"retirement source must differ from the destination: {retire}")
+    if directory.lstat(retire_name) is None:
+        raise ConfigurationError(f"retirement source does not exist: {retire}")
     with directory.open(retire_name) as pin:
         _fs.require_owner_only(pin.entry, f"retirement source {retire}")
         directory.expect(retire_name, pin.entry)
@@ -282,7 +301,7 @@ def draft_builder(build: Callable[[Draft], object]) -> Build:
     return run
 
 
-def _mode(mode: int | None) -> int | None:
+def checked_mode(mode: int | None) -> int | None:
     return None if mode is None else _fs.check_mode(mode)
 
 
@@ -302,12 +321,14 @@ def publish(
     directory is pinned before the builder and removed only after the commit is durable.
     """
     _fs.require_supported_platform()
-    checked = _mode(mode)
+    checked = checked_mode(mode)
     parent, name = _fs.split(destination)
     with (
+        _fs.Boundary(parent / name) as boundary,
         _fs.open_path(parent) as directory,
         _retirement(parent, directory, name, retire) as retired,
     ):
+        build = boundary.passthrough(build)
         clean = transact(
             parent, directory, name, draft_builder(build), mode=checked, retire=retired
         )
@@ -325,14 +346,16 @@ def publish_file(
     just before commit (default: `0o666` minus the umask), overriding any mode the writer chose.
     """
     _fs.require_supported_platform()
-    checked = _mode(mode)
+    checked = checked_mode(mode)
     parent, name = _fs.split(destination)
 
-    def build(path: Path, stage: Pin) -> str:
-        del stage
-        write(path / name)
-        return name
+    with _fs.Boundary(parent / name) as boundary, _fs.open_path(parent) as directory:
+        written = boundary.passthrough(write)
 
-    with _fs.open_path(parent) as directory:
+        def build(path: Path, stage: Pin) -> str:
+            del stage
+            written(path / name)
+            return name
+
         clean = transact(parent, directory, name, build, mode=checked)
     return result(parent / name, clean)

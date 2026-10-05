@@ -19,6 +19,17 @@ Deliberate changes from 0.11 (all other ADR 0002/0004 guarantees are unchanged):
 - Entering a `Workspace` whose destination already exists first removes leftover private work
   bound to the same identity (or never initialized), then raises `DestinationExists`.
 - A failed identity-stage cleanup sync is reported once, without a retry.
+- Workspace containers are removed work first and `.identity` last. The same identity finishes an
+  interrupted removal on its next entry; a container holding work without an identity is never
+  adopted (`WorkspaceConflict` naming the private path).
+- No raw `OSError` escapes: a missing, unwritable, or overlong location is `ConfigurationError`;
+  transient failures (no space, quota, I/O errors, descriptor exhaustion) are `Unavailable`;
+  `UnsafeFilesystem` means substitution, type, or ownership. Exceptions raised by builders and
+  writers propagate unchanged. A file unreadable by its owner is `ConfigurationError`.
+- `Draft.link_tree` rejects a source tree containing the draft (`ConfigurationError`).
+- Where `flock` on a directory handle fails (NFS: EBADF, ENOLCK, EOPNOTSUPP, EINVAL), parent
+  coordination locks an owner-only `.servatus.lock` file in that directory instead; it is left in
+  place, and must not be shared between users.
 """
 
 from ._transaction import Draft, Publication, publish, publish_file

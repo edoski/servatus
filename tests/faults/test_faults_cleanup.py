@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from servatus.errors import DestinationExists, UnsafeFilesystem
+from servatus.errors import DestinationExists, Unavailable, UnsafeFilesystem, WorkspaceConflict
 from servatus.publication import Draft, Workspace, publish, publish_file
 
 Sync = Callable[[int], None]
@@ -64,7 +64,7 @@ def test_workspace_discard_failure_propagates(tmp_path: Path, syscalls: Any) -> 
     fail_rmdir_of(syscalls, lambda name: name.endswith(".work"))
 
     with Workspace(tmp_path / "result", identity=b"run") as workspace:
-        with pytest.raises(OSError, match="injected cleanup failure"):
+        with pytest.raises(Unavailable, match="injected cleanup failure"):
             workspace.discard()
         with pytest.raises(RuntimeError, match="already discarded"):
             workspace.publish(lambda draft: None)
@@ -354,3 +354,57 @@ def test_identity_warning_preserves_other_thread_warning_policy(
 
     assert not worker.is_alive()
     assert failures == []
+
+
+# -- interrupted container removal -----------------------------------------------------------
+@pytest.mark.parametrize("finish", ["discard", "publish"])
+def test_interrupted_removal_keeps_the_identity_until_work_is_gone(
+    tmp_path: Path, syscalls: Any, finish: str
+) -> None:
+    # Regression: `.identity` went first, so a failed removal left bare work for anyone to adopt.
+    destination = tmp_path / "result"
+    with Workspace(destination, identity=b"alice") as workspace:
+        (workspace.path / "checkpoint").write_text("alice")
+    fail_rmdir_of(syscalls, lambda name: name == "work")
+
+    with Workspace(destination, identity=b"alice") as workspace:
+        container = workspace.path.parent
+        if finish == "discard":
+            with pytest.raises(Unavailable, match="injected cleanup failure"):
+                workspace.discard()
+        else:
+            with pytest.warns(RuntimeWarning, match="private cleanup remains pending"):
+                workspace.publish(lambda draft: None)
+
+    assert sorted(path.name for path in container.iterdir()) == [".identity", ".lock", "work"]
+    if finish == "discard":
+        with (
+            pytest.raises(WorkspaceConflict, match="different identity"),
+            Workspace(destination, identity=b"bob"),
+        ):
+            pass
+
+
+def test_removal_interrupted_before_the_identity_is_finished_on_entry(
+    tmp_path: Path, syscalls: Any
+) -> None:
+    destination = tmp_path / "result"
+    interrupted: list[bool] = []
+
+    def unlink(real: Callable[..., None], path: Any, *args: Any, **kwargs: Any) -> None:
+        if path == ".identity" and not interrupted:
+            interrupted.append(True)
+            raise KeyboardInterrupt
+        real(path, *args, **kwargs)
+
+    syscalls.os("unlink", unlink)
+    with Workspace(destination, identity=b"alice") as workspace:
+        (workspace.path / "checkpoint").write_text("alice")
+        container = workspace.path.parent
+        with pytest.raises(KeyboardInterrupt):
+            workspace.discard()
+
+    assert sorted(path.name for path in container.iterdir()) == [".identity"]
+    with Workspace(destination, identity=b"alice") as workspace:
+        assert list(workspace.path.iterdir()) == []
+    assert sorted(path.name for path in container.iterdir()) == [".identity", ".lock", "work"]

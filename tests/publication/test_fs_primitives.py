@@ -3,11 +3,12 @@ from __future__ import annotations
 import os
 import stat
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from servatus import _fs
-from servatus.errors import ConfigurationError, UnsafeFilesystem
+from servatus.errors import ConfigurationError, CrossDeviceError, UnsafeFilesystem
 
 
 def mode_of(path: Path) -> int:
@@ -131,3 +132,107 @@ def test_probe_umask_reads_the_mask_without_residue(tmp_path: Path) -> None:
         os.umask(previous)
 
     assert list(tmp_path.iterdir()) == []
+
+
+def test_present_reports_a_disappeared_entry(tmp_path: Path) -> None:
+    (tmp_path / "entry").write_text("x")
+    with _fs.open_path(tmp_path) as directory:
+        entry = directory.present("entry")
+        (tmp_path / "entry").unlink()
+        with pytest.raises(UnsafeFilesystem, match="disappeared: entry"):
+            directory.present("entry")
+        with pytest.raises(UnsafeFilesystem, match="disappeared: entry"):
+            directory.expect("entry", entry)
+
+
+def other_device(entry: os.stat_result) -> os.stat_result:
+    fields = list(entry)
+    fields[2] = entry.st_dev + 1  # st_dev
+    return os.stat_result(fields)
+
+
+def test_open_rejects_a_child_on_another_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "mounted").mkdir()
+    mounted = (tmp_path / "mounted").stat().st_ino
+    real = os.fstat
+
+    def fstat(fd: int) -> os.stat_result:
+        entry = real(fd)
+        return other_device(entry) if entry.st_ino == mounted else entry
+
+    monkeypatch.setattr(os, "fstat", fstat)
+    with _fs.open_path(tmp_path) as directory:
+        before = len(os.listdir("/dev/fd"))
+        with pytest.raises(CrossDeviceError, match="filesystem boundary: mounted"):
+            directory.open("mounted")
+        assert len(os.listdir("/dev/fd")) == before
+
+
+def test_walk_rejects_an_entry_on_another_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "mounted").mkdir()
+    real = os.stat
+
+    def stat_(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        entry = real(path, *args, **kwargs)
+        return other_device(entry) if path == "mounted" else entry
+
+    monkeypatch.setattr(os, "stat", stat_)
+    visited: list[str] = []
+    with (
+        _fs.open_path(tmp_path) as directory,
+        pytest.raises(CrossDeviceError, match="filesystem boundary: mounted"),
+    ):
+        _fs.walk(directory, lambda parent, name, entry: visited.append(name))
+    assert visited == []
+
+
+def test_replace_file_never_installs_or_deletes_a_substituted_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "state").write_bytes(b"original")
+    real = os.stat
+    impostors: list[str] = []
+
+    def stat_(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if isinstance(path, str) and path.startswith(".servatus-replace-") and not impostors:
+            os.rename(tmp_path / path, tmp_path / "moved")
+            (tmp_path / path).write_bytes(b"impostor")
+            impostors.append(path)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", stat_)
+    with (
+        _fs.open_path(tmp_path) as directory,
+        pytest.raises(UnsafeFilesystem, match="replacement stage was substituted"),
+    ):
+        _fs.replace_file(directory.fd, "state", b"new")
+
+    assert (tmp_path / "state").read_bytes() == b"original"
+    assert (
+        tmp_path / impostors[0]
+    ).read_bytes() == b"impostor"  # cleanup kept what it did not make
+    assert (tmp_path / "moved").read_bytes() == b"new"
+
+
+def test_write_new_cleanup_never_deletes_a_substituted_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def write(fd: int, data: Any) -> int:
+        os.rename(tmp_path / "state", tmp_path / "moved")
+        (tmp_path / "state").write_bytes(b"impostor")
+        raise OSError("injected write failure")
+
+    monkeypatch.setattr(os, "write", write)
+    with (
+        _fs.open_path(tmp_path) as directory,
+        pytest.raises(OSError, match="injected write failure"),
+    ):
+        _fs.write_new(directory.fd, "state", b"payload")
+    monkeypatch.undo()
+
+    assert (tmp_path / "state").read_bytes() == b"impostor"
+    assert (tmp_path / "moved").exists()

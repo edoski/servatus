@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from servatus import _fs
-from servatus.errors import UnsafeFilesystem
+from servatus.errors import Unavailable, UnsafeFilesystem
 from servatus.publication import Workspace, publish, publish_file
 
 
@@ -34,9 +34,12 @@ def track_opens(syscalls: Any, prefix: str) -> set[int]:
     return opened
 
 
-@pytest.mark.parametrize("failure", [OSError("injected fstat failure"), KeyboardInterrupt()])
+@pytest.mark.parametrize(
+    ("failure", "raised"),
+    [(OSError("injected fstat failure"), Unavailable), (KeyboardInterrupt(), KeyboardInterrupt)],
+)
 def test_fstat_failure_on_a_new_stage_leaks_nothing(
-    tmp_path: Path, syscalls: Any, failure: BaseException
+    tmp_path: Path, syscalls: Any, failure: BaseException, raised: type[BaseException]
 ) -> None:
     # Regression: the descriptor (and stage) leaked when fstat failed right after open.
     opened = track_opens(syscalls, ".servatus-stage-")
@@ -53,7 +56,7 @@ def test_fstat_failure_on_a_new_stage_leaks_nothing(
         lambda: publish(tmp_path / "directory", lambda draft: None),
         lambda: publish_file(tmp_path / "file", lambda path: path.write_text("x")),
     ):
-        with pytest.raises(type(failure), match="injected fstat failure|^$"):
+        with pytest.raises(raised, match="injected fstat failure|^$"):
             publisher()
 
     assert open_descriptors() == before
@@ -88,7 +91,7 @@ def test_fstat_failure_on_workspace_lock_leaks_nothing(tmp_path: Path, syscalls:
     before = open_descriptors()
 
     with (
-        pytest.raises(OSError, match="injected fstat failure"),
+        pytest.raises(Unavailable, match="injected fstat failure"),
         Workspace(tmp_path / "result", identity=b"request"),
     ):
         pass
@@ -243,3 +246,46 @@ def test_foreign_owned_private_entries_are_rejected(
         Workspace(tmp_path / "result", identity=b"request"),
     ):
         pass
+
+
+@pytest.mark.parametrize("failure", [OSError(5, "close reported EIO"), KeyboardInterrupt()])
+def test_write_new_close_failure_removes_the_file(
+    tmp_path: Path, syscalls: Any, failure: BaseException
+) -> None:
+    # Regression: the descriptor was closed after the cleanup handler, so the file survived.
+    opened = track_opens(syscalls, "state")
+
+    def close(real: Callable[[int], None], fd: int) -> None:
+        real(fd)
+        if fd in opened:
+            raise failure
+
+    syscalls.os("close", close)
+    before = open_descriptors()
+
+    with _fs.open_path(tmp_path) as directory, pytest.raises(type(failure), match="EIO|^$"):
+        _fs.write_new(directory.fd, "state", b"payload")
+
+    assert open_descriptors() == before
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_stage_name_collision_allocates_another_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    taken = tmp_path / f".servatus-stage-{bytes(12).hex()}"
+    taken.mkdir()
+    (taken / "foreign").write_text("preserve")
+    draws: list[int] = []
+    real = os.urandom
+
+    def urandom(size: int) -> bytes:
+        draws.append(size)
+        return bytes(size) if len(draws) == 1 else real(size)
+
+    monkeypatch.setattr(os, "urandom", urandom)
+
+    publication = publish(tmp_path / "result", lambda draft: (draft.path / "value").touch())
+
+    assert sorted(path.name for path in publication.destination.iterdir()) == ["value"]
+    assert sorted(path.name for path in taken.iterdir()) == ["foreign"]

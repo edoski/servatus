@@ -352,3 +352,104 @@ def test_existing_destination_without_private_work_creates_nothing(tmp_path: Pat
         pass
 
     assert sorted(path.name for path in tmp_path.iterdir()) == ["result"]
+
+
+def test_cleanup_removes_directories_without_owner_access(tmp_path: Path) -> None:
+    # Regression: removal opened such directories before making them accessible, and failed.
+    for finish in ("discard", "publish"):
+        with Workspace(tmp_path / finish, identity=b"request") as workspace:
+            for name, mode in (("write-only", 0o300), ("closed", 0o000), ("no-search", 0o600)):
+                (workspace.path / name).mkdir()
+                (workspace.path / name / "value").write_text("x")
+                (workspace.path / name).chmod(mode)
+            if finish == "discard":
+                workspace.discard()
+            else:
+                assert workspace.publish(lambda draft: None).cleanup_pending is False
+
+    assert hidden(tmp_path) == []
+
+
+# -- containers left by interrupted removal or initialization ---------------------------------
+def remnant(tmp_path: Path, *, keep_work: bool, keep_identity: bool) -> Path:
+    """A container as an interrupted removal or initialization could leave it."""
+    with Workspace(tmp_path / "result", identity=b"alice") as workspace:
+        (workspace.path / "checkpoint").write_text("alice")
+        container = workspace.path.parent
+    if not keep_work:
+        (container / "work/checkpoint").unlink()
+        (container / "work").rmdir()
+        (container / ".lock").unlink()
+    if not keep_identity:
+        (container / ".identity").unlink()
+    return container
+
+
+def test_identity_without_work_is_finished_by_the_same_identity_only(tmp_path: Path) -> None:
+    container = remnant(tmp_path, keep_work=False, keep_identity=True)
+
+    with (
+        pytest.raises(WorkspaceConflict, match="different identity") as raised,
+        Workspace(tmp_path / "result", identity=b"bob"),
+    ):
+        pass
+    assert str(container / "work") in str(raised.value)
+    assert sorted(path.name for path in container.iterdir()) == [".identity", ".lock"]
+
+    with Workspace(tmp_path / "result", identity=b"alice") as workspace:
+        assert list(workspace.path.iterdir()) == []
+        workspace.publish(lambda draft: None)
+    assert hidden(tmp_path) == []
+
+
+def test_unbound_container_with_work_is_never_adopted(tmp_path: Path) -> None:
+    container = remnant(tmp_path, keep_work=True, keep_identity=False)
+
+    for identity in (b"bob", b"alice"):
+        with (
+            pytest.raises(WorkspaceConflict, match="has no workspace identity") as raised,
+            Workspace(tmp_path / "result", identity=identity),
+        ):
+            pass
+        assert str(container / "work") in str(raised.value)
+    assert (container / "work/checkpoint").read_text() == "alice"
+    assert not (container / ".identity").exists()
+
+
+def test_unbound_container_with_empty_work_is_a_fresh_initialization(tmp_path: Path) -> None:
+    container = remnant(tmp_path, keep_work=True, keep_identity=False)
+    (container / "work/checkpoint").unlink()
+
+    with Workspace(tmp_path / "result", identity=b"bob") as workspace:
+        (workspace.path / "checkpoint").write_text("bob")
+    assert (container / ".identity").is_file()
+
+
+@pytest.mark.parametrize("keep_identity", [True, False], ids=["bound", "unbound"])
+def test_existing_destination_reclaims_workless_remnants(
+    tmp_path: Path, keep_identity: bool
+) -> None:
+    remnant(tmp_path, keep_work=False, keep_identity=keep_identity)
+    (tmp_path / "result").mkdir()
+
+    with (
+        pytest.raises(DestinationExists, match="already exists"),
+        Workspace(tmp_path / "result", identity=b"alice"),
+    ):
+        pass
+
+    assert hidden(tmp_path) == []
+
+
+def test_existing_destination_keeps_unbound_work(tmp_path: Path) -> None:
+    container = remnant(tmp_path, keep_work=True, keep_identity=False)
+    (tmp_path / "result").mkdir()
+
+    with (
+        pytest.raises(DestinationExists, match="already exists") as raised,
+        Workspace(tmp_path / "result", identity=b"bob"),
+    ):
+        pass
+
+    assert (container / "work/checkpoint").read_text() == "alice"
+    assert any("has no workspace identity" in note for note in raised.value.__notes__)

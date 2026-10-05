@@ -6,6 +6,7 @@ import fcntl
 import multiprocessing
 import os
 import platform
+import stat
 import sys
 import threading
 from collections.abc import Callable
@@ -20,6 +21,7 @@ from servatus import _fs
 from servatus.errors import (
     CrossDeviceError,
     DestinationExists,
+    Unavailable,
     UnsafeFilesystem,
     UnsupportedPlatform,
 )
@@ -180,7 +182,7 @@ def test_native_noreplace_remains_the_fast_path(
     ("code", "expected", "message"),
     [
         (errno.EXDEV, CrossDeviceError, "filesystem boundary"),
-        (errno.EIO, OSError, "Input/output error"),
+        (errno.EIO, Unavailable, "Input/output error"),
         (errno.EEXIST, DestinationExists, "already exists"),
     ],
 )
@@ -336,7 +338,8 @@ def test_directory_fallback_fails_closed_without_flock(
     with pytest.raises(UnsupportedPlatform, match="lock is unavailable"):
         publish(tmp_path / "result", lambda draft: None)
 
-    assert list(tmp_path.iterdir()) == []
+    # The NFS lock file was tried too; it is never removed (that would split its holders).
+    assert [path.name for path in tmp_path.iterdir()] == [".servatus.lock"]
 
 
 @pytest.mark.usefixtures("linux_fallback")
@@ -538,3 +541,74 @@ def test_directory_fallback_does_not_hold_parent_lock_across_durability_sync(
     assert winner_result.poll(5)
     assert winner_result.recv() == "committed"
     assert all(process.exitcode == 0 for process in (same, other, winner))
+
+
+@pytest.mark.usefixtures("linux_fallback")
+def test_file_fallback_verifies_the_hard_linked_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_link = os.link
+
+    def link_then_substitute(source: Any, destination: Any, **kwargs: Any) -> None:
+        real_link(source, destination, **kwargs)
+        os.unlink(destination, dir_fd=kwargs["dst_dir_fd"])
+        (tmp_path / destination).write_text("impostor")
+
+    monkeypatch.setattr(os, "link", link_then_substitute)
+
+    with pytest.raises(UnsafeFilesystem, match="not the verified source"):
+        publish_file(tmp_path / "result", lambda path: path.write_text("verified"))
+
+
+NFS_LOCK_ERRORS = [errno.EBADF, errno.ENOLCK, errno.EOPNOTSUPP, errno.EINVAL]
+
+
+def refuse_directory_locks(monkeypatch: pytest.MonkeyPatch, code: int) -> list[int]:
+    """Behave like NFS: `flock` on a directory descriptor fails; regular files still lock."""
+    real_flock = fcntl.flock
+    locked_files: list[int] = []
+
+    def flock(fd: int, operation: int) -> None:
+        entry = os.fstat(fd)
+        if stat.S_ISDIR(entry.st_mode):
+            raise OSError(code, os.strerror(code))
+        locked_files.append(entry.st_ino)
+        real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", flock)
+    return locked_files
+
+
+@pytest.mark.usefixtures("linux_fallback")
+@pytest.mark.parametrize("code", NFS_LOCK_ERRORS)
+def test_directory_fallback_locks_a_file_where_directories_cannot_be_locked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    locked_files = refuse_directory_locks(monkeypatch, code)
+
+    publication = publish(tmp_path / "result", lambda draft: (draft.path / "value").touch())
+
+    lock = tmp_path / ".servatus.lock"
+    assert publication.cleanup_pending is False
+    assert sorted(path.name for path in tmp_path.iterdir()) == [".servatus.lock", "result"]
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+    assert locked_files == [lock.stat().st_ino]
+
+
+@pytest.mark.usefixtures("linux_fallback")
+def test_directory_fallback_lock_file_must_be_a_private_regular_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    refuse_directory_locks(monkeypatch, errno.ENOLCK)
+    (tmp_path / "elsewhere").write_text("x")
+    (tmp_path / ".servatus.lock").symlink_to(tmp_path / "elsewhere")
+
+    with pytest.raises(UnsafeFilesystem, match="lock .servatus.lock is not a plain file"):
+        publish(tmp_path / "result", lambda draft: None)
+    (tmp_path / ".servatus.lock").unlink()
+    (tmp_path / ".servatus.lock").write_text("")
+    (tmp_path / ".servatus.lock").chmod(0o644)
+    with pytest.raises(UnsafeFilesystem, match="must be owner-only"):
+        publish(tmp_path / "result", lambda draft: None)
+
+    assert not (tmp_path / "result").exists()

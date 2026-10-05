@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import stat
 import sys
@@ -17,7 +18,7 @@ from servatus.errors import (
     UnsafeFilesystem,
     UnsupportedPlatform,
 )
-from servatus.publication import Draft, Publication, publish, publish_file
+from servatus.publication import Draft, Publication, Workspace, publish, publish_file
 
 
 def hidden(parent: Path) -> list[Path]:
@@ -335,7 +336,7 @@ def test_temp_then_rename_writer_is_supported_and_leftovers_discarded(tmp_path: 
     assert sorted(path.name for path in tmp_path.iterdir()) == ["metrics.json"]
 
 
-@pytest.mark.parametrize("result", ["missing", "directory", "symlink", "fifo"])
+@pytest.mark.parametrize("result", ["directory", "symlink", "fifo"])
 def test_writer_must_leave_one_regular_file(tmp_path: Path, result: str) -> None:
     target = tmp_path / "target"
     target.write_text("target")
@@ -352,6 +353,13 @@ def test_writer_must_leave_one_regular_file(tmp_path: Path, result: str) -> None
         publish_file(tmp_path / "result", write)
 
     assert sorted(path.name for path in tmp_path.iterdir()) == ["target"]
+
+
+def test_writer_that_creates_nothing_is_a_configuration_error(tmp_path: Path) -> None:
+    with pytest.raises(ConfigurationError, match="writer did not create"):
+        publish_file(tmp_path / "result", lambda path: None)
+
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_writer_hard_link_to_outside_file_is_rejected_without_chmod(tmp_path: Path) -> None:
@@ -437,6 +445,7 @@ def test_precommit_failure_preserves_retirement_source(tmp_path: Path, failure: 
 
 @pytest.mark.parametrize("kind", ["missing", "file", "symlink", "fifo"])
 def test_unsafe_retirement_source_is_rejected_before_builder(tmp_path: Path, kind: str) -> None:
+    expected = (ConfigurationError, "does not exist") if kind == "missing" else None
     source = tmp_path / "bundle"
     if kind == "file":
         source.write_text("not a directory")
@@ -447,7 +456,8 @@ def test_unsafe_retirement_source_is_rejected_before_builder(tmp_path: Path, kin
         os.mkfifo(source)
     called: list[object] = []
 
-    with pytest.raises(UnsafeFilesystem, match="not a safe directory"):
+    error, message = expected or (UnsafeFilesystem, "not a safe directory")
+    with pytest.raises(error, match=message):
         publish(tmp_path / "result", called.append, retire=source)
 
     assert called == []
@@ -538,3 +548,62 @@ def test_link_rejects_cross_device_source(tmp_path: Path) -> None:
         source.write_text("value")
         with pytest.raises(CrossDeviceError, match="another filesystem"):
             publish(tmp_path / "result", lambda draft: draft.link(source, "source"))
+
+
+# -- error mapping ---------------------------------------------------------------------------
+needs_permissions = pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permissions")
+
+
+@needs_permissions
+@pytest.mark.parametrize("publisher", ["publish", "publish_file", "Workspace"])
+def test_unwritable_parent_is_a_configuration_error(tmp_path: Path, publisher: str) -> None:
+    parent = tmp_path / "read-only"
+    parent.mkdir()
+    parent.chmod(0o500)
+    destination = parent / "result"
+    try:
+        with pytest.raises(ConfigurationError, match="not a usable location.*Permission denied"):
+            if publisher == "publish":
+                publish(destination, lambda draft: None)
+            elif publisher == "publish_file":
+                publish_file(destination, lambda path: path.write_text("x"))
+            else:
+                with Workspace(destination, identity=b"request"):
+                    pass
+    finally:
+        parent.chmod(0o700)
+
+    assert list(parent.iterdir()) == []
+
+
+def test_overlong_destination_name_is_a_configuration_error(tmp_path: Path) -> None:
+    with pytest.raises(ConfigurationError, match="not a usable location"):
+        publish(tmp_path / ("x" * 300), lambda draft: None)
+
+
+def test_writer_os_errors_propagate_unchanged(tmp_path: Path) -> None:
+    failure = OSError(errno.ENOSPC, "writer ran out of space")
+
+    def write(path: Path) -> None:
+        raise failure
+
+    with pytest.raises(OSError, match="writer ran out of space") as raised:
+        publish_file(tmp_path / "result", write)
+    with pytest.raises(OSError, match="writer ran out of space") as built:
+        publish(tmp_path / "tree", lambda draft: write(draft.path))
+
+    assert raised.value is failure
+    assert built.value is failure
+    assert list(tmp_path.iterdir()) == []
+
+
+@needs_permissions
+def test_member_unreadable_by_its_owner_is_a_configuration_error(tmp_path: Path) -> None:
+    def write(path: Path) -> None:
+        path.write_text("secret")
+        path.chmod(0o200)
+
+    with pytest.raises(ConfigurationError, match="not readable by its owner: result"):
+        publish_file(tmp_path / "result", write)
+
+    assert list(tmp_path.iterdir()) == []

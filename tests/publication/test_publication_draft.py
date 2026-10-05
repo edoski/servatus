@@ -76,7 +76,7 @@ def test_link_rejects_occupied_draft_path(tmp_path: Path) -> None:
         publish(tmp_path / "result", build)
 
 
-@pytest.mark.parametrize("kind", ["missing", "symlink", "fifo", "directory"])
+@pytest.mark.parametrize("kind", ["symlink", "fifo", "directory"])
 def test_link_rejects_unsafe_source_without_leaving_an_entry(tmp_path: Path, kind: str) -> None:
     source = tmp_path / "source"
     if kind == "symlink":
@@ -195,3 +195,48 @@ def test_draft_is_invalid_after_builder_fails(tmp_path: Path) -> None:
         publish(tmp_path / "result", fail)
     with pytest.raises(RuntimeError, match="no longer valid"):
         kept[0].link(source, "late")
+
+
+def test_link_reports_a_missing_source_as_a_configuration_error(tmp_path: Path) -> None:
+    def build(draft: Draft) -> None:
+        with pytest.raises(ConfigurationError, match="hard-link source does not exist"):
+            draft.link(tmp_path / "missing", "value")
+        with pytest.raises(ConfigurationError, match="does not exist"):
+            draft.link_tree(tmp_path / "missing")
+
+    publish(tmp_path / "result", build)
+
+    assert list((tmp_path / "result").iterdir()) == []
+
+
+@pytest.mark.parametrize("case", ["contains-draft", "is-draft", "contains-destination"])
+def test_link_tree_rejects_a_source_containing_its_draft(tmp_path: Path, case: str) -> None:
+    # Regression: linking a tree that contains the stage recursed into its own output.
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data/value").write_text("x")
+
+    def build(draft: Draft) -> None:
+        if case == "contains-draft":
+            draft.link_tree(tmp_path, "all")
+        elif case == "is-draft":
+            draft.link_tree(draft.path, "copy")
+        else:
+            (draft.path / "outer").mkdir()
+            draft.link_tree(draft.path / "outer", "outer/inner")
+
+    with pytest.raises(ConfigurationError, match="contains the draft"):
+        publish(tmp_path / "snapshot", build)
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["data"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permissions")
+def test_linked_file_unreadable_by_its_owner_is_a_configuration_error(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.write_text("secret")
+    source.chmod(0o200)
+
+    with pytest.raises(ConfigurationError, match="not readable by its owner: value"):
+        publish(tmp_path / "result", lambda draft: draft.link(source, "value"))
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["source"]

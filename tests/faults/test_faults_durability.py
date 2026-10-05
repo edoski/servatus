@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
 import stat
@@ -11,6 +12,7 @@ from typing import Any
 import pytest
 
 from servatus import _fs
+from servatus.errors import Unavailable, UnsafeFilesystem
 from servatus.publication import Draft, Workspace, publish, publish_file
 
 Sync = Callable[[int], None]
@@ -98,9 +100,9 @@ def test_post_commit_parent_sync_failure_propagates_without_stage_residue(
 
     syscalls.on_sync(fail)
 
-    with pytest.raises(OSError, match="post-commit parent sync failure"):
+    with pytest.raises(Unavailable, match="post-commit parent sync failure"):
         publish(destination, lambda draft: (draft.path / "value").write_text("complete"))
-    with pytest.raises(OSError, match="post-commit parent sync failure"):
+    with pytest.raises(Unavailable, match="post-commit parent sync failure"):
         publish_file(tmp_path / "file", lambda path: path.write_text("complete"))
 
     assert (destination / "value").read_text() == "complete"
@@ -229,7 +231,7 @@ def test_parent_sync_failure_prevents_identity_and_allows_resume(
         real(fd)
 
     syscalls.on_sync(fail)
-    with pytest.raises(OSError, match="parent sync failure"), workspace:
+    with pytest.raises(Unavailable, match="parent sync failure"), workspace:
         pytest.fail("undurable work was exposed")
     assert not (workspace.path.parent / ".identity").exists()
 
@@ -269,7 +271,7 @@ def test_identity_initialization_failure_allows_same_identity_resume(
 
     syscalls.on_sync(fail_first)
     with (
-        pytest.raises(OSError, match="identity sync failure"),
+        pytest.raises(Unavailable, match="identity sync failure"),
         Workspace(tmp_path / "result", identity=b"request"),
     ):
         pass
@@ -289,10 +291,66 @@ def test_identity_commit_sync_failure_removes_identity_stage(tmp_path: Path, sys
 
     syscalls.on_sync(fail_after_identity)
     with (
-        pytest.raises(OSError, match="identity commit sync failure"),
+        pytest.raises(Unavailable, match="identity commit sync failure"),
         Workspace(tmp_path / "result", identity=b"request"),
     ):
         pass
 
     (container,) = tmp_path.glob(".servatus-*")
     assert list(container.glob(".identity-*")) == []
+
+
+# -- substitution after pinning and error mapping ----------------------------------------------
+def test_member_swapped_after_it_was_pinned_is_never_published(
+    tmp_path: Path, syscalls: Any
+) -> None:
+    written: list[Path] = []
+
+    def swap(real: Sync, fd: int) -> None:
+        if written and stat.S_ISREG(os.fstat(fd).st_mode) and not (tmp_path / "moved").exists():
+            written[0].rename(tmp_path / "moved")
+            written[0].write_text("impostor")
+        real(fd)
+
+    syscalls.on_sync(swap)
+
+    def write(path: Path) -> None:
+        path.write_text("verified")
+        written.append(path)
+
+    with pytest.raises(UnsafeFilesystem, match="substituted"):
+        publish_file(tmp_path / "result", write)
+
+    assert not (tmp_path / "result").exists()
+    assert (tmp_path / "moved").read_text() == "verified"
+
+
+@pytest.mark.parametrize("code", [errno.ENOSPC, errno.EIO, errno.EDQUOT])
+def test_transient_write_failures_are_unavailable(tmp_path: Path, syscalls: Any, code: int) -> None:
+    def write(real: Callable[..., int], fd: int, data: Any) -> int:
+        raise OSError(code, os.strerror(code))
+
+    syscalls.os("write", write)
+
+    with (
+        pytest.raises(Unavailable, match="retry later") as raised,
+        Workspace(tmp_path / "result", identity=b"request"),
+    ):
+        pass
+
+    assert isinstance(raised.value.__cause__, OSError)
+    assert raised.value.__cause__.errno == code
+
+
+def test_descriptor_exhaustion_is_unavailable(tmp_path: Path, syscalls: Any) -> None:
+    def open_(real: Callable[..., int], path: Any, *args: Any, **kwargs: Any) -> int:
+        if str(path).startswith(".servatus-stage-"):
+            raise OSError(errno.EMFILE, os.strerror(errno.EMFILE))
+        return real(path, *args, **kwargs)
+
+    syscalls.os("open", open_)
+
+    with pytest.raises(Unavailable, match="Too many open files"):
+        publish(tmp_path / "result", lambda draft: None)
+
+    assert list(tmp_path.iterdir()) == []
