@@ -376,8 +376,9 @@ def decode(data: bytes) -> State:
                 for item in document.attempts
             ),
         )
+        canonical = encode(state) == data
     except (ValueError, TypeError, ConfigurationError) as error:
         raise CorruptState(f"invalid campaign state: {error}") from None
-    if encode(state) != data:
+    if not canonical:
         raise CorruptState("campaign state is not canonically encoded")
     return state

@@ -82,7 +82,7 @@ def digest(value: object) -> str:
 
 
 def decode_json(data: bytes) -> object:
-    """Parse JSON, rejecting duplicate object keys."""
+    """Parse strict JSON, rejecting duplicate object keys, NaN/Infinity, and runaway nesting."""
 
     def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
         result: dict[str, object] = {}
@@ -92,9 +92,12 @@ def decode_json(data: bytes) -> object:
             result[name] = item
         return result
 
+    def constant(name: str) -> object:
+        raise CodecError(f"non-standard JSON constant {name}")
+
     try:
-        return json.loads(data.decode("utf-8"), object_pairs_hook=pairs)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        return json.loads(data.decode("utf-8"), object_pairs_hook=pairs, parse_constant=constant)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
         raise CodecError("document is not valid UTF-8 JSON") from error
 
 
