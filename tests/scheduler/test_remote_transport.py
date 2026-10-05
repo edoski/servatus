@@ -15,7 +15,7 @@ from support.builders import target
 
 import servatus.campaign._remote as _remote
 from servatus.campaign._evidence import AllocationState, JobRef
-from servatus.campaign._remote import Completed, Local, Ssh, connect
+from servatus.campaign._remote import Completed, Local, Ssh, after_marker, connect
 from servatus.campaign._scheduler import Scheduler
 from servatus.campaign._script import check_command
 from servatus.errors import ConfigurationError, Unavailable
@@ -92,6 +92,15 @@ def test_check_command_accepts_the_largest_permitted_command() -> None:
     argv = ("/bin/echo", *["x" * 4095] * 3, "y" * (16 * 1024 - 3 * 4096 - 11))
     assert check_command(argv) == argv
     assert check_command(("/bin/echo", "x" * 4096)) == ("/bin/echo", "x" * 4096)
+
+
+def test_stdout_bounds_and_markers_at_their_edges() -> None:
+    assert Local().run(("/usr/bin/true",), max_stdout=0) == Completed(0, b"", b"")
+    with pytest.raises(ConfigurationError, match="max_stdout must be a non-negative integer"):
+        Local().run(("/usr/bin/true",), max_stdout=True)
+    assert after_marker(b"servatus-m\nreply", "servatus-m") == b"reply"
+    with pytest.raises(Unavailable, match="marker missing"):
+        after_marker(b"servatus-m", "servatus-m")
 
 
 def test_bound_violations_never_spawn(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -309,6 +309,23 @@ def test_terminal_accounting_carries_exit_code_times_and_reason() -> None:
     )
 
 
+def test_times_missing_from_the_chosen_row_come_from_accounting() -> None:
+    queue = squeue_row("COMPLETING")
+    history = sacct_row("RUNNING", start="2030-01-01T12:01:00", end="2030-01-01T12:09:00")
+    result = evidence(queue, history)
+    assert (result.raw_state, result.started_at, result.ended_at) == (
+        "COMPLETING",
+        "2030-01-01T12:01:00",
+        "2030-01-01T12:09:00",
+    )
+
+
+@pytest.mark.parametrize("cluster", [5, b"alpha", "two words"])
+def test_job_references_need_a_token_cluster(cluster: object) -> None:
+    with pytest.raises(ConfigurationError, match="cluster must be one safe site token"):
+        JobRef(1, cluster)  # pyright: ignore[reportArgumentType]
+
+
 @pytest.mark.parametrize(
     ("queue", "accounting", "state", "raw", "retained"),
     [

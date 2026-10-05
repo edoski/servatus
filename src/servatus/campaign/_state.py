@@ -293,7 +293,7 @@ def correct_outcome(state: State, allocation_id: str, job: JobRef) -> State:
     Attempt already names one of its Tasks (that history cannot be rewritten).
     """
     attempt = state.attempt(allocation_id)
-    if attempt.acceptance is AcceptanceState.ACCEPTED and attempt.job == job:
+    if attempt.job == job:
         return state
     if attempt.acceptance is not AcceptanceState.NOT_SUBMITTED:
         raise Conflict(f"allocation {allocation_id} is not recorded as not submitted")

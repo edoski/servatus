@@ -60,7 +60,6 @@ Connect = Callable[[Target], Transport]
 """Given a Target, return the Transport that reaches its scheduler."""
 Clock = Callable[[], datetime]
 
-MAX_LOG_BYTES = 1024 * 1024
 _ACCEPTED = AcceptanceState.ACCEPTED
 _PRIVATE = object()
 
@@ -236,12 +235,11 @@ class Campaign:
     def read_log(
         self, *, task: str | None = None, allocation: str | None = None, max_bytes: int = 65_536
     ) -> LogSnapshot:
-        """The last ``max_bytes`` (1 B to 1 MiB) of an allocation log, or of one Task's step log.
+        """The last ``max_bytes`` (1 B to 1 MiB, checked before any contact) of an allocation
+        log, or of one Task's step log.
 
         ``task`` alone reads that Task's step log in its current accepted allocation.
         """
-        if type(max_bytes) is not int or not 1 <= max_bytes <= MAX_LOG_BYTES:
-            raise ConfigurationError(f"max_bytes must be an integer from 1 to {MAX_LOG_BYTES}")
         if task is None and allocation is None:
             raise ConfigurationError("read_log needs a task, an allocation, or both")
         state = self._store.read()
