@@ -18,7 +18,6 @@ from ._evidence import (
     Expectation,
     JobRef,
     Observation,
-    StepEvidence,
     combine,
     is_missing_reply,
     parse_accounting,
@@ -161,25 +160,26 @@ class Scheduler:
             active = parse_active(b"", expected, cluster)
         else:
             active = parse_active(_require_ok(squeue, "squeue").stdout, expected, cluster)
-        sacct = self._transport.run(
-            (
-                self._command("sacct"),
-                "--noheader",
-                "--parsable2",
+        names = ",".join(item.identity for item in expected.values())
+        window = ("--starttime", earliest, route)
+        history = parse_accounting(
+            self._sacct(
                 "--allocations",
                 "--duplicates",
                 "--jobs",
                 jobs,
                 "--name",
-                ",".join(item.identity for item in expected.values()),
-                "--starttime",
-                earliest,
-                route,
+                names,
+                *window,
                 SACCT_ALLOCATION_FORMAT,
-            )
+            ),
+            expected,
+            cluster,
         )
-        history = parse_accounting(_require_ok(sacct, "sacct").stdout, expected, cluster)
-        steps = self._steps(expected, jobs, earliest, route)
+        try:  # step evidence is best effort: any failure leaves it unavailable
+            steps = parse_steps(self._sacct("--jobs", jobs, *window, SACCT_STEP_FORMAT), expected)
+        except (Unavailable, EvidenceConflict):
+            steps = None
         return {
             item.allocation_id: Observation(
                 combine(item, active[job], history[job]),
@@ -188,27 +188,10 @@ class Scheduler:
             for job, item in expected.items()
         }
 
-    def _steps(
-        self, expected: dict[int, Expectation], jobs: str, earliest: str, route: str
-    ) -> dict[int, tuple[StepEvidence | None, ...]] | None:
-        """Per-step evidence, or ``None`` (unavailable) when the step query fails in any way."""
-        try:
-            completed = self._transport.run(
-                (
-                    self._command("sacct"),
-                    "--noheader",
-                    "--parsable2",
-                    "--jobs",
-                    jobs,
-                    "--starttime",
-                    earliest,
-                    route,
-                    SACCT_STEP_FORMAT,
-                )
-            )
-            return parse_steps(_require_ok(completed, "sacct").stdout, expected)
-        except (Unavailable, EvidenceConflict):
-            return None
+    def _sacct(self, *arguments: str) -> bytes:
+        """The checked stdout of ``sacct --noheader --parsable2 <arguments>``."""
+        argv = (self._command("sacct"), "--noheader", "--parsable2", *arguments)
+        return _require_ok(self._transport.run(argv), "sacct").stdout
 
     def identify(self, allocation_id: str, intent_at: datetime) -> JobRef:
         """The one job Slurm holds for an allocation, else ``ReconciliationError``."""
@@ -230,24 +213,18 @@ class Scheduler:
             (self._command("squeue"), "--noheader", "--name", identity, "--format=%i|%j|%k")
         )
         _require_ok(squeue, "squeue")
-        sacct = self._transport.run(
-            (
-                self._command("sacct"),
-                "--noheader",
-                "--parsable2",
-                "--allocations",
-                "--duplicates",
-                "--name",
-                identity,
-                "--starttime",
-                start,
-                "--endtime",
-                end,
-                SACCT_IDENTITY_FORMAT,
-            )
+        history = self._sacct(
+            "--allocations",
+            "--duplicates",
+            "--name",
+            identity,
+            "--starttime",
+            start,
+            "--endtime",
+            end,
+            SACCT_IDENTITY_FORMAT,
         )
-        _require_ok(sacct, "sacct")
-        return parse_identity(squeue.stdout, sacct.stdout, identity)
+        return parse_identity(squeue.stdout, history, identity)
 
     def tail(self, path: PurePosixPath, max_bytes: int) -> tuple[bytes, bool]:
         """The last ``max_bytes`` of a remote file and whether earlier bytes exist.

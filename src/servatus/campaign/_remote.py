@@ -32,6 +32,7 @@ DEADLINE_SECONDS = 30.0
 NOISE_ALLOWANCE = 64 * 1024
 
 _PATH = "/usr/bin:/bin"
+_SSH_OPTIONS = ("-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "--")
 _REMOTE_ENV = ("PATH=" + _PATH, "LANG=C", "LC_ALL=C", "TZ=UTC")
 _LOCAL_ENV = {"PATH": _PATH, "LANG": "C", "LC_ALL": "C", "TZ": "UTC"}
 # What the ssh client needs to find its configuration, agent, and Kerberos (GSSAPI) credentials.
@@ -92,17 +93,7 @@ class Ssh:
             f"exec /usr/bin/env -i {' '.join(_REMOTE_ENV)} {shlex.join(fields)}"
         )
         remote = shlex.join(("/bin/sh", "-c", script))
-        command = (
-            *self.command,
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "LogLevel=ERROR",
-            "--",
-            self.host,
-            remote,
-        )
+        command = (*self.command, *_SSH_OPTIONS, self.host, remote)
         allowance = NOISE_ALLOWANCE + len(marker) + 1
         raw = run_bounded(
             command,
