@@ -347,7 +347,10 @@ def write_new(dir_fd: int, name: str, data: bytes, *, mode: int = 0o600) -> os.s
         os.fchmod(fd, checked)
         view = memoryview(data)
         while view:
-            view = view[os.write(fd, view) :]
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError(errno.EIO, f"write made no progress: {name}")
+            view = view[written:]
         sync(fd)
         return os.fstat(fd)
     except BaseException:

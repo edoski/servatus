@@ -118,10 +118,10 @@ def test_explicit_retry_of_accepted_work(
         assert selection.retry == (KEY,) and selection.duplicate_risk == ()
 
 
-def test_accepted_work_is_finished_unless_retry_is_requested() -> None:
+def test_accepted_work_is_submitted_unless_retry_is_requested() -> None:
     for evidence in (None, observed(S.RUNNING), observed(S.FAILED), observed(S.UNKNOWN)):
         state, observations = once(evidence)
-        assert outcome(choose(state, observations)) == Hold.FINISHED
+        assert outcome(choose(state, observations)) == Hold.SUBMITTED
         assert observation_scope(state) == ()
 
 
@@ -218,8 +218,8 @@ def test_acknowledgement_requires_explicit_retry() -> None:
     [
         (observed(S.FAILED), "retry"),
         (observed(S.CANCELLED), "retry"),
-        (observed(S.SUCCEEDED), Hold.FINISHED),
-        (observed(S.FAILED, steps=(step(S.SUCCEEDED),)), Hold.FINISHED),
+        (observed(S.SUCCEEDED), Hold.SUBMITTED),
+        (observed(S.FAILED, steps=(step(S.SUCCEEDED),)), Hold.SUBMITTED),
         (observed(S.SUCCEEDED, steps=(step(S.FAILED),)), "retry"),
         (observed(S.SUCCEEDED, steps=(step(S.CANCELLED),)), "retry"),
         (observed(S.FAILED, steps=(None,)), "retry"),
@@ -241,7 +241,7 @@ def test_retry_failed_judges_the_latest_accepted_attempt() -> None:
     state, first = submit(roster(1), [KEY])
     state, second = submit(state, [KEY])
     evidence = {first: observed(S.FAILED), second: observed(S.SUCCEEDED)}
-    assert outcome(choose(state, evidence, retry=Retry.FAILED)) == Hold.FINISHED
+    assert outcome(choose(state, evidence, retry=Retry.FAILED)) == Hold.SUBMITTED
     evidence = {first: observed(S.SUCCEEDED), second: observed(S.CANCELLED)}
     assert outcome(choose(state, evidence, retry=Retry.FAILED)) == "retry"
 
@@ -278,7 +278,7 @@ def test_bulk_selection_mixes_fresh_and_resubmitted_work_in_roster_order() -> No
     selection = choose(state, evidence, retry=Retry.FAILED)
     assert selection.selected == ("task-0", "task-1", "task-3")
     assert selection.retry == ("task-1", "task-3")
-    assert dict(selection.held) == {"task-2": Hold.FINISHED}
+    assert dict(selection.held) == {"task-2": Hold.SUBMITTED}
     with pytest.raises(TypeError, match="does not support item assignment"):
         selection.held["x"] = Hold.VALID  # pyright: ignore[reportIndexIssue]
 

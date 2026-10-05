@@ -22,9 +22,10 @@ import fcntl
 import os
 import stat
 from collections.abc import Callable, Generator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from pathlib import Path
 
+from .._fs import replace_file, sync
 from ..errors import ConfigurationError, Conflict, CorruptState, NotFound, UnsafeFilesystem
 from ._config import StrPath
 from ._state import State, decode, encode
@@ -71,7 +72,7 @@ class Store:
             except FileExistsError:
                 pass
             else:
-                os.fsync(parent)
+                sync(parent)
             descriptor = _open_directory(location.name, parent)
         finally:
             os.close(parent)
@@ -158,38 +159,6 @@ class Store:
             )
         replace_file(descriptor, STATE_NAME, data)
         self._cache = (data, state)
-
-
-def replace_file(dir_fd: int, name: str, data: bytes, *, mode: int = 0o600) -> None:
-    """Atomically replace ``name`` in ``dir_fd`` with ``data`` and make the change durable.
-
-    The bytes go to a fresh exclusive stage file that is fully written and synced, renamed over
-    ``name``, and followed by a directory sync. Before the rename, any failure removes the stage
-    and leaves ``name`` untouched; after it, the new content is visible even if the directory
-    sync fails.
-    """
-    stage = f".{name}.{os.urandom(8).hex()}.tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
-    renamed = False
-    try:
-        handle = os.open(stage, flags, mode, dir_fd=dir_fd)
-        try:
-            view = memoryview(data)
-            while view:
-                written = os.write(handle, view)
-                if written <= 0:
-                    raise OSError(errno.EIO, "campaign state write made no progress")
-                view = view[written:]
-            os.fsync(handle)
-        finally:
-            os.close(handle)
-        os.rename(stage, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-        renamed = True
-        os.fsync(dir_fd)
-    finally:
-        if not renamed:
-            with suppress(FileNotFoundError):
-                os.unlink(stage, dir_fd=dir_fd)
 
 
 def _location(path: StrPath) -> Path:

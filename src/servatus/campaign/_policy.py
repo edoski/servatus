@@ -7,8 +7,9 @@ this order:
 2. The result probe said VALID: ``VALID``. Valid work is never resubmitted.
 3. An Attempt naming the Task has unresolved acceptance: ``UNRESOLVED``. Reconcile it first.
 4. No accepted Attempt has ever named the Task: selected as fresh work.
-5. Resubmission was not requested for the Task: ``FINISHED``. Its scheduler state is not
-   consulted, so plans without retries do not depend on (or observe) scheduler evidence.
+5. The Task has accepted work and resubmission was not requested for it: ``SUBMITTED``. Its
+   scheduler state is not consulted (the work may still be queued, running, or long finished),
+   so plans without retries do not depend on (or observe) scheduler evidence.
 6. Any accepted Attempt is queued, running, or retained by the scheduler: ``ACTIVE``.
 7. Any accepted Attempt lacks scheduler evidence: ``UNOBSERVABLE``.
 8. Otherwise every accepted Attempt is terminal or UNKNOWN, and the retry selector decides.
@@ -44,12 +45,19 @@ from ._status import ResultState, task_execution
 
 
 class Hold(StrEnum):
-    """Why a plan does not submit a Task."""
+    """Why a plan does not submit a Task.
+
+    ``VALID``: the probe reports a valid result. ``UNRESOLVED``: an intent has no recorded
+    outcome. ``ACTIVE``: the scheduler still holds earlier work. ``SUBMITTED``: the Task has
+    accepted work and was not selected for retry (its scheduler state was not consulted).
+    ``UNOBSERVABLE``: evidence for earlier work is missing or unknown. ``NOT_REQUESTED``:
+    excluded by ``only``.
+    """
 
     VALID = "VALID"
     UNRESOLVED = "UNRESOLVED"
     ACTIVE = "ACTIVE"
-    FINISHED = "FINISHED"
+    SUBMITTED = "SUBMITTED"
     UNOBSERVABLE = "UNOBSERVABLE"
     NOT_REQUESTED = "NOT_REQUESTED"
 
@@ -181,7 +189,7 @@ def decide(
                 selected.append(key)
             continue
         if explicit is not None and not named:
-            held[key] = Hold.FINISHED
+            held[key] = Hold.SUBMITTED
             continue
         hold, unknown, current = _assess(history, observations)
         if hold is not None:
@@ -199,7 +207,7 @@ def decide(
                 selected.append(key)
                 retried.append(key)
             else:
-                held[key] = Hold.FINISHED
+                held[key] = Hold.SUBMITTED
         elif result is ResultState.MISSING:
             selected.append(key)
             retried.append(key)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
@@ -7,20 +8,38 @@ import stat
 import subprocess
 import sys
 import textwrap
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
 from core_helpers import CAMPAIGN_ID, reencode, roster, submit
 from support.builders import tasks
 
+from servatus._fs import replace_file
 from servatus.campaign import _store
 from servatus.campaign._config import Task
 from servatus.campaign._state import State, append, decode, encode, seal
-from servatus.campaign._store import Store, replace_file
+from servatus.campaign._store import Store
 from servatus.errors import ConfigurationError, Conflict, CorruptState, NotFound, UnsafeFilesystem
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(autouse=True)
+def plain_fsync(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Behave like a filesystem without ``F_FULLFSYNC`` so every durability request reaches
+    ``os.fsync`` exactly once, where these tests observe and inject faults."""
+    full_sync: int | None = getattr(fcntl, "F_FULLFSYNC", None)
+    real = fcntl.fcntl
+
+    def without_full_sync(descriptor: int, command: int, *args: int) -> object:
+        if command == full_sync:
+            raise OSError(errno.ENOTSUP, "F_FULLFSYNC disabled by the test")
+        return real(descriptor, command, *args)
+
+    if full_sync is not None:
+        monkeypatch.setattr(fcntl, "fcntl", without_full_sync)
+    yield
 
 
 def created(tmp_path: Path, state: State | None = None) -> tuple[Path, Store]:
