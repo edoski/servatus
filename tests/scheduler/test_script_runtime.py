@@ -38,7 +38,7 @@ while args and args[0].startswith("--"):
 config = json.load(open({config!r}))
 name = next(item.split("=", 1)[1] for item in options if item.startswith("--job-name="))
 with open(os.path.join(config["dir"], name + ".srun.json"), "w") as handle:
-    json.dump({{"options": options}}, handle)
+    json.dump({{"options": options, "path": os.environ.get("PATH")}}, handle)
 if any(item.startswith("--gres=") for item in options) and not config["no_gpu"]:
     os.environ["CUDA_VISIBLE_DEVICES"] = "GPU-step-" + name.rsplit("-", 1)[1]
 else:
@@ -206,6 +206,8 @@ def test_steps_receive_exact_stdin_argv_and_environment(
         ]
         assert f"--job-name=servatus-{ALLOCATION}-{slot}" in options
         assert "--export=ALL" in options
+        # --export=NIL leaves no PATH; Apptainer --nv locates the host NVIDIA files on it.
+        assert step["path"] == "/usr/bin:/bin"
         assert ("--gres=gpu:a100:1" in options) == bool(gpus)
         if container:
             launch = json.loads((runtime.records / f"apptainer-{slot}.json").read_text())

@@ -150,6 +150,9 @@ _PRELUDE = (
     "#!/bin/sh",
     "set -u",
     "umask 077",
+    # --export=NIL leaves no PATH, and Apptainer's --nv finds the host NVIDIA binaries and
+    # libraries (nvidia-smi, MPS, libcuda) on it; without one it binds nothing.
+    "export PATH=/usr/bin:/bin",
     "pids=",
     "interrupt() {",
     "  trap '' HUP INT TERM",

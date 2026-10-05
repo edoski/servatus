@@ -6,6 +6,12 @@ All notable changes to Servatus are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Batch scripts export `PATH=/usr/bin:/bin`. Under `--export=NIL` they had none, so Apptainer's
+  `--nv` bound no host NVIDIA files: GPU Tasks could not reach `nvidia-smi` or an MPS daemon,
+  and CUDA used whatever `libcuda` the image carried.
+
 ## [0.12.0] - 2026-10-05
 
 A clean break: no compatibility aliases and no migration of earlier campaign state. See

@@ -342,7 +342,8 @@ In Python these are `Target`, `Apptainer`, `Resources`, and `Profile`;
 `work_root`, so the Task's `args` run directly and the image's runscript is ignored (a relative
 `args[0]` resolves on the container's `PATH`; empty `args` fail at planning). `work_root` plus
 `binds` are mounted and the Task's `env` passed as `APPTAINERENV_*`; GPU steps get `--nv` and
-Slurm's step-local `CUDA_VISIBLE_DEVICES`. Without Apptainer, each step runs the Task's absolute
+Slurm's step-local `CUDA_VISIBLE_DEVICES`. The batch script sets `PATH=/usr/bin:/bin`, which
+`--nv` needs to find the host's `nvidia-smi`, MPS daemon and `libcuda`. Without Apptainer, each step runs the Task's absolute
 `args[0]` under `env -i` with the same variables. Either way, Task stdin and environment are
 written into the batch script and are visible to cluster administrators: never put secrets in
 Tasks.

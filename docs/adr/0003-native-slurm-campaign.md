@@ -46,7 +46,9 @@ escalates a request, emits job-level exclusivity, or accepts raw Slurm options. 
 rounded up once to whole minutes. Target ceilings prevent user mistakes but do not replace cluster
 policy.
 
-Each allocation starts one `srun --exclusive --exact --nodes=1 --ntasks=1` step per Task, named
+The script exports `PATH=/usr/bin:/bin` first: `--export=NIL` leaves none, and Apptainer's `--nv`
+finds the host NVIDIA binaries and libraries on it. Each allocation starts one
+`srun --exclusive --exact --nodes=1 --ntasks=1` step per Task, named
 `servatus-<allocation_id>-<slot>` with `--job-name`. Each step's stdin is a single-quoted `printf`
 literal piped into `srun`: printable ASCII verbatim, every other byte as `\ooo`. The script needs
 no scratch directory, `mktemp`, `base64`, or cleanup. Every step receives the Task environment plus
