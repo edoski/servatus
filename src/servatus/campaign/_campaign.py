@@ -19,8 +19,10 @@ from ..errors import (
     Conflict,
     NotFound,
     PlanRefused,
+    ReconciliationError,
     StalePlan,
     SubmissionInterrupted,
+    Unavailable,
 )
 from ._config import Profile, StrPath, Target, Task
 from ._evidence import JobRef, Observation
@@ -43,6 +45,7 @@ from ._state import (
     Attempt,
     State,
     append,
+    correct_outcome,
     create,
     record_intent,
     record_outcome,
@@ -379,16 +382,14 @@ class Campaign:
         scheduler.ping()
         self._still_eligible(plan)
         receipts: list[Receipt] = []
-        expected = plan.revision
+        expected: int | None = plan.revision
         for index, item in enumerate(plan.allocations):
             later = plan.allocations[index + 1 :]
             unresolved = (UnresolvedSubmission(item.allocation_id, item.task_keys),)
             try:
-                expected = self._claim(plan, item, expected)
+                claimed = self._claim(plan, item, expected)
             except Exception as error:
-                if self._recorded(
-                    item.allocation_id
-                ):  # durable, though the commit reported failure
+                if self._recorded(item.allocation_id):  # durable, though the commit failed
                     stop = "recording the intent failed after it became durable"
                     raise _interrupted(stop, error, receipts, unresolved, later) from error
                 stop = "the next intent was not recorded"
@@ -399,11 +400,21 @@ class Campaign:
                 stop = "scheduler acceptance is unresolved"
                 raise _interrupted(stop, error, receipts, unresolved, later) from error
             try:
-                receipts.append(self._resolve(item.allocation_id, job))
+                state = self._resolve(item.allocation_id, job)
             except Exception as error:
+                if (receipt := self._durable_receipt(item.allocation_id, job)) is not None:
+                    receipts.append(receipt)
+                    stop = "recording the receipt failed after it became durable"
+                    raise _interrupted(stop, error, receipts, (), later) from error
                 stop = f"Slurm accepted job {job} but recording the receipt failed"
                 observed = UnresolvedSubmission(item.allocation_id, item.task_keys, job)
                 raise _interrupted(stop, error, receipts, (observed,), later) from error
+            attempt = state.attempt(item.allocation_id)
+            receipts.append(_receipt(attempt))
+            # Continue only if this receipt is the one change since the intent; any other
+            # change makes the next claim stale.
+            unchanged = attempt.outcome_revision == state.revision == claimed + 1
+            expected = state.revision if unchanged else None
         return SubmitResult(tuple(receipts))
 
     def reconcile(self, allocation_id: str) -> Receipt:
@@ -415,16 +426,50 @@ class Campaign:
             raise Conflict(f"allocation {allocation_id} is recorded as not submitted")
         target = attempt.profile.target
         job = self._scheduler(target).identify(allocation_id, attempt.intent_at)
-        return self._resolve(allocation_id, job)
+        return _receipt(self._resolve(allocation_id, job).attempt(allocation_id))
 
     def mark_accepted(
         self, allocation_id: str, job_id: int, *, cluster: str | None = None
     ) -> Receipt:
-        """Record a job the operator found for an unresolved allocation."""
-        return self._resolve(allocation_id, JobRef(job_id, cluster))
+        """Record a job the operator found for an unresolved allocation.
+
+        An allocation already recorded as not submitted is corrected only when its original
+        target proves that exactly this job carries the allocation's identity.
+        """
+        job = JobRef(job_id, cluster)
+        attempt = self._store.read().attempt(allocation_id)
+        if attempt.acceptance is not AcceptanceState.NOT_SUBMITTED:
+            return _receipt(self._resolve(allocation_id, job).attempt(allocation_id))
+        scheduler = self._scheduler(attempt.profile.target)
+        try:
+            found = scheduler.identify(allocation_id, attempt.intent_at)
+        except ReconciliationError as error:
+            found, detail = None, str(error)
+        else:
+            detail = f"Slurm holds job {found}"
+        if found != job:
+            raise Conflict(
+                f"allocation {allocation_id} is recorded as not submitted and Slurm does not "
+                f"prove job {job} for it ({detail})"
+            )
+        state = self._store.update(lambda current: correct_outcome(current, allocation_id, job))
+        return _receipt(state.attempt(allocation_id))
 
     def mark_not_submitted(self, allocation_id: str) -> None:
-        """Record that an unresolved allocation never reached Slurm."""
+        """Record that an unresolved allocation never reached Slurm, once Slurm proves it.
+
+        The original target is asked first. ``Conflict`` when any job carries the allocation's
+        identity (record it with ``reconcile`` or ``mark_accepted`` instead); a failed query
+        raises ``Unavailable`` and records nothing.
+        """
+        attempt = self._store.read().attempt(allocation_id)
+        if attempt.acceptance is AcceptanceState.UNRESOLVED:
+            scheduler = self._scheduler(attempt.profile.target)
+            if found := scheduler.find(allocation_id, attempt.intent_at):
+                raise Conflict(
+                    f"Slurm holds job {', '.join(map(str, found))} for allocation "
+                    f"{allocation_id}; record it with reconcile or mark-accepted instead"
+                )
         self._store.update(lambda state: record_outcome(state, allocation_id, None))
 
     def cancel(
@@ -455,13 +500,22 @@ class Campaign:
             chosen.update((item.allocation_id, _receipt(item)) for item in owned)
         observations = self._observe(state, tuple(chosen))
         cancelled: list[Receipt] = []
+        failed: list[str] = []
         for attempt in state.attempts:
             receipt = chosen.get(attempt.allocation_id)
             evidence = observations[attempt.allocation_id].allocation if receipt else None
             if receipt is None or (evidence and evidence.state.terminal and not evidence.retained):
                 continue
-            self._scheduler(attempt.profile.target).cancel(attempt.allocation_id, receipt.job)
-            cancelled.append(receipt)
+            scheduler = self._scheduler(attempt.profile.target)
+            try:
+                scheduler.cancel(attempt.allocation_id, receipt.job)
+            except Unavailable as error:
+                failed.append(f"{attempt.allocation_id} ({error})")
+            else:
+                cancelled.append(receipt)
+        if failed:
+            done = ", ".join(item.allocation_id for item in cancelled) or "none"
+            raise Unavailable(f"cancel failed for {'; '.join(failed)}; cancelled: {done}")
         return tuple(cancelled)
 
     # --- Internals ----------------------------------------------------------------------------
@@ -547,12 +601,15 @@ class Campaign:
             )
             raise StalePlan(f"planned Tasks are no longer eligible: {held}; plan again")
 
-    def _claim(self, plan: Plan, item: PlannedAllocation, expected: int) -> int:
-        """Record intent if the campaign is still at ``expected``; return the next expectation."""
+    def _claim(self, plan: Plan, item: PlannedAllocation, expected: int | None) -> int:
+        """Record intent if the campaign is still at ``expected``; return the committed revision.
+
+        ``expected`` is None once the campaign is known to have changed during submission.
+        """
         keys = item.task_keys
 
         def claim(state: State) -> State:
-            if state.revision != expected:
+            if expected is None or state.revision != expected:
                 raise StalePlan("the campaign changed during submission; plan again")
             changed, _ = record_intent(
                 state,
@@ -565,7 +622,7 @@ class Campaign:
             )
             return changed
 
-        return self._store.update(claim).revision + 1
+        return self._store.update(claim).revision
 
     def _recorded(self, allocation_id: str) -> bool:
         """Whether an intent is durable; an unreadable campaign counts as recorded."""
@@ -574,6 +631,14 @@ class Campaign:
         except Exception:
             return True
 
-    def _resolve(self, allocation_id: str, job: JobRef) -> Receipt:
-        state = self._store.update(lambda current: record_outcome(current, allocation_id, job))
-        return _receipt(state.attempt(allocation_id))
+    def _durable_receipt(self, allocation_id: str, job: JobRef) -> Receipt | None:
+        """The receipt, if acceptance of ``job`` is durable though its commit reported failure."""
+        try:
+            attempt = self._store.read().attempt(allocation_id)
+        except Exception:
+            return None
+        return _receipt(attempt) if attempt.job == job else None
+
+    def _resolve(self, allocation_id: str, job: JobRef) -> State:
+        """Record acceptance of ``job``; return the committed state."""
+        return self._store.update(lambda state: record_outcome(state, allocation_id, job))

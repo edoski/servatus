@@ -490,16 +490,23 @@ def test_malformed_step_rows_raise_for_the_caller_to_degrade() -> None:
 def test_identity_accepts_absent_accounting_comment_and_adopts_cluster() -> None:
     squeue = f"42|{IDENTITY}|{IDENTITY}\n".encode()
     sacct = f"42|{IDENTITY}||alpha\n42|{IDENTITY}|{IDENTITY}|alpha\n".encode()
-    assert parse_identity(squeue, sacct, IDENTITY) == JobRef(42, "alpha")
-    assert parse_identity(b"", f"42|{IDENTITY}|N/A|\n".encode(), IDENTITY) == JobRef(42)
+    assert parse_identity(squeue, sacct, IDENTITY) == (JobRef(42, "alpha"),)
+    assert parse_identity(b"", f"42|{IDENTITY}|N/A|\n".encode(), IDENTITY) == (JobRef(42),)
+
+
+def test_identity_lists_every_job_or_proves_absence() -> None:
+    assert parse_identity(b"", b"", IDENTITY) == ()
+    squeue = f"43|{IDENTITY}|{IDENTITY}\n".encode()
+    sacct = f"42|{IDENTITY}|{IDENTITY}|alpha\n".encode()
+    assert parse_identity(squeue, sacct, IDENTITY) == (JobRef(42, "alpha"), JobRef(43))
 
 
 @pytest.mark.parametrize(
     ("squeue", "sacct", "message"),
     [
-        ("", "", "0 jobs"),
-        (f"42|{IDENTITY}|{IDENTITY}\n", f"43|{IDENTITY}|{IDENTITY}|alpha\n", "2 jobs"),
         ("42|wrong|wrong\n", "", "unrelated"),
+        (f"42|{IDENTITY}|wrong\n", "", "unrelated"),  # queue rows need both name and comment
+        (f"42|wrong|{IDENTITY}\n", "", "unrelated"),
         (f"42|{IDENTITY}|{IDENTITY}\n", f"42|{IDENTITY}|wrong-identity|alpha\n", "unrelated"),
         (f"42|{IDENTITY}|{IDENTITY}\nmalformed\n", "", "malformed"),
         (f"42|{IDENTITY}|{IDENTITY}\n0|{IDENTITY}|{IDENTITY}\n", "", "invalid job"),
@@ -511,7 +518,7 @@ def test_identity_accepts_absent_accounting_comment_and_adopts_cluster() -> None
         (f"42|{IDENTITY}|{IDENTITY}", "", "partial"),
     ],
 )
-def test_identity_that_is_not_exactly_one_proven_job_is_a_reconciliation_error(
+def test_untrustworthy_identity_replies_are_reconciliation_errors(
     squeue: str, sacct: str, message: str
 ) -> None:
     with pytest.raises(ReconciliationError, match=message):

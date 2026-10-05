@@ -7,11 +7,12 @@ written or read. Transitions are pure functions that return a new ``State``.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field, replace
+from collections.abc import Generator, Iterable, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import cast
+from typing import Any, cast
 
 from ..errors import ConfigurationError, Conflict, CorruptState, NotFound
 from . import _codec
@@ -188,11 +189,18 @@ def check(state: State) -> None:
 # --- Pure transitions ------------------------------------------------------------------------
 
 
-def _changed(state: State, **changes: object) -> State:
+@contextmanager
+def _rejected() -> Generator[None, None, None]:
+    """Report an invariant violation from a transition as ``Conflict``."""
     try:
-        return replace(state, **changes)  # pyright: ignore[reportArgumentType]
+        yield
     except _Invalid as error:
         raise Conflict(f"campaign state change rejected: {error}") from None
+
+
+def _changed(state: State, **changes: object) -> State:
+    with _rejected():
+        return replace(state, **changes)  # pyright: ignore[reportArgumentType]
 
 
 def _unique_tasks(tasks: Iterable[Task]) -> tuple[Task, ...]:
@@ -208,10 +216,8 @@ def create(campaign_id: str, tasks: Iterable[Task], *, appendable: bool) -> Stat
     if type(appendable) is not bool:
         raise ConfigurationError("appendable must be a bool")
     roster = tuple(RegisteredTask(task, 0) for task in _unique_tasks(tasks))
-    try:
+    with _rejected():
         return State(campaign_id, 0, roster, None if appendable else 0)
-    except _Invalid as error:
-        raise Conflict(f"campaign state change rejected: {error}") from None
 
 
 def append(state: State, tasks: Iterable[Task]) -> State:
@@ -244,7 +250,7 @@ def record_intent(
     duplicate_risk: tuple[str, ...],
     at: datetime,
 ) -> tuple[State, Attempt]:
-    try:
+    with _rejected():
         attempt = Attempt(
             allocation_id=allocation_id,
             task_keys=task_keys,
@@ -254,8 +260,6 @@ def record_intent(
             intent_revision=state.revision + 1,
             intent_at=at,
         )
-    except _Invalid as error:
-        raise Conflict(f"campaign state change rejected: {error}") from None
     changed = _changed(
         state, revision=attempt.intent_revision, attempts=state.attempts + (attempt,)
     )
@@ -271,8 +275,37 @@ def record_outcome(state: State, allocation_id: str, job: JobRef | None) -> Stat
         if attempt.acceptance is acceptance and attempt.job == job:
             return state
         raise Conflict(f"allocation {allocation_id} already has a conflicting outcome")
+    return _resolved(state, attempt, job)
+
+
+def correct_outcome(state: State, allocation_id: str, job: JobRef) -> State:
+    """Replace a NOT_SUBMITTED outcome with acceptance of ``job`` at a new revision.
+
+    Only for scheduler proof that the allocation was accepted after all. Identical repeats are
+    idempotent. ``Conflict`` when the Attempt is not recorded as not submitted, or when a later
+    Attempt already names one of its Tasks (that history cannot be rewritten).
+    """
+    attempt = state.attempt(allocation_id)
+    if attempt.acceptance is AcceptanceState.ACCEPTED and attempt.job == job:
+        return state
+    if attempt.acceptance is not AcceptanceState.NOT_SUBMITTED:
+        raise Conflict(f"allocation {allocation_id} is not recorded as not submitted")
+    keys = set(attempt.task_keys)
+    later = state.attempts[state.attempts.index(attempt) + 1 :]
+    if clashes := [item.allocation_id for item in later if keys.intersection(item.task_keys)]:
+        raise Conflict(
+            f"allocation {allocation_id} cannot be marked accepted: later allocations "
+            f"{', '.join(clashes)} already include its Tasks"
+        )
+    return _resolved(state, attempt, job)
+
+
+def _resolved(state: State, attempt: Attempt, job: JobRef | None) -> State:
+    """``state`` with ``attempt``'s outcome recorded at the next revision."""
+    acceptance = AcceptanceState.NOT_SUBMITTED if job is None else AcceptanceState.ACCEPTED
     revision = state.revision + 1
-    resolved = replace(attempt, acceptance=acceptance, job=job, outcome_revision=revision)
+    with _rejected():
+        resolved = replace(attempt, acceptance=acceptance, job=job, outcome_revision=revision)
     attempts = tuple(resolved if item is attempt else item for item in state.attempts)
     return _changed(state, revision=revision, attempts=attempts)
 
@@ -305,6 +338,11 @@ class _StateDocument:
     attempts: tuple[_AttemptDocument, ...]
 
 
+def _fields(value: Attempt | _AttemptDocument, **changes: object) -> dict[str, Any]:
+    """An Attempt or its document as keyword arguments for the other, with ``changes``."""
+    return {item.name: getattr(value, item.name) for item in fields(value)} | changes
+
+
 def profile_key(profile: Profile) -> str:
     return _codec.digest(_codec.dump(profile))[:16]
 
@@ -319,18 +357,7 @@ def encode(state: State) -> bytes:
         tasks=state.roster,
         profiles=profiles,
         attempts=tuple(
-            _AttemptDocument(
-                allocation_id=attempt.allocation_id,
-                task_keys=attempt.task_keys,
-                profile=profile_key(attempt.profile),
-                retry=attempt.retry,
-                duplicate_risk=attempt.duplicate_risk,
-                intent_revision=attempt.intent_revision,
-                intent_at=attempt.intent_at,
-                acceptance=attempt.acceptance,
-                job=attempt.job,
-                outcome_revision=attempt.outcome_revision,
-            )
+            _AttemptDocument(**_fields(attempt, profile=profile_key(attempt.profile)))
             for attempt in state.attempts
         ),
     )
@@ -361,18 +388,7 @@ def decode(data: bytes) -> State:
             roster=document.tasks,
             sealed_revision=document.sealed_revision,
             attempts=tuple(
-                Attempt(
-                    allocation_id=item.allocation_id,
-                    task_keys=item.task_keys,
-                    profile=profiles[item.profile],
-                    retry=item.retry,
-                    duplicate_risk=item.duplicate_risk,
-                    intent_revision=item.intent_revision,
-                    intent_at=item.intent_at,
-                    acceptance=item.acceptance,
-                    job=item.job,
-                    outcome_revision=item.outcome_revision,
-                )
+                Attempt(**_fields(item, profile=profiles[item.profile]))
                 for item in document.attempts
             ),
         )

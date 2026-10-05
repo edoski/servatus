@@ -523,9 +523,13 @@ def parse_steps(
 # --- Identity --------------------------------------------------------------------------------
 
 
-def parse_identity(squeue: bytes, sacct: bytes, identity: str) -> JobRef:
-    """Prove exactly one job for ``identity`` from ``squeue --format=%i|%j|%k`` and ``sacct
-    --format=JobIDRaw,JobName,Comment,Cluster`` replies, else raise ``ReconciliationError``."""
+def parse_identity(squeue: bytes, sacct: bytes, identity: str) -> tuple[JobRef, ...]:
+    """Every job carrying ``identity`` in ``squeue --format=%i|%j|%k`` and ``sacct
+    --format=JobIDRaw,JobName,Comment,Cluster`` replies, in job-number order.
+
+    An empty result proves absence. Malformed or unrelated rows, and one job number reported on
+    several clusters, raise ``ReconciliationError``: such replies prove nothing.
+    """
     candidates: dict[int, set[str | None]] = {}
     try:
         for line in reply_lines(squeue):
@@ -542,15 +546,13 @@ def parse_identity(squeue: bytes, sacct: bytes, identity: str) -> JobRef:
             candidates.setdefault(_candidate(job_id), set()).add(cluster or None)
     except EvidenceConflict as error:
         raise ReconciliationError(f"scheduler identity evidence is malformed: {error}") from None
-    if len(candidates) != 1:
-        raise ReconciliationError(
-            f"scheduler evidence shows {len(candidates)} jobs named {identity}, not exactly one"
-        )
-    ((job_id, clusters),) = candidates.items()
-    known = {cluster for cluster in clusters if cluster is not None}
-    if len(known) > 1:
-        raise ReconciliationError("scheduler returned conflicting cluster identities")
-    return JobRef(job_id, next(iter(known), None))
+    jobs: list[JobRef] = []
+    for job_id, clusters in sorted(candidates.items()):
+        known = {cluster for cluster in clusters if cluster is not None}
+        if len(known) > 1:
+            raise ReconciliationError("scheduler returned conflicting cluster identities")
+        jobs.append(JobRef(job_id, next(iter(known), None)))
+    return tuple(jobs)
 
 
 def _candidate(value: str) -> int:

@@ -256,9 +256,10 @@ def test_step_parsing_yields_one_entry_per_slot_or_raises(output: bytes) -> None
 @given(rows(3), rows(4))
 def test_identity_proof_only_ever_fails_closed(squeue: bytes, sacct: bytes) -> None:
     try:
-        job = parse_identity(squeue, sacct, IDENTITY)
+        jobs = parse_identity(squeue, sacct, IDENTITY)
     except ReconciliationError:
         return
-    assert job.job_id > 0
-    assert str(job.job_id).encode() in squeue + sacct
-    assert IDENTITY.encode() in squeue + sacct
+    for job in jobs:
+        assert job.job_id > 0
+        assert str(job.job_id).encode() in squeue + sacct
+        assert IDENTITY.encode() in squeue + sacct

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from campaign_world import World, cpu_profile, jobs
 
-from servatus.campaign import AllocationState, Hold, JobRef, Retry
+from servatus.campaign import AllocationState, Completed, Hold, JobRef, Retry
 from servatus.errors import (
     ConfigurationError,
     Conflict,
@@ -47,6 +47,54 @@ def test_cancel_reaches_every_live_attempt_of_a_task(world: World) -> None:
     campaign.submit(campaign.plan(cpu_profile(), retry=["task-0"], allow_duplicate_risk=["task-0"]))
     receipts = campaign.cancel(tasks=["task-0"])
     assert [receipt.job for receipt in receipts] == [JobRef(1000), JobRef(1001)]
+
+
+def test_cancel_attempts_every_allocation_and_reports_failures(world: World) -> None:
+    campaign = world.create(jobs(3))
+    first, second, third = campaign.submit(
+        campaign.plan(cpu_profile(), tasks_per_allocation=1)
+    ).receipts
+
+    def refused(_argv: tuple[str, ...]) -> Completed:
+        return Completed(1, b"", b"scancel: error: Access/permission denied\n")
+
+    world.wire.on("scancel", refused)
+    world.wire.on("scancel", lambda _argv: None)
+    world.wire.on("scancel", refused)
+    with pytest.raises(Unavailable, match="cancel failed for") as caught:
+        campaign.cancel(tasks=["task-0", "task-1", "task-2"])
+    message = str(caught.value)
+    assert f"{first.allocation_id} (scancel failed with exit status 1" in message
+    assert f"{third.allocation_id} (scancel" in message
+    assert message.endswith(f"cancelled: {second.allocation_id}")
+    assert [job.state for job in world.fake.jobs] == ["PENDING", "CANCELLED by 1000", "PENDING"]
+
+
+def test_cancel_still_stops_terminal_work_the_scheduler_retains(world: World) -> None:
+    campaign = world.create(jobs(1))
+    (receipt,) = campaign.submit(campaign.plan(cpu_profile())).receipts
+    world.fake.start(1000)
+    world.fake.finish(1000, in_queue=True, accounted=False)  # accounting still says RUNNING
+    evidence = campaign.status().attempts[0].scheduler
+    assert evidence is not None and evidence.state.terminal and evidence.retained
+    assert campaign.cancel(tasks=["task-0"]) == (receipt,)
+    assert world.fake.count("scancel") == 1
+
+
+def test_cancel_by_task_skips_attempts_that_were_never_submitted(world: World) -> None:
+    campaign = world.create(jobs(1))
+    world.wire.on("sbatch", reset_sbatch)
+    with pytest.raises(SubmissionInterrupted, match="unresolved") as caught:
+        campaign.submit(campaign.plan(cpu_profile()))
+    campaign.mark_not_submitted(caught.value.result.unresolved[0].allocation_id)
+    with pytest.raises(Conflict, match="'task-0' has no accepted allocation to cancel"):
+        campaign.cancel(tasks=["task-0"])
+    (receipt,) = campaign.submit(campaign.plan(cpu_profile())).receipts
+    assert campaign.cancel(tasks=["task-0"]) == (receipt,)
+
+
+def reset_sbatch(_argv: tuple[str, ...]) -> Completed:
+    raise Unavailable("connection reset by peer")
 
 
 def test_cancel_refuses_unknown_or_unaccepted_targets(world: World) -> None:

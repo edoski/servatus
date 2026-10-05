@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import PurePosixPath
 
-from ..errors import ConfigurationError, EvidenceConflict, Unavailable
+from ..errors import ConfigurationError, EvidenceConflict, ReconciliationError, Unavailable
 from ._evidence import (
     Expectation,
     JobRef,
@@ -222,8 +222,19 @@ class Scheduler:
             return None
 
     def identify(self, allocation_id: str, intent_at: datetime) -> JobRef:
-        """Find the one job Slurm holds for an unresolved allocation, else raise
-        ``ReconciliationError``; command failures raise ``Unavailable``."""
+        """The one job Slurm holds for an allocation, else ``ReconciliationError``."""
+        jobs = self.find(allocation_id, intent_at)
+        if len(jobs) != 1:
+            raise ReconciliationError(
+                f"scheduler evidence shows {len(jobs)} jobs named {job_name(allocation_id)}, "
+                "not exactly one"
+            )
+        return jobs[0]
+
+    def find(self, allocation_id: str, intent_at: datetime) -> tuple[JobRef, ...]:
+        """Every job carrying an allocation's identity: queued or running, or accounted near
+        ``intent_at``. Empty proves absence; command failures raise ``Unavailable`` and
+        untrustworthy replies ``ReconciliationError``."""
         identity = job_name(allocation_id)
         start, end = submission_window(intent_at)
         squeue = self._transport.run(

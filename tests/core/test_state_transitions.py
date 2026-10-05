@@ -20,6 +20,7 @@ from servatus.campaign._state import (
     RegisteredTask,
     State,
     append,
+    correct_outcome,
     create,
     decode,
     encode,
@@ -113,6 +114,32 @@ def test_outcome_is_idempotent_and_conflicts_are_rejected() -> None:
         record_outcome(state, allocation_id(99), None)
     with pytest.raises(NotFound, match="unknown allocation"):
         state.attempt(allocation_id(99))
+
+
+def test_a_not_submitted_outcome_is_corrected_at_a_new_revision() -> None:
+    state, identity = submit(roster(2, appendable=True), ["task-0"], job=None)
+    state = append(state, [Task("late")])  # unrelated history in between is fine
+    corrected = correct_outcome(state, identity, JobRef(42))
+    attempt = corrected.attempt(identity)
+    assert attempt.acceptance is AcceptanceState.ACCEPTED and attempt.job == JobRef(42)
+    assert attempt.outcome_revision == corrected.revision == state.revision + 1
+    assert decode(encode(corrected)) == corrected
+    assert correct_outcome(corrected, identity, JobRef(42)) is corrected
+    with pytest.raises(Conflict, match="is not recorded as not submitted"):
+        correct_outcome(corrected, identity, JobRef(43))
+    pending, unresolved = intend(roster(1), ["task-0"])
+    with pytest.raises(Conflict, match="is not recorded as not submitted"):
+        correct_outcome(pending, unresolved, JobRef(42))
+    with pytest.raises(NotFound, match="unknown allocation"):
+        correct_outcome(state, allocation_id(99), JobRef(42))
+
+
+def test_a_not_submitted_outcome_followed_by_its_tasks_cannot_be_corrected() -> None:
+    state, identity = submit(roster(2), ["task-0", "task-1"], job=None)
+    state, _ = submit(state, ["task-0"])
+    state, later = intend(state, ["task-1"])
+    with pytest.raises(Conflict, match=f"later allocations .*, {later} already include"):
+        correct_outcome(state, identity, JobRef(42))
 
 
 def test_outcome_survives_unrelated_authoring() -> None:
