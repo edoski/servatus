@@ -58,8 +58,11 @@ def check_imports() -> None:
     assert not missing, f"missing public names: {missing}"
     assert hasattr(servatus.testing, "FakeScheduler")
     assert servatus.__version__ == version("servatus"), servatus.__version__
-    assert Path(servatus.__file__).resolve().is_relative_to(Path(sys.prefix).resolve()), (
-        f"imported servatus from {servatus.__file__}, not the installed wheel"
+    # `uv run --with` installs into a cached layer outside sys.prefix, so check the source instead.
+    imported = Path(servatus.__file__).resolve()
+    repository = Path(__file__).resolve().parents[2]
+    assert "site-packages" in imported.parts and not imported.is_relative_to(repository), (
+        f"imported servatus from {imported}, not the installed wheel"
     )
 
 
@@ -78,6 +81,34 @@ def check_cli(root: Path) -> None:
     document = json.loads(run(executable, "status", "state", "--offline", "--json", cwd=root))
     assert document["format"] == "servatus.status/1", document
     assert [task["key"] for task in document["tasks"]] == ["alpha", "beta"], document
+
+
+def check_campaign(root: Path) -> None:
+    from servatus import Campaign, Profile, Resources, Retry, Target, Task
+    from servatus.testing import FakeScheduler
+
+    fake = FakeScheduler()
+    target = Target(
+        slurm_bin="/opt/slurm/bin",
+        work_root="/work",
+        log_root="/logs",
+        partitions=["cpu"],
+        max_tasks_per_allocation=2,
+        max_cpus_per_allocation=4,
+        max_memory_mib_per_allocation=4096,
+        max_time_limit="01:00:00",
+    )
+    profile = Profile("smoke", target, Resources(cpus=1, memory_mib=512, time_limit="00:05:00"))
+    tasks = [Task(f"t{index}", ["/bin/echo", str(index)]) for index in range(3)]
+    campaign = Campaign.create(root / "campaign", tasks, connect=fake)
+    plan = campaign.load_plan(campaign.plan(profile).to_json())
+    assert [len(item.task_keys) for item in plan.allocations] == [2, 1], plan
+    assert all(check.accepted for check in campaign.validate(plan))
+    result = campaign.submit(plan)
+    assert result.complete and len(result.receipts) == 2, result
+    fake.finish(result.receipts[0].job.job_id, "FAILED", exit_code="1:0")
+    assert campaign.status().counts()["failed"] == 2
+    assert campaign.plan(profile, retry=Retry.FAILED).selected == ("t0", "t1")
 
 
 def check_publication(root: Path) -> None:
@@ -121,6 +152,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory).resolve()
         check_cli(root)
+        check_campaign(root)
         check_publication(root)
     print(f"servatus {version('servatus')}: installed-artifact smoke passed")
 
