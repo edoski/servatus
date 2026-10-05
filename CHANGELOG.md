@@ -6,7 +6,7 @@ All notable changes to Servatus are recorded here. The format follows
 
 ## [Unreleased]
 
-## [0.12.0]
+## [0.12.0] - 2026-10-05
 
 A clean break: no compatibility aliases and no migration of earlier campaign state. See
 [ADR 0006](https://github.com/edoski/servatus/blob/main/docs/adr/0006-clean-break-0.12.md).
