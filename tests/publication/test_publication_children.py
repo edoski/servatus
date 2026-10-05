@@ -1,29 +1,26 @@
 from __future__ import annotations
 
 import multiprocessing
+from collections.abc import Callable
 from multiprocessing.connection import Connection
+from multiprocessing.process import BaseProcess
 from pathlib import Path
 
 import pytest
 
-from servatus import (
+from servatus.errors import (
+    Busy,
+    ConfigurationError,
     DestinationExists,
-    Draft,
-    UnsafePublication,
-    WorkConflict,
-    Workspace,
-    WorkspaceBusy,
+    UnsafeFilesystem,
+    WorkspaceConflict,
 )
+from servatus.publication import Draft, Workspace
 
 
-def _hold_child(
-    destination: str,
-    name: str,
-    ready: Connection,
-    release: Connection,
-) -> None:
+def _hold_child(destination: str, name: str, ready: Connection, release: Connection) -> None:
     try:
-        with Workspace(Path(destination), identity=b"study").child(name, identity=name.encode()):
+        with Workspace(destination, identity=b"study").child(name, identity=name.encode()):
             ready.send("entered")
             release.recv()
     except BaseException as error:
@@ -31,15 +28,12 @@ def _hold_child(
         raise
 
 
-def _spawn_child_holder(
-    destination: Path, name: str
-) -> tuple[multiprocessing.Process, Connection, Connection]:
+def _spawn_holder(destination: Path, name: str) -> tuple[BaseProcess, Connection, Connection]:
     context = multiprocessing.get_context("spawn")
     ready_parent, ready_child = context.Pipe(duplex=False)
     release_child, release_parent = context.Pipe(duplex=False)
     process = context.Process(
-        target=_hold_child,
-        args=(str(destination), name, ready_child, release_child),
+        target=_hold_child, args=(str(destination), name, ready_child, release_child)
     )
     process.start()
     ready_child.close()
@@ -47,7 +41,7 @@ def _spawn_child_holder(
     return process, ready_parent, release_parent
 
 
-def _finish_holder(process: multiprocessing.Process, release: Connection) -> None:
+def _finish(process: BaseProcess, release: Connection) -> None:
     release.send("release")
     release.close()
     process.join(timeout=10)
@@ -57,9 +51,9 @@ def _finish_holder(process: multiprocessing.Process, release: Connection) -> Non
 def _race_parent(destination: str, start: Connection, result: Connection) -> None:
     start.recv()
     try:
-        with Workspace(Path(destination), identity=b"study") as workspace:
+        with Workspace(destination, identity=b"study") as workspace:
             workspace.publish(lambda draft: None)
-    except WorkspaceBusy:
+    except Busy:
         result.send("busy")
     else:
         result.send("published")
@@ -68,11 +62,9 @@ def _race_parent(destination: str, start: Connection, result: Connection) -> Non
 def _race_child(destination: str, start: Connection, result: Connection) -> None:
     start.recv()
     try:
-        with Workspace(Path(destination), identity=b"study").child(
-            "method-0", identity=b"method-0"
-        ):
+        with Workspace(destination, identity=b"study").child("method-0", identity=b"method-0"):
             pass
-    except WorkspaceBusy:
+    except Busy:
         result.send("busy")
     except DestinationExists:
         result.send("finalized")
@@ -83,21 +75,22 @@ def _race_child(destination: str, start: Connection, result: Connection) -> None
 def _race_child_publication(destination: str, start: Connection, result: Connection) -> None:
     start.recv()
     try:
-        with Workspace(Path(destination), identity=b"study").child(
+        workspace = Workspace(destination, identity=b"study").child(
             "method-0", identity=b"method-0"
-        ) as child:
-            source = child.path / "result"
-            source.write_text("complete")
-            child.publish(lambda draft: draft.link(source, "result"))
-    except WorkspaceBusy:
+        )
+        with workspace as child:
+            (child.path / "result").write_text("complete")
+            child.publish(lambda draft: draft.link(child.path / "result", "result"))
+    except Busy:
         result.send("busy")
     else:
         result.send("published")
 
 
-def _start_racer(
-    target: object, destination: Path
-) -> tuple[multiprocessing.Process, Connection, Connection]:
+Racer = Callable[[str, Connection, Connection], None]
+
+
+def _start(target: Racer, destination: Path) -> tuple[BaseProcess, Connection, Connection]:
     context = multiprocessing.get_context("spawn")
     start_child, start_parent = context.Pipe(duplex=False)
     result_parent, result_child = context.Pipe(duplex=False)
@@ -108,58 +101,78 @@ def _start_racer(
     return process, start_parent, result_parent
 
 
+def _race(first: Racer, second: Racer, destination: Path) -> tuple[str, str]:
+    racers = [_start(first, destination), _start(second, destination)]
+    for _, start, _ in racers:
+        start.send("start")
+        start.close()
+    outcomes: list[str] = []
+    for process, _, result in racers:
+        assert result.poll(10)
+        outcomes.append(result.recv())
+        process.join(timeout=10)
+        assert process.exitcode == 0
+    return outcomes[0], outcomes[1]
+
+
 @pytest.mark.parametrize("name", ["", ".", "..", "nested/child", "child\0suffix"])
 def test_child_rejects_unsafe_leaf(tmp_path: Path, name: str) -> None:
     parent = Workspace(tmp_path / "study", identity=b"study")
 
-    with pytest.raises(UnsafePublication):
+    with pytest.raises(ConfigurationError, match="unsafe filesystem leaf"):
         parent.child(name, identity=b"candidate")
 
     assert list(tmp_path.iterdir()) == []
 
 
 def test_child_rejects_recursive_hierarchy(tmp_path: Path) -> None:
-    child = Workspace(tmp_path / "study", identity=b"study").child("method-0", identity=b"method-0")
+    child = Workspace(tmp_path / "study", identity=b"study").child("method-0", identity=b"m")
 
-    with pytest.raises(UnsafePublication):
+    with pytest.raises(ConfigurationError, match="cannot contain child"):
         child.child("nested", identity=b"nested")
 
     assert list(tmp_path.iterdir()) == []
 
 
+def test_child_paths_live_under_parent_work(tmp_path: Path) -> None:
+    parent = Workspace(tmp_path / "study", identity=b"study")
+    child = parent.child("method-0", identity=b"m")
+
+    assert child.path.parent.parent == parent.path
+    assert child.path.name == "work"
+
+
 def test_spawned_sibling_children_overlap_and_exclude_parent(tmp_path: Path) -> None:
     destination = tmp_path / "study"
-    first, first_ready, first_release = _spawn_child_holder(destination, "method-0")
-    second, second_ready, second_release = _spawn_child_holder(destination, "method-1")
+    first, first_ready, first_release = _spawn_holder(destination, "method-0")
+    second, second_ready, second_release = _spawn_holder(destination, "method-1")
     try:
         assert first_ready.poll(10)
         assert first_ready.recv() == "entered"
         assert second_ready.poll(10)
         assert second_ready.recv() == "entered"
-        with pytest.raises(WorkspaceBusy), Workspace(destination, identity=b"study"):
+        with pytest.raises(Busy, match="already in use"), Workspace(destination, identity=b"study"):
             pass
     finally:
-        _finish_holder(first, first_release)
-        _finish_holder(second, second_release)
+        _finish(first, first_release)
+        _finish(second, second_release)
 
 
-def test_spawned_child_excludes_duplicate_and_parent_then_parent_reopens(
-    tmp_path: Path,
-) -> None:
+def test_spawned_child_excludes_duplicate_and_parent_then_parent_reopens(tmp_path: Path) -> None:
     destination = tmp_path / "study"
-    process, ready, release = _spawn_child_holder(destination, "method-0")
+    process, ready, release = _spawn_holder(destination, "method-0")
     try:
         assert ready.poll(10)
         assert ready.recv() == "entered"
-        with (
-            pytest.raises(WorkspaceBusy),
-            Workspace(destination, identity=b"study").child("method-0", identity=b"method-0"),
-        ):
+        duplicate = Workspace(destination, identity=b"study").child(
+            "method-0", identity=b"method-0"
+        )
+        with pytest.raises(Busy, match="already in use"), duplicate:
             pass
-        with pytest.raises(WorkspaceBusy), Workspace(destination, identity=b"study"):
+        with pytest.raises(Busy, match="already in use"), Workspace(destination, identity=b"study"):
             pass
     finally:
-        _finish_holder(process, release)
+        _finish(process, release)
 
     with Workspace(destination, identity=b"study"):
         pass
@@ -167,10 +180,9 @@ def test_spawned_child_excludes_duplicate_and_parent_then_parent_reopens(
 
 def test_parent_entry_excludes_child_without_waiting(tmp_path: Path) -> None:
     destination = tmp_path / "study"
-
     with (
         Workspace(destination, identity=b"study"),
-        pytest.raises(WorkspaceBusy),
+        pytest.raises(Busy, match="already in use"),
         Workspace(destination, identity=b"study").child("method-0", identity=b"method-0"),
     ):
         pass
@@ -182,16 +194,15 @@ def test_child_verifies_parent_and_child_identities(tmp_path: Path) -> None:
         pass
 
     with (
-        pytest.raises(WorkConflict),
-        Workspace(destination, identity=b"other-study").child("method-0", identity=b"method-0"),
+        pytest.raises(WorkspaceConflict, match="different identity"),
+        Workspace(destination, identity=b"other").child("method-0", identity=b"method-0"),
     ):
         pass
-
     with Workspace(destination, identity=b"study").child("method-0", identity=b"method-0"):
         pass
     with (
-        pytest.raises(WorkConflict),
-        Workspace(destination, identity=b"study").child("method-0", identity=b"other-method"),
+        pytest.raises(WorkspaceConflict, match="different identity"),
+        Workspace(destination, identity=b"study").child("method-0", identity=b"other"),
     ):
         pass
 
@@ -213,14 +224,13 @@ def test_failed_child_resumes_and_publishes_for_parent_assembly(tmp_path: Path) 
     with parent.child("method-0", identity=b"method-0") as child:
         checkpoint = child.path / "last.ckpt"
         assert checkpoint.read_bytes() == b"checkpoint"
-        child.publish(lambda draft: draft.link(checkpoint, "result.bin"))
+        publication = child.publish(lambda draft: draft.link(checkpoint, "result.bin"))
 
-    completed_child = parent.path / "method-0"
-    assert (completed_child / "result.bin").read_bytes() == b"checkpoint"
+    completed = parent.path / "method-0"
+    assert publication.destination == completed
+    assert (completed / "result.bin").read_bytes() == b"checkpoint"
     with parent as workspace:
-        workspace.publish(
-            lambda draft: draft.link(completed_child / "result.bin", "method-0/result.bin")
-        )
+        workspace.publish(lambda draft: draft.link(completed / "result.bin", "method-0/result.bin"))
 
     assert (destination / "method-0/result.bin").read_bytes() == b"checkpoint"
     assert list(tmp_path.glob(".servatus-*")) == []
@@ -230,9 +240,8 @@ def test_parent_failure_preserves_completed_children(tmp_path: Path) -> None:
     destination = tmp_path / "study"
     parent = Workspace(destination, identity=b"study")
     with parent.child("method-0", identity=b"method-0") as child:
-        source = child.path / "result.bin"
-        source.write_bytes(b"complete")
-        child.publish(lambda draft: draft.link(source, "result.bin"))
+        (child.path / "result.bin").write_bytes(b"complete")
+        child.publish(lambda draft: draft.link(child.path / "result.bin", "result.bin"))
 
     def fail(draft: Draft) -> None:
         draft.link(parent.path / "method-0/result.bin", "method-0/result.bin")
@@ -249,92 +258,84 @@ def test_parent_destination_collision_preserves_completed_children(tmp_path: Pat
     destination = tmp_path / "study"
     parent = Workspace(destination, identity=b"study")
     with parent.child("method-0", identity=b"method-0") as child:
-        source = child.path / "result"
-        source.write_text("complete")
-        child.publish(lambda draft: draft.link(source, "result"))
+        (child.path / "result").write_text("complete")
+        child.publish(lambda draft: draft.link(child.path / "result", "result"))
 
     with parent as workspace:
         destination.mkdir()
-        with pytest.raises(DestinationExists):
+        with pytest.raises(DestinationExists, match="already exists"):
             workspace.publish(
                 lambda draft: draft.link(parent.path / "method-0/result", "method-0/result")
             )
 
     assert (parent.path / "method-0/result").read_text() == "complete"
-    assert destination.is_dir()
 
 
 def test_child_destination_collision_preserves_resumable_work(tmp_path: Path) -> None:
     parent = Workspace(tmp_path / "study", identity=b"study")
-    child = parent.child("method-0", identity=b"method-0")
-    with child as workspace:
-        checkpoint = workspace.path / "checkpoint"
+    with parent.child("method-0", identity=b"method-0") as child:
+        checkpoint = child.path / "checkpoint"
         checkpoint.write_text("resumable")
         (parent.path / "method-0").mkdir()
-        with pytest.raises(DestinationExists):
-            workspace.publish(lambda draft: draft.link(checkpoint, "result"))
+        with pytest.raises(DestinationExists, match="already exists"):
+            child.publish(lambda draft: draft.link(checkpoint, "result"))
 
     assert checkpoint.read_text() == "resumable"
 
 
-def test_final_destination_blocks_stale_child_state(tmp_path: Path) -> None:
+def test_final_destination_blocks_child_without_reclaiming_parent(tmp_path: Path) -> None:
     destination = tmp_path / "study"
     parent = Workspace(destination, identity=b"study")
     child = parent.child("method-0", identity=b"method-0")
-    stale_checkpoint = child.path / "checkpoint"
     with child:
-        stale_checkpoint.write_text("stale")
+        (child.path / "checkpoint").write_text("stale")
     destination.mkdir()
 
     with (
-        pytest.raises(DestinationExists),
+        pytest.raises(DestinationExists, match="already exists"),
         parent.child("method-1", identity=b"method-1"),
     ):
         pass
 
-    assert destination.is_dir()
-    assert stale_checkpoint.read_text() == "stale"
+    assert (child.path / "checkpoint").read_text() == "stale"
 
 
-def test_completed_child_destination_blocks_stale_duplicate(tmp_path: Path) -> None:
+def test_completed_child_destination_reclaims_stale_duplicate(tmp_path: Path) -> None:
     parent = Workspace(tmp_path / "study", identity=b"study")
     with parent.child("method-0", identity=b"method-0") as child:
-        source = child.path / "source"
-        source.write_text("complete")
-        child.publish(lambda draft: draft.link(source, "result"))
+        (child.path / "source").write_text("complete")
+        child.publish(lambda draft: draft.link(child.path / "source", "result"))
 
     with (
-        pytest.raises(DestinationExists),
+        pytest.raises(DestinationExists, match="already exists"),
         parent.child("method-0", identity=b"method-0"),
     ):
         pass
 
+    assert sorted(path.name for path in parent.path.iterdir()) == ["method-0"]
 
-@pytest.mark.parametrize("substitution", ["lock", "work"])
-def test_child_rejects_lifecycle_entry_substitution(tmp_path: Path, substitution: str) -> None:
+
+def test_child_discard_removes_only_that_child(tmp_path: Path) -> None:
     parent = Workspace(tmp_path / "study", identity=b"study")
-    with parent.child("method-0", identity=b"method-0") as child:
-        container = child.path.parent
-        entry = container / (".lock" if substitution == "lock" else "work")
-        entry.rename(container / f"{entry.name}-moved")
-        if substitution == "lock":
-            entry.write_text("replacement")
-        else:
-            entry.mkdir()
-        with pytest.raises(UnsafePublication):
-            child.publish(lambda draft: None)
+    keep = parent.child("keep", identity=b"keep")
+    with keep:
+        (keep.path / "value").write_text("kept")
+    with parent.child("drop", identity=b"drop") as drop:
+        (drop.path / "value").write_text("dropped")
+        drop.discard()
 
-    assert not (tmp_path / "study").exists()
+    with keep:
+        assert (keep.path / "value").read_text() == "kept"
+    assert len(list(parent.path.iterdir())) == 1
 
 
-def test_active_child_handle_rejects_container_path_replacement(tmp_path: Path) -> None:
+def test_active_child_rejects_container_replacement(tmp_path: Path) -> None:
     parent = Workspace(tmp_path / "study", identity=b"study")
     with parent.child("method-0", identity=b"method-0") as child:
         container = child.path.parent
         container.rename(container.with_name(f"{container.name}-moved"))
-        container.mkdir()
-
-        with pytest.raises(UnsafePublication):
+        container.mkdir(mode=0o700)
+        with pytest.raises(UnsafeFilesystem, match="substituted"):
             child.publish(lambda draft: None)
 
     assert not (tmp_path / "study").exists()
@@ -346,9 +347,9 @@ def test_replaced_child_lock_cannot_admit_duplicate(tmp_path: Path) -> None:
         lock = child.path.parent / ".lock"
         lock.rename(lock.with_name(".lock-moved"))
         lock.write_text("replacement")
-
+        lock.chmod(0o600)
         with (
-            pytest.raises(UnsafePublication),
+            pytest.raises(UnsafeFilesystem, match="lifecycle entries changed"),
             parent.child("method-0", identity=b"method-0"),
         ):
             pass
@@ -361,33 +362,21 @@ def test_replaced_parent_lock_cannot_admit_parent_during_child(tmp_path: Path) -
         lock = parent.path.parent / ".lock"
         lock.rename(lock.with_name(".lock-moved"))
         lock.write_text("replacement")
-
-        with pytest.raises(UnsafePublication), Workspace(destination, identity=b"study"):
+        lock.chmod(0o600)
+        with (
+            pytest.raises(UnsafeFilesystem, match="lifecycle entries changed"),
+            Workspace(destination, identity=b"study"),
+        ):
             pass
 
 
-def test_spawned_parent_finalization_and_child_open_race_is_fail_closed(
-    tmp_path: Path,
-) -> None:
+def test_spawned_parent_finalization_and_child_open_race_is_fail_closed(tmp_path: Path) -> None:
     for index in range(8):
         destination = tmp_path / f"study-{index}"
         with Workspace(destination, identity=b"study"):
             pass
-        parent_process, parent_start, parent_result = _start_racer(_race_parent, destination)
-        child_process, child_start, child_result = _start_racer(_race_child, destination)
 
-        parent_start.send("start")
-        child_start.send("start")
-        parent_start.close()
-        child_start.close()
-        assert parent_result.poll(10)
-        assert child_result.poll(10)
-        parent_outcome = parent_result.recv()
-        child_outcome = child_result.recv()
-        parent_process.join(timeout=10)
-        child_process.join(timeout=10)
-        assert parent_process.exitcode == 0
-        assert child_process.exitcode == 0
+        parent_outcome, child_outcome = _race(_race_parent, _race_child, destination)
 
         assert parent_outcome in {"busy", "published"}
         assert child_outcome in {"busy", "entered", "finalized"}
@@ -395,33 +384,15 @@ def test_spawned_parent_finalization_and_child_open_race_is_fail_closed(
         assert destination.exists() is (parent_outcome == "published")
 
 
-def test_spawned_child_cleanup_and_duplicate_open_race_is_fail_closed(
-    tmp_path: Path,
-) -> None:
+def test_spawned_child_cleanup_and_duplicate_open_race_is_fail_closed(tmp_path: Path) -> None:
     for index in range(8):
         destination = tmp_path / f"study-{index}"
         parent = Workspace(destination, identity=b"study")
         with parent.child("method-0", identity=b"method-0"):
             pass
-        publisher, publisher_start, publisher_result = _start_racer(
-            _race_child_publication, destination
-        )
-        opener, opener_start, opener_result = _start_racer(_race_child, destination)
 
-        publisher_start.send("start")
-        opener_start.send("start")
-        publisher_start.close()
-        opener_start.close()
-        assert publisher_result.poll(10)
-        assert opener_result.poll(10)
-        publisher_outcome = publisher_result.recv()
-        opener_outcome = opener_result.recv()
-        publisher.join(timeout=10)
-        opener.join(timeout=10)
-        assert publisher.exitcode == 0
-        assert opener.exitcode == 0
+        publisher, opener = _race(_race_child_publication, _race_child, destination)
 
-        assert publisher_outcome in {"busy", "published"}
-        assert opener_outcome in {"busy", "entered", "finalized"}
-        completed = parent.path / "method-0"
-        assert completed.exists() is (publisher_outcome == "published")
+        assert publisher in {"busy", "published"}
+        assert opener in {"busy", "entered", "finalized"}
+        assert (parent.path / "method-0").exists() is (publisher == "published")

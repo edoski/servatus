@@ -37,7 +37,7 @@ from ._model import (
     UnresolvedSubmission,
     ValidationResult,
 )
-from ._workspace import Draft, Publication, Workspace, publish, publish_file
+from .publication import Draft, Publication, Workspace, publish, publish_file
 
 __all__ = [
     "AcceptanceState",

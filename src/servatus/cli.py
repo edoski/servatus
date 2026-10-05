@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import cast
 
+from . import errors
 from ._campaign import (
     Campaign,
     plan_document,
@@ -16,7 +17,7 @@ from ._campaign import (
 )
 from ._errors import ConfigurationError, ServatusError, SubmissionError
 from ._model import Profile, Task, decode_json, receipt_document
-from ._workspace import publish_file
+from .publication import publish_file
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -159,11 +160,7 @@ def _write_json(path: Path, value: object) -> None:
     encoded = json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False).encode() + b"\n"
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    def write(stage: Path) -> None:
-        stage.chmod(0o600)
-        stage.write_bytes(encoded)
-
-    publish_file(path, write)
+    publish_file(path, lambda stage: stage.write_bytes(encoded), mode=0o600)
 
 
 def _run(arguments: argparse.Namespace) -> int:
@@ -245,5 +242,5 @@ def main(argv: list[str] | None = None) -> int:
     try:
         arguments = parser.parse_args(argv)
         return _run(arguments)
-    except ServatusError as error:
+    except (ServatusError, errors.ServatusError) as error:
         parser.error(str(error))
