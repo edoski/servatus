@@ -464,12 +464,19 @@ def large_state(task_count: int = 1000, attempt_count: int = 3000) -> State:
     return State(CAMPAIGN_ID, 2 * attempt_count, roster_items, 0, attempts)
 
 
-def test_decoding_three_thousand_attempts_is_fast() -> None:
-    state = large_state()
+def best_decode_seconds(state: State) -> float:
     data = encode(state)
     timings: list[float] = []
     for _ in range(3):
         started = time.perf_counter()
         assert decode(data) == state
         timings.append(time.perf_counter() - started)
-    assert min(timings) < 1.0, f"decode took {min(timings):.3f}s"
+    return min(timings)
+
+
+def test_decoding_scales_linearly_with_history() -> None:
+    # Quadrupling the history should about quadruple decode time (quadratic: about 16x).
+    # A ratio, unlike a wall-clock budget, holds on slow or coverage-instrumented runners.
+    small = best_decode_seconds(large_state(task_count=1000, attempt_count=1000))
+    large = best_decode_seconds(large_state(task_count=1000, attempt_count=4000))
+    assert large / small < 8.0, f"decode took {small:.3f}s at 1000 and {large:.3f}s at 4000"
