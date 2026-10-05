@@ -15,7 +15,6 @@ from servatus.campaign._scheduler import AttemptQuery, Scheduler
 from servatus.campaign._script import log_path, render_batch, sbatch_argv
 from servatus.errors import (
     ConfigurationError,
-    EvidenceConflict,
     ReconciliationError,
     Unavailable,
 )
@@ -232,14 +231,27 @@ def test_reused_job_numbers_stay_bound_to_their_allocations() -> None:
     assert harness.fake.count("squeue") == 2  # one batch per reuse of the number
 
 
-def test_live_foreign_job_under_a_queried_number_is_an_identity_violation() -> None:
+def test_live_foreign_job_under_a_queried_number_withholds_only_that_allocation() -> None:
     harness = Harness()
     first = harness.submit(allocation(1))
+    other = harness.submit(allocation(3))
     harness.fake.finish(first)
+    harness.fake.finish(other)
     harness.fake.set_next_job_id(first.job_id)
     harness.submit(allocation(2))
-    with pytest.raises(EvidenceConflict, match="unrelated allocation"):
-        harness.observe(allocation(1), first)
+    observed = harness.scheduler.observe(
+        [
+            AttemptQuery(allocation(1), first, INTENT, 2),
+            AttemptQuery(allocation(3), other, INTENT, 2),
+        ]
+    )
+    foreign = observed[allocation(1)].allocation
+    assert (foreign.state, foreign.retained, foreign.problem) == (
+        AllocationState.UNKNOWN,
+        True,
+        "job number is held by a foreign job",
+    )
+    assert observed[allocation(3)].allocation.state is AllocationState.SUCCEEDED
 
 
 def test_batches_are_counted_per_command() -> None:

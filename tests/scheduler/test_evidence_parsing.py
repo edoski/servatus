@@ -160,7 +160,7 @@ def test_only_the_exact_native_missing_reply_means_absence(
     assert is_missing_reply(returncode, stdout, stderr, cluster) is missing
 
 
-# --- Identity guards (raise for the whole reply) ---------------------------------------------
+# --- Identity guards ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -169,20 +169,36 @@ def test_only_the_exact_native_missing_reply_means_absence(
         (squeue_row(job=43), "", "unrelated job"),
         (squeue_row(job="042"), "", "unrelated job"),
         (squeue_row(job=" 42"), "", "unrelated job"),
-        (squeue_row(name="servatus-000000000000000000000000"), "", "unrelated allocation"),
-        (squeue_row(comment=""), "", "unrelated allocation"),
-        (squeue_row(comment=f" {IDENTITY} "), "", "unrelated allocation"),
         ("", sacct_row(job=43), "unrelated job"),
-        ("", sacct_row(name=f" {IDENTITY} "), "unrelated allocation"),
-        ("", sacct_row(comment="wrong-identity"), "unrelated allocation"),
-        ("", sacct_row(comment=" N/A "), "unrelated allocation"),
-        ("", sacct_row(comment=" "), "unrelated allocation"),
         ("", sacct_row(cluster="bad cluster"), "unrelated cluster"),
     ],
 )
-def test_identity_violations_raise_evidence_conflict(squeue: str, sacct: str, message: str) -> None:
+def test_rows_for_unqueried_jobs_raise_evidence_conflict(
+    squeue: str, sacct: str, message: str
+) -> None:
     with pytest.raises(EvidenceConflict, match=message):
         evidence(squeue, sacct)
+
+
+@pytest.mark.parametrize(
+    ("squeue", "sacct"),
+    [
+        (squeue_row(name="servatus-000000000000000000000000"), ""),
+        (squeue_row(comment=""), ""),
+        (squeue_row(comment=f" {IDENTITY} "), ""),
+        (squeue_row(name="someone-else", comment="someone-else"), sacct_row("COMPLETED")),
+        ("", sacct_row(name=f" {IDENTITY} ")),
+        ("", sacct_row(comment="wrong-identity")),
+        ("", sacct_row(comment=" N/A ")),
+        ("", sacct_row(comment=" ")),
+    ],
+)
+def test_foreign_identity_under_a_queried_job_number_is_confined_to_its_allocation(
+    squeue: str, sacct: str
+) -> None:
+    assert evidence(squeue, sacct) == SchedulerEvidence(
+        AllocationState.UNKNOWN, retained=True, problem="job number is held by a foreign job"
+    )
 
 
 def test_accounting_cluster_must_match_the_queried_route() -> None:

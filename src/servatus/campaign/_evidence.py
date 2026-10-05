@@ -96,10 +96,11 @@ class Observation:
 
 # --- Pure Slurm output parsing ---------------------------------------------------------------
 #
-# Reply-level defects (partial or oversized output, malformed rows, rows for unrelated jobs or
-# identities) raise ``EvidenceConflict`` for the whole query. Contradictions confined to one
-# allocation's own rows become that allocation's ``problem`` instead, so one odd job cannot hide
-# the evidence of every other job in its batch.
+# Reply-level defects (partial or oversized output, malformed rows, rows for job numbers that were
+# not queried, rows from another cluster) raise ``EvidenceConflict`` for the whole query.
+# Contradictions confined to one allocation's own job number become that allocation's ``problem``
+# instead, so one odd job cannot hide the evidence of every other job in its batch. That includes
+# a queried job number now held by a foreign job (a reused number with a different identity).
 
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"
 WINDOW = timedelta(hours=1)
@@ -113,6 +114,7 @@ _SLOT = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 _EXIT_CODE = re.compile(r"[0-9]+:[0-9]+\Z")
 _RECEIPT = re.compile(rb"([1-9][0-9]*)(?:;([A-Za-z0-9][A-Za-z0-9._-]*))?\n?\Z")
 _NULL = frozenset({"", "None", "Unknown", "N/A"})
+FOREIGN_JOB = "job number is held by a foreign job"
 
 _STATES: Mapping[str, AllocationState] = {
     **dict.fromkeys(
@@ -209,6 +211,7 @@ class ActiveRow:
     reason: str | None
     started_at: str | None
     ended_at: str | None
+    foreign: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +225,7 @@ class AccountingRow:
     reason: str | None
     started_at: str | None
     ended_at: str | None
+    foreign: bool = False
 
 
 def reply_lines(output: bytes) -> tuple[bytes, ...]:
@@ -317,15 +321,14 @@ def parse_active(
 ) -> dict[int, list[ActiveRow]]:
     """Parse ``squeue --format=%i|%j|%k|%V|%T|%r|%S|%e`` rows by job number.
 
-    Queue rows must carry the exact allocation identity as both name and comment.
+    Queue rows must carry the exact allocation identity as both name and comment; a row that does
+    not is marked ``foreign`` (the job number was reused) and confined to its allocation.
     """
     rows: dict[int, list[ActiveRow]] = {job: [] for job in expected}
     for line in _without_cluster_banner(reply_lines(output), cluster):
         job_id, name, comment, submitted, state, reason, started, ended = reply_fields(line, 8)
         job = _job_number(job_id, expected)
         identity = expected[job].identity
-        if name != identity or comment != identity:
-            raise EvidenceConflict("scheduler returned evidence for an unrelated allocation")
         rows[job].append(
             ActiveRow(
                 _required_timestamp(submitted),
@@ -333,6 +336,7 @@ def parse_active(
                 _optional(reason),
                 _timestamp(started),
                 _timestamp(ended),
+                foreign=name != identity or comment != identity,
             )
         )
     return rows
@@ -345,6 +349,7 @@ def parse_accounting(
     ExitCode, Reason, Start, End) by job number, in reply order.
 
     The name must be the exact allocation identity; sites may omit the comment from accounting.
+    A row with another identity is marked ``foreign`` and confined to its allocation.
     """
     rows: dict[int, list[AccountingRow]] = {job: [] for job in expected}
     for line in reply_lines(output):
@@ -353,8 +358,7 @@ def parse_accounting(
         submitted, state, exit_code, reason, started, ended = fields[4:]
         job = _job_number(job_id, expected)
         identity = expected[job].identity
-        if name != identity or (comment != identity and comment not in _NULL):
-            raise EvidenceConflict("scheduler returned evidence for an unrelated allocation")
+        foreign = name != identity or (comment != identity and comment not in _NULL)
         found = None if row_cluster in _NULL else row_cluster
         if (found is not None and TOKEN.fullmatch(found) is None) or (
             cluster is not None and found != cluster
@@ -369,6 +373,7 @@ def parse_accounting(
                 _optional(reason),
                 _timestamp(started),
                 _timestamp(ended),
+                foreign=foreign,
             )
         )
     return rows
@@ -402,8 +407,11 @@ def combine(
     strictly increasing submit times on one cluster. Within one incarnation the more advanced
     state wins (terminal over running over queued). Any unfinished or unlisted sample keeps the
     allocation ``retained``. A terminal state needs anchored accounting: a terminal queue row
-    alone is ``UNKNOWN``. Contradictions yield ``UNKNOWN`` with ``problem`` set.
+    alone is ``UNKNOWN``. Contradictions, and rows from a foreign job holding this job number,
+    yield ``UNKNOWN`` with ``problem`` set.
     """
+    if any(row.foreign for row in active) or any(row.foreign for row in history):
+        return SchedulerEvidence(AllocationState.UNKNOWN, retained=True, problem=FOREIGN_JOB)
     latest = history[-1] if history else None
     queue = active[0] if active else None
     if len(active) > 1:
