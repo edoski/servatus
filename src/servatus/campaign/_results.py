@@ -29,8 +29,9 @@ class Receipt:
 class UnresolvedSubmission:
     """Durable intent exists, but acceptance was not durably recorded.
 
-    ``observed_job`` is set when Slurm answered but recording the receipt failed. Save it and
-    reconcile before retrying.
+    ``observed_job`` is set when Slurm answered but recording the receipt failed. Record it with
+    ``mark_accepted`` (which also corrects a concurrent ``mark_not_submitted`` once Slurm proves
+    the job) or ``reconcile`` before retrying.
     """
 
     allocation_id: str

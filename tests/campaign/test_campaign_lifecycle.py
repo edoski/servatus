@@ -8,7 +8,16 @@ from pathlib import Path
 import pytest
 from campaign_world import Probe, World, cpu_profile, jobs
 
-from servatus.campaign import AllocationState, Campaign, Hold, ResultState, Retry, Task
+from servatus.campaign import (
+    AllocationState,
+    Campaign,
+    Hold,
+    ResultState,
+    Retry,
+    Task,
+    ping,
+    to_document,
+)
 from servatus.errors import (
     Busy,
     ConfigurationError,
@@ -21,6 +30,31 @@ from servatus.errors import (
 
 def keys(count: int, prefix: str = "task") -> tuple[str, ...]:
     return tuple(f"{prefix}-{index}" for index in range(count))
+
+
+def test_ping_and_documents_for_results(world: World) -> None:
+    target = cpu_profile().target
+    assert ping(target, connect=world.wire) == "slurm 23.11.4"
+    with pytest.raises(ConfigurationError, match="ping needs a Target"):
+        ping("login.example.edu", connect=world.wire)  # pyright: ignore[reportArgumentType]
+    world.wire.down.add(target.host)
+    with pytest.raises(Unavailable, match="Connection refused"):
+        ping(target, connect=world.wire)
+    world.wire.down.clear()
+    campaign = world.create(jobs(1))
+    result = campaign.submit(campaign.plan(cpu_profile()))
+    assert to_document(result) == {
+        "receipts": [
+            {
+                "allocation_id": result.receipts[0].allocation_id,
+                "job": {"job_id": 1000, "cluster": None},
+                "task_keys": ["task-0"],
+            }
+        ],
+        "unresolved": [],
+        "unattempted": [],
+        "stop_reason": None,
+    }
 
 
 def test_sweep_from_creation_through_failure_retry_and_saved_plans(world: World) -> None:
