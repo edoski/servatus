@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 from core_helpers import CAMPAIGN_ID, NOW, allocation_id, intend, reencode, roster, submit
-from support.builders import profile, target, tasks
+from support.builders import profile, resources, target, tasks
 
 from servatus.campaign import _codec
 from servatus.campaign._config import Profile, Task
@@ -178,6 +178,27 @@ def _intent(state: State, **changes: Any) -> State:
             "attempt exceeds its target capacity",
         ),
         ({"profile": profile(target(max_time_limit="01:00:00"))}, "exceeds its target capacity"),
+        (  # 3 Tasks x 2 GPUs exceed 4 GPUs while every other ceiling fits
+            {
+                "task_keys": ("task-0", "task-1", "task-2"),
+                "profile": profile(resource_value=resources(gpus=2)),
+            },
+            "exceeds its target capacity",
+        ),
+        (
+            {
+                "task_keys": ("task-0", "task-1", "task-2"),
+                "profile": profile(resource_value=resources(cpus=64)),
+            },
+            "exceeds its target capacity",
+        ),
+        (
+            {
+                "task_keys": ("task-0", "task-1", "task-2"),
+                "profile": profile(resource_value=resources(memory_mib=131072)),
+            },
+            "exceeds its target capacity",
+        ),
     ],
 )
 def test_record_intent_rejects_invalid_attempts_as_conflicts(

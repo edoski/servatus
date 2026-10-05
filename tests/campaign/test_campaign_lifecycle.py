@@ -70,6 +70,9 @@ def test_sweep_from_creation_through_failure_retry_and_saved_plans(world: World)
 def test_probe_is_called_once_per_operation_with_only_the_tasks_that_matter(world: World) -> None:
     probe = Probe()
     campaign = world.create(jobs(3), probe=probe)
+    campaign.plan(cpu_profile(), only=["task-1"])
+    assert probe.calls == [("task-1",)]  # only the requested Tasks can change the decision
+    probe.calls.clear()
     plan = campaign.plan(cpu_profile())
     assert probe.calls == [keys(3)]
     campaign.submit(plan)

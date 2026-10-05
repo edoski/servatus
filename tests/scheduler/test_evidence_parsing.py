@@ -247,6 +247,12 @@ def test_reply_line_bound_is_enforced() -> None:
         evidence(sacct=sacct_row() * 4097)
 
 
+def test_reply_field_bound_is_4096_bytes() -> None:
+    assert evidence(squeue_row(reason="r" * 4096)).reason == "r" * 4096
+    with pytest.raises(EvidenceConflict, match="malformed"):
+        evidence(squeue_row(reason="r" * 4097))
+
+
 def test_padded_state_and_time_fields_are_normalized() -> None:
     row = squeue_row(" RUNNING ", submit=f" {SUBMIT} ", start=" 2030-01-01T12:01:00 ")
     result = evidence(row)
