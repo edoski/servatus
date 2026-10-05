@@ -32,8 +32,12 @@ identical targets. Decoding requires the exact canonical encoding; any defect ra
 The store is an owner-only directory with a `.lock` file (`flock`) and `campaign.json`, replaced
 atomically (write a new file, sync it, rename it over the old one, sync the directory) through the
 same pinned-descriptor primitives as publication. `update(change)` writes only when the change
-returns a different state. The store caches the decoded state by file content and decodes again only
-when the bytes differ.
+returns a different state; exceptions from `change` propagate unchanged and leave the state
+untouched. The lock is not reentrant, so `change` must not call back into the store; `Campaign`
+keeps probes, scheduler calls, and other callbacks outside store transactions. The store caches the
+decoded state by file content and decodes again only when the bytes differ. A missing campaign or
+state file is `NotFound`; other filesystem failures map as in ADR 0002 (`ConfigurationError`,
+`Unavailable`, or `UnsafeFilesystem`), never a raw `OSError`.
 
 ## Authoring
 
@@ -57,27 +61,29 @@ work beyond it is deferred. `Plan.warnings` reports acknowledged duplicate risk 
 
 The policy (`Hold`, `Retry`) is pure and evaluates each Task in order: `NOT_REQUESTED` (outside
 `only`); `VALID` (the probe reports a valid result; valid work is never resubmitted); `UNRESOLVED`
-(an Attempt naming it has intent without outcome); selected as fresh work if it was never
-accepted; `SUBMITTED` if it has accepted work and resubmission was not requested for it, without
-consulting the scheduler; `ACTIVE` if any accepted Attempt is queued, running, or retained;
-`UNOBSERVABLE` if any accepted Attempt lacks evidence; otherwise the retry selector decides.
-`Retry.FAILED` selects Tasks whose current (latest accepted) Attempt failed or was cancelled, judged
-per step when step evidence exists and per allocation otherwise; other terminal Tasks stay
-`SUBMITTED`. `Retry.INCOMPLETE` selects terminal Tasks whose result the probe reports missing; it
-requires a probe, and planning without one raises `ConfigurationError`. Under either selector,
-`UNKNOWN` evidence holds a Task as `UNOBSERVABLE`. Explicit retry keys raise `PlanRefused`, listing
-every offending key, for an unknown key, a valid result, no accepted history, `UNKNOWN` evidence
-without acknowledgement, or an acknowledgement of a key that was not explicitly retried (so
-duplicate risk can never be acknowledged through a bulk selector). Explicit retries of active,
-unresolved, or unobservable work are held, not raised. Bulk selectors never raise for individual
-Tasks.
+(an Attempt naming it has intent without outcome); selected as fresh work if it was never accepted;
+`SUBMITTED` if it has accepted work and resubmission was not requested for it, without consulting
+the scheduler; `ACTIVE` if any accepted Attempt is queued, running, or retained; `UNOBSERVABLE` if
+any accepted Attempt lacks evidence; otherwise the retry selector decides. `Retry.FAILED` selects
+Tasks whose current (latest accepted) execution failed or was cancelled, following the status rule
+below (so a failed packed allocation without the Task's step is `UNKNOWN`, not failed); other
+terminal Tasks stay `SUBMITTED`. `Retry.INCOMPLETE` selects terminal Tasks whose result the probe
+reports missing; it requires a probe, and planning without one raises `ConfigurationError`. Under
+either selector, `UNKNOWN` evidence holds a Task as `UNOBSERVABLE`. Explicit retry keys raise
+`PlanRefused`, listing every offending key, for an unknown key, a valid result, no accepted history,
+`UNKNOWN` evidence without acknowledgement, or an acknowledgement of a key that was not explicitly
+retried (so duplicate risk can never be acknowledged through a bulk selector). Explicit retries of
+active, unresolved, or unobservable work are held, not raised. Bulk selectors never raise for
+individual Tasks.
 
 Observation is scoped: a plan observes only the accepted Attempts whose Tasks could be retried, so a
 plan of fresh Tasks makes no scheduler calls. The probe is called once per operation with the
 relevant Tasks.
 
-`Plan.to_json()` serializes the Decision with its digest; `Plan.save(path)` writes it owner-only
-without overwriting. `Campaign.load_plan(data)` rebuilds the Plan from the Decision and current
+`Plan` exposes the reviewed `decision`, the derived `allocations`, the `digest`, and `warnings`;
+there are no forwarding properties. `Plan.to_json()` serializes the Decision with its digest as
+canonical JSON bytes without a trailing newline; `Plan.save(path)` writes it owner-only without
+overwriting. `Campaign.load_plan(data)` rebuilds the Plan from the Decision and current
 state and requires the same digest.
 
 ## Submission
@@ -92,7 +98,9 @@ once, observes only the Attempts of planned retries, and raises `StalePlan` unle
 Task is still selected. All of these failures are ordinary errors raised before any intent. For
 each allocation it then checks the revision, records intent (synced), contacts Slurm outside the
 lock, and records the outcome. A receipt is recorded even if an unrelated append or seal advanced
-the revision; that change stops further allocations from the stale plan.
+the revision; that change stops further allocations from the stale plan. If committing a receipt
+reports failure but rereading the state shows it durable, the allocation is reported as a receipt,
+not as unresolved.
 
 A complete batch returns `SubmitResult`. Any stop once the first intent is attempted raises
 `SubmissionInterrupted` whose `result` holds confirmed receipts, unresolved allocations (with any
@@ -100,14 +108,28 @@ job observed but not durably recorded), and unattempted allocations. `KeyboardIn
 `SystemExit` propagate, leaving durable intent for recovery. Recovery uses `reconcile` (exactly one
 job carrying the allocation identity, otherwise `ReconciliationError`; an already accepted
 allocation returns its receipt without contacting Slurm, and one recorded as not submitted raises
-`Conflict`), `mark_accepted(allocation_id, job_id, *, cluster=None)`, or `mark_not_submitted`. No
+`Conflict`), `mark_accepted(allocation_id, job_id, *, cluster=None)`, or `mark_not_submitted`.
+
+`mark_not_submitted` releases Tasks for resubmission, so it needs proof. It first runs
+`Scheduler.find` on the Attempt's original target (ADR 0003): any matching job raises `Conflict`
+(record it with `reconcile` or `mark_accepted`), a failed query raises `Unavailable`, an
+untrustworthy reply raises `ReconciliationError`, and only proven absence records the outcome. The
+original target must therefore be reachable. `mark_accepted` records a job for an unresolved
+allocation; for one already recorded as not submitted, it asks the original target and replaces
+the outcome (the pure `correct_outcome` transition, at a new revision) only when `identify` proves
+exactly that job, refusing with `Conflict` when a later Attempt already includes its Tasks. No
 automatic retry hides ambiguity; history is never erased.
 
 ## Status
 
 `Campaign.status(*, scheduler=True)` projects all Tasks and Attempts at one revision. Each
-`TaskStatus` carries the result state, current allocation, execution state (step evidence when
-known), exit code, and whether it is unresolved. Result readiness requires a sealed roster and valid
+`TaskStatus` carries the result state, current allocation, execution state, exit code, and whether
+it is unresolved. A Task's execution is its own step when known, otherwise the allocation's state,
+except that `UNKNOWN` or contradictory (`problem`) allocation evidence makes every Task `UNKNOWN`
+whatever its step says, and a failed or cancelled allocation of several Tasks makes a Task without
+step evidence `UNKNOWN` (a packed allocation fails when any step does, so its failure says nothing
+about one Task). A successful allocation, or one holding a single Task, speaks for its Tasks. Exit
+codes accompany terminal executions only. Result readiness requires a sealed roster and valid
 results for every Task; quiescence independently requires scheduler evidence, no unresolved
 acceptance, and terminal, non-retained evidence for every accepted Attempt. `Status.counts()` has a
 fixed set of keys. `scheduler=False` makes no scheduler
@@ -115,8 +137,10 @@ calls. `Status.to_json()` (`servatus.status/1`) serializes the snapshot without 
 
 `cancel(*, tasks=None, allocations=None)` observes the chosen allocations, then `scancel`s each that
 is not known to be terminal on its original route: every accepted allocation of each named Task
-(`Conflict` if a Task has none), plus each named allocation (`Conflict` unless accepted). It returns
-the receipts it asked to stop. `read_log(*, task=None, allocation=None, max_bytes=65_536)` reads the
-allocation log, a Task's step log in its latest accepted allocation, or with both that Task's step
-log in that allocation; `max_bytes` is 1 B to 1 MiB. It derives the log path from state and reads a
+(`Conflict` if a Task has none), plus each named allocation (`Conflict` unless accepted). It tries
+every chosen allocation and returns the receipts it asked to stop; if any `scancel` fails it raises
+`Unavailable` naming both the cancelled and the failed allocations.
+`read_log(*, task=None, allocation=None, max_bytes=65_536)` reads the allocation log, a Task's
+step log in its latest accepted allocation, or with both that Task's step log in that allocation;
+`max_bytes` is 1 B to 1 MiB. It derives the log path from state and reads a
 bounded suffix outside the store lock; log content never enters state or decisions.

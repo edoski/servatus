@@ -39,20 +39,42 @@ The hidden Workspace container is the lifecycle trust root. Its container, work 
 lifecycle lock, and identity file must belong to the effective user with no group or world
 permissions and are reverified through pinned descriptors. Initialization syncs the private
 hierarchy and its parent before identity becomes authoritative; no sync runs under shared parent
-coordination. Cleanup, `discard()`, and residue reclaim walk only the pinned tree without following
-links, check name bindings before descriptor-relative removal, and preserve a moved or substituted
-root as residue. These checks do not make inspection and unlink atomic against a concurrent
+coordination. A container holding work but no identity is never adopted (`WorkspaceConflict`
+naming the private path). Removal deletes `work` first and the identity file last, so an
+interrupted removal leaves an identity-bound remnant that only the same identity finishes.
+Cleanup, `discard()`, and residue reclaim walk only the pinned tree without following links,
+check name bindings before descriptor-relative removal, and preserve a moved or substituted root
+as residue. A private directory lacking owner read or search permission is made owner-accessible
+by name relative to its pinned parent after its binding is checked, and its inode is verified again
+once opened. These checks do not make inspection and unlink (or chmod) atomic against a concurrent
 same-account namespace writer. Keep destination parents private.
+
+Parent coordination and the directory-commit fallback below hold an exclusive `flock` on a
+dedicated handle to the pinned directory. Where the filesystem refuses `flock` on a directory
+handle (`EBADF`, `ENOLCK`, `EOPNOTSUPP`, `EINVAL`, typical of NFS), Servatus instead creates and
+locks an owner-only (`0600`) regular file `.servatus.lock` in that directory and checks after
+locking that the name still binds the locked inode. The file is never removed, because unlinking a
+lock file would split its holders. It must be owned by the effective user with no group or world
+permissions, so a directory coordinated this way cannot be shared between users; another user's
+lock file is refused.
+
+Filesystem failures surface as Servatus errors, never as a raw `OSError`: a missing, denied,
+read-only, or overlong path, or a file its owner cannot read, is `ConfigurationError` (`NotFound`
+for a missing campaign or state file); no space, quota, I/O errors, and descriptor exhaustion are
+`Unavailable`; a cross-device operation is `CrossDeviceError`. `UnsafeFilesystem` is reserved for
+explicit substitution, type (for example a symlink or file where a directory must be), and
+ownership checks, so treat it as a reason to investigate. Exceptions raised by builders, writers,
+and other application callbacks propagate unchanged.
 
 On Linux, when `renameat2(RENAME_NOREPLACE)` is unavailable (no libc wrapper and no known raw
 syscall number) or the filesystem rejects it (`EINVAL`, `ENOSYS`, `EOPNOTSUPP`/`ENOTSUP`),
 regular-file publication keeps kernel-enforced create-if-absent semantics through a hard link.
-Directory publication instead uses a check-and-rename transaction under an exclusive advisory lock
-on the pinned parent, released before the parent sync. A failure or crash after rename can leave a
-complete visible destination with unconfirmed directory durability; treat that outcome as ambiguous
-and validate the destination before retrying. The fallback requires a parent owned by the effective
-user and not group- or world-writable, every same-account publisher on every client to use
-Servatus, and a mount with coherent `flock` and stable inode identities.
+Directory publication instead uses a check-and-rename transaction under the exclusive directory
+lock described above on the pinned parent, released before the parent sync. A failure or crash
+after rename can leave a complete visible destination with unconfirmed directory durability; treat
+that outcome as ambiguous and validate the destination before retrying. The fallback requires a
+parent owned by the effective user and not group- or world-writable, every same-account publisher
+on every client to use Servatus, and a mount with coherent `flock` and stable inode identities.
 
 ## Campaigns
 
@@ -67,10 +89,18 @@ admission, isolation, allocation, accounting, and billing. GPU steps forward Slu
 device visibility with PCI bus ordering; this does not replace site GPU isolation.
 
 Scheduler commands run under a scrubbed environment with a fixed path, C locale, and UTC timezone;
-local scheduler or timezone overrides are not forwarded. Over SSH, Servatus uses batch mode (never
-prompting), and discards everything printed before its per-call marker, so login banners and
+local scheduler or timezone overrides are not forwarded. The local `ssh` client receives only
+`HOME`, `LOGNAME`, `USER`, `SSH_AUTH_SOCK`, `KRB5CCNAME`, and `KRB5_CONFIG` from the caller's
+environment, so agent and Kerberos (GSSAPI) credentials work. Over SSH, Servatus uses batch mode
+(never prompting), and discards everything printed before its per-call marker, so login banners and
 shell-startup output cannot be mistaken for scheduler output. SSH authentication, host keys, and
 connection sharing are configured in the user's OpenSSH configuration.
+
+Scheduler replies, Task keys, Profile labels, paths, and error messages are untrusted text. Human
+CLI output escapes every non-printable character, so they cannot inject terminal control
+sequences; errors are one escaped line and never a traceback. Two outputs are exact rather than
+escaped: `--json` output, which is data for programs to parse, and `plan --show-scripts`, which
+prints scripts verbatim, including any control characters in Task arguments or environment.
 
 Campaign state is an owner-only directory. It keeps complete Task arguments, stdin, and environment
 for retry; keep it private.
@@ -95,6 +125,14 @@ then syncs unresolved intent before each `sbatch`. A failure after launch does n
 `SubmissionInterrupted.result` distinguishes confirmed receipts, unresolved work, unattempted
 allocations, and a job observed but not durably recorded. Reconcile uncertain acceptance before
 retrying; unknown accepted work is retried only after an explicit duplicate-risk acknowledgement.
+
+`mark_not_submitted` (`servatus mark-not-submitted`) releases Tasks for resubmission, so it
+requires proof: it first asks the allocation's original target for every job carrying the
+allocation's identity, raises `Conflict` if any exists, `Unavailable` if the query fails, and
+`ReconciliationError` for an untrustworthy reply, and records the outcome only on proven absence.
+The proof is bounded by Slurm's own retention (queue plus accounting near the intent time).
+`mark_accepted` may replace a not-submitted record only when the original target proves exactly
+that job and no later allocation already includes the Tasks.
 
 ## Logs
 

@@ -23,15 +23,21 @@ Target has a host and `Local()` otherwise; callers and tests may supply their ow
   LC_ALL=C TZ=UTC` with the argv. Output before the markers (login banners, shell-startup noise) is
   discarded; a missing marker means the command did not run as intended and is `Unavailable`.
   Batch mode means Servatus never prompts; connection reuse and multi-factor login belong in the
-  user's ssh_config (`ControlMaster`/`ControlPersist`).
+  user's ssh_config (`ControlMaster`/`ControlPersist`). The local `ssh` client gets a fixed `PATH`
+  and C locale plus only `HOME`, `LOGNAME`, `USER`, `SSH_AUTH_SOCK`, `KRB5CCNAME`, and
+  `KRB5_CONFIG` from the caller, enough for its configuration, agent, and Kerberos credentials.
 - `Local` runs the argv with the same scrubbed environment and no shell.
 
 Every operation has a 30-second deadline, at most 32 arguments, 16 KiB of command text, 4 KiB per
 field, and 1 MiB per output stream (plus 64 KiB for SSH noise before the marker); streams are
-drained concurrently and a failing child is killed and reaped. Spawn, timeout, overflow,
-missing-marker, and connection failures, and scheduler commands that fail where success is
-required, all surface as `Unavailable`: one error boundary. `check_command(argv)` applies the
-bounds purely, so planning rejects an oversized `sbatch` request before any intent exists.
+drained concurrently and a failing child is killed and reaped. Once the child exits, the runner
+reads what is already buffered and stops waiting for end-of-file, because a descendant (an OpenSSH
+`ControlPersist` master started by this call) may hold the pipes open indefinitely. Spawn, timeout,
+overflow, missing-marker, and connection failures, and scheduler commands that fail where success is
+required, all surface as `Unavailable`: one error boundary. `check_command(argv)` applies the bounds
+purely, so planning rejects an oversized `sbatch` request before any intent exists.
+`servatus.campaign.ping(target)` runs `sbatch --version` through this seam for `servatus doctor`,
+and every submission runs the same check first; a failure reports Slurm's first stderr line.
 
 ## Batch script and launchers
 
@@ -47,11 +53,13 @@ no scratch directory, `mktemp`, `base64`, or cleanup. Every step receives the Ta
 `SERVATUS_TASK_KEY`, `SERVATUS_ALLOCATION_ID`, `SERVATUS_SLOT`, `SERVATUS_JOB_ID` (from
 `$SLURM_JOB_ID`), and `SERVATUS_RESTART_COUNT` (`${SLURM_RESTART_COUNT:-0}`).
 
-- **Apptainer launcher:** `apptainer run --cleanenv` with `--bind WORK_ROOT:WORK_ROOT`, one
+- **Apptainer launcher:** `apptainer exec --cleanenv` with `--bind WORK_ROOT:WORK_ROOT`, one
   `--bind` per Target bind, `--pwd WORK_ROOT`, and `--nv` for GPU work, then the image and the
-  Task's arguments, which the image's runscript receives. Environment values are passed as
-  `APPTAINERENV_NAME=<shell-quoted value>` assignments, never `--env`, so values containing commas
-  or equals signs survive intact.
+  Task's arguments. `exec`, not `run`: the Task's `args` are the program and its arguments
+  whatever the image's runscript does, and a relative `args[0]` resolves on the container's `PATH`.
+  An Apptainer Task with empty `args` is a `ConfigurationError` at planning. Environment values are
+  passed as `APPTAINERENV_NAME=<shell-quoted value>` assignments, never `--env`, so values
+  containing commas or equals signs survive intact.
 - **Direct launcher:** `env -i ... NAME=VALUE` runs the Task's `args[0]`, which must be an absolute
   path without `=` (`ConfigurationError` at planning otherwise), from `work_root`.
 
@@ -63,7 +71,9 @@ aggregates failure into the allocation's exit status.
 
 Allocation output goes to `log_root/<allocation_id>-%j.out` and each Task's combined output to
 `log_root/<allocation_id>-%j-<slot>.out`. The immutable allocation identity prevents reused job
-numbers from aliasing Attempts.
+numbers from aliasing Attempts. Paths that these commands would reinterpret are rejected when the
+Target is built: `%` in `log_root` (Slurm filename patterns), `,` or `:` in `work_root` (bind
+syntax), and `:` in the Apptainer image (Apptainer reads it as a URI such as `docker://`).
 
 ## Evidence
 
@@ -88,13 +98,21 @@ rows from another cluster) still raise `EvidenceConflict` for the query. Held or
 including `SPECIAL_EXIT`, is retained and blocks retry.
 
 **Step evidence.** One additional `sacct` query (without `--allocations`) maps step rows named
-`servatus-<id>-<slot>` to per-Task `StepEvidence`. A failure of that query degrades step evidence to
-`None`; it never aborts observation.
+`servatus-<id>-<slot>` to per-Task `StepEvidence`: one entry per slot, `None` when that step was
+not found. A failure of that query leaves `steps` empty (step evidence unavailable, not absent); it
+never aborts observation. How a Task's execution follows from step and allocation evidence is
+ADR 0005's status rule.
+
+**Identity search.** `Scheduler.find` lists every job carrying an allocation's identity, queued or
+running (`squeue --name`) or accounted within the submission window (`sacct --name`). An empty
+answer proves absence; a failed command is `Unavailable`, and a malformed or unrelated row, or one
+job number on several clusters, is `ReconciliationError` because it proves nothing. `identify`
+(used by `reconcile` and `mark_accepted`) requires exactly one such job.
 
 **Cancel.** `scancel --name=servatus-<id> JOB` targets the allocation's job on its original route
 and cluster, so a reused job number is never cancelled; a job that already ended or aged out counts
 as cancelled. Cancellation is a request; retry stays blocked until evidence shows the work
-terminal.
+terminal. `Campaign.cancel` tries every chosen allocation and reports failures together.
 
 **Logs.** Log reads derive one path from a validated accepted Attempt, slot, and job number and
 `tail` a bounded suffix. No caller-supplied remote path or command is accepted; the path stays

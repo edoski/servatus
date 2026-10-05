@@ -13,23 +13,28 @@ an exclusive child lease. Different children may overlap; a duplicate child or p
 fails immediately with `Busy`. Children cannot have children. The application decides which
 children are required and when they are ready.
 
-Opening each level takes a short exclusive `flock` on its pinned parent directory while creating or
-opening the private hierarchy and acquiring its lifecycle lease without blocking. Destination
-absence is checked after the lease is acquired and again before application access. If a level's
-destination already exists, its leftover private work (bound to the same identity, or never
-initialized) is reclaimed under an exclusive lease and entry raises `DestinationExists`; a parent
-level is reclaimed only when no sibling child holds its shared lease. Parent coordination ends
-before identity initialization and every durability sync, so slow synchronization cannot convoy
-independent children or destinations. Within the owner-only container, the durable identity record
-stores exact container, lifecycle-lock, and work inode identities. A distributed filesystem must
-expose stable inode identities and one coherent `flock` domain across every participating client.
+Opening each level takes a short exclusive directory lock (ADR 0002: `flock` on its pinned parent
+directory, or on an owner-only `.servatus.lock` file inside it where the filesystem refuses
+directory `flock`, as NFS does) while creating or opening the private hierarchy and acquiring its
+lifecycle lease without blocking. Destination absence is checked after the lease is acquired and
+again before application access. If a level's destination already exists, its leftover private work
+(bound to the same identity, or never initialized) is reclaimed under an exclusive lease and entry
+raises `DestinationExists`; a parent level is reclaimed only when no sibling child holds its shared
+lease. Parent coordination ends before identity initialization and every durability sync, so slow
+synchronization cannot convoy independent children or destinations. Within the owner-only container,
+the durable identity record stores exact container, lifecycle-lock, and work inode identities. A
+distributed filesystem must expose stable inode identities and one coherent `flock` domain across
+every participating client; the `.servatus.lock` files it may need are left in place and tie those
+directories to one user.
 
 The hidden Workspace container is the lifecycle trust root. Root and child containers, work
 directories, locks, and identity files must be owned by the effective user with no group or world
 permissions. Descriptor-rooted cleanup and `discard()` remove only the pinned hierarchy and preserve
-a moved or substituted name as residue. Arbitrary same-account code can rename and recreate a whole
-root, which an unprivileged library cannot distinguish from first initialization without a separate
-registry; that is outside the threat model.
+a moved or substituted name as residue. Every level is removed `work` first and `.identity` last
+(ADR 0002), so an interrupted removal of a root or child is finished only by the same identity, and
+a container holding work without an identity is never adopted. Arbitrary same-account code can
+rename and recreate a whole root, which an unprivileged library cannot distinguish from first
+initialization without a separate registry; that is outside the threat model.
 
 Child publication atomically retains one immutable result under parent work (with the same `mode=`
 and `Draft` rules as ADR 0002) and removes only that child's private workspace. Child or parent

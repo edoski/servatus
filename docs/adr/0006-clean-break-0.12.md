@@ -39,22 +39,27 @@ old names and the old state format alive indefinitely.
 `DestinationExists`, `WorkspaceConflict`), `PlanRefused` (decide explicitly), `Busy` (retry soon),
 `Unavailable` (retry later), `IntegrityError` (with `CorruptState`, `UnsafeFilesystem`,
 `EvidenceConflict`; investigate), `ReconciliationError`, and `SubmissionInterrupted`. The CLI maps
-them to exit codes 0, 1, 2, 3, and 75.
+them to exit codes 0, 1, 2, 3, and 75, exits 130 on Ctrl-C, and reports any unexpected exception
+as one escaped error line with exit 1, never a traceback. Filesystem failures never escape as a raw
+`OSError`; `UnsafeFilesystem` is kept for substitution, type, and ownership problems (ADR 0002).
 
-**Reshaped.** The campaign engine is a functional core with one imperative shell (ADR 0005).
-Plans hold every unselected Task with one `Hold` reason; Tasks with accepted work are held
-`SUBMITTED` unless a retry is requested, so plans of fresh work never consult the scheduler. The
-CLI prints human-readable output, with `--json` on every command except `logs`; `plan --output` is
-optional.
-Scheduler access goes through one `Transport` seam with `Ssh` and `Local` implementations, and Tasks
-start through an Apptainer or a direct launcher (ADR 0003). Publication uses one stage-directory
-design for files and directories (ADR 0002).
+**Reshaped.** The campaign engine is a functional core with one imperative shell (ADR 0005). A
+`Plan` is its reviewed `decision` plus derived allocations and digest; the 0.11 plan fields live on
+`plan.decision`. Plans hold every unselected Task with one `Hold` reason; Tasks with accepted work
+are held `SUBMITTED` unless a retry is requested, so plans of fresh work never consult the
+scheduler. The CLI prints human-readable output, with `--json` on every command except `logs`;
+`plan --output` is optional. Scheduler access goes through one `Transport` seam with `Ssh` and
+`Local` implementations, and Tasks start through an Apptainer launcher (now `apptainer exec`, so
+Task arguments no longer pass through the image's runscript) or a direct launcher (ADR 0003).
+Recording an allocation as not submitted requires the scheduler's proof of absence (ADR 0005).
+Publication uses one stage-directory design for files and directories (ADR 0002).
 
 **Added.** Local execution on a login node (omit `host`); the direct launcher; per-Task step
 evidence and exit codes; `signal_before_end`; injected `SERVATUS_*` variables; `Campaign.ensure`;
 `Retry` selectors and `only=`; `cancel`; `read_log` by Task; `Plan.save`; public `capacity`;
-`status --offline`; `doctor`; `--version`; `servatus.testing.FakeScheduler`; `Draft.link_tree`;
-`Workspace.discard`; `mode=` on publication.
+`status --offline`; `doctor`; `--version`; `servatus.campaign.ping` and `to_document`;
+`servatus.testing.FakeScheduler`; `Draft.link_tree`; `Workspace.discard`; `mode=` on publication;
+an owner-only `.servatus.lock` file where NFS refuses directory `flock`.
 
 **Removed.** Batch scratch payload files, `--env` forwarding, the 0.11 error classes, and the
 default one-allocation submission cap (`max_allocations_per_submit` now defaults to no cap).

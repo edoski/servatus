@@ -16,16 +16,18 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
 - **Target (`Target`):** one concrete Slurm route: optional SSH host, absolute Slurm directory,
   work and log roots, partitions, site options, optional launcher, and conservative ceilings. Every
   Attempt keeps its original Target for observation, recovery, logs, and cancellation.
-- **Launcher:** how a step starts a Task. The **Apptainer launcher** (`Apptainer`) runs the Task in
-  one immutable image with a clean environment; the **direct launcher** (no container) runs the
-  Task's absolute `args[0]` under `env -i`.
+- **Launcher:** how a step starts a Task. The **Apptainer launcher** (`Apptainer`) runs the Task's
+  `args` with `apptainer exec` in one immutable image with a clean environment (the image's
+  runscript is never used; `args` must be nonempty); the **direct launcher** (no container) runs
+  the Task's absolute `args[0]` under `env -i`.
 - **Profile (`Profile`):** one nonbinding label plus a complete Target and Resources, loaded from
   `SERVATUS.toml` with document-level defaults overridden per key.
 - **Transport (`Transport`):** how scheduler commands reach Slurm. `connect(target)` returns an SSH
   transport (OpenSSH in batch mode, output fenced by per-call markers) when the Target has a host,
   and a local one otherwise. Both run with a scrubbed environment and fixed bounds and return a
   `Completed`; every failure surfaces as `Unavailable`. Any callable from Target to Transport (for
-  example `servatus.testing.FakeScheduler`) can replace `connect`.
+  example `servatus.testing.FakeScheduler`) can replace `connect`. `ping(target)` proves a Target's
+  scheduler answers (`sbatch --version`).
 - **Allocation:** one single-node Slurm job named `servatus-<allocation_id>` running its Tasks as
   concurrent exact steps. Each step is named `servatus-<allocation_id>-<slot>`.
 - **Capacity (`capacity`):** how many Tasks of one Resources fit one allocation under every Target
@@ -34,18 +36,20 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
 - **Decision (`Decision`):** the reviewed part of a plan: Campaign identity and revision, Profile,
   selected, held, and deferred Tasks, retry choices, duplicate-risk acknowledgements, packing,
   whether a probe was used, and a random nonce from which allocation identities derive.
-- **Plan (`Plan`):** a Decision plus its derived `PlannedAllocation`s (Task keys, totals, batch
-  script, `sbatch` argv) and digest, with `warnings` for acknowledged duplicate risk and deferred
-  work. A saved plan (`servatus.plan/1`) holds only the Decision and digest. Submission rebuilds
-  the plan from its Decision and the current state and refuses it when it differs.
+- **Plan (`Plan`):** a Decision (`plan.decision`) plus its derived `PlannedAllocation`s (Task
+  keys, totals, batch script, `sbatch` argv) and digest, with `warnings` for acknowledged duplicate
+  risk and deferred work. A saved plan (`servatus.plan/1`) holds only the Decision and digest.
+  Submission rebuilds the plan from its Decision and the current state and refuses it when it
+  differs.
 - **Hold (`Hold`):** why a Task is not selected: `VALID` (valid result), `UNRESOLVED` (intent
   without outcome), `SUBMITTED` (accepted work and not requested for retry; the scheduler is not
   consulted), `ACTIVE` (retry requested, but Slurm still holds earlier work), `UNOBSERVABLE`
-  (evidence for earlier work is missing or `UNKNOWN`), or `NOT_REQUESTED` (outside `only`).
+  (evidence for earlier work is missing, or the Task's execution is `UNKNOWN`), or `NOT_REQUESTED`
+  (outside `only`).
 - **Deferred Task:** eligible work beyond the plan's `max_allocations_per_submit` batch.
 - **Retry selector (`Retry`):** a bulk retry choice. `Retry.FAILED` selects Tasks whose current
-  (latest accepted) work failed or was cancelled; `Retry.INCOMPLETE` selects terminal Tasks whose
-  probed result is missing and requires a probe. Explicit retry keys name single Tasks and are
+  (latest accepted) execution failed or was cancelled; `Retry.INCOMPLETE` selects terminal Tasks
+  whose probed result is missing and requires a probe. Explicit retry keys name single Tasks and are
   checked strictly (`PlanRefused`).
 - **Duplicate-risk acknowledgement:** an explicit decision, for an explicitly retried key only,
   allowing retry when earlier accepted work has `UNKNOWN` evidence. It never claims the earlier
@@ -55,7 +59,8 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
 - **Intent:** the synced unresolved Attempt recorded before scheduler contact.
 - **Receipt (`Receipt`):** a Slurm job identity (`JobRef`) proving acceptance, not completion.
 - **Unresolved allocation:** an intent without an outcome. It blocks its Tasks until `reconcile`,
-  `mark_accepted`, or `mark_not_submitted` resolves it.
+  `mark_accepted`, or `mark_not_submitted` resolves it. `mark_not_submitted` records only proven
+  absence: the original target must report no job carrying the allocation's identity.
 - **Submit result (`SubmitResult`):** receipts, unresolved, and unattempted allocations from one
   submission. `SubmissionInterrupted` carries it when submission stops early.
 - **Shape check (`ShapeCheck`):** one time-specific `sbatch --test-only` answer for a distinct
@@ -67,18 +72,24 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   cancelled, or unknown), with raw state, exit code, reason, whether Slurm retains the work, and
   any per-allocation `problem` (for example, a foreign job now holding the job number).
 - **Step evidence (`StepEvidence`):** the state and exit code of one Task's own `srun` step, when
-  accounting reports it. It refines a packed Task's execution state.
+  accounting reports it. An observation holds one entry per slot (`None`: step not found), or none
+  at all when the step query failed (step evidence unavailable).
+- **Task execution:** a Task's state in its current allocation: its own step when known, else the
+  allocation's state. `UNKNOWN` or contradictory (`problem`) allocation evidence makes it `UNKNOWN`
+  whatever the steps say, and so does a failed or cancelled allocation of several Tasks without the
+  Task's step (that Task may have finished first). Exit codes accompany terminal executions only.
 - **Observation scope:** the accepted Attempts a plan needs to observe: only those whose Tasks
   could be retried. Plans of fresh Tasks observe nothing.
 - **Status (`Status`):** one transient revision-bound projection of Tasks (`TaskStatus`) and
   Attempts (`AttemptStatus`), with counts, result readiness, and quiescence. `to_json()` exports
-  it as a `servatus.status/1` document.
+  it as a `servatus.status/1` document; `to_document` encodes other results for JSON.
 - **Result readiness:** the sealed roster has valid results for every Task.
 - **Quiescence:** scheduler evidence was requested, every accepted Attempt is terminal and no
   longer retained by Slurm, and no acceptance is unresolved. It is independent from result
   readiness.
 - **Cancellation:** `scancel` of accepted allocations not known to be terminal, by allocation or
-  for every accepted allocation of a Task. It is a request; it retries nothing.
+  for every accepted allocation of a Task. Every chosen allocation is tried. It is a request; it
+  retries nothing.
 - **Log snapshot (`LogSnapshot`):** a bounded binary suffix of an allocation or Task log. It is
   sensitive, untrusted, and has no lifecycle authority.
 
@@ -105,7 +116,12 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   destination.
 - **Residue:** private work or stages left behind by interruption or unprovable cleanup. Entering a
   Workspace whose destination exists reclaims residue bound to the same identity (or never
-  initialized), then raises `DestinationExists`.
+  initialized), then raises `DestinationExists`. Containers are removed `work` first and identity
+  last, so an interrupted removal leaves an identity-bound remnant that only the same identity
+  finishes; work without an identity is never adopted.
+- **Directory lock:** an exclusive `flock` coordinating entries of one directory (Workspace
+  parents, the directory-commit fallback). Where a directory handle cannot be locked (NFS), an
+  owner-only `.servatus.lock` file in the directory is locked instead and never removed.
 - **Retained tree:** one existing owner-only destination sibling removed only after the destination
   commit is durable.
 - **Builder / writer:** the application callbacks that write and validate a draft or file member,

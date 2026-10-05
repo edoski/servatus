@@ -25,13 +25,26 @@ A clean break: no compatibility aliases and no migration of earlier campaign sta
   `TaskEvidence` → `TaskStatus`, `AttemptEvidence` → `AttemptStatus`, `AllocationEvidence` →
   `SchedulerEvidence`, `SubmissionError` → `SubmissionInterrupted`.
 - Renamed methods: `Campaign.load` → `Campaign.open`, `Campaign.inspect` → `Campaign.status`,
-  `restore_plan` → `Campaign.load_plan`, `plan_document` → `Plan.to_json`. `resolve` is replaced
-  by `Campaign.mark_accepted` and `Campaign.mark_not_submitted`.
+  `restore_plan` → `Campaign.load_plan`, `plan_document` → `Plan.to_json` (canonical bytes without
+  a trailing newline). `resolve` is replaced by `Campaign.mark_accepted` and
+  `Campaign.mark_not_submitted`.
+- The reviewed fields of a plan (`campaign_id`, `revision`, `profile`, `selected`, `held`,
+  `deferred`, `retry`, `duplicate_risk`, `tasks_per_allocation`, `probe_required`) live on
+  `Plan.decision`; `Plan` itself keeps only `decision`, `allocations`, `digest`, `warnings`,
+  `to_json`, and `save`.
 - CLI: `resolve` is replaced by `mark-accepted` and `mark-not-submitted`; `logs` takes `--task`,
   `--allocation`, or both instead of a positional allocation; usage errors exit 2, interrupted
-  submissions exit 3, and an unavailable cluster or busy campaign exits 75.
+  submissions exit 3, an unavailable cluster or busy campaign exits 75, and Ctrl-C exits 130.
 - CLI output is human-readable; pass `--json` (every command except `logs`) for machine output.
-  `status --json` prints a canonical `servatus.status/1` document with `counts`.
+  `status --json` prints a canonical `servatus.status/1` document with `counts`. JSON receipts
+  nest the job as `"job": {"job_id", "cluster"}`.
+- `mark_not_submitted` (CLI `mark-not-submitted`) records an outcome only after the allocation's
+  original target proves no job carries its identity, so that target must be reachable.
+- Apptainer steps run `apptainer exec` instead of `apptainer run`: the Task's `args` run directly
+  whatever the image's runscript does, and an Apptainer Task with empty `args` is refused at
+  planning.
+- `Target` rejects `%` in `log_root` (Slurm expands it) and `,` or `:` in `work_root` (it is
+  bound into containers); `Apptainer` rejects `:` in `image` (Apptainer reads it as a URI).
 - `servatus plan` prints the plan and saves it only with `--output`, which is no longer required.
   `servatus validate` exits 1 when Slurm rejects any allocation shape.
 - Errors are regrouped in `servatus.errors` by what the caller can do: `ConfigurationError` (with
@@ -49,9 +62,10 @@ A clean break: no compatibility aliases and no migration of earlier campaign sta
 - The Apptainer launcher is a separate `Apptainer(executable=..., image=..., binds=...)` value on
   `Target.container`. TOML keeps the `apptainer` and `image` keys, now optional.
 - `max_allocations_per_submit` defaults to no cap instead of one allocation per plan.
-- Plans report held Tasks as a mapping of key to `Hold` reason and deferred Tasks as `deferred`,
-  replacing `excluded_task_keys` and `deferred_task_keys`. A Task with accepted work is held
-  `SUBMITTED` unless a retry is requested for it, and its scheduler state is not consulted.
+- Plans report held Tasks as a mapping of key to `Hold` reason (`plan.decision.held`) and deferred
+  Tasks as `plan.decision.deferred`, replacing `excluded_task_keys` and `deferred_task_keys`. A
+  Task with accepted work is held `SUBMITTED` unless a retry is requested for it, and its
+  scheduler state is not consulted.
 - The result probe receives a sequence of Tasks and returns the keys with valid results; it is
   called once per operation instead of once per Task.
 - `publish_file` writers receive `<private stage>/<destination name>` instead of a pre-created
@@ -60,6 +74,12 @@ A clean break: no compatibility aliases and no migration of earlier campaign sta
 - Invalid publication input (an unsafe draft path, a missing destination parent, a non-sibling
   `retire`, a bad `mode`, a non-bytes identity) raises `ConfigurationError` instead of
   `UnsafePublication`.
+- Filesystem failures in publication, Workspaces, and the campaign store never escape as a raw
+  `OSError`. A missing, unwritable, or overlong path, a missing link or `retire` source, a writer
+  that creates nothing, and a file its owner cannot read raise `ConfigurationError` (`NotFound`
+  for missing campaign state); no space, quota, I/O errors, and descriptor exhaustion raise
+  `Unavailable`. `UnsafeFilesystem` now means only substitution, wrong type, or wrong ownership.
+  Exceptions raised by builders and writers propagate unchanged.
 
 ### Added
 
@@ -80,12 +100,17 @@ A clean break: no compatibility aliases and no migration of earlier campaign sta
   for explicitly retried keys.
 - `Campaign.cancel` (CLI `cancel`) stops every accepted allocation of the named Tasks, or the named
   allocations, unless Slurm already reports them finished.
-- `servatus.campaign.capacity` reports how many Tasks fit one allocation.
+- `servatus.campaign.capacity` reports how many Tasks fit one allocation,
+  `servatus.campaign.ping(target, *, connect=None)` returns the `sbatch --version` text (as
+  `servatus doctor` does), and `servatus.campaign.to_document(value)` turns results, receipts,
+  shape checks, and planned allocations into the JSON-compatible data the CLI prints.
 - `Campaign.read_log` by Task, allocation, or both; CLI `logs --output FILE` writes owner-only files and
   refuses to print to a terminal.
 - `Plan.save` writes owner-only plan files without overwriting.
 - `servatus status --offline`, `servatus doctor`, and `servatus --version`.
 - `servatus.testing.FakeScheduler`, an in-memory Slurm for testing launchers and recovery code.
+  Its controls and `count` name commands by basename, except the `sbatch --version` check, whose
+  key is `"ping"` (so `count("sbatch")` counts only submissions and shape checks).
 - `Draft.link_tree` hard-links a whole source tree into a draft.
 - `Workspace.discard` removes private work without publishing.
 - `mode=` on `publish`, `publish_file`, and `Workspace.publish` sets the published permissions.
@@ -103,6 +128,23 @@ A clean break: no compatibility aliases and no migration of earlier campaign sta
   before commit.
 - Scheduler replies may hold up to 4096 lines (previously 128).
 - `REVOKED` is `UNKNOWN` and retained instead of `CANCELLED`.
+- A Task's execution is its own step when Slurm reports it. Allocation evidence that is `UNKNOWN`
+  or carries a `problem` makes all its Tasks `UNKNOWN` whatever their steps say, and a failed or
+  cancelled allocation of several Tasks makes a Task without step evidence `UNKNOWN`: such Tasks
+  are held `UNOBSERVABLE` by `Retry.FAILED` and need a duplicate-risk acknowledgement to retry
+  explicitly. Exit codes are reported only for terminal executions (`-` in human output).
+- A failed step query leaves an allocation's `steps` empty (step evidence unavailable) instead of
+  one `None` per slot.
+- `mark_accepted` can correct an allocation recorded as not submitted, but only when its original
+  target proves exactly that job and no later allocation already includes its Tasks.
+- `cancel` tries every selected allocation; if any `scancel` fails it raises `Unavailable` naming
+  the cancelled and the failed allocations.
+- Workspace containers are removed `work` first and `.identity` last. The same identity finishes
+  an interrupted removal on its next entry; a container holding work but no identity is never
+  adopted (`WorkspaceConflict` naming the private path).
+- Human CLI output escapes every non-printable character (scripts printed by `--show-scripts`
+  stay verbatim); `servatus doctor` failures include Slurm's first stderr line.
+- The ssh client also receives `KRB5CCNAME` and `KRB5_CONFIG`, so Kerberos (GSSAPI) logins work.
 
 ### Fixed
 
@@ -127,6 +169,21 @@ A clean break: no compatibility aliases and no migration of earlier campaign sta
 - Entering a Workspace whose destination already exists reclaims leftover private work.
 - Filesystem pins no longer leak descriptors when verification fails.
 - A `Draft` can no longer be used after its builder returns.
+- Publication and Workspaces work on filesystems that refuse `flock` on a directory (NFS: `EBADF`,
+  `ENOLCK`, `EOPNOTSUPP`, `EINVAL`) by locking an owner-only `.servatus.lock` file in that
+  directory instead. The file is never removed and cannot be shared between users.
+- Cleanup removes private directories that lack owner read or search permission.
+- `Draft.link_tree` refuses a source tree that contains the draft it links into
+  (`ConfigurationError`).
+- A receipt that became durable although its commit reported failure is reported as a receipt,
+  not as unresolved work.
+- A ControlPersist master holding the ssh client's stderr open no longer stalls every scheduler
+  call until the deadline: the runner stops waiting for end-of-file once the client exits.
+- The CLI never prints a traceback: an unexpected error is one `servatus: error: unexpected
+  <type>: <message>` line with exit 1. `Profile.load` with a NUL in the path raises
+  `ConfigurationError`.
+- Task JSONL files are split on `\n` only, so strings may contain U+2028 and other Unicode line
+  separators.
 
 ## Earlier versions
 
