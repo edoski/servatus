@@ -334,7 +334,7 @@ REVISIONS = {"revision", "sealed_revision", "intent_revision", "outcome_revision
 
 def open_gap(doc: Any, rng: random.Random) -> None:
     """Shift every revision at or above a random point up by one, leaving a free revision."""
-    if not is_int(doc.get("revision")):
+    if not is_int(doc.get("revision")) or doc["revision"] < 0:
         return
     start = rng.randint(1, doc["revision"] + 1)
     for path in paths(doc):
@@ -354,7 +354,7 @@ def mutate(base: Any, rng: random.Random) -> Any:
         operation = rng.randrange(10)
         if operation == 8:
             open_gap(doc, rng)
-        elif operation == 9 and is_int(value) and leaf in REVISIONS:
+        elif operation == 9 and is_int(value) and value >= 0 and leaf in REVISIONS:
             parent[leaf] = rng.randint(0, value + 1)
         elif operation == 0 and is_int(value):
             parent[leaf] = value + rng.choice((-2, -1, 1, 2))

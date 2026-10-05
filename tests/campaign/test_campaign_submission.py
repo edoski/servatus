@@ -318,7 +318,8 @@ def test_a_receipt_that_cannot_be_recorded_is_reported_with_the_observed_job(
     finally:
         world.path.chmod(0o700)
     result = caught.value.result
-    assert isinstance(caught.value.__cause__, PermissionError)
+    assert isinstance(caught.value.__cause__, ConfigurationError)
+    assert isinstance(caught.value.__cause__.__cause__, PermissionError)
     assert result.receipts == ()
     assert result.unresolved[0].observed_job == JobRef(1000)
     assert result.unattempted == unattempted(plan.allocations[1])
