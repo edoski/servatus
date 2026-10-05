@@ -13,7 +13,7 @@ import pytest
 from scheduler_fixtures import ALLOCATION, IDENTITY, query, sacct_row
 from support.builders import target
 
-from servatus.campaign import _remote
+import servatus.campaign._remote as _remote
 from servatus.campaign._evidence import AllocationState, JobRef
 from servatus.campaign._remote import Completed, Local, Ssh, check_command, connect
 from servatus.campaign._scheduler import Scheduler
