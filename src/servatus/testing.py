@@ -11,6 +11,9 @@ bounds as the real transport. Controls move jobs through their lifecycle and inj
     fake.start(1000)
     fake.finish(1000)
 
+Controls and ``count`` name commands by basename (``"sbatch"``, ``"squeue"``, ...), except the
+``sbatch --version`` connectivity check that precedes every submission, which is ``"ping"``: so
+``fail_next("sbatch")`` affects the next real submission, and ``fail_next("ping")`` the check.
 Commands Servatus never issues raise ``AssertionError`` so that drift fails tests loudly.
 """
 
@@ -24,7 +27,7 @@ from pathlib import PurePosixPath
 
 from .campaign._config import Target
 from .campaign._evidence import TIMESTAMP_FORMAT, JobRef, normalize_state
-from .campaign._remote import MAX_STREAM_BYTES, Completed, Transport, check_command
+from .campaign._remote import MAX_STREAM_BYTES, Completed, Transport
 from .campaign._scheduler import (
     SACCT_ALLOCATION_FORMAT,
     SACCT_IDENTITY_FORMAT,
@@ -32,6 +35,7 @@ from .campaign._scheduler import (
     SQUEUE_FORMAT,
     TAIL,
 )
+from .campaign._script import check_command
 from .errors import ConfigurationError, Unavailable
 
 __all__ = ["FakeJob", "FakeScheduler"]
@@ -88,6 +92,12 @@ class _Job:
         return self.history[-1]
 
 
+def _key(argv: Sequence[str]) -> str:
+    """A command's control key: its basename, or ``ping`` for ``sbatch --version``."""
+    command = posixpath.basename(argv[0])
+    return "ping" if command == "sbatch" and tuple(argv[1:]) == ("--version",) else command
+
+
 def _lines(rows: Sequence[str]) -> bytes:
     return "".join(f"{row}\n" for row in rows).encode("utf-8")
 
@@ -141,13 +151,14 @@ class FakeScheduler:
         """Answer one command exactly as the real transport and Slurm would."""
         fields = check_command(argv)
         self._calls.append(fields)
-        command = posixpath.basename(fields[0])
+        command = _key(fields)
         if queued := self._failures.get(command):
             reply = queued.pop(0)
             if reply is None:
                 raise Unavailable(f"FakeScheduler: injected failure of {command}")
             return reply
         handlers: Mapping[str, Callable[[tuple[str, ...], bytes], Completed]] = {
+            "ping": self._ping,
             "sbatch": self._sbatch,
             "squeue": self._squeue,
             "sacct": self._sacct,
@@ -172,8 +183,8 @@ class FakeScheduler:
         return tuple(self._calls)
 
     def count(self, command: str) -> int:
-        """How many times a command (by basename, such as ``"sbatch"``) was invoked."""
-        return sum(1 for call in self._calls if posixpath.basename(call[0]) == command)
+        """How many times a command (by key, such as ``"sbatch"`` or ``"ping"``) was invoked."""
+        return sum(1 for call in self._calls if _key(call) == command)
 
     @property
     def jobs(self) -> tuple[FakeJob, ...]:
@@ -256,7 +267,7 @@ class FakeScheduler:
         found.in_queue = found.accounted = False
 
     def fail_next(self, command: str, reply: Completed | None = None) -> None:
-        """Make the next ``command`` (basename) fail without acting.
+        """Make the next ``command`` (by key) fail without acting.
 
         With no ``reply`` the transport raises ``Unavailable``; otherwise ``reply`` is returned.
         Calls queue up in order.
@@ -264,7 +275,7 @@ class FakeScheduler:
         self._failures.setdefault(command, []).append(reply)
 
     def lose_next_reply(self, command: str) -> None:
-        """The next ``command`` takes effect, but its reply is lost (``Unavailable``)."""
+        """The next ``command`` (by key) takes effect, but its reply is lost (``Unavailable``)."""
         self._lost[command] = self._lost.get(command, 0) + 1
 
     def write_log(self, path: str | PurePosixPath, content: bytes) -> None:
@@ -333,9 +344,10 @@ class FakeScheduler:
             options["operands"] = " ".join(operands)
         return options
 
+    def _ping(self, _argv: tuple[str, ...], _stdin: bytes) -> Completed:
+        return Completed(0, f"{self._version}\n".encode(), b"")
+
     def _sbatch(self, argv: tuple[str, ...], stdin: bytes) -> Completed:
-        if argv[1:] == ("--version",):
-            return Completed(0, f"{self._version}\n".encode(), b"")
         allowed = frozenset(
             {
                 "--parsable",

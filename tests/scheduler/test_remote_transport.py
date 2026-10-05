@@ -15,8 +15,9 @@ from support.builders import target
 
 import servatus.campaign._remote as _remote
 from servatus.campaign._evidence import AllocationState, JobRef
-from servatus.campaign._remote import Completed, Local, Ssh, check_command, connect
+from servatus.campaign._remote import Completed, Local, Ssh, connect
 from servatus.campaign._scheduler import Scheduler
+from servatus.campaign._script import check_command
 from servatus.errors import ConfigurationError, Unavailable
 
 FAKE_SSH = """#!{python}
@@ -41,6 +42,12 @@ sys.stdout.flush()
 if mode == "quiet-stderr":
     fd = os.open(os.devnull, os.O_WRONLY)
     os.dup2(fd, 2)
+if mode == "persist":  # a ControlPersist master outlives the client and keeps stderr open
+    import subprocess
+    master = subprocess.Popen(["/bin/sleep", "30"], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, start_new_session=True)
+    with open(config["record"] + ".master", "w") as handle:
+        handle.write(str(master.pid))
 os.execv("/bin/sh", ["/bin/sh", "-c", args[-1]])
 """
 
@@ -84,6 +91,7 @@ def test_check_command_rejects_out_of_bound_commands(argv: Any, message: str) ->
 def test_check_command_accepts_the_largest_permitted_command() -> None:
     argv = ("/bin/echo", *["x" * 4095] * 3, "y" * (16 * 1024 - 3 * 4096 - 11))
     assert check_command(argv) == argv
+    assert check_command(("/bin/echo", "x" * 4096)) == ("/bin/echo", "x" * 4096)
 
 
 def test_bound_violations_never_spawn(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -97,12 +105,6 @@ def test_bound_violations_never_spawn(monkeypatch: pytest.MonkeyPatch, tmp_path:
             transport.run(("/bin/echo",) * 33)
         with pytest.raises(ConfigurationError, match="max_stdout"):
             transport.run(("/bin/echo",), max_stdout=-1)
-
-
-@pytest.mark.parametrize("host", ["", "-oProxyCommand=evil", "a b", "h" * 4097, "x\ny"])
-def test_ssh_rejects_unsafe_destinations(host: str) -> None:
-    with pytest.raises(ConfigurationError, match="SSH destination"):
-        Ssh(host)
 
 
 def test_connect_selects_ssh_or_local() -> None:
@@ -323,10 +325,68 @@ def test_ssh_client_environment_drops_scheduler_overrides(
         "LOGNAME",
         "USER",
         "SSH_AUTH_SOCK",
+        "KRB5CCNAME",
+        "KRB5_CONFIG",
     }
     assert environment["PATH"] == "/usr/bin:/bin"
     assert environment["HOME"] == "/home/servatus-test"
     assert environment["SSH_AUTH_SOCK"] == "/tmp/agent.sock"
+
+
+def test_ssh_client_environment_passes_kerberos_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("KRB5CCNAME", "FILE:/tmp/krb5cc_test")
+    monkeypatch.setenv("KRB5_CONFIG", "/etc/krb5-test.conf")
+    monkeypatch.setenv("SSH_ASKPASS", "/usr/bin/askpass")
+    ssh, record = fake_ssh(tmp_path)
+    ssh.run(("/bin/true",))
+    environment: dict[str, str] = recorded(record)["env"]
+    assert environment["KRB5CCNAME"] == "FILE:/tmp/krb5cc_test"
+    assert environment["KRB5_CONFIG"] == "/etc/krb5-test.conf"
+    assert "SSH_ASKPASS" not in environment
+
+
+def test_a_persisting_ssh_master_holding_stderr_does_not_stall_calls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(_remote, "DEADLINE_SECONDS", 10.0)
+    ssh, record = fake_ssh(tmp_path, "persist")
+    started = time.monotonic()
+    try:
+        result = ssh.run(("/bin/sh", "-c", "printf 'out\\n'; printf 'err\\n' >&2; exit 3"))
+    finally:
+        os.kill(int(Path(f"{record}.master").read_text()), 9)
+    assert time.monotonic() - started < 5
+    assert result == Completed(3, b"out\n", b"err\n")
+
+
+def test_ssh_bounds_stderr_after_the_marker(tmp_path: Path) -> None:
+    ssh, _ = fake_ssh(tmp_path)
+    limit = _remote.MAX_STREAM_BYTES
+    exact = ssh.run(("/bin/sh", "-c", f"head -c {limit} /dev/zero >&2"))
+    assert exact.stderr == b"\0" * limit
+    with pytest.raises(Unavailable, match="byte bound"):
+        ssh.run(("/bin/sh", "-c", f"head -c {limit + 1} /dev/zero >&2"))
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        (ValueError("bad argument"), "could not run: ValueError"),
+        (subprocess.SubprocessError("broken"), "could not run: SubprocessError"),
+        (PermissionError(13, "Permission denied"), "could not run: Permission denied"),
+    ],
+)
+def test_every_spawn_failure_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, failure: Exception, message: str
+) -> None:
+    def broken(*_args: object, **_kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(subprocess, "Popen", broken)
+    with pytest.raises(Unavailable, match=message):
+        Local().run(("/bin/true",))
 
 
 def test_scheduler_over_noisy_ssh_reads_exact_replies(tmp_path: Path) -> None:

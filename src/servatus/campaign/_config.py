@@ -66,6 +66,14 @@ def _optional_token(value: object, name: str) -> str | None:
     return None if value is None else _token(value, name)
 
 
+def _plain(path: PurePosixPath, name: str, forbidden: str, use: str) -> PurePosixPath:
+    """``path``, unless it contains a character that ``use`` would interpret."""
+    if found := sorted(set(forbidden) & set(str(path))):
+        shown = " or ".join(repr(character) for character in found)
+        raise ConfigurationError(f"{name} cannot contain {shown}: {use}")
+    return path
+
+
 def _absolute(value: object, name: str) -> PurePosixPath:
     _require(isinstance(value, (str, PurePosixPath)), f"{name} must be an absolute POSIX path")
     raw = _text(str(cast(PosixInput, value)), name)
@@ -227,8 +235,10 @@ class Apptainer:
     def __init__(
         self, *, executable: PosixInput, image: PosixInput, binds: Iterable[str] = ()
     ) -> None:
+        container = _absolute(image, "image")
+        use = "Apptainer reads it as a URI such as docker://"
         object.__setattr__(self, "executable", _absolute(executable, "apptainer"))
-        object.__setattr__(self, "image", _absolute(image, "image"))
+        object.__setattr__(self, "image", _plain(container, "image", ":", use))
         object.__setattr__(self, "binds", tuple(_bind(item) for item in _strings(binds, "binds")))
 
 
@@ -299,8 +309,18 @@ class Target:
         _require((gpu_gres is None) == (gpus == 0), "gpu_gres and max_gpus_per_allocation conflict")
         values: dict[str, object] = {
             "slurm_bin": _absolute(slurm_bin, "slurm_bin"),
-            "work_root": _absolute(work_root, "work_root"),
-            "log_root": _absolute(log_root, "log_root"),
+            "work_root": _plain(
+                _absolute(work_root, "work_root"),
+                "work_root",
+                ",:",
+                "it is bound into containers as SOURCE:DESTINATION",
+            ),
+            "log_root": _plain(
+                _absolute(log_root, "log_root"),
+                "log_root",
+                "%",
+                "Slurm expands '%' patterns in output paths",
+            ),
             "partitions": frozen_partitions,
             "max_tasks_per_allocation": _integer(
                 max_tasks_per_allocation, "max_tasks_per_allocation", minimum=1

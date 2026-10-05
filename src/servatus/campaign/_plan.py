@@ -22,8 +22,7 @@ from ..publication import publish_file
 from . import _codec
 from ._config import Profile, Resources, StrPath, Target, Task
 from ._policy import Hold
-from ._remote import check_command
-from ._script import render_batch, sbatch_argv
+from ._script import check_command, render_batch, sbatch_argv
 from ._state import AcceptanceState, State
 
 PLAN_FORMAT = "servatus.plan/1"

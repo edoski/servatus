@@ -201,6 +201,10 @@ def test_target_accepts_ssh_destinations(host: str | None) -> None:
         ({"log_root": "/logs\n"}, "log_root must be an absolute POSIX path"),
         ({"log_root": 7}, "log_root must be an absolute POSIX path"),
         ({"work_root": "/w\udcff"}, "work_root must be valid UTF-8"),
+        ({"work_root": "/w,x"}, "work_root cannot contain ',': it is bound into containers"),
+        ({"work_root": "/w:x"}, "work_root cannot contain ':': it is bound"),
+        ({"work_root": "/a:b,c"}, "work_root cannot contain ',' or ':'"),
+        ({"log_root": "/logs/%u"}, "log_root cannot contain '%': Slurm expands"),
         ({"partitions": ()}, "partitions must be nonempty"),
         ({"partitions": ("a", "a")}, "partitions must be unique"),
         ({"partitions": "gpu"}, "partitions must be a sequence"),
@@ -245,6 +249,7 @@ def test_apptainer_accepts_bind_forms(binds: tuple[str, ...]) -> None:
     [
         ({"executable": "apptainer"}, "apptainer must be an absolute POSIX path"),
         ({"image": "/images/../a.sif"}, "image must be an absolute POSIX path"),
+        ({"image": "/images/docker:a.sif"}, "image cannot contain ':': Apptainer reads it"),
         ({"binds": "/data"}, "binds must be a sequence"),
         ({"binds": ("data",)}, "bind path must be an absolute"),
         ({"binds": ("/a,/b",)}, "commas"),

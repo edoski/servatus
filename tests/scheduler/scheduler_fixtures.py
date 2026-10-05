@@ -8,8 +8,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from servatus.campaign._evidence import JobRef
-from servatus.campaign._remote import MAX_STREAM_BYTES, Completed, check_command
+from servatus.campaign._remote import MAX_STREAM_BYTES, Completed
 from servatus.campaign._scheduler import AttemptQuery
+from servatus.campaign._script import check_command
 
 ALLOCATION = "0123456789abcdef01234567"
 IDENTITY = f"servatus-{ALLOCATION}"

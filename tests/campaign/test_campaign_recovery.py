@@ -107,7 +107,7 @@ def test_cancel_refuses_unknown_or_unaccepted_targets(world: World) -> None:
         campaign.cancel(tasks=["task-0"])
     with pytest.raises(NotFound, match="unknown allocation"):
         campaign.cancel(allocations=["0" * 24])
-    world.wire.on("sbatch", lambda _argv: world.fake.lose_next_reply("sbatch"))
+    world.fake.lose_next_reply("sbatch")
     with pytest.raises(SubmissionInterrupted, match="unresolved") as caught:
         campaign.submit(campaign.plan(cpu_profile()))
     allocation = caught.value.result.unresolved[0].allocation_id
@@ -187,7 +187,7 @@ def test_history_keeps_each_attempt_on_its_original_route(world: World) -> None:
 def test_reconcile_asks_the_original_target(world: World) -> None:
     campaign = world.create(jobs(1))
     plan = campaign.plan(cpu_profile("old", host="old.example.edu"))
-    world.wire.on("sbatch", lambda _argv: world.fake.lose_next_reply("sbatch"))
+    world.fake.lose_next_reply("sbatch")
     with pytest.raises(SubmissionInterrupted, match="unresolved"):
         campaign.submit(plan)
     world.wire.hosts.clear()

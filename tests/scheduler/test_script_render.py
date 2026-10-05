@@ -53,6 +53,7 @@ def test_names_and_log_paths_bind_the_allocation_identity() -> None:
         (lambda: job_name("abc"), "allocation_id"),
         (lambda: job_name(ALLOCATION.upper()), "allocation_id"),
         (lambda: step_name(ALLOCATION, -1), "slot"),
+        (lambda: step_name(ALLOCATION, True), "slot"),  # a bool is not a slot number
         (lambda: log_path(PurePosixPath(LOG), ALLOCATION, 0), "job must be"),
         (lambda: log_path(PurePosixPath(LOG), ALLOCATION, "../x"), "job must be"),
         (lambda: log_path(PurePosixPath(LOG), ALLOCATION, 1, -2), "slot"),
@@ -227,7 +228,7 @@ def test_apptainer_binds_work_root_and_configured_binds() -> None:
     )
     script = render((task(),), container=container)
     assert (
-        "/usr/bin/apptainer run --cleanenv --bind /cluster/work/project:/cluster/work/project "
+        "/usr/bin/apptainer exec --cleanenv --bind /cluster/work/project:/cluster/work/project "
         "--bind /data --bind /a:/b:ro --pwd /cluster/work/project --nv /images/x.sif"
     ) in script
 
@@ -259,6 +260,8 @@ def test_servatus_variables_are_injected_with_runtime_job_identity() -> None:
 def test_interrupt_trap_kills_only_recorded_pids() -> None:
     script = render((task(),))
     assert "trap interrupt HUP INT TERM" in script
+    # The handler first ignores further signals, so repeated signals cannot re-enter it.
+    assert "interrupt() {\n  trap '' HUP INT TERM\n" in script
     assert 'for pid in $pids; do kill "$pid"' in script
     assert 'pids="$pids $!"' in script
 
@@ -278,7 +281,14 @@ def test_direct_launcher_requires_an_absolute_program(args: tuple[str, ...], mes
 
 
 def test_apptainer_launcher_accepts_relative_commands_inside_the_image() -> None:
-    assert " python train.py &" in render((Task("t", ("python", "train.py")),))
+    script = render((Task("t", ("python", "train.py")),))
+    assert " python train.py &" in script
+    assert "/usr/bin/apptainer exec --cleanenv " in script and " run " not in script
+
+
+def test_apptainer_tasks_need_a_program_regardless_of_the_runscript() -> None:
+    with pytest.raises(ConfigurationError, match="'t': an Apptainer Task needs args"):
+        render((Task("t"),))
 
 
 @pytest.mark.parametrize(

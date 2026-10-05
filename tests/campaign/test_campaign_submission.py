@@ -89,8 +89,8 @@ def test_tampered_in_memory_plans_are_refused_before_any_intent(world: World) ->
 def test_failed_ping_records_no_intent(world: World) -> None:
     campaign = world.create(jobs(1))
     plan = campaign.plan(cpu_profile())
-    world.fake.fail_next("sbatch")
-    with pytest.raises(Unavailable, match="injected failure of sbatch"):
+    world.fake.fail_next("ping")
+    with pytest.raises(Unavailable, match="injected failure of ping"):
         campaign.submit(plan)
     world.wire.down.add("login.example.edu")
     with pytest.raises(Unavailable, match="Connection refused"):
@@ -128,7 +128,7 @@ def test_partial_submission_reports_every_allocation(world: World, fault: str) -
 def test_unresolved_allocations_are_recovered_by_reconcile_or_marking(world: World) -> None:
     campaign = world.create(jobs(2))
     plan = campaign.plan(cpu_profile(), tasks_per_allocation=1)
-    world.wire.on("sbatch", lambda _argv: world.fake.lose_next_reply("sbatch"))
+    world.fake.lose_next_reply("sbatch")
     with pytest.raises(SubmissionInterrupted, match="unresolved") as caught:
         campaign.submit(plan)
     lost = caught.value.result.unresolved[0].allocation_id
@@ -157,7 +157,7 @@ def test_marking_not_submitted_needs_proof_of_absence(world: World) -> None:
     campaign = world.create(jobs(1))
     plan = campaign.plan(cpu_profile("old", host="old.example.edu"))
     allocation = plan.allocations[0].allocation_id
-    world.wire.on("sbatch", lambda _argv: world.fake.lose_next_reply("sbatch"))
+    world.fake.lose_next_reply("sbatch")
     with pytest.raises(SubmissionInterrupted, match="unresolved"):
         campaign.submit(plan)
     world.wire.hosts.clear()
@@ -186,7 +186,7 @@ def test_a_proven_job_overrides_a_not_submitted_outcome(world: World) -> None:
     campaign = world.create(jobs(2))
     plan = campaign.plan(cpu_profile(), tasks_per_allocation=1)
     first = plan.allocations[0].allocation_id
-    world.wire.on("sbatch", lambda _argv: world.fake.lose_next_reply("sbatch"))
+    world.fake.lose_next_reply("sbatch")
     with pytest.raises(SubmissionInterrupted, match="unresolved"):
         campaign.submit(plan)
     world.wire.on("squeue", lambda _argv: Completed(0, b"", b""))  # Slurm lags behind
@@ -209,7 +209,7 @@ def test_a_proven_job_overrides_a_not_submitted_outcome(world: World) -> None:
 
 def test_a_not_submitted_outcome_with_later_attempts_cannot_be_overridden(world: World) -> None:
     campaign = world.create(jobs(1))
-    world.wire.on("sbatch", lambda _argv: world.fake.lose_next_reply("sbatch"))
+    world.fake.lose_next_reply("sbatch")
     with pytest.raises(SubmissionInterrupted, match="unresolved") as caught:
         campaign.submit(campaign.plan(cpu_profile()))
     lost = caught.value.result.unresolved[0].allocation_id
@@ -390,7 +390,7 @@ def test_a_plan_made_with_a_probe_needs_one_to_submit(world: World) -> None:
     with pytest.raises(StalePlan, match=r"no longer eligible: 'task-1' \(VALID\)"):
         checked.submit(checked.load_plan(data))
     assert probe.calls[-1] == ("task-0", "task-1")
-    assert world.fake.count("sbatch") == 1  # only the ping
+    assert (world.fake.count("ping"), world.fake.count("sbatch")) == (1, 0)
     assert checked.status(scheduler=False).attempts == ()
 
 

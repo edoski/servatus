@@ -4,7 +4,7 @@
 Servatus already runs on a login node. Both execute the exact argument vector under a scrubbed
 environment (fixed C locale, UTC, minimal ``PATH``). Every spawn, deadline, byte-bound, or protocol
 failure surfaces as ``Unavailable``: the remote outcome is unknown. Only deterministic local bound
-violations raise ``ConfigurationError``, and ``check_command`` checks them without spawning.
+violations raise ``ConfigurationError`` (``_script.check_command`` checks them without spawning).
 """
 
 from __future__ import annotations
@@ -20,14 +20,12 @@ import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import IO, Protocol, cast
 
 from ..errors import ConfigurationError, Unavailable
 from ._config import Target
+from ._script import check_command
 
-MAX_ARGS = 32
-MAX_COMMAND_BYTES = 16 * 1024
-MAX_FIELD_BYTES = 4096
 MAX_STREAM_BYTES = 1024 * 1024
 DEADLINE_SECONDS = 30.0
 # Login banners and shell start-up noise precede the output marker; bound them separately.
@@ -36,7 +34,10 @@ NOISE_ALLOWANCE = 64 * 1024
 _PATH = "/usr/bin:/bin"
 _REMOTE_ENV = ("PATH=" + _PATH, "LANG=C", "LC_ALL=C", "TZ=UTC")
 _LOCAL_ENV = {"PATH": _PATH, "LANG": "C", "LC_ALL": "C", "TZ": "UTC"}
-_SSH_PASSTHROUGH = ("HOME", "LOGNAME", "USER", "SSH_AUTH_SOCK")
+# What the ssh client needs to find its configuration, agent, and Kerberos (GSSAPI) credentials.
+_SSH_PASSTHROUGH = ("HOME", "LOGNAME", "USER", "SSH_AUTH_SOCK", "KRB5CCNAME", "KRB5_CONFIG")
+# How often to check whether the child exited while its pipes stay open.
+_POLL_SECONDS = 0.05
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,40 +55,6 @@ class Transport(Protocol):
     def run(
         self, argv: Sequence[str], *, stdin: bytes = b"", max_stdout: int = MAX_STREAM_BYTES
     ) -> Completed: ...
-
-
-def check_command(argv: Sequence[str]) -> tuple[str, ...]:
-    """Check the deterministic bounds of one command without running it.
-
-    At most 32 arguments (the first a nonempty program), 4 KiB per argument, and 16 KiB in total,
-    all UTF-8 text without NUL.
-    Raises ``ConfigurationError``, so callers can reject a command before recording any intent.
-    """
-    if isinstance(argv, (str, bytes)):
-        raise ConfigurationError("command must be a sequence of arguments")
-    fields = tuple(argv)
-    if not fields or any(not isinstance(field, str) for field in fields):
-        raise ConfigurationError("command must be a nonempty sequence of strings")
-    if not fields[0]:
-        raise ConfigurationError("command program must be nonempty")
-    if len(fields) > MAX_ARGS:
-        raise ConfigurationError(f"command exceeds its bound of {MAX_ARGS} arguments")
-    total = 0
-    for field in fields:
-        if "\0" in field:
-            raise ConfigurationError("command arguments cannot contain NUL")
-        try:
-            size = len(field.encode("utf-8"))
-        except UnicodeEncodeError:
-            raise ConfigurationError("command arguments must be valid UTF-8 text") from None
-        if size > MAX_FIELD_BYTES:
-            raise ConfigurationError(
-                f"command argument exceeds its bound of {MAX_FIELD_BYTES} bytes"
-            )
-        total += size + 1
-    if total > MAX_COMMAND_BYTES:
-        raise ConfigurationError(f"command exceeds its bound of {MAX_COMMAND_BYTES} bytes")
-    return fields
 
 
 def _check_stdout_bound(max_stdout: int) -> None:
@@ -110,17 +77,9 @@ class Ssh:
     command: tuple[str, ...]
 
     def __init__(self, host: str, *, command: Sequence[str] = ("ssh",)) -> None:
-        if (
-            not isinstance(host, str)
-            or not host
-            or host.startswith("-")
-            or any(character.isspace() or not character.isprintable() for character in host)
-            or len(host.encode("utf-8", "replace")) > MAX_FIELD_BYTES
-        ):
-            raise ConfigurationError("host must be one SSH destination")
-        prefix = check_command(command)
+        # ``Target`` validates the destination; ``--`` keeps it from parsing as an option.
         object.__setattr__(self, "host", host)
-        object.__setattr__(self, "command", prefix)
+        object.__setattr__(self, "command", check_command(command))
 
     def run(
         self, argv: Sequence[str], *, stdin: bytes = b"", max_stdout: int = MAX_STREAM_BYTES
@@ -242,17 +201,32 @@ def run_bounded(
     except subprocess.TimeoutExpired:
         raise Unavailable(f"command exceeded its {DEADLINE_SECONDS:g} s deadline") from None
     except (OSError, subprocess.SubprocessError, ValueError) as error:
-        detail = error.strerror if isinstance(error, OSError) and error.strerror else ""
-        raise Unavailable(f"command could not run: {detail or type(error).__name__}") from None
+        detail = getattr(error, "strerror", None) or type(error).__name__
+        raise Unavailable(f"command could not run: {detail}") from None
 
 
 def _drain(process: subprocess.Popen[bytes], max_stdout: int, max_stderr: int) -> Completed:
-    stdout, stderr = process.stdout, process.stderr
-    if stdout is None or stderr is None:  # pragma: no cover - both pipes are always requested
-        raise Unavailable("command streams are unavailable")
-    out, err = stdout.fileno(), stderr.fileno()
+    """Read both pipes until EOF, or until the child has exited and its buffered output is read.
+
+    A descendant may outlive the child and keep the pipes open (an OpenSSH ControlPersist master
+    holding stderr); waiting for EOF would then stall every command until the deadline.
+    """
+    out, err = (cast(IO[bytes], stream).fileno() for stream in (process.stdout, process.stderr))
     limits = {out: max_stdout, err: max_stderr}
     buffers = {out: bytearray(), err: bytearray()}
+
+    def take(descriptor: int) -> bytes | None:
+        """The next chunk (empty at EOF), or None when nothing is buffered right now."""
+        buffer = buffers[descriptor]
+        try:
+            chunk = os.read(descriptor, min(65_536, limits[descriptor] + 1 - len(buffer)))
+        except BlockingIOError:
+            return None
+        buffer.extend(chunk)
+        if len(buffer) > limits[descriptor]:
+            raise Unavailable("command output exceeds its byte bound")
+        return chunk
+
     deadline = time.monotonic() + DEADLINE_SECONDS
     with selectors.DefaultSelector() as selector:
         for descriptor in limits:
@@ -262,19 +236,14 @@ def _drain(process: subprocess.Popen[bytes], max_stdout: int, max_stderr: int) -
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired("command", DEADLINE_SECONDS)
-            for key, _ in selector.select(remaining):
-                descriptor = key.fd
-                buffer = buffers[descriptor]
-                try:
-                    chunk = os.read(descriptor, min(65_536, limits[descriptor] + 1 - len(buffer)))
-                except BlockingIOError:
-                    continue
-                if not chunk:
-                    selector.unregister(descriptor)
-                    continue
-                buffer.extend(chunk)
-                if len(buffer) > limits[descriptor]:
-                    raise Unavailable("command output exceeds its byte bound")
+            for key, _ in selector.select(min(remaining, _POLL_SECONDS)):
+                if take(key.fd) == b"":
+                    selector.unregister(key.fd)
+            if process.poll() is not None:
+                for key in tuple(selector.get_map().values()):
+                    while take(key.fd):
+                        pass
+                break
     returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
     return Completed(returncode, bytes(buffers[out]), bytes(buffers[err]))
 

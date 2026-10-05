@@ -249,7 +249,6 @@ def test_plan_reports_holds_deferrals_and_scripts(cli: Cli) -> None:
 def test_interrupted_submission_exits_3_and_recovery_commands_resolve_it(cli: Cli) -> None:
     cli("create", "state", "tasks.jsonl")
     cli("plan", "state", "--output", "plan.json", "--tasks-per-allocation", "1")
-    cli.fake.fail_next("sbatch", Completed(0, b"slurm 23.11.4\n", b""))
     cli.fake.fail_next("sbatch", Completed(1, b"", b"sbatch: error: Socket timed out\n"))
     code, out, err = cli("submit", "state", "plan.json", "--json")
     assert code == 3 and err.startswith("servatus: error: submission interrupted")
@@ -265,12 +264,11 @@ def test_interrupted_submission_exits_3_and_recovery_commands_resolve_it(cli: Cl
     )
 
     cli("plan", "state", "--output", "again.json")
-    cli.fake.lose_next_reply("sbatch")  # the ping's reply is lost
+    cli.fake.lose_next_reply("ping")
     code, _, err = cli("submit", "state", "again.json")
-    assert code == 75 and "reply from sbatch was lost" in err
+    assert code == 75 and "reply from ping was lost" in err
     assert Campaign.open(cli.root / "state").status(scheduler=False).revision == 2
 
-    cli.fake.fail_next("sbatch", Completed(0, b"slurm 23.11.4\n", b""))
     cli.fake.fail_next("sbatch", None)
     code, out, _ = cli("submit", "state", "again.json")
     assert code == 3 and "next: servatus reconcile state" in out
@@ -316,6 +314,6 @@ def test_cancel_needs_a_selector_and_doctor_reports_unavailable_clusters(cli: Cl
     assert code == 1 and "cancel needs Task keys or allocation ids" in err
     code, out, _ = cli("doctor")
     assert code == 0 and "sbatch: slurm 23.11.4" in out and "up to 4 Tasks" in out
-    cli.fake.fail_next("sbatch", Completed(127, b"", b"sbatch: not found\n"))
+    cli.fake.fail_next("ping", Completed(127, b"", b"sbatch: not found\n"))
     code, _, err = cli("doctor")
     assert (code, err) == (75, "servatus: error: sbatch --version failed with exit status 127\n")
