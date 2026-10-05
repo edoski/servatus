@@ -16,12 +16,13 @@ children are required and when they are ready.
 Opening each level takes a short exclusive `flock` on its pinned parent directory while creating or
 opening the private hierarchy and acquiring its lifecycle lease without blocking. Destination
 absence is checked after the lease is acquired and again before application access. If a level's
-destination already exists, its leftover private work is reclaimed under the lease and entry raises
-`DestinationExists`. Parent coordination ends before identity initialization and every durability
-sync, so slow synchronization cannot convoy independent children or destinations. Within the
-owner-only container, the durable identity record stores exact container, lifecycle-lock, and work
-inode identities. A distributed filesystem must expose stable inode identities and one coherent
-`flock` domain across every participating client.
+destination already exists, its leftover private work (bound to the same identity, or never
+initialized) is reclaimed under an exclusive lease and entry raises `DestinationExists`; a parent
+level is reclaimed only when no sibling child holds its shared lease. Parent coordination ends
+before identity initialization and every durability sync, so slow synchronization cannot convoy
+independent children or destinations. Within the owner-only container, the durable identity record
+stores exact container, lifecycle-lock, and work inode identities. A distributed filesystem must
+expose stable inode identities and one coherent `flock` domain across every participating client.
 
 The hidden Workspace container is the lifecycle trust root. Root and child containers, work
 directories, locks, and identity files must be owned by the effective user with no group or world

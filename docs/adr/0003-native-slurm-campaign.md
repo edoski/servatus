@@ -27,10 +27,11 @@ Target has a host and `Local()` otherwise; callers and tests may supply their ow
 - `Local` runs the argv with the same scrubbed environment and no shell.
 
 Every operation has a 30-second deadline, at most 32 arguments, 16 KiB of command text, 4 KiB per
-field, and 1 MiB per output stream; streams are drained concurrently and a failing child is killed
-and reaped. Spawn, timeout, overflow, missing-marker, and connection failures, and scheduler
-commands that fail where success is required, all surface as `Unavailable`: one error boundary. `check_command(argv)` applies the bounds purely, so submission
-validates commands before recording intent.
+field, and 1 MiB per output stream (plus 64 KiB for SSH noise before the marker); streams are
+drained concurrently and a failing child is killed and reaped. Spawn, timeout, overflow,
+missing-marker, and connection failures, and scheduler commands that fail where success is
+required, all surface as `Unavailable`: one error boundary. `check_command(argv)` applies the
+bounds purely, so planning rejects an oversized `sbatch` request before any intent exists.
 
 ## Batch script and launchers
 
@@ -46,11 +47,13 @@ no scratch directory, `mktemp`, `base64`, or cleanup. Every step receives the Ta
 `SERVATUS_TASK_KEY`, `SERVATUS_ALLOCATION_ID`, `SERVATUS_SLOT`, `SERVATUS_JOB_ID` (from
 `$SLURM_JOB_ID`), and `SERVATUS_RESTART_COUNT` (`${SLURM_RESTART_COUNT:-0}`).
 
-- **Apptainer launcher:** `apptainer exec` with a clean environment, binding `work_root` and the
-  Target's `binds`. Environment values are passed as `APPTAINERENV_NAME=<shell-quoted value>`
-  assignments, never `--env`, so values containing commas or equals signs survive intact.
-- **Direct launcher:** `env -i ... NAME=VALUE` runs the Task's `args[0]`, which must be absolute
-  (`ConfigurationError` otherwise), from `work_root`.
+- **Apptainer launcher:** `apptainer run --cleanenv` with `--bind WORK_ROOT:WORK_ROOT`, one
+  `--bind` per Target bind, `--pwd WORK_ROOT`, and `--nv` for GPU work, then the image and the
+  Task's arguments, which the image's runscript receives. Environment values are passed as
+  `APPTAINERENV_NAME=<shell-quoted value>` assignments, never `--env`, so values containing commas
+  or equals signs survive intact.
+- **Direct launcher:** `env -i ... NAME=VALUE` runs the Task's `args[0]`, which must be an absolute
+  path without `=` (`ConfigurationError` at planning otherwise), from `work_root`.
 
 GPU steps forward Slurm's step-local `CUDA_VISIBLE_DEVICES` (failing the step when it is unset) and
 set `CUDA_DEVICE_ORDER=PCI_BUS_ID`; site configuration owns device isolation. When the Resources set
@@ -65,25 +68,33 @@ numbers from aliasing Attempts.
 ## Evidence
 
 Observation batches at most 16 jobs per query, grouped by each Attempt's original Target and
-cluster; reused job numbers are queried separately. Rows must match the job number and immutable
-allocation name. One state table normalizes Slurm states to `QUEUED` (including `EXPEDITING`),
-`RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, or `UNKNOWN`; unlisted states such as `REVOKED` are
-`UNKNOWN` and retained.
+cluster; reused job numbers are queried separately. Each batch runs `squeue`, anchored
+`sacct --allocations --duplicates` history, and a step query. Replies are bounded to 4096 lines and
+4096 bytes per field, and must be complete, strict UTF-8 rows without control characters. `squeue`'s
+exact "Invalid job id specified" reply means none of the queried jobs is active. One state table
+normalizes Slurm states to `QUEUED` (including `EXPEDITING`), `RUNNING`, `SUCCEEDED`, `FAILED`,
+`CANCELLED`, or `UNKNOWN`; unlisted states such as `REVOKED` are `UNKNOWN` and retained.
 
-Requeue history is anchored: the first `sacct` row must fall in the submission window, and each later
-incarnation must have a strictly increasing submit time. Within one incarnation, when `squeue` and
-`sacct` disagree, the more advanced state wins (terminal over active, running over queued).
-Contradictions that cannot be reconciled become a per-attempt `problem`: that allocation is
-`UNKNOWN` and retained, which withholds only its Tasks instead of aborting the whole observation.
-Identity violations, such as rows for unrelated job ids or names, still raise `EvidenceConflict`.
-Held or requeued work, including `SPECIAL_EXIT`, is retained and blocks retry.
+Requeue history is anchored: only the first `sacct` row must fall in the submission window (intent
+time plus or minus one hour); each later incarnation must have a strictly increasing submit time on
+the same cluster. Within one incarnation, when `squeue` and `sacct` disagree, the more advanced
+state wins (terminal over active, running over queued); a terminal queue row without accounting is
+`UNKNOWN`. Contradictions confined to one allocation's job number become a per-allocation
+`problem`: that allocation is `UNKNOWN` and retained, which withholds only its Tasks instead of
+aborting the whole observation. That includes a queried job number now held by a foreign job (a
+row whose name or comment is not the allocation identity, after job-number reuse). Reply-level
+defects (partial or oversized output, malformed rows, rows for job numbers that were not queried,
+rows from another cluster) still raise `EvidenceConflict` for the query. Held or requeued work,
+including `SPECIAL_EXIT`, is retained and blocks retry.
 
 **Step evidence.** One additional `sacct` query (without `--allocations`) maps step rows named
 `servatus-<id>-<slot>` to per-Task `StepEvidence`. A failure of that query degrades step evidence to
 `None`; it never aborts observation.
 
-**Cancel.** `scancel` targets the allocation's job on its original route. Cancellation is a request;
-retry stays blocked until evidence shows the work terminal.
+**Cancel.** `scancel --name=servatus-<id> JOB` targets the allocation's job on its original route
+and cluster, so a reused job number is never cancelled; a job that already ended or aged out counts
+as cancelled. Cancellation is a request; retry stays blocked until evidence shows the work
+terminal.
 
 **Logs.** Log reads derive one path from a validated accepted Attempt, slot, and job number and
 `tail` a bounded suffix. No caller-supplied remote path or command is accepted; the path stays

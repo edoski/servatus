@@ -15,7 +15,7 @@ Run the full verification before handing off a change; CI runs the same steps on
 3.14 on Linux and on 3.11 and 3.14 on macOS:
 
 ```sh
-uv run coverage run --source=src -m pytest && uv run coverage report --show-missing
+uv run coverage run -m pytest && uv run coverage report --show-missing
 uv run ruff check .
 uv run ruff format --check .
 uv run pyright
@@ -25,9 +25,12 @@ uv run --isolated --no-project --with dist/servatus-*.whl \
   python .github/scripts/smoke.py dist/servatus-*.whl
 ```
 
-The last step installs the built wheel into a throwaway environment and checks the console script,
-`--version`, `py.typed`, an offline campaign round-trip, and publication. Clear `dist/` first if it
-holds older wheels.
+The last step installs the built wheel into a throwaway environment and checks the wheel contents
+(`py.typed`, no tests), the public names, that `servatus` is imported from the installed wheel,
+the console script and `--version`, an offline CLI campaign, a `FakeScheduler` plan, validate,
+submit, and retry round-trip, and publication. It takes the wheel path as its only argument. Clear
+`dist/` first if it holds older wheels. Coverage settings (`source`, branch coverage) live in
+`pyproject.toml`.
 
 ## Test layout
 

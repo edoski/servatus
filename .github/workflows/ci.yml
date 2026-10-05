@@ -31,7 +31,7 @@ jobs:
           enable-cache: true
       - run: uv sync --locked
       - name: Test with coverage
-        run: uv run coverage run --source=src -m pytest && uv run coverage report --show-missing
+        run: uv run coverage run -m pytest && uv run coverage report --show-missing
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run pyright
