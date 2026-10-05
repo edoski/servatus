@@ -223,3 +223,5 @@ def test_unreadable_documents_are_configuration_errors(tmp_path: Path) -> None:
     path.write_bytes(b'[profiles.cpu]\nlabel = "\xff"\n')
     with pytest.raises(ConfigurationError, match="cannot read TOML configuration"):
         Profile.load(path)
+    with pytest.raises(ConfigurationError, match="cannot read TOML configuration.*null byte"):
+        Profile.load(f"{tmp_path}/SERVATUS\0.toml")

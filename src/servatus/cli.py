@@ -1,7 +1,8 @@
 """The ``servatus`` command line: a thin adapter over the public API.
 
 Exit codes: 0 success, 1 error, 2 usage (argparse), 3 submission interrupted, 75 cluster
-unavailable or campaign busy. Errors are one ``servatus: error: ...`` line on stderr.
+unavailable or campaign busy, 130 interrupted. Errors are one ``servatus: error: ...`` line on
+stderr. Human output escapes non-printable characters; ``--json`` output is exact.
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ from .publication import publish_file
 EXIT_ERROR = 1
 EXIT_INTERRUPTED = 3
 EXIT_UNAVAILABLE = 75
+EXIT_INTERRUPT = 130
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 _TASK_FIELDS = frozenset({"key", "args", "stdin_file", "env"})
 
@@ -118,12 +120,12 @@ def _read_tasks(path: Path) -> list[Task]:
     except UnicodeDecodeError:
         raise ConfigurationError(f"task file {path} is not UTF-8") from None
     tasks: list[Task] = []
-    for number, line in enumerate(text.splitlines(), start=1):
+    for number, line in enumerate(text.split("\n"), start=1):
         if not line.strip():
             continue
         try:
             tasks.append(_task(json.loads(line, object_pairs_hook=_unique), path.parent))
-        except (ValueError, ConfigurationError) as error:
+        except (ValueError, RecursionError, ConfigurationError) as error:
             raise ConfigurationError(f"invalid task file {path} line {number}: {error}") from None
     return tasks
 
@@ -136,7 +138,18 @@ def _emit(document: object) -> None:
 
 
 def _note(message: str) -> None:
-    print(f"servatus: {message}", file=sys.stderr)
+    print(f"servatus: {_safe(message)}", file=sys.stderr)
+
+
+def _safe(text: object) -> str:
+    """``text`` for a terminal: every non-printable character is shown as an escape."""
+    return "".join(
+        character if character.isprintable() else repr(character)[1:-1] for character in str(text)
+    )
+
+
+def _keys(keys: Sequence[str]) -> str:
+    return ", ".join(map(_safe, keys))
 
 
 def _duration(value: timedelta) -> str:
@@ -160,8 +173,7 @@ def _receipt(receipt: Receipt) -> dict[str, object]:
 
 
 def _receipt_line(receipt: Receipt) -> str:
-    keys = ", ".join(receipt.task_keys)
-    return f"allocation {receipt.allocation_id}: job {receipt.job} ({keys})"
+    return f"allocation {receipt.allocation_id}: job {receipt.job} ({_keys(receipt.task_keys)})"
 
 
 def _roster(arguments: argparse.Namespace, campaign: Campaign, verb: str) -> int:
@@ -232,7 +244,7 @@ def _plan_document(plan: Plan, scripts: bool, saved: Path | None) -> dict[str, o
 
 
 def _print_plan(plan: Plan, scripts: bool, saved: Path | None) -> None:
-    profile = plan.profile.label
+    profile = _safe(plan.profile.label)
     print(f"plan for campaign {plan.campaign_id} (revision {plan.revision}, profile {profile})")
     print(f"digest: {plan.digest}")
     allocations = _plural(len(plan.allocations), "allocation")
@@ -242,20 +254,20 @@ def _print_plan(plan: Plan, scripts: bool, saved: Path | None) -> None:
             f"  {item.allocation_id}  {_plural(len(item.task_keys), 'Task')}, {item.cpus} CPUs, "
             f"{item.memory_mib} MiB, {item.gpus} GPUs, {_duration(item.time_limit)}"
         )
-        print(f"    {', '.join(item.task_keys)}")
+        print(f"    {_keys(item.task_keys)}")
     if plan.retry:
-        print(f"retry: {', '.join(plan.retry)}")
+        print(f"retry: {_keys(plan.retry)}")
     if plan.duplicate_risk:
-        print(f"duplicate risk acknowledged: {', '.join(plan.duplicate_risk)}")
+        print(f"duplicate risk acknowledged: {_keys(plan.duplicate_risk)}")
     print(f"held: {_plural(len(plan.held), 'Task')}")
     reasons: dict[str, list[str]] = {}
     for key, hold in plan.held.items():
         reasons.setdefault(hold.value, []).append(key)
     for reason, keys in reasons.items():
-        print(f"  {reason}: {', '.join(keys)}")
+        print(f"  {reason}: {_keys(keys)}")
     if plan.deferred:
         print(f"deferred: {_plural(len(plan.deferred), 'Task')}")
-        print(f"  {', '.join(plan.deferred)}")
+        print(f"  {_keys(plan.deferred)}")
     if scripts:
         for item in plan.allocations:
             print(f"--- allocation {item.allocation_id} (sensitive) ---")
@@ -264,7 +276,7 @@ def _print_plan(plan: Plan, scripts: bool, saved: Path | None) -> None:
     if saved is None:
         print("not saved; pass --output PLAN.json to save it")
     else:
-        print(f"saved: {saved}")
+        print(f"saved: {_safe(saved)}")
 
 
 def _plan(arguments: argparse.Namespace, context: _Context) -> int:
@@ -324,9 +336,9 @@ def _validate(arguments: argparse.Namespace, context: _Context) -> int:
                 f"{_plural(check.task_count, 'Task')} ({check.cpus} CPUs, {check.memory_mib} MiB, "
                 f"{check.gpus} GPUs, {_duration(check.time_limit)}): {verdict}"
             )
-            for line in (check.scheduler_stdout + "\n" + check.scheduler_stderr).splitlines():
+            for line in (check.scheduler_stdout + "\n" + check.scheduler_stderr).split("\n"):
                 if line.strip():
-                    print(f"  {line}")
+                    print(f"  {_safe(line)}")
         if not checks:
             print("nothing to validate: the plan has no allocations")
     return 0 if all(check.accepted for check in checks) else EXIT_ERROR
@@ -364,9 +376,9 @@ def _print_result(result: SubmitResult, arguments: argparse.Namespace) -> None:
         return
     for receipt in result.receipts:
         print(f"submitted {_receipt_line(receipt)}")
-    state = arguments.state
+    state = _safe(arguments.state)
     for item in result.unresolved:
-        print(f"UNRESOLVED allocation {item.allocation_id} ({', '.join(item.task_keys)})")
+        print(f"UNRESOLVED allocation {item.allocation_id} ({_keys(item.task_keys)})")
         if item.observed_job is None:
             print(f"  next: servatus reconcile {state} {item.allocation_id}")
         else:
@@ -377,7 +389,7 @@ def _print_result(result: SubmitResult, arguments: argparse.Namespace) -> None:
                 f"  next: servatus mark-accepted {state} {item.allocation_id} {job.job_id}{option}"
             )
     for item in result.unattempted:
-        print(f"not attempted: allocation {item.allocation_id} ({', '.join(item.task_keys)})")
+        print(f"not attempted: allocation {item.allocation_id} ({_keys(item.task_keys)})")
     if not result.receipts and result.complete:
         print("nothing to submit: the plan has no allocations")
 
@@ -396,7 +408,8 @@ def _submit(arguments: argparse.Namespace, context: _Context) -> int:
 # --- Status and logs -------------------------------------------------------------------------
 
 
-def _print_status(status: Status, state: Path) -> None:
+def _print_status(status: Status, path: Path) -> None:
+    state = _safe(path)
     kind = "sealed" if status.sealed else "appendable"
     observed = "observed" if status.scheduler_observed else "not observed (--offline)"
     print(f"campaign {status.campaign_id}: revision {status.revision}, {kind}")
@@ -411,7 +424,7 @@ def _print_status(status: Status, state: Path) -> None:
             execution = "ACCEPTED" if task.execution is None else task.execution.value
         rows.append(
             (
-                task.key,
+                _safe(task.key),
                 task.result.value,
                 execution,
                 task.exit_code or "-",
@@ -531,7 +544,7 @@ def _doctor(arguments: argparse.Namespace, context: _Context) -> int:
     if completed.returncode != 0:
         raise Unavailable(f"sbatch --version failed with exit status {completed.returncode}")
     text = completed.stdout.decode("utf-8", "replace").strip()
-    version = "".join(character if character.isprintable() else "?" for character in text)
+    version = _safe(text)
     if arguments.json:
         _emit(
             {
@@ -543,7 +556,7 @@ def _doctor(arguments: argparse.Namespace, context: _Context) -> int:
             }
         )
     else:
-        print(f"profile {profile.label}: ok, up to {_plural(fits, 'Task')} per allocation")
+        print(f"profile {_safe(profile.label)}: ok, up to {_plural(fits, 'Task')} per allocation")
         print(f"target: {target.host or 'local'} ({target.slurm_bin})")
         print(f"sbatch: {version}")
     return 0
@@ -656,5 +669,9 @@ def main(argv: Sequence[str] | None = None, *, connect: Connect | None = None) -
         code, message = EXIT_ERROR, str(error)
     except OSError as error:
         code, message = EXIT_ERROR, f"{error.strerror or error}"
-    print(f"servatus: error: {message}", file=sys.stderr)
+    except KeyboardInterrupt:
+        code, message = EXIT_INTERRUPT, "interrupted"
+    except Exception as error:  # a last resort: one line, never a traceback
+        code, message = EXIT_ERROR, f"unexpected {type(error).__name__}: {error}"
+    print(f"servatus: error: {_safe(message)}", file=sys.stderr)
     return code

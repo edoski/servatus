@@ -193,6 +193,71 @@ def test_duplicate_fields_and_unreadable_files_are_errors(cli: Cli) -> None:
     assert cli("status", "nowhere")[:2] == (1, "")
 
 
+def test_task_lines_end_only_at_newlines(cli: Cli) -> None:
+    # JSON allows raw U+2028, U+0085, and friends inside strings; they are not line breaks.
+    (cli.root / "odd.jsonl").write_text(
+        '{"key": "a b\x85c", "args": []}\r\n\n{"key": "d", "args": []}\n', newline=""
+    )
+    assert cli.json("create", "state", "odd.jsonl")["tasks"] == 2
+    assert [task.key for task in Campaign.open(cli.root / "state").tasks()] == [
+        "a b\x85c",
+        "d",
+    ]
+
+
+def test_runaway_nesting_is_an_input_error(cli: Cli) -> None:
+    (cli.root / "deep.jsonl").write_text("[" * 100_000 + "]" * 100_000 + "\n")
+    code, _, err = cli("create", "state", "deep.jsonl")
+    assert code == 1 and err.startswith("servatus: error: invalid task file deep.jsonl line 1")
+    cli("create", "state", "tasks.jsonl")
+    (cli.root / "deep.json").write_text('{"held": ' + "[" * 100_000 + "]" * 100_000 + "}")
+    code, _, err = cli("submit", "state", "deep.json")
+    assert code == 1 and err.startswith("servatus: error: invalid plan document")
+    assert err.count("\n") == 1
+
+
+def test_unexpected_failures_are_one_line_and_interrupts_exit_130(
+    cli: Cli, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cli("create", "state", "tasks.jsonl")
+
+    def broken(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("boom\x1b[2J")
+
+    monkeypatch.setattr(Campaign, "status", broken)
+    assert cli("status", "state") == (
+        1,
+        "",
+        "servatus: error: unexpected RuntimeError: boom\\x1b[2J\n",
+    )
+
+    def interrupted(*_args: object, **_kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(Campaign, "status", interrupted)
+    assert cli("status", "state") == (130, "", "servatus: error: interrupted\n")
+    code, _, err = cli("plan", "state", "--config", "bad\0name.toml")
+    assert code == 1 and err.startswith("servatus: error: cannot read TOML configuration")
+
+
+def test_human_output_escapes_untrusted_text(cli: Cli) -> None:
+    cli.tasks({"key": "evil\x1b[2J\r", "args": ["/bin/true"]}, name="evil.jsonl")
+    cli("create", "state", "evil.jsonl")
+    code, out, _ = cli("plan", "state", "--output", "plan.json")
+    assert code == 0 and "evil\\x1b[2J\\r" in out and "\x1b" not in out
+    cli.fake.fail_next("sbatch", Completed(1, b"", b"sbatch: error: \x1b]0;pwned\x07\n"))
+    code, out, _ = cli("validate", "state", "plan.json")
+    assert code == 1 and "sbatch: error: \\x1b]0;pwned\\x07" in out and "\x1b" not in out
+    code, out, err = cli("submit", "state", "plan.json")
+    assert code == 0 and "(evil\\x1b[2J\\r)" in out and "\x1b" not in out + err
+    code, out, _ = cli("status", "state")
+    assert code == 0 and "evil\\x1b[2J\\r  " in out and "\x1b" not in out
+    assert cli.json("status", "state")["tasks"][0]["key"] == "evil\x1b[2J\r"
+    cli.fake.fail_next("ping", Completed(0, b"slurm \x1b[31m23\n", b""))
+    code, out, _ = cli("doctor")
+    assert code == 0 and "sbatch: slurm \\x1b[31m23" in out
+
+
 @pytest.mark.parametrize("failure", ["missing_config", "bad_config", "occupied_output"])
 def test_planning_failures_never_author_the_campaign(cli: Cli, failure: str) -> None:
     cli("create", "state", "tasks.jsonl")

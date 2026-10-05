@@ -386,7 +386,7 @@ class Profile:
                 document = cast(dict[str, object], tomllib.load(handle))
         except FileNotFoundError:
             raise NotFound(f"configuration file does not exist: {source}") from None
-        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        except (OSError, ValueError) as error:  # ValueError: undecodable, malformed, or NUL
             raise ConfigurationError(f"cannot read TOML configuration {source}: {error}") from None
         if unknown := document.keys() - {"profiles", "default_profile", "target", "resources"}:
             raise ConfigurationError(f"unknown document keys: {', '.join(sorted(unknown))}")
