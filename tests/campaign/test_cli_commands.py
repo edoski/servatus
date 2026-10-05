@@ -134,11 +134,12 @@ def test_machine_output_for_every_data_command(cli: Cli) -> None:
     submitted = cli.json("submit", "state", "plan.json")
     assert submitted["complete"] is True and submitted["unresolved"] == []
     receipt = submitted["receipts"][0]
-    assert receipt["job_id"] == 1000 and receipt["task_keys"] == ["one", "two"]
+    assert receipt["job"] == {"job_id": 1000, "cluster": None}
+    assert receipt["task_keys"] == ["one", "two"]
     status = cli.json("status", "state")
     assert status["format"] == "servatus.status/1" and status["counts"]["queued"] == 2
     cancelled = cli.json("cancel", "state", "--task", "one")
-    assert [item["job_id"] for item in cancelled["cancelled"]] == [1000]
+    assert [item["job"]["job_id"] for item in cancelled["cancelled"]] == [1000]
     doctor = cli.json("doctor")
     assert doctor == {
         "profile": "cpu",
@@ -339,7 +340,7 @@ def test_interrupted_submission_exits_3_and_recovery_commands_resolve_it(cli: Cl
     assert code == 3 and "next: servatus reconcile state" in out
     pending = out.split("UNRESOLVED allocation ")[1].split()[0]
     accepted = cli.json("mark-accepted", "state", pending, "4242", "--cluster", "alpha")
-    assert accepted["accepted"][0]["cluster"] == "alpha"
+    assert accepted["accepted"][0]["job"] == {"job_id": 4242, "cluster": "alpha"}
     code, out, _ = cli("status", "state", "--offline")
     assert "next: servatus status state" in out
 
@@ -381,4 +382,7 @@ def test_cancel_needs_a_selector_and_doctor_reports_unavailable_clusters(cli: Cl
     assert code == 0 and "sbatch: slurm 23.11.4" in out and "up to 4 Tasks" in out
     cli.fake.fail_next("ping", Completed(127, b"", b"sbatch: not found\n"))
     code, _, err = cli("doctor")
-    assert (code, err) == (75, "servatus: error: sbatch --version failed with exit status 127\n")
+    assert (code, err) == (
+        75,
+        "servatus: error: sbatch --version failed with exit status 127: sbatch: not found\n",
+    )

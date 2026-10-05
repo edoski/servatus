@@ -5,7 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+from . import _codec
 from ._evidence import JobRef
+
+
+def to_document(value: object) -> object:
+    """JSON-compatible data for a campaign value (a result, receipt, check, or planned
+    allocation), as the strict codec writes it: durations as ``[D-]HH:MM:SS`` text, bytes as
+    base64, enums by value, and nested values such as ``JobRef`` as objects."""
+    return _codec.dump(value)
 
 
 @dataclass(frozen=True, slots=True)

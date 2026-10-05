@@ -33,7 +33,7 @@ def test_cancel_stops_live_allocations_of_tasks_or_ids(world: World) -> None:
     assert world.fake.count("scancel") == scancels + 1
     # The queued allocation never started a step, so its Tasks' own outcomes are unknown.
     retry = campaign.plan(cpu_profile(), retry=Retry.FAILED)
-    assert retry.selected == ("task-0", "task-1")
+    assert retry.decision.selected == ("task-0", "task-1")
     assert dict(retry.decision.held) == {
         "task-2": Hold.UNOBSERVABLE,
         "task-3": Hold.UNOBSERVABLE,

@@ -12,10 +12,8 @@ import json
 import shlex
 import sys
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
-from datetime import timedelta
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from . import __version__
 from .campaign import (
@@ -26,20 +24,14 @@ from .campaign import (
     Profile,
     Receipt,
     Retry,
-    ShapeCheck,
     Status,
     SubmitResult,
     Task,
     capacity,
-    connect,
+    ping,
+    to_document,
 )
-from .errors import (
-    Busy,
-    ConfigurationError,
-    ServatusError,
-    SubmissionInterrupted,
-    Unavailable,
-)
+from .errors import Busy, ConfigurationError, ServatusError, SubmissionInterrupted, Unavailable
 from .publication import publish_file
 
 EXIT_ERROR = 1
@@ -49,16 +41,7 @@ EXIT_INTERRUPT = 130
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 _TASK_FIELDS = frozenset({"key", "args", "stdin_file", "env"})
 
-
-@dataclass(frozen=True, slots=True)
-class _Context:
-    connect: Connect | None
-
-    def open(self, path: Path) -> Campaign:
-        return Campaign.open(path, connect=self.connect)
-
-
-Handler = Callable[[argparse.Namespace, _Context], int]
+Handler = Callable[[argparse.Namespace], int]
 
 
 # --- Input -----------------------------------------------------------------------------------
@@ -105,16 +88,13 @@ def _task(raw: object, base: Path) -> Task:
     if not isinstance(env, dict):
         raise ConfigurationError("env must be an object mapping names to strings")
     return Task(
-        cast(str, fields["key"]),
-        cast(list[str], args),
-        stdin=stdin,
-        env=cast(dict[str, str], env),
+        cast(str, fields["key"]), cast(list[str], args), stdin=stdin, env=cast(dict[str, str], env)
     )
 
 
 def _read_tasks(path: Path) -> list[Task]:
     """One Task per JSONL line: ``key``, ``args``, optional ``stdin_file`` (relative to the
-    file's directory) and ``env``. Blank lines are ignored."""
+    file's directory) and ``env``. Lines end at ``\\n`` only; blank lines are ignored."""
     try:
         text = _read_bytes(path, "task file").decode("utf-8")
     except UnicodeDecodeError:
@@ -130,15 +110,15 @@ def _read_tasks(path: Path) -> list[Task]:
     return tasks
 
 
+def _open(arguments: argparse.Namespace) -> Campaign:
+    return Campaign.open(arguments.state, connect=arguments.connect)
+
+
 # --- Output ----------------------------------------------------------------------------------
 
 
 def _emit(document: object) -> None:
     print(json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False))
-
-
-def _note(message: str) -> None:
-    print(f"servatus: {_safe(message)}", file=sys.stderr)
 
 
 def _safe(text: object) -> str:
@@ -148,28 +128,23 @@ def _safe(text: object) -> str:
     )
 
 
+def _note(message: str) -> None:
+    print(f"servatus: {_safe(message)}", file=sys.stderr)
+
+
 def _keys(keys: Sequence[str]) -> str:
     return ", ".join(map(_safe, keys))
-
-
-def _duration(value: timedelta) -> str:
-    total = int(value.total_seconds())
-    days, rest = divmod(total, 86_400)
-    clock = f"{rest // 3600:02d}:{rest % 3600 // 60:02d}:{rest % 60:02d}"
-    return f"{days}-{clock}" if days else clock
 
 
 def _plural(count: int, noun: str) -> str:
     return f"{count} {noun}{'' if count == 1 else 's'}"
 
 
-def _receipt(receipt: Receipt) -> dict[str, object]:
-    return {
-        "allocation_id": receipt.allocation_id,
-        "job_id": receipt.job.job_id,
-        "cluster": receipt.job.cluster,
-        "task_keys": list(receipt.task_keys),
-    }
+def _shape(item: Any) -> str:
+    """The request of a planned allocation or a shape check, for one human line."""
+    return (
+        f"{item.cpus} CPUs, {item.memory_mib} MiB, {item.gpus} GPUs, {to_document(item.time_limit)}"
+    )
 
 
 def _receipt_line(receipt: Receipt) -> str:
@@ -189,31 +164,31 @@ def _roster(arguments: argparse.Namespace, campaign: Campaign, verb: str) -> int
 # --- Authoring -------------------------------------------------------------------------------
 
 
-def _create(arguments: argparse.Namespace, context: _Context) -> int:
+def _create(arguments: argparse.Namespace) -> int:
     tasks = _read_tasks(arguments.tasks)
     campaign = Campaign.create(
-        arguments.state, tasks, appendable=arguments.appendable, connect=context.connect
+        arguments.state, tasks, appendable=arguments.appendable, connect=arguments.connect
     )
     return _roster(arguments, campaign, "created")
 
 
-def _ensure(arguments: argparse.Namespace, context: _Context) -> int:
+def _ensure(arguments: argparse.Namespace) -> int:
     tasks = _read_tasks(arguments.tasks)
     campaign = Campaign.ensure(
-        arguments.state, tasks, appendable=not arguments.sealed, connect=context.connect
+        arguments.state, tasks, appendable=not arguments.sealed, connect=arguments.connect
     )
     return _roster(arguments, campaign, "ensured")
 
 
-def _append(arguments: argparse.Namespace, context: _Context) -> int:
+def _append(arguments: argparse.Namespace) -> int:
     tasks = _read_tasks(arguments.tasks)
-    campaign = context.open(arguments.state)
+    campaign = _open(arguments)
     campaign.append(tasks)
     return _roster(arguments, campaign, f"appended {_plural(len(tasks), 'Task')} to")
 
 
-def _seal(arguments: argparse.Namespace, context: _Context) -> int:
-    campaign = context.open(arguments.state)
+def _seal(arguments: argparse.Namespace) -> int:
+    campaign = _open(arguments)
     campaign.seal()
     return _roster(arguments, campaign, "sealed")
 
@@ -225,49 +200,45 @@ def _plan_document(plan: Plan, scripts: bool, saved: Path | None) -> dict[str, o
     document = cast(dict[str, object], json.loads(plan.to_json()))
     allocations: list[dict[str, object]] = []
     for item in plan.allocations:
-        entry: dict[str, object] = {
-            "allocation_id": item.allocation_id,
-            "task_keys": list(item.task_keys),
-            "cpus": item.cpus,
-            "memory_mib": item.memory_mib,
-            "gpus": item.gpus,
-            "time_limit": _duration(item.time_limit),
-        }
+        entry = cast(dict[str, object], to_document(item))
         if scripts:
-            entry["argv"] = list(item.argv)
             entry["script"] = item.script.decode("utf-8", "replace")
+        else:
+            del entry["script"], entry["argv"]
         allocations.append(entry)
-    document["allocations"] = allocations
-    document["warnings"] = list(plan.warnings)
-    document["saved"] = None if saved is None else str(saved)
+    document.update(
+        allocations=allocations,
+        warnings=list(plan.warnings),
+        saved=None if saved is None else str(saved),
+    )
     return document
 
 
 def _print_plan(plan: Plan, scripts: bool, saved: Path | None) -> None:
-    profile = _safe(plan.profile.label)
-    print(f"plan for campaign {plan.campaign_id} (revision {plan.revision}, profile {profile})")
+    decision = plan.decision
+    print(
+        f"plan for campaign {decision.campaign_id} (revision {decision.revision}, "
+        f"profile {_safe(decision.profile.label)})"
+    )
     print(f"digest: {plan.digest}")
     allocations = _plural(len(plan.allocations), "allocation")
-    print(f"selected: {_plural(len(plan.selected), 'Task')} in {allocations}")
+    print(f"selected: {_plural(len(decision.selected), 'Task')} in {allocations}")
     for item in plan.allocations:
-        print(
-            f"  {item.allocation_id}  {_plural(len(item.task_keys), 'Task')}, {item.cpus} CPUs, "
-            f"{item.memory_mib} MiB, {item.gpus} GPUs, {_duration(item.time_limit)}"
-        )
+        print(f"  {item.allocation_id}  {_plural(len(item.task_keys), 'Task')}, {_shape(item)}")
         print(f"    {_keys(item.task_keys)}")
-    if plan.retry:
-        print(f"retry: {_keys(plan.retry)}")
-    if plan.duplicate_risk:
-        print(f"duplicate risk acknowledged: {_keys(plan.duplicate_risk)}")
-    print(f"held: {_plural(len(plan.held), 'Task')}")
+    if decision.retry:
+        print(f"retry: {_keys(decision.retry)}")
+    if decision.duplicate_risk:
+        print(f"duplicate risk acknowledged: {_keys(decision.duplicate_risk)}")
+    print(f"held: {_plural(len(decision.held), 'Task')}")
     reasons: dict[str, list[str]] = {}
-    for key, hold in plan.held.items():
+    for key, hold in decision.held.items():
         reasons.setdefault(hold.value, []).append(key)
     for reason, keys in reasons.items():
         print(f"  {reason}: {_keys(keys)}")
-    if plan.deferred:
-        print(f"deferred: {_plural(len(plan.deferred), 'Task')}")
-        print(f"  {_keys(plan.deferred)}")
+    if decision.deferred:
+        print(f"deferred: {_plural(len(decision.deferred), 'Task')}")
+        print(f"  {_keys(decision.deferred)}")
     if scripts:
         for item in plan.allocations:
             print(f"--- allocation {item.allocation_id} (sensitive) ---")
@@ -279,15 +250,12 @@ def _print_plan(plan: Plan, scripts: bool, saved: Path | None) -> None:
         print(f"saved: {_safe(saved)}")
 
 
-def _plan(arguments: argparse.Namespace, context: _Context) -> int:
-    campaign = context.open(arguments.state)
+def _plan(arguments: argparse.Namespace) -> int:
+    campaign = _open(arguments)
     profile = Profile.load(arguments.config, name=arguments.profile)
-    retry: tuple[str, ...] | Retry = (
-        Retry.FAILED if arguments.retry_failed else tuple(arguments.retry)
-    )
     plan = campaign.plan(
         profile,
-        retry=retry,
+        retry=Retry.FAILED if arguments.retry_failed else tuple(arguments.retry),
         allow_duplicate_risk=tuple(arguments.allow_duplicate_risk),
         only=tuple(arguments.only) if arguments.only else None,
         tasks_per_allocation=arguments.tasks_per_allocation,
@@ -306,37 +274,21 @@ def _plan(arguments: argparse.Namespace, context: _Context) -> int:
     return 0
 
 
-def _load_plan(arguments: argparse.Namespace, context: _Context) -> tuple[Campaign, Plan]:
-    campaign = context.open(arguments.state)
+def _load_plan(arguments: argparse.Namespace) -> tuple[Campaign, Plan]:
+    campaign = _open(arguments)
     return campaign, campaign.load_plan(_read_bytes(arguments.plan, "plan"))
 
 
-def _check_document(check: ShapeCheck) -> dict[str, object]:
-    return {
-        "task_count": check.task_count,
-        "cpus": check.cpus,
-        "memory_mib": check.memory_mib,
-        "gpus": check.gpus,
-        "time_limit": _duration(check.time_limit),
-        "accepted": check.accepted,
-        "scheduler_stdout": check.scheduler_stdout,
-        "scheduler_stderr": check.scheduler_stderr,
-    }
-
-
-def _validate(arguments: argparse.Namespace, context: _Context) -> int:
-    campaign, plan = _load_plan(arguments, context)
+def _validate(arguments: argparse.Namespace) -> int:
+    campaign, plan = _load_plan(arguments)
     checks = campaign.validate(plan)
     if arguments.json:
-        _emit({"checks": [_check_document(check) for check in checks]})
+        _emit({"checks": [to_document(check) for check in checks]})
     else:
         for check in checks:
             verdict = "accepted" if check.accepted else "REJECTED"
-            print(
-                f"{_plural(check.task_count, 'Task')} ({check.cpus} CPUs, {check.memory_mib} MiB, "
-                f"{check.gpus} GPUs, {_duration(check.time_limit)}): {verdict}"
-            )
-            for line in (check.scheduler_stdout + "\n" + check.scheduler_stderr).split("\n"):
+            print(f"{_plural(check.task_count, 'Task')} ({_shape(check)}): {verdict}")
+            for line in f"{check.scheduler_stdout}\n{check.scheduler_stderr}".split("\n"):
                 if line.strip():
                     print(f"  {_safe(line)}")
         if not checks:
@@ -349,41 +301,18 @@ def _validate(arguments: argparse.Namespace, context: _Context) -> int:
 
 def _print_result(result: SubmitResult, arguments: argparse.Namespace) -> None:
     if arguments.json:
-        _emit(
-            {
-                "receipts": [_receipt(receipt) for receipt in result.receipts],
-                "unresolved": [
-                    {
-                        "allocation_id": item.allocation_id,
-                        "task_keys": list(item.task_keys),
-                        "observed_job": None
-                        if item.observed_job is None
-                        else {
-                            "job_id": item.observed_job.job_id,
-                            "cluster": item.observed_job.cluster,
-                        },
-                    }
-                    for item in result.unresolved
-                ],
-                "unattempted": [
-                    {"allocation_id": item.allocation_id, "task_keys": list(item.task_keys)}
-                    for item in result.unattempted
-                ],
-                "stop_reason": result.stop_reason,
-                "complete": result.complete,
-            }
-        )
+        document = cast(dict[str, object], to_document(result))
+        _emit({**document, "complete": result.complete})
         return
     for receipt in result.receipts:
         print(f"submitted {_receipt_line(receipt)}")
     state = _safe(arguments.state)
     for item in result.unresolved:
         print(f"UNRESOLVED allocation {item.allocation_id} ({_keys(item.task_keys)})")
-        if item.observed_job is None:
+        if (job := item.observed_job) is None:
             print(f"  next: servatus reconcile {state} {item.allocation_id}")
         else:
-            job, cluster = item.observed_job, item.observed_job.cluster
-            option = "" if cluster is None else f" --cluster {cluster}"
+            option = "" if job.cluster is None else f" --cluster {job.cluster}"
             print(f"  Slurm accepted job {job}; record it:")
             print(
                 f"  next: servatus mark-accepted {state} {item.allocation_id} {job.job_id}{option}"
@@ -394,8 +323,8 @@ def _print_result(result: SubmitResult, arguments: argparse.Namespace) -> None:
         print("nothing to submit: the plan has no allocations")
 
 
-def _submit(arguments: argparse.Namespace, context: _Context) -> int:
-    campaign, plan = _load_plan(arguments, context)
+def _submit(arguments: argparse.Namespace) -> int:
+    campaign, plan = _load_plan(arguments)
     try:
         result = campaign.submit(plan)
     except SubmissionInterrupted as error:
@@ -422,19 +351,14 @@ def _print_status(status: Status, path: Path) -> None:
             execution = "-"
         else:
             execution = "ACCEPTED" if task.execution is None else task.execution.value
+        allocation = task.current_allocation_id or "-"
         rows.append(
-            (
-                _safe(task.key),
-                task.result.value,
-                execution,
-                task.exit_code or "-",
-                task.current_allocation_id or "-",
-            )
+            (_safe(task.key), task.result.value, execution, task.exit_code or "-", allocation)
         )
     widths = [max(len(row[column]) for row in rows) for column in range(4)]
     for row in rows:
         print(
-            "  ".join(cell.ljust(width) for cell, width in zip(row[:4], widths, strict=True))
+            "  ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=False))
             + "  "
             + row[4]
         )
@@ -444,12 +368,12 @@ def _print_status(status: Status, path: Path) -> None:
     )
     print(f"counts: {shown}")
     quiescent = "yes" if status.quiescent else "no"
-    ready = "yes" if status.results_ready else "no"
-    print(f"quiescent: {quiescent}; results ready: {ready}")
-    hints: list[str] = []
-    for attempt in status.attempts:
-        if attempt.acceptance is AcceptanceState.UNRESOLVED:
-            hints.append(f"servatus reconcile {state} {attempt.allocation_id}")
+    print(f"quiescent: {quiescent}; results ready: {'yes' if status.results_ready else 'no'}")
+    hints = [
+        f"servatus reconcile {state} {attempt.allocation_id}"
+        for attempt in status.attempts
+        if attempt.acceptance is AcceptanceState.UNRESOLVED
+    ]
     if counts["failed"] + counts["cancelled"]:
         hints.append(f"servatus plan {state} --retry-failed --output PLAN.json")
     if counts["unsubmitted"]:
@@ -460,8 +384,8 @@ def _print_status(status: Status, path: Path) -> None:
         print(f"next: {hint}")
 
 
-def _status(arguments: argparse.Namespace, context: _Context) -> int:
-    status = context.open(arguments.state).status(scheduler=not arguments.offline)
+def _status(arguments: argparse.Namespace) -> int:
+    status = _open(arguments).status(scheduler=not arguments.offline)
     if arguments.json:
         print(status.to_json().decode("utf-8"))
     else:
@@ -469,13 +393,13 @@ def _status(arguments: argparse.Namespace, context: _Context) -> int:
     return 0
 
 
-def _logs(arguments: argparse.Namespace, context: _Context) -> int:
+def _logs(arguments: argparse.Namespace) -> int:
     output = cast(Path | None, arguments.output)
     if output is None and sys.stdout.isatty():
         raise ConfigurationError(
             "refusing to write raw log bytes to a terminal; pass --output FILE or redirect"
         )
-    snapshot = context.open(arguments.state).read_log(
+    snapshot = _open(arguments).read_log(
         task=arguments.task, allocation=arguments.allocation, max_bytes=arguments.bytes
     )
     content = snapshot.content
@@ -492,59 +416,50 @@ def _logs(arguments: argparse.Namespace, context: _Context) -> int:
 # --- Recovery --------------------------------------------------------------------------------
 
 
-def _print_receipts(arguments: argparse.Namespace, receipts: Sequence[Receipt], verb: str) -> None:
+def _print_receipts(arguments: argparse.Namespace, receipts: Sequence[Receipt], verb: str) -> int:
     if arguments.json:
-        _emit({verb: [_receipt(receipt) for receipt in receipts]})
-        return
+        _emit({verb: [to_document(receipt) for receipt in receipts]})
+        return 0
     for receipt in receipts:
         print(f"{verb} {_receipt_line(receipt)}")
     if not receipts:
         print(f"nothing {verb}")
-
-
-def _reconcile(arguments: argparse.Namespace, context: _Context) -> int:
-    receipt = context.open(arguments.state).reconcile(arguments.allocation)
-    _print_receipts(arguments, (receipt,), "accepted")
     return 0
 
 
-def _mark_accepted(arguments: argparse.Namespace, context: _Context) -> int:
-    campaign = context.open(arguments.state)
-    receipt = campaign.mark_accepted(
+def _reconcile(arguments: argparse.Namespace) -> int:
+    receipt = _open(arguments).reconcile(arguments.allocation)
+    return _print_receipts(arguments, (receipt,), "accepted")
+
+
+def _mark_accepted(arguments: argparse.Namespace) -> int:
+    receipt = _open(arguments).mark_accepted(
         arguments.allocation, arguments.job_id, cluster=arguments.cluster
     )
-    _print_receipts(arguments, (receipt,), "accepted")
-    return 0
+    return _print_receipts(arguments, (receipt,), "accepted")
 
 
-def _mark_not_submitted(arguments: argparse.Namespace, context: _Context) -> int:
-    context.open(arguments.state).mark_not_submitted(arguments.allocation)
+def _mark_not_submitted(arguments: argparse.Namespace) -> int:
+    _open(arguments).mark_not_submitted(arguments.allocation)
     if arguments.json:
         _emit({"allocation_id": arguments.allocation, "acceptance": "NOT_SUBMITTED"})
     else:
-        print(f"allocation {arguments.allocation}: recorded as not submitted")
+        print(f"allocation {_safe(arguments.allocation)}: recorded as not submitted")
     return 0
 
 
-def _cancel(arguments: argparse.Namespace, context: _Context) -> int:
-    receipts = context.open(arguments.state).cancel(
+def _cancel(arguments: argparse.Namespace) -> int:
+    receipts = _open(arguments).cancel(
         tasks=tuple(arguments.task), allocations=tuple(arguments.allocation)
     )
-    _print_receipts(arguments, receipts, "cancelled")
-    return 0
+    return _print_receipts(arguments, receipts, "cancelled")
 
 
-def _doctor(arguments: argparse.Namespace, context: _Context) -> int:
+def _doctor(arguments: argparse.Namespace) -> int:
     profile = Profile.load(arguments.config, name=arguments.profile)
     target = profile.target
     fits = capacity(target, profile.resources)
-    completed = (context.connect or connect)(target).run(
-        (str(target.slurm_bin / "sbatch"), "--version")
-    )
-    if completed.returncode != 0:
-        raise Unavailable(f"sbatch --version failed with exit status {completed.returncode}")
-    text = completed.stdout.decode("utf-8", "replace").strip()
-    version = _safe(text)
+    version = ping(target, connect=arguments.connect)
     if arguments.json:
         _emit(
             {
@@ -558,11 +473,109 @@ def _doctor(arguments: argparse.Namespace, context: _Context) -> int:
     else:
         print(f"profile {_safe(profile.label)}: ok, up to {_plural(fits, 'Task')} per allocation")
         print(f"target: {target.host or 'local'} ({target.slurm_bin})")
-        print(f"sbatch: {version}")
+        print(f"sbatch: {_safe(version)}")
     return 0
 
 
 # --- Parser ----------------------------------------------------------------------------------
+
+Argument = tuple[tuple[str, ...], dict[str, Any]]
+_STATE: Argument = (("state",), {"type": Path, "metavar": "STATE", "help": "campaign directory"})
+_TASKS: Argument = (("tasks",), {"type": Path, "metavar": "TASKS.jsonl"})
+_PLAN_FILE: Argument = (("plan",), {"type": Path, "metavar": "PLAN.json"})
+_ALLOCATION: Argument = (("allocation",), {"metavar": "ALLOCATION"})
+_PROFILE: tuple[Argument, ...] = (
+    (("--config",), {"type": Path, "default": Path("SERVATUS.toml"), "metavar": "PATH"}),
+    (("--profile",), {"metavar": "NAME"}),
+)
+_KEYS: dict[str, Any] = {"action": "append", "default": [], "metavar": "KEY"}
+
+
+def _flag(name: str, text: str) -> Argument:
+    return ((name,), {"action": "store_true", "help": text})
+
+
+# name, handler, help, arguments; every command but doctor and logs also takes --json.
+_COMMANDS: tuple[tuple[str, Handler, str, tuple[Argument, ...]], ...] = (
+    (
+        "create",
+        _create,
+        "create a campaign; sealed unless --appendable",
+        (_STATE, _TASKS, _flag("--appendable", "allow appending Tasks later")),
+    ),
+    (
+        "ensure",
+        _ensure,
+        "create a campaign, or append Tasks it has not seen",
+        (_STATE, _TASKS, _flag("--sealed", "create the campaign sealed")),
+    ),
+    ("append", _append, "append new Tasks to an appendable campaign", (_STATE, _TASKS)),
+    ("seal", _seal, "end authoring irreversibly", (_STATE,)),
+    (
+        "plan",
+        _plan,
+        "show selected, held, and deferred Tasks; save the plan",
+        (
+            _STATE,
+            (("--output",), {"type": Path, "metavar": "PLAN.json", "help": "save the plan (0600)"}),
+            *_PROFILE,
+            (("--allow-duplicate-risk",), _KEYS),
+            (("--only",), _KEYS),
+            (("--tasks-per-allocation",), {"type": int, "metavar": "N"}),
+            _flag("--show-scripts", "print batch scripts (sensitive)"),
+        ),
+    ),
+    (
+        "validate",
+        _validate,
+        "ask sbatch --test-only once per allocation shape",
+        (_STATE, _PLAN_FILE),
+    ),
+    ("submit", _submit, "submit a reviewed plan", (_STATE, _PLAN_FILE)),
+    (
+        "status",
+        _status,
+        "show Task and allocation status",
+        (_STATE, _flag("--offline", "do not contact Slurm")),
+    ),
+    (
+        "logs",
+        _logs,
+        "write a bounded raw log tail (sensitive)",
+        (
+            _STATE,
+            (("--task",), {"metavar": "KEY"}),
+            (("--allocation",), {"metavar": "ID"}),
+            (("--bytes",), {"type": int, "default": 65_536, "metavar": "N"}),
+            (("--output",), {"type": Path, "metavar": "FILE", "help": "write a new 0600 file"}),
+        ),
+    ),
+    ("reconcile", _reconcile, "resolve an allocation from Slurm evidence", (_STATE, _ALLOCATION)),
+    (
+        "mark-accepted",
+        _mark_accepted,
+        "record a job you found yourself",
+        (
+            _STATE,
+            _ALLOCATION,
+            (("job_id",), {"type": int, "metavar": "JOB_ID"}),
+            (("--cluster",), {"metavar": "NAME"}),
+        ),
+    ),
+    (
+        "mark-not-submitted",
+        _mark_not_submitted,
+        "record an allocation Slurm proves it never received",
+        (_STATE, _ALLOCATION),
+    ),
+    (
+        "cancel",
+        _cancel,
+        "scancel the matching accepted allocations",
+        (_STATE, (("--task",), _KEYS), (("--allocation",), {**_KEYS, "metavar": "ID"})),
+    ),
+    ("doctor", _doctor, "check the profile and the scheduler connection", _PROFILE),
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -573,83 +586,19 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
     machine = argparse.ArgumentParser(add_help=False)
     machine.add_argument("--json", action="store_true", help="print machine-readable JSON")
-
-    def command(
-        name: str, run: Handler, text: str, *, json_output: bool = True
-    ) -> argparse.ArgumentParser:
-        sub = commands.add_parser(
-            name, help=text, description=text, parents=[machine] if json_output else []
-        )
+    for name, run, text, arguments in _COMMANDS:
+        parents = [] if name == "logs" else [machine]
+        sub = commands.add_parser(name, help=text, description=text, parents=parents)
         sub.set_defaults(run=run)
-        if name != "doctor":
-            sub.add_argument("state", type=Path, metavar="STATE", help="campaign directory")
-        return sub
-
-    def profile_options(sub: argparse.ArgumentParser) -> None:
-        sub.add_argument("--config", type=Path, default=Path("SERVATUS.toml"), metavar="PATH")
-        sub.add_argument("--profile", metavar="NAME")
-
-    create = command("create", _create, "create a campaign; sealed unless --appendable")
-    create.add_argument("tasks", type=Path, metavar="TASKS.jsonl")
-    create.add_argument("--appendable", action="store_true", help="allow appending Tasks later")
-    ensure = command("ensure", _ensure, "create a campaign, or append Tasks it has not seen")
-    ensure.add_argument("tasks", type=Path, metavar="TASKS.jsonl")
-    ensure.add_argument("--sealed", action="store_true", help="create the campaign sealed")
-    append = command("append", _append, "append new Tasks to an appendable campaign")
-    append.add_argument("tasks", type=Path, metavar="TASKS.jsonl")
-    command("seal", _seal, "end authoring irreversibly")
-
-    plan = command("plan", _plan, "show selected, held, and deferred Tasks; save the plan")
-    plan.add_argument("--output", type=Path, metavar="PLAN.json", help="save the plan (0600)")
-    profile_options(plan)
-    retry = plan.add_mutually_exclusive_group()
-    retry.add_argument("--retry", action="append", default=[], metavar="KEY")
-    retry.add_argument(
-        "--retry-failed", action="store_true", help="retry failed or cancelled Tasks"
-    )
-    plan.add_argument("--allow-duplicate-risk", action="append", default=[], metavar="KEY")
-    plan.add_argument("--only", action="append", default=[], metavar="KEY")
-    plan.add_argument("--tasks-per-allocation", type=int, metavar="N")
-    plan.add_argument("--show-scripts", action="store_true", help="print batch scripts (sensitive)")
-
-    for name, run, text in (
-        ("validate", _validate, "ask sbatch --test-only once per allocation shape"),
-        ("submit", _submit, "submit a reviewed plan"),
-    ):
-        command(name, run, text).add_argument("plan", type=Path, metavar="PLAN.json")
-
-    status = command("status", _status, "show Task and allocation status")
-    status.add_argument("--offline", action="store_true", help="do not contact Slurm")
-
-    logs = command("logs", _logs, "write a bounded raw log tail (sensitive)", json_output=False)
-    logs.add_argument("--task", metavar="KEY")
-    logs.add_argument("--allocation", metavar="ID")
-    logs.add_argument("--bytes", type=int, default=65_536, metavar="N")
-    logs.add_argument("--output", type=Path, metavar="FILE", help="write a new 0600 file")
-
-    reconcile = command("reconcile", _reconcile, "resolve an allocation from Slurm evidence")
-    reconcile.add_argument("allocation", metavar="ALLOCATION")
-    accepted = command("mark-accepted", _mark_accepted, "record a job you found yourself")
-    accepted.add_argument("allocation", metavar="ALLOCATION")
-    accepted.add_argument("job_id", type=int, metavar="JOB_ID")
-    accepted.add_argument("--cluster", metavar="NAME")
-    unsent = command(
-        "mark-not-submitted", _mark_not_submitted, "record a never-submitted allocation"
-    )
-    unsent.add_argument("allocation", metavar="ALLOCATION")
-
-    cancel = command("cancel", _cancel, "scancel the matching accepted allocations")
-    cancel.add_argument("--task", action="append", default=[], metavar="KEY")
-    cancel.add_argument("--allocation", action="append", default=[], metavar="ID")
-
-    profile_options(command("doctor", _doctor, "check the profile and the scheduler connection"))
+        for flags, options in arguments:
+            sub.add_argument(*flags, **options)
+        if name == "plan":
+            retry = sub.add_mutually_exclusive_group()
+            retry.add_argument("--retry", **_KEYS)
+            retry.add_argument(
+                "--retry-failed", action="store_true", help="retry failed or cancelled Tasks"
+            )
     return parser
-
-
-def _exit_code(code: object) -> int:
-    if code is None:
-        return 0
-    return code if isinstance(code, int) else EXIT_ERROR
 
 
 def main(argv: Sequence[str] | None = None, *, connect: Connect | None = None) -> int:
@@ -657,10 +606,11 @@ def main(argv: Sequence[str] | None = None, *, connect: Connect | None = None) -
     try:
         arguments = _parser().parse_args(argv)
     except SystemExit as exit_:
-        return _exit_code(exit_.code)
-    run = cast(Handler, arguments.run)
+        code = exit_.code
+        return code if isinstance(code, int) else 0 if code is None else EXIT_ERROR
+    arguments.connect = connect
     try:
-        return run(arguments, _Context(connect))
+        return cast(Handler, arguments.run)(arguments)
     except SubmissionInterrupted as error:
         code, message = EXIT_INTERRUPTED, str(error)
     except (Unavailable, Busy) as error:

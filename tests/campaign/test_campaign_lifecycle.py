@@ -27,7 +27,11 @@ def test_sweep_from_creation_through_failure_retry_and_saved_plans(world: World)
     probe = Probe()
     campaign = world.create(jobs(6), probe=probe)
     plan = campaign.plan(cpu_profile())
-    assert plan.selected == keys(6) and dict(plan.held) == {} and plan.deferred == ()
+    assert (
+        plan.decision.selected == keys(6)
+        and dict(plan.decision.held) == {}
+        and plan.decision.deferred == ()
+    )
     assert [item.task_keys for item in plan.allocations] == [keys(6)[:3], keys(6)[3:]]
     result = campaign.submit(plan)
     assert result.complete and result.unresolved == result.unattempted == ()
@@ -49,8 +53,8 @@ def test_sweep_from_creation_through_failure_retry_and_saved_plans(world: World)
     assert status.tasks[4].exit_code == "1:0"
 
     retry = campaign.plan(cpu_profile(), retry=Retry.FAILED)
-    assert retry.selected == retry.retry == ("task-4",)
-    assert dict(retry.held) == {
+    assert retry.decision.selected == retry.decision.retry == ("task-4",)
+    assert dict(retry.decision.held) == {
         **dict.fromkeys(keys(4), Hold.VALID),
         "task-5": Hold.SUBMITTED,
     }
@@ -60,11 +64,11 @@ def test_sweep_from_creation_through_failure_retry_and_saved_plans(world: World)
     world.fake.finish(1002)
 
     incomplete = campaign.plan(cpu_profile(), retry=Retry.INCOMPLETE)
-    assert incomplete.selected == ("task-4", "task-5")
+    assert incomplete.decision.selected == ("task-4", "task-5")
     probe.valid.update({"task-4", "task-5"})
     final = campaign.status()
     assert final.results_ready and final.quiescent
-    assert campaign.plan(cpu_profile(), retry=Retry.FAILED).selected == ()
+    assert campaign.plan(cpu_profile(), retry=Retry.FAILED).decision.selected == ()
 
 
 def test_probe_is_called_once_per_operation_with_only_the_tasks_that_matter(world: World) -> None:
@@ -80,7 +84,7 @@ def test_probe_is_called_once_per_operation_with_only_the_tasks_that_matter(worl
     campaign.status()
     assert probe.calls[2:] == [keys(3)]
     calls = len(probe.calls)
-    assert campaign.plan(cpu_profile()).selected == ()
+    assert campaign.plan(cpu_profile()).decision.selected == ()
     assert len(probe.calls) == calls  # accepted work without a retry request is not probed
     world.fake.start(1000)
     world.fake.finish(1000, "FAILED", exit_code="1:0")
@@ -189,7 +193,7 @@ def test_requeue_within_the_submission_window_does_not_wedge_the_task(world: Wor
     world.fake.finish(1000, "FAILED", exit_code="1:0")
     status = campaign.status()
     assert status.tasks[0].execution is AllocationState.FAILED and status.quiescent
-    assert campaign.plan(cpu_profile(), retry=Retry.FAILED).selected == ("task-0",)
+    assert campaign.plan(cpu_profile(), retry=Retry.FAILED).decision.selected == ("task-0",)
 
 
 def test_latest_accepted_attempt_projects_the_task_but_quiescence_uses_all(world: World) -> None:

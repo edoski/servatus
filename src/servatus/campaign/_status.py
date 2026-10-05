@@ -24,6 +24,7 @@ from typing import cast
 
 from ..errors import ConfigurationError
 from . import _codec
+from ._config import task_keys
 from ._evidence import AllocationState, JobRef, Observation, SchedulerEvidence, StepEvidence
 from ._state import AcceptanceState, State
 
@@ -120,9 +121,7 @@ class Status:
 def classify_results(keys: Iterable[str], valid: Collection[str]) -> dict[str, ResultState]:
     """Turn one probe answer for ``keys`` into result states. Unprobed Tasks stay UNOBSERVED."""
     asked = tuple(keys)
-    if isinstance(valid, (str, bytes)) or not isinstance(valid, Collection):
-        raise ConfigurationError("a result probe must return a collection of Task keys")
-    answered = set(valid)
+    answered = set(task_keys(valid, "a result probe answer"))
     if foreign := answered - set(asked):
         shown = ", ".join(sorted(map(repr, foreign)))
         raise ConfigurationError(f"result probe returned keys it was not asked about: {shown}")

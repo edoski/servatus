@@ -6,7 +6,7 @@ import dataclasses
 import os
 import re
 import tomllib
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path, PurePosixPath
@@ -48,6 +48,19 @@ def _text(value: object, name: str, *, empty: bool = False) -> str:
     except UnicodeEncodeError:
         raise ConfigurationError(f"{name} must be valid UTF-8 text") from None
     return text
+
+
+def task_keys(value: object, name: str) -> tuple[str, ...]:
+    """A collection (not a single string) of Task key strings, as a tuple."""
+    _require(
+        isinstance(value, Collection) and not isinstance(value, (str, bytes)),
+        f"{name} must be a collection of Task keys",
+    )
+    items = tuple(cast(Collection[object], value))
+    _require(
+        all(isinstance(item, str) for item in items), f"{name} must contain only Task key strings"
+    )
+    return cast(tuple[str, ...], items)
 
 
 def _integer(value: object, name: str, *, minimum: int) -> int:

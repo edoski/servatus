@@ -122,7 +122,10 @@ def test_partial_submission_reports_every_allocation(world: World, fault: str) -
         assert "site rejection" in str(caught.value)
     assert len(world.fake.jobs) == 1  # nothing reached the queue after the failure
     following = campaign.plan(cpu_profile())
-    assert following.selected == ("task-2",) and following.held["task-1"] is Hold.UNRESOLVED
+    assert (
+        following.decision.selected == ("task-2",)
+        and following.decision.held["task-1"] is Hold.UNRESOLVED
+    )
 
 
 def test_unresolved_allocations_are_recovered_by_reconcile_or_marking(world: World) -> None:
@@ -150,7 +153,7 @@ def test_unresolved_allocations_are_recovered_by_reconcile_or_marking(world: Wor
         campaign.reconcile(never)
     with pytest.raises(Conflict, match=r"does not prove job 77 for it \(.*0 jobs"):
         campaign.mark_accepted(never, 77)
-    assert campaign.plan(cpu_profile()).selected == ("task-1",)
+    assert campaign.plan(cpu_profile()).decision.selected == ("task-1",)
 
 
 def test_marking_not_submitted_needs_proof_of_absence(world: World) -> None:
@@ -204,7 +207,7 @@ def test_a_proven_job_overrides_a_not_submitted_outcome(world: World) -> None:
     assert campaign.status(scheduler=False).revision == revision + 1
     assert campaign.mark_accepted(first, 1000) == receipt  # identical repeat
     following = campaign.plan(cpu_profile())
-    assert following.selected == ("task-1",)
+    assert following.decision.selected == ("task-1",)
 
 
 def test_a_not_submitted_outcome_with_later_attempts_cannot_be_overridden(world: World) -> None:
@@ -375,7 +378,9 @@ def test_interrupts_propagate_and_leave_durable_intent(
     attempt = campaign.status(scheduler=False).attempts[0]
     assert attempt.acceptance is AcceptanceState.UNRESOLVED
     following = campaign.plan(cpu_profile())
-    assert following.selected == () and following.held["task-0"] is Hold.UNRESOLVED
+    assert (
+        following.decision.selected == () and following.decision.held["task-0"] is Hold.UNRESOLVED
+    )
 
 
 def test_a_plan_made_with_a_probe_needs_one_to_submit(world: World) -> None:

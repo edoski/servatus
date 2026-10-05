@@ -117,6 +117,16 @@ class State:
     def sealed(self) -> bool:
         return self.sealed_revision is not None
 
+    @property
+    def accepted_keys(self) -> frozenset[str]:
+        """Task keys with accepted work in any Attempt."""
+        return frozenset(
+            key
+            for attempt in self.attempts
+            if attempt.acceptance is AcceptanceState.ACCEPTED
+            for key in attempt.task_keys
+        )
+
     def attempt(self, allocation_id: str) -> Attempt:
         for attempt in self.attempts:
             if attempt.allocation_id == allocation_id:
