@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from campaign_world import World, cpu_profile, jobs
 
-from servatus.campaign import AllocationState, JobRef, Retry
+from servatus.campaign import AllocationState, Hold, JobRef, Retry
 from servatus.errors import (
     ConfigurationError,
     Conflict,
@@ -31,12 +31,13 @@ def test_cancel_stops_live_allocations_of_tasks_or_ids(world: World) -> None:
     assert world.fake.count("scancel") == scancels
     assert campaign.cancel(allocations=[second.allocation_id], tasks=["task-3"]) == (second,)
     assert world.fake.count("scancel") == scancels + 1
-    assert campaign.plan(cpu_profile(), retry=Retry.FAILED).selected == (
-        "task-0",
-        "task-1",
-        "task-2",
-        "task-3",
-    )
+    # The queued allocation never started a step, so its Tasks' own outcomes are unknown.
+    retry = campaign.plan(cpu_profile(), retry=Retry.FAILED)
+    assert retry.selected == ("task-0", "task-1")
+    assert dict(retry.decision.held) == {
+        "task-2": Hold.UNOBSERVABLE,
+        "task-3": Hold.UNOBSERVABLE,
+    }
 
 
 def test_cancel_reaches_every_live_attempt_of_a_task(world: World) -> None:

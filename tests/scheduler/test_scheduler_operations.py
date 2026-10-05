@@ -263,11 +263,11 @@ def test_accounting_window_starts_at_the_earliest_intent_in_the_batch() -> None:
         Unavailable("timeout"),
     ],
 )
-def test_step_query_failures_degrade_to_no_step_evidence(steps: Completed | Unavailable) -> None:
+def test_step_query_failures_make_step_evidence_unavailable(steps: Completed | Unavailable) -> None:
     transport = Scripted().queue("squeue", MISSING).queue("sacct", ok(sacct_row("RUNNING")), steps)
     observed = scheduler(transport).observe([query(task_count=3)])[ALLOCATION]
     assert observed.allocation.state is AllocationState.RUNNING
-    assert observed.steps == (None, None, None)
+    assert observed.steps == ()
 
 
 def test_observe_rejects_duplicate_allocations_and_foreign_values() -> None:

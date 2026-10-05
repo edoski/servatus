@@ -79,6 +79,7 @@ def test_probe_is_called_once_per_operation_with_only_the_tasks_that_matter(worl
     calls = len(probe.calls)
     assert campaign.plan(cpu_profile()).selected == ()
     assert len(probe.calls) == calls  # accepted work without a retry request is not probed
+    world.fake.start(1000)
     world.fake.finish(1000, "FAILED", exit_code="1:0")
     campaign.plan(cpu_profile(), retry=["task-1"])
     assert probe.calls[-1] == ("task-1",)

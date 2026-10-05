@@ -370,9 +370,9 @@ requests = st.one_of(subsets, st.sampled_from(list(Retry)))
 onlys = st.none() | subsets
 
 
-def accepted_history(state: State, key: str) -> list[tuple[str, int]]:
+def accepted_history(state: State, key: str) -> list[tuple[str, int, int]]:
     return [
-        (attempt.allocation_id, attempt.task_keys.index(key))
+        (attempt.allocation_id, attempt.task_keys.index(key), len(attempt.task_keys))
         for attempt in state.attempts
         if attempt.acceptance is AcceptanceState.ACCEPTED and key in attempt.task_keys
     ]
@@ -385,9 +385,19 @@ def unresolved(state: State, key: str) -> bool:
     )
 
 
-def task_states(observation: Observation, slot: int) -> tuple[AllocationState, AllocationState]:
+def task_states(
+    observation: Observation, slot: int, count: int
+) -> tuple[AllocationState, AllocationState, *tuple[AllocationState, ...]]:
+    """The allocation state, the Task's current state, then its raw step state when known."""
+    allocation = observation.allocation.state
     own = observation.steps[slot] if slot < len(observation.steps) else None
-    return observation.allocation.state, observation.allocation.state if own is None else own.state
+    raw = () if own is None else (own.state,)
+    if allocation is S.UNKNOWN:
+        return allocation, S.UNKNOWN, *raw
+    if own is None:
+        packed_failure = count > 1 and allocation in (S.FAILED, S.CANCELLED)
+        return allocation, S.UNKNOWN if packed_failure else allocation
+    return allocation, own.state, *raw
 
 
 def expected_refusals(
@@ -412,17 +422,22 @@ def expected_refusals(
         if not history:
             refused.add(key)
             continue
-        evidence = [(observations.get(identity), slot) for identity, slot in history]
+        evidence = [(observations.get(identity), slot, count) for identity, slot, count in history]
         if any(
             item is not None
-            and (item.allocation.retained or any(value.active for value in task_states(item, slot)))
-            for item, slot in evidence
+            and (
+                item.allocation.retained
+                or any(value.active for value in task_states(item, slot, count))
+            )
+            for item, slot, count in evidence
         ):
             continue
-        if any(item is None for item, _ in evidence):
+        if any(item is None for item, _, _ in evidence):
             continue
         unknown = any(
-            S.UNKNOWN in task_states(item, slot) for item, slot in evidence if item is not None
+            S.UNKNOWN in task_states(item, slot, count)
+            for item, slot, count in evidence
+            if item is not None
         )
         if unknown and key not in ack:
             refused.add(key)
@@ -463,15 +478,16 @@ def test_policy_safety_properties(
             continue
         # Resubmission is always explicit, observed, terminal, and acknowledged when unknown.
         assert isinstance(retry, Retry) or key in retry
-        for identity, slot in history:
+        for identity, slot, count in history:
             evidence = observations.get(identity)
             assert evidence is not None and not evidence.allocation.retained
-            assert not any(value.active for value in task_states(evidence, slot))
-            if S.UNKNOWN in task_states(evidence, slot):
+            assert not any(value.active for value in task_states(evidence, slot, count))
+            if S.UNKNOWN in task_states(evidence, slot, count):
                 assert key in ack and not isinstance(retry, Retry)
         if retry is Retry.FAILED:
-            identity, slot = history[-1]
-            assert task_states(observations[identity], slot)[1] in (S.FAILED, S.CANCELLED)
+            identity, slot, count = history[-1]
+            current = task_states(observations[identity], slot, count)[1]
+            assert current in (S.FAILED, S.CANCELLED)
         if retry is Retry.INCOMPLETE:
             assert results.get(key) is ResultState.MISSING
     # Scheduler evidence outside the observation scope never matters.

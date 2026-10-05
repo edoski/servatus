@@ -23,9 +23,11 @@ Resubmission is always explicit, in one of two forms:
   explicitly retried are all collected into one ``PlanRefused`` listing every offending key.
   Explicit retries of active, unresolved, or unobservable Tasks are held, not refused.
 - A bulk selector never raises for an individual Task. ``Retry.FAILED`` selects Tasks whose
-  current (latest accepted) Attempt failed or was cancelled, judged by the Task's step when
-  known and by the allocation otherwise. ``Retry.INCOMPLETE`` selects terminal Tasks whose
-  result was observed MISSING; it needs a probe, and unprobed Tasks are held ``UNOBSERVABLE``.
+  current (latest accepted) Attempt failed or was cancelled, judged by ``task_execution``: the
+  Task's step when known, else the allocation (a failed packed allocation without the Task's
+  step is UNKNOWN, because that Task may have succeeded). ``Retry.INCOMPLETE`` selects terminal
+  Tasks whose result was observed MISSING; it needs a probe, and unprobed Tasks are held
+  ``UNOBSERVABLE``.
   UNKNOWN evidence holds a Task as ``UNOBSERVABLE``: acknowledging duplicate risk always
   requires explicit keys.
 """
@@ -41,7 +43,7 @@ from typing import cast
 from ..errors import ConfigurationError, PlanRefused
 from ._evidence import AllocationState, Observation
 from ._state import AcceptanceState, Attempt, State
-from ._status import ResultState, task_execution
+from ._status import ResultState, own_step, task_execution
 
 
 class Hold(StrEnum):
@@ -234,9 +236,15 @@ def _assess(
         if observation is None:
             unobserved = True
             continue
-        allocation = observation.allocation
-        current, _ = task_execution(observation, slot)
-        active = active or allocation.retained or allocation.state.active or current.active
+        allocation, step = observation.allocation, own_step(observation, slot)
+        current, _ = task_execution(observation, slot, len(attempt.task_keys))
+        active = (
+            active
+            or allocation.retained
+            or allocation.state.active
+            or current.active
+            or (step is not None and step.state.active)
+        )
         unknown = unknown or AllocationState.UNKNOWN in (allocation.state, current)
     if active:
         return Hold.ACTIVE, unknown, current

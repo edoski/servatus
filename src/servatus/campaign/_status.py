@@ -5,8 +5,9 @@ Projection rules:
 - The latest accepted Attempt containing a Task owns that Task's current execution. An
   unresolved Attempt (intent recorded, acceptance unknown) dominates instead: the Task is
   ``unresolved`` and its execution is unknown (``None``).
-- A Task's execution and exit code come from its own ``srun`` step when the observation has
-  that step, and from the allocation otherwise.
+- A Task's execution and exit code follow ``task_execution``: its own ``srun`` step when known,
+  else the allocation, except that UNKNOWN or contradictory allocation evidence, and a failed or
+  cancelled packed allocation without the Task's step, leave the Task UNKNOWN.
 - ``results_ready`` means the roster is sealed and every Task has a VALID result.
 - ``quiescent`` means the scheduler was observed, no acceptance is unresolved, and every
   accepted Attempt has terminal, non-retained allocation evidence. Scheduler completion says
@@ -61,6 +62,7 @@ class AttemptStatus:
     steps: tuple[StepEvidence | None, ...]
 
 
+_UNATTRIBUTED = (AllocationState.FAILED, AllocationState.CANCELLED)
 _EXECUTION_COUNTS = ("unsubmitted", "unresolved", "accepted") + tuple(
     state.value.lower() for state in AllocationState
 )
@@ -127,12 +129,33 @@ def classify_results(keys: Iterable[str], valid: Collection[str]) -> dict[str, R
     return {key: ResultState.VALID if key in answered else ResultState.MISSING for key in asked}
 
 
-def task_execution(observation: Observation, slot: int) -> tuple[AllocationState, str | None]:
-    """The Task in ``slot`` of an observed allocation: its step if known, else the allocation."""
-    step = observation.steps[slot] if slot < len(observation.steps) else None
+def task_execution(
+    observation: Observation, slot: int, task_count: int
+) -> tuple[AllocationState, str | None]:
+    """The Task in ``slot`` of an observed allocation of ``task_count`` Tasks.
+
+    Contradictory (``problem``) or UNKNOWN allocation evidence makes every Task UNKNOWN, whatever
+    its step says. Otherwise the Task's own step decides when known. Without one, a single-Task
+    allocation is the Task, and so is a successful allocation (its script fails when any step
+    does); but a failed or cancelled packed allocation says nothing about one Task, which may
+    have finished first, so the Task is UNKNOWN. Exit codes accompany terminal states only.
+    """
+    allocation = observation.allocation
+    if allocation.problem is not None or allocation.state is AllocationState.UNKNOWN:
+        return AllocationState.UNKNOWN, None
+    step = own_step(observation, slot)
     if step is not None:
-        return step.state, step.exit_code
-    return observation.allocation.state, observation.allocation.exit_code
+        state, exit_code = step.state, step.exit_code
+    elif task_count > 1 and allocation.state in _UNATTRIBUTED:
+        return AllocationState.UNKNOWN, None
+    else:
+        state, exit_code = allocation.state, allocation.exit_code
+    return state, exit_code if state.terminal else None
+
+
+def own_step(observation: Observation, slot: int) -> StepEvidence | None:
+    """The step evidence of the Task in ``slot``, when the step query found exactly one."""
+    return observation.steps[slot] if slot < len(observation.steps) else None
 
 
 def project(
@@ -180,7 +203,9 @@ def project(
         if owner is not None and owner[0].acceptance is AcceptanceState.ACCEPTED:
             observation = observations.get(owner[0].allocation_id)
             if observation is not None:
-                execution, exit_code = task_execution(observation, owner[1])
+                execution, exit_code = task_execution(
+                    observation, owner[1], len(owner[0].task_keys)
+                )
         tasks.append(
             TaskStatus(
                 key=task.key,

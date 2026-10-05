@@ -113,7 +113,7 @@ def test_human_workflow_from_creation_to_status(cli: Cli) -> None:
     cli.fake.finish_step(1000, 1, "FAILED", exit_code="3:0")
     code, out, _ = cli("status", "state")
     assert code == 0
-    assert "one  UNOBSERVED  RUNNING    0:0" in out and "two  UNOBSERVED  FAILED     3:0" in out
+    assert "one  UNOBSERVED  RUNNING    -  " in out and "two  UNOBSERVED  FAILED     3:0" in out
     assert "counts: tasks 2, unobserved 2, running 1, failed 1" in out
     assert "next: servatus plan state --retry-failed --output PLAN.json" in out
     cli.fake.finish(1000)
@@ -230,6 +230,7 @@ def test_plan_reports_holds_deferrals_and_scripts(cli: Cli) -> None:
     cli("create", "state", "tasks.jsonl")
     cli("plan", "state", "--output", "first.json")
     cli("submit", "state", "first.json")
+    cli.fake.start(1000)
     cli.fake.finish(1000, "FAILED", exit_code="1:0")
     code, out, err = cli(
         "plan", "state", "--retry", "one", "--show-scripts", "--tasks-per-allocation", "1"

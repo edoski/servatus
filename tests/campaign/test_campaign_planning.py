@@ -12,7 +12,7 @@ import pytest
 from campaign_world import Probe, World, cpu_profile, jobs
 from support.builders import profile, resources, target
 
-from servatus.campaign import Completed, Hold, Profile, Retry, Task
+from servatus.campaign import AllocationState, Completed, Hold, Profile, Retry, Task
 from servatus.errors import (
     ConfigurationError,
     DestinationExists,
@@ -94,6 +94,7 @@ def test_batch_cap_defers_eligible_tasks_and_keeps_retry_intent(world: World) ->
     assert campaign.plan(capped, tasks_per_allocation=3).selected == keys(*range(6, 11))
 
     for job in (1000, 1001):
+        world.fake.start(job)
         world.fake.finish(job, "FAILED", exit_code="1:0")
     single = cpu_profile(max_allocations_per_submit=1)
     retry = campaign.plan(single, retry=Retry.FAILED, tasks_per_allocation=2)
@@ -312,3 +313,34 @@ def test_validate_checks_each_distinct_shape_without_recording(world: World) -> 
     (rejected, _) = campaign.validate(plan)
     assert not rejected.accepted and rejected.scheduler_stderr == rejection
     assert campaign.status(scheduler=False).attempts == () and world.fake.jobs == ()
+
+
+@pytest.mark.parametrize(
+    "steps", [Completed(1, b"", b"sacct: error: timeout\n"), Completed(0, b"", b"")]
+)
+def test_failed_retry_never_resubmits_a_packed_task_whose_own_outcome_is_unknown(
+    world: World, steps: Completed
+) -> None:
+    """A packed allocation fails after one Task's step succeeded. Without that step's evidence
+    (the step query fails or finds nothing) the Task may have succeeded: never bulk-retry it."""
+    campaign = world.create(jobs(2))
+    campaign.submit(campaign.plan(cpu_profile()))
+    world.fake.start(1000)
+    world.fake.finish_step(1000, 0, "COMPLETED")
+    world.fake.finish(1000, "FAILED", exit_code="1:0")
+
+    def without_steps() -> None:
+        world.wire.on("sacct", lambda _argv: None)  # allocation history answers normally
+        world.wire.on("sacct", lambda _argv: steps)
+
+    without_steps()
+    status = campaign.status()
+    assert [task.execution for task in status.tasks] == [AllocationState.UNKNOWN] * 2
+    without_steps()
+    bulk = campaign.plan(cpu_profile(), retry=Retry.FAILED)
+    assert bulk.selected == ()
+    assert dict(bulk.decision.held) == {"task-0": Hold.UNOBSERVABLE, "task-1": Hold.UNOBSERVABLE}
+    without_steps()
+    with pytest.raises(PlanRefused, match="needs a duplicate-risk acknowledgement: 'task-0'"):
+        campaign.plan(cpu_profile(), retry=["task-0"])
+    assert campaign.plan(cpu_profile(), retry=Retry.FAILED).selected == ("task-1",)

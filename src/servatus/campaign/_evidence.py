@@ -88,7 +88,11 @@ class StepEvidence:
 
 @dataclass(frozen=True, slots=True)
 class Observation:
-    """Everything observed for one accepted allocation; ``steps`` is indexed by slot."""
+    """Everything observed for one accepted allocation.
+
+    ``steps`` has one entry per slot (``None`` when that Task's step was not found), or is empty
+    when the step query itself failed, so step evidence is unavailable rather than absent.
+    """
 
     allocation: SchedulerEvidence
     steps: tuple[StepEvidence | None, ...] = ()

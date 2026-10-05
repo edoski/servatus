@@ -192,15 +192,15 @@ class Scheduler:
         return {
             item.allocation_id: Observation(
                 combine(item, active[job], history[job]),
-                steps.get(job, (None,) * item.task_count),
+                () if steps is None else steps[job],
             )
             for job, item in expected.items()
         }
 
     def _steps(
         self, expected: dict[int, Expectation], jobs: str, earliest: str, route: str
-    ) -> dict[int, tuple[StepEvidence | None, ...]]:
-        """Per-step evidence, or nothing at all when the step query fails in any way."""
+    ) -> dict[int, tuple[StepEvidence | None, ...]] | None:
+        """Per-step evidence, or ``None`` (unavailable) when the step query fails in any way."""
         try:
             completed = self._transport.run(
                 (
@@ -216,10 +216,10 @@ class Scheduler:
                 )
             )
             if completed.returncode != 0 or completed.stderr:
-                return {}
+                return None
             return parse_steps(completed.stdout, expected)
         except (Unavailable, EvidenceConflict):
-            return {}
+            return None
 
     def identify(self, allocation_id: str, intent_at: datetime) -> JobRef:
         """Find the one job Slurm holds for an unresolved allocation, else raise
