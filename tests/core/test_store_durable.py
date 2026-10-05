@@ -15,12 +15,20 @@ import pytest
 from core_helpers import CAMPAIGN_ID, reencode, roster, submit
 from support.builders import tasks
 
+from servatus import _fs
 from servatus._fs import replace_file
 from servatus.campaign import _store
 from servatus.campaign._config import Task
 from servatus.campaign._state import State, append, decode, encode, seal
 from servatus.campaign._store import Store
-from servatus.errors import ConfigurationError, Conflict, CorruptState, NotFound, UnsafeFilesystem
+from servatus.errors import (
+    ConfigurationError,
+    Conflict,
+    CorruptState,
+    NotFound,
+    Unavailable,
+    UnsafeFilesystem,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -139,28 +147,31 @@ def test_symlinked_campaign_directory_is_rejected(tmp_path: Path) -> None:
     path, _ = created(tmp_path)
     link = tmp_path / "link"
     link.symlink_to(path, target_is_directory=True)
-    with pytest.raises(UnsafeFilesystem, match="not a plain directory"):
+    with pytest.raises(UnsafeFilesystem, match="not a safe directory"):
         Store.open(link)
-    with pytest.raises(UnsafeFilesystem, match="not a plain directory"):
+    with pytest.raises(UnsafeFilesystem, match="not a safe directory"):
         Store.create(link, roster(1))
 
 
 def test_campaign_path_that_is_a_file_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "campaign"
     path.write_bytes(b"")
-    with pytest.raises(UnsafeFilesystem, match="not a plain directory"):
+    with pytest.raises(UnsafeFilesystem, match="not a safe directory"):
         Store.create(path, roster(1))
-    with pytest.raises(UnsafeFilesystem, match="not a plain directory"):
+    with pytest.raises(UnsafeFilesystem, match="not a safe directory"):
         Store.open(path)
 
 
-@pytest.mark.parametrize(("name", "message"), [("campaign.json", "state"), (".lock", "lock")])
+@pytest.mark.parametrize(
+    ("name", "message"),
+    [("campaign.json", "not a safe regular file: campaign.json"), (".lock", "lock is not a plain")],
+)
 def test_symlinked_entries_are_rejected(tmp_path: Path, name: str, message: str) -> None:
     path, store = created(tmp_path)
     target = tmp_path / "elsewhere"
     os.replace(path / name, target)
     (path / name).symlink_to(target)
-    with pytest.raises(UnsafeFilesystem, match=f"campaign {message} is not a plain file"):
+    with pytest.raises(UnsafeFilesystem, match=message):
         store.read()
 
 
@@ -168,7 +179,7 @@ def test_non_regular_entries_are_rejected(tmp_path: Path) -> None:
     path, store = created(tmp_path)
     (path / "campaign.json").unlink()
     (path / "campaign.json").mkdir(mode=0o700)
-    with pytest.raises(UnsafeFilesystem, match="campaign state must be owner-only"):
+    with pytest.raises(UnsafeFilesystem, match="not a regular file: campaign.json"):
         store.read()
     (path / ".lock").unlink()
     (path / ".lock").mkdir(mode=0o700)
@@ -283,7 +294,7 @@ def test_unchanged_update_writes_nothing(tmp_path: Path, monkeypatch: pytest.Mon
     def record(*_args: object, **_kwargs: object) -> None:
         writes.append("write")
 
-    monkeypatch.setattr(_store, "replace_file", record)
+    monkeypatch.setattr(_fs, "replace_file", record)
     state = store.read()
     assert store.update(lambda current: current) is state
     assert store.update(lambda current: append(current, ())) is state
@@ -391,7 +402,7 @@ def test_precommit_failure_preserves_state_and_removes_stage(
     path, store = created(tmp_path)
     before = (path / "campaign.json").read_bytes()
     inject(monkeypatch)
-    with pytest.raises(OSError, match="injected failure|no progress"):
+    with pytest.raises(Unavailable, match="injected failure|no progress"):
         store.update(seal)
     monkeypatch.undo()
     assert (path / "campaign.json").read_bytes() == before
@@ -428,7 +439,7 @@ def test_directory_sync_failure_after_rename_keeps_new_state(
         real(descriptor)
 
     monkeypatch.setattr(os, "fsync", fsync)
-    with pytest.raises(OSError, match="injected failure"):
+    with pytest.raises(Unavailable, match="injected failure"):
         store.update(seal)
     monkeypatch.undo()
     assert leftovers(path) == []
@@ -537,3 +548,76 @@ def test_two_handles_in_one_process_see_each_other(tmp_path: Path) -> None:
     second.update(seal)
     assert first.read().sealed
     assert first.read().campaign_id == CAMPAIGN_ID
+
+
+# --- error mapping and descriptors ------------------------------------------------------------
+
+
+def open_descriptors() -> int:
+    return len(os.listdir("/dev/fd"))
+
+
+def test_create_closes_every_descriptor_when_a_close_is_interrupted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: an interrupted close of the parent leaked the campaign directory descriptor.
+    parents: list[int] = []
+    real_open, real_close = os.open, os.close
+
+    def open_(path: object, *args: object, **kwargs: object) -> int:
+        fd = real_open(path, *args, **kwargs)  # pyright: ignore[reportArgumentType, reportCallIssue]
+        if path == str(tmp_path):
+            parents.append(fd)
+        return fd
+
+    def close(fd: int) -> None:
+        real_close(fd)
+        if fd in parents:
+            raise KeyboardInterrupt("injected interrupt")
+
+    monkeypatch.setattr(os, "open", open_)
+    monkeypatch.setattr(os, "close", close)
+    before = open_descriptors()
+    with pytest.raises(KeyboardInterrupt, match="injected interrupt"):
+        Store.create(tmp_path / "campaign", roster(1))
+    monkeypatch.undo()
+
+    assert parents
+    assert open_descriptors() == before
+    assert Store.open(tmp_path / "campaign").read() == roster(1)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permissions")
+def test_unwritable_location_is_a_configuration_error(tmp_path: Path) -> None:
+    parent = tmp_path / "read-only"
+    parent.mkdir()
+    parent.chmod(0o500)
+    try:
+        with pytest.raises(ConfigurationError, match="not a usable location.*Permission denied"):
+            Store.create(parent / "campaign", roster(1))
+        with pytest.raises(ConfigurationError, match="not a usable location.*Permission denied"):
+            Store.create(parent / "nested" / "campaign", roster(1), parents=True)
+    finally:
+        parent.chmod(0o700)
+    assert list(parent.iterdir()) == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permissions")
+def test_state_unreadable_by_its_owner_is_a_configuration_error(tmp_path: Path) -> None:
+    path, store = created(tmp_path)
+    (path / "campaign.json").chmod(0o200)
+    with pytest.raises(ConfigurationError, match="not readable by its owner: campaign.json"):
+        store.read()
+
+
+def test_change_os_errors_propagate_unchanged(tmp_path: Path) -> None:
+    path, store = created(tmp_path)
+    failure = OSError(errno.EIO, "the change itself failed")
+
+    def change(state: State) -> State:
+        raise failure
+
+    with pytest.raises(OSError, match="the change itself failed") as raised:
+        store.update(change)
+    assert raised.value is failure
+    assert leftovers(path) == []

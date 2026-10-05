@@ -8,7 +8,8 @@ Layout::
 
 Every operation reopens the directory without following a final symlink and checks that it is
 still the directory the store was opened on. Reads hold a shared lock and writes an exclusive one;
-the lock file's inode is re-checked after locking so a replaced lock cannot split writers.
+the lock file's inode is re-checked after locking so a replaced lock cannot split writers. Missing
+entries are ``NotFound``; other filesystem failures map like publication's (see ``_fs.os_error``).
 
 Decoding is the expensive step, so each ``Store`` caches the last state with the exact bytes it
 came from. A read compares the file's bytes with the cache and decodes only when they differ.
@@ -17,15 +18,14 @@ Commits fill the cache with the bytes they wrote.
 
 from __future__ import annotations
 
-import errno
 import fcntl
 import os
-import stat
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
-from .._fs import replace_file, sync
+from .. import _fs
+from .._fs import Pin
 from ..errors import ConfigurationError, Conflict, CorruptState, NotFound, UnsafeFilesystem
 from ._config import StrPath
 from ._state import State, decode, encode
@@ -33,18 +33,16 @@ from ._state import State, decode, encode
 MAX_STATE_BYTES = 256 * 1024 * 1024
 STATE_NAME = "campaign.json"
 LOCK_NAME = ".lock"
-_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-_READ_CHUNK = 1024 * 1024
 
 
 class Store:
     """A locked, durable, content-cached home for one Campaign ``State``."""
 
-    __slots__ = ("_cache", "_identity", "path")
+    __slots__ = ("_cache", "_entry", "path")
 
-    def __init__(self, path: Path, identity: tuple[int, int]) -> None:
+    def __init__(self, path: Path, entry: os.stat_result) -> None:
         self.path = path
-        self._identity = identity
+        self._entry = entry
         self._cache: tuple[bytes, State] | None = None
 
     @classmethod
@@ -58,92 +56,83 @@ class Store:
         if not isinstance(state, State):
             raise ConfigurationError("state must be a campaign State")
         location = _location(path)
-        if parents:
-            os.makedirs(location.parent, exist_ok=True)
-        try:
-            parent = os.open(location.parent, _DIRECTORY_FLAGS)
-        except FileNotFoundError:
-            raise NotFound(f"campaign parent directory does not exist: {location.parent}") from None
-        except OSError as error:
-            raise UnsafeFilesystem(f"campaign parent is not a usable directory: {error}") from None
-        try:
+        with _fs.Boundary(location, missing=NotFound), ExitStack() as stack:
+            if parents:
+                os.makedirs(location.parent, exist_ok=True)
+            parent = stack.enter_context(
+                _open(
+                    location.parent, f"campaign parent directory does not exist: {location.parent}"
+                )
+            )
             try:
-                os.mkdir(location.name, 0o700, dir_fd=parent)
+                os.mkdir(location.name, 0o700, dir_fd=parent.fd)
             except FileExistsError:
                 pass
             else:
-                sync(parent)
-            descriptor = _open_directory(location.name, parent)
-        finally:
-            os.close(parent)
-        try:
-            entry = os.fstat(descriptor)
-            store = cls(location, (entry.st_dev, entry.st_ino))
-            with _locked(descriptor, fcntl.LOCK_EX):
-                try:
-                    os.stat(STATE_NAME, dir_fd=descriptor, follow_symlinks=False)
-                except FileNotFoundError:
-                    pass
-                else:
+                _fs.sync(parent.fd)
+            directory = stack.enter_context(parent.open(location.name, same_device=False))
+            _fs.require_owner_only(directory.entry, "campaign directory")
+            store = cls(location, directory.entry)
+            with _locked(directory, fcntl.LOCK_EX):
+                if directory.lstat(STATE_NAME) is not None:
                     raise Conflict(f"campaign already exists: {location}")
-                store._commit(descriptor, state)
-        finally:
-            os.close(descriptor)
+                store._commit(directory, state)
         return store
 
     @classmethod
     def open(cls, path: StrPath) -> Store:
         """Open an existing campaign and validate its state. ``NotFound`` if there is none."""
         location = _location(path)
-        try:
-            descriptor = _open_directory(location)
-        except NotFound:
-            raise NotFound(f"campaign does not exist: {location}") from None
-        try:
-            entry = os.fstat(descriptor)
-        finally:
-            os.close(descriptor)
-        store = cls(location, (entry.st_dev, entry.st_ino))
+        with _fs.Boundary(location, missing=NotFound), _directory(location) as directory:
+            store = cls(location, directory.entry)
         store.read()
         return store
 
     def read(self) -> State:
         """Return the current state, decoding only if its bytes changed since the last call."""
-        with self._transaction(fcntl.LOCK_SH) as descriptor:
-            return self._load(descriptor)
+        with _fs.Boundary(self.path, missing=NotFound), self._transaction(fcntl.LOCK_SH) as pin:
+            return self._load(pin)
 
     def update(self, change: Callable[[State], State]) -> State:
         """Apply ``change`` to the current state under the exclusive lock and commit the result.
 
         Returning the same object commits nothing. Exceptions from ``change`` propagate and leave
-        the stored state untouched.
+        the stored state untouched. The lock is not reentrant: ``change`` must not use any
+        ``Store`` for this campaign, or it deadlocks.
         """
-        with self._transaction(fcntl.LOCK_EX) as descriptor:
-            current = self._load(descriptor)
-            changed = change(current)
+        with (
+            _fs.Boundary(self.path, missing=NotFound) as boundary,
+            self._transaction(fcntl.LOCK_EX) as directory,
+        ):
+            current = self._load(directory)
+            changed = boundary.passthrough(change)(current)
             if changed is current:
                 return current
             if not isinstance(changed, State):
                 raise TypeError("a campaign state change must return a State")
-            self._commit(descriptor, changed)
+            self._commit(directory, changed)
             return changed
 
     # --- internals ----------------------------------------------------------------------------
 
     @contextmanager
-    def _transaction(self, operation: int) -> Generator[int]:
-        descriptor = _open_directory(self.path)
-        try:
-            entry = os.fstat(descriptor)
-            if (entry.st_dev, entry.st_ino) != self._identity:
+    def _transaction(self, operation: int) -> Generator[Pin]:
+        with _directory(self.path) as directory:
+            if not _fs.same(directory.entry, self._entry):
                 raise UnsafeFilesystem(f"campaign directory was replaced: {self.path}")
-            with _locked(descriptor, operation):
-                yield descriptor
-        finally:
-            os.close(descriptor)
+            with _locked(directory, operation):
+                yield directory
 
-    def _load(self, descriptor: int) -> State:
-        data = _read_state(descriptor)
+    def _load(self, directory: Pin) -> State:
+        if directory.lstat(STATE_NAME) is None:
+            raise NotFound("campaign state does not exist")
+        with directory.open(STATE_NAME, directory=False) as file:
+            _fs.require_owner_only(file.entry, "campaign state")
+            if file.entry.st_size > MAX_STATE_BYTES:
+                raise CorruptState(
+                    f"campaign state is {file.entry.st_size} bytes; the limit is {MAX_STATE_BYTES}"
+                )
+            data = _fs.read(file)
         cache = self._cache
         if cache is not None and cache[0] == data:
             return cache[1]
@@ -151,13 +140,13 @@ class Store:
         self._cache = (data, state)
         return state
 
-    def _commit(self, descriptor: int, state: State) -> None:
+    def _commit(self, directory: Pin, state: State) -> None:
         data = encode(state)
         if len(data) > MAX_STATE_BYTES:
             raise Conflict(
                 f"campaign state would be {len(data)} bytes; the limit is {MAX_STATE_BYTES}"
             )
-        replace_file(descriptor, STATE_NAME, data)
+        _fs.replace_file(directory.fd, STATE_NAME, data)
         self._cache = (data, state)
 
 
@@ -171,77 +160,23 @@ def _location(path: StrPath) -> Path:
     return location
 
 
-def _open_directory(path: StrPath, dir_fd: int | None = None) -> int:
+def _open(path: Path, missing: str) -> Pin:
     try:
-        descriptor = os.open(path, _DIRECTORY_FLAGS, dir_fd=dir_fd)
-    except FileNotFoundError:
-        raise NotFound(f"campaign directory does not exist: {path}") from None
-    except OSError as error:
-        if error.errno in (errno.ELOOP, errno.ENOTDIR, errno.EACCES, errno.EPERM):
-            raise UnsafeFilesystem(f"campaign path is not a plain directory: {path}") from None
-        raise
+        return _fs.open_path(path)
+    except FileNotFoundError as error:
+        raise NotFound(missing) from error
+
+
+def _directory(path: Path) -> Pin:
+    """Pin the owner-only campaign directory at `path`."""
+    directory = _open(path, f"campaign does not exist: {path}")
     try:
-        _require_owner_only(os.fstat(descriptor), stat.S_ISDIR, "campaign directory")
+        _fs.require_owner_only(directory.entry, "campaign directory")
     except BaseException:
-        os.close(descriptor)
+        directory.close()
         raise
-    return descriptor
+    return directory
 
 
-def _require_owner_only(entry: os.stat_result, kind: Callable[[int], bool], what: str) -> None:
-    if not kind(entry.st_mode) or entry.st_uid != os.geteuid() or entry.st_mode & 0o077:
-        raise UnsafeFilesystem(f"{what} must be owner-only and owned by the current user")
-
-
-@contextmanager
-def _locked(descriptor: int, operation: int) -> Generator[None]:
-    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
-    try:
-        lock = os.open(LOCK_NAME, flags, 0o600, dir_fd=descriptor)
-    except OSError as error:
-        if error.errno in (errno.ELOOP, errno.EISDIR, errno.EACCES, errno.EPERM):
-            raise UnsafeFilesystem("campaign lock is not a plain file") from None
-        raise
-    try:
-        _require_owner_only(os.fstat(lock), stat.S_ISREG, "campaign lock")
-        fcntl.flock(lock, operation)
-        held = os.fstat(lock)
-        try:
-            named = os.stat(LOCK_NAME, dir_fd=descriptor, follow_symlinks=False)
-        except FileNotFoundError:
-            named = None
-        if named is None or (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino):
-            raise UnsafeFilesystem("campaign lock was replaced while waiting for it")
-        yield
-    finally:
-        os.close(lock)
-
-
-def _read_state(descriptor: int) -> bytes:
-    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
-    try:
-        handle = os.open(STATE_NAME, flags, dir_fd=descriptor)
-    except FileNotFoundError:
-        raise NotFound("campaign state does not exist") from None
-    except OSError as error:
-        if error.errno in (errno.ELOOP, errno.EACCES, errno.EPERM):
-            raise UnsafeFilesystem("campaign state is not a plain file") from None
-        raise
-    try:
-        entry = os.fstat(handle)
-        _require_owner_only(entry, stat.S_ISREG, "campaign state")
-        if entry.st_size > MAX_STATE_BYTES:
-            raise CorruptState(
-                f"campaign state is {entry.st_size} bytes; the limit is {MAX_STATE_BYTES}"
-            )
-        chunks: list[bytes] = []
-        remaining = entry.st_size + 1
-        while remaining and (chunk := os.read(handle, min(remaining, _READ_CHUNK))):
-            chunks.append(chunk)
-            remaining -= len(chunk)
-    finally:
-        os.close(handle)
-    data = b"".join(chunks)
-    if len(data) != entry.st_size:
-        raise UnsafeFilesystem("campaign state changed while it was being read")
-    return data
+def _locked(directory: Pin, operation: int) -> Pin:
+    return _fs.lock_file(directory, LOCK_NAME, operation, "campaign lock")
