@@ -185,7 +185,9 @@ def _link_error(error: OSError, source: object, destination: object) -> Exceptio
         return DestinationExists(f"draft path already exists: {destination}")
     if error.errno == errno.ENOENT:
         return ConfigurationError(f"hard-link source does not exist: {source}")
-    if error.errno in {errno.EPERM, errno.EACCES, errno.ELOOP, errno.EISDIR}:
+    if error.errno == errno.EACCES:
+        return ConfigurationError(f"hard-link source is not accessible: {source}")
+    if error.errno in {errno.EPERM, errno.ELOOP, errno.EISDIR}:
         return UnsafeFilesystem(f"unsafe hard-link source: {source}")
     if error.errno == errno.EXDEV:
         return CrossDeviceError(f"hard-link source is on another filesystem: {source}")

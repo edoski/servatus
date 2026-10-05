@@ -209,6 +209,24 @@ def test_link_reports_a_missing_source_as_a_configuration_error(tmp_path: Path) 
     assert list((tmp_path / "result").iterdir()) == []
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_link_reports_an_inaccessible_source_as_a_configuration_error(tmp_path: Path) -> None:
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "weights.bin").write_bytes(b"weights")
+    locked.chmod(0o000)
+
+    def build(draft: Draft) -> None:
+        with pytest.raises(ConfigurationError, match="hard-link source is not accessible"):
+            draft.link(locked / "weights.bin", "weights.bin")
+
+    try:
+        publish(tmp_path / "result", build)
+    finally:
+        locked.chmod(0o700)
+    assert list((tmp_path / "result").iterdir()) == []
+
+
 @pytest.mark.parametrize("case", ["contains-draft", "is-draft", "contains-destination"])
 def test_link_tree_rejects_a_source_containing_its_draft(tmp_path: Path, case: str) -> None:
     # Regression: linking a tree that contains the stage recursed into its own output.
