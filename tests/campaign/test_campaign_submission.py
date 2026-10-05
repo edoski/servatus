@@ -62,6 +62,17 @@ def test_submission_records_intent_before_contact_and_receipts_after(world: Worl
     assert [job.script for job in world.fake.jobs] == [item.script for item in plan.allocations]
 
 
+def test_only_plans_are_submitted_or_validated(world: World) -> None:
+    campaign = world.create(jobs(1))
+    plan = campaign.plan(cpu_profile())
+    for value in (plan.decision, replace(plan, decision=plan.to_json())):
+        with pytest.raises(ConfigurationError, match="plan must be a Plan"):
+            campaign.submit(value)  # pyright: ignore[reportArgumentType]
+        with pytest.raises(ConfigurationError, match="plan must be a Plan"):
+            campaign.validate(value)  # pyright: ignore[reportArgumentType]
+    assert world.scheduler_calls() == 0
+
+
 def test_tampered_in_memory_plans_are_refused_before_any_intent(world: World) -> None:
     campaign = world.create(jobs(2))
     plan = campaign.plan(cpu_profile())
