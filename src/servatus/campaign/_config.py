@@ -68,7 +68,7 @@ def _optional_token(value: object, name: str) -> str | None:
 
 def _absolute(value: object, name: str) -> PurePosixPath:
     _require(isinstance(value, (str, PurePosixPath)), f"{name} must be an absolute POSIX path")
-    raw = str(cast(PosixInput, value))
+    raw = _text(str(cast(PosixInput, value)), name)
     path = PurePosixPath(raw)
     _require(
         _CONTROL.search(raw) is None and path.is_absolute() and ".." not in path.parts,
@@ -366,7 +366,7 @@ class Profile:
                 document = cast(dict[str, object], tomllib.load(handle))
         except FileNotFoundError:
             raise NotFound(f"configuration file does not exist: {source}") from None
-        except (OSError, tomllib.TOMLDecodeError) as error:
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
             raise ConfigurationError(f"cannot read TOML configuration {source}: {error}") from None
         if unknown := document.keys() - {"profiles", "default_profile", "target", "resources"}:
             raise ConfigurationError(f"unknown document keys: {', '.join(sorted(unknown))}")
