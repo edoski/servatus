@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "servatus"
-version = "0.11.0"
+version = "0.12.0"
 description = "Run resumable work through Slurm and atomically publish validated outputs."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -32,6 +32,8 @@ Issues = "https://github.com/edoski/servatus/issues"
 
 [dependency-groups]
 dev = [
+  "coverage>=7.6",
+  "hypothesis>=6.112",
   "pyright>=1.1.404",
   "pytest>=8.4",
   "ruff>=0.12",
@@ -42,12 +44,16 @@ dev = [
 packages = ["src/servatus"]
 
 [tool.pyright]
-include = ["src"]
+include = ["src", "tests"]
+extraPaths = ["tests"]
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
+# Public constructors validate runtime types that annotations already describe.
+reportUnnecessaryIsInstance = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests"]
 
 [tool.ruff]
 line-length = 100
