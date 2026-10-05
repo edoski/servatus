@@ -479,103 +479,14 @@ def _doctor(arguments: argparse.Namespace) -> int:
 
 # --- Parser ----------------------------------------------------------------------------------
 
-Argument = tuple[tuple[str, ...], dict[str, Any]]
-_STATE: Argument = (("state",), {"type": Path, "metavar": "STATE", "help": "campaign directory"})
-_TASKS: Argument = (("tasks",), {"type": Path, "metavar": "TASKS.jsonl"})
-_PLAN_FILE: Argument = (("plan",), {"type": Path, "metavar": "PLAN.json"})
-_ALLOCATION: Argument = (("allocation",), {"metavar": "ALLOCATION"})
-_PROFILE: tuple[Argument, ...] = (
-    (("--config",), {"type": Path, "default": Path("SERVATUS.toml"), "metavar": "PATH"}),
-    (("--profile",), {"metavar": "NAME"}),
-)
+_POSITIONALS: dict[str, dict[str, Any]] = {
+    "state": {"type": Path, "metavar": "STATE", "help": "campaign directory"},
+    "tasks": {"type": Path, "metavar": "TASKS.jsonl"},
+    "plan": {"type": Path, "metavar": "PLAN.json"},
+    "allocation": {"metavar": "ALLOCATION"},
+    "job_id": {"type": int, "metavar": "JOB_ID"},
+}
 _KEYS: dict[str, Any] = {"action": "append", "default": [], "metavar": "KEY"}
-
-
-def _flag(name: str, text: str) -> Argument:
-    return ((name,), {"action": "store_true", "help": text})
-
-
-# name, handler, help, arguments; every command but doctor and logs also takes --json.
-_COMMANDS: tuple[tuple[str, Handler, str, tuple[Argument, ...]], ...] = (
-    (
-        "create",
-        _create,
-        "create a campaign; sealed unless --appendable",
-        (_STATE, _TASKS, _flag("--appendable", "allow appending Tasks later")),
-    ),
-    (
-        "ensure",
-        _ensure,
-        "create a campaign, or append Tasks it has not seen",
-        (_STATE, _TASKS, _flag("--sealed", "create the campaign sealed")),
-    ),
-    ("append", _append, "append new Tasks to an appendable campaign", (_STATE, _TASKS)),
-    ("seal", _seal, "end authoring irreversibly", (_STATE,)),
-    (
-        "plan",
-        _plan,
-        "show selected, held, and deferred Tasks; save the plan",
-        (
-            _STATE,
-            (("--output",), {"type": Path, "metavar": "PLAN.json", "help": "save the plan (0600)"}),
-            *_PROFILE,
-            (("--allow-duplicate-risk",), _KEYS),
-            (("--only",), _KEYS),
-            (("--tasks-per-allocation",), {"type": int, "metavar": "N"}),
-            _flag("--show-scripts", "print batch scripts (sensitive)"),
-        ),
-    ),
-    (
-        "validate",
-        _validate,
-        "ask sbatch --test-only once per allocation shape",
-        (_STATE, _PLAN_FILE),
-    ),
-    ("submit", _submit, "submit a reviewed plan", (_STATE, _PLAN_FILE)),
-    (
-        "status",
-        _status,
-        "show Task and allocation status",
-        (_STATE, _flag("--offline", "do not contact Slurm")),
-    ),
-    (
-        "logs",
-        _logs,
-        "write a bounded raw log tail (sensitive)",
-        (
-            _STATE,
-            (("--task",), {"metavar": "KEY"}),
-            (("--allocation",), {"metavar": "ID"}),
-            (("--bytes",), {"type": int, "default": 65_536, "metavar": "N"}),
-            (("--output",), {"type": Path, "metavar": "FILE", "help": "write a new 0600 file"}),
-        ),
-    ),
-    ("reconcile", _reconcile, "resolve an allocation from Slurm evidence", (_STATE, _ALLOCATION)),
-    (
-        "mark-accepted",
-        _mark_accepted,
-        "record a job you found yourself",
-        (
-            _STATE,
-            _ALLOCATION,
-            (("job_id",), {"type": int, "metavar": "JOB_ID"}),
-            (("--cluster",), {"metavar": "NAME"}),
-        ),
-    ),
-    (
-        "mark-not-submitted",
-        _mark_not_submitted,
-        "record an allocation Slurm proves it never received",
-        (_STATE, _ALLOCATION),
-    ),
-    (
-        "cancel",
-        _cancel,
-        "scancel the matching accepted allocations",
-        (_STATE, (("--task",), _KEYS), (("--allocation",), {**_KEYS, "metavar": "ID"})),
-    ),
-    ("doctor", _doctor, "check the profile and the scheduler connection", _PROFILE),
-)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -586,18 +497,59 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
     machine = argparse.ArgumentParser(add_help=False)
     machine.add_argument("--json", action="store_true", help="print machine-readable JSON")
-    for name, run, text, arguments in _COMMANDS:
+
+    def command(name: str, run: Handler, text: str, *positionals: str) -> argparse.ArgumentParser:
         parents = [] if name == "logs" else [machine]
         sub = commands.add_parser(name, help=text, description=text, parents=parents)
         sub.set_defaults(run=run)
-        for flags, options in arguments:
-            sub.add_argument(*flags, **options)
-        if name == "plan":
-            retry = sub.add_mutually_exclusive_group()
-            retry.add_argument("--retry", **_KEYS)
-            retry.add_argument(
-                "--retry-failed", action="store_true", help="retry failed or cancelled Tasks"
-            )
+        for positional in positionals:
+            sub.add_argument(positional, **_POSITIONALS[positional])
+        return sub
+
+    def flag(sub: argparse.ArgumentParser, name: str, text: str) -> None:
+        sub.add_argument(name, action="store_true", help=text)
+
+    def profile_options(sub: argparse.ArgumentParser) -> None:
+        sub.add_argument("--config", type=Path, default=Path("SERVATUS.toml"), metavar="PATH")
+        sub.add_argument("--profile", metavar="NAME")
+
+    text = "create a campaign; sealed unless --appendable"
+    flag(command("create", _create, text, "state", "tasks"), "--appendable", "allow appending")
+    text = "create a campaign, or append Tasks it has not seen"
+    flag(command("ensure", _ensure, text, "state", "tasks"), "--sealed", "create it sealed")
+    command("append", _append, "append new Tasks to an appendable campaign", "state", "tasks")
+    command("seal", _seal, "end authoring irreversibly", "state")
+    plan = command("plan", _plan, "show selected, held, and deferred Tasks; save the plan", "state")
+    plan.add_argument("--output", type=Path, metavar="PLAN.json", help="save the plan (0600)")
+    profile_options(plan)
+    retry = plan.add_mutually_exclusive_group()
+    retry.add_argument("--retry", **_KEYS)
+    retry.add_argument("--retry-failed", action="store_true", help="retry failed or cancelled")
+    plan.add_argument("--allow-duplicate-risk", **_KEYS)
+    plan.add_argument("--only", **_KEYS)
+    plan.add_argument("--tasks-per-allocation", type=int, metavar="N")
+    flag(plan, "--show-scripts", "print batch scripts (sensitive)")
+    text = "ask sbatch --test-only once per allocation shape"
+    command("validate", _validate, text, "state", "plan")
+    command("submit", _submit, "submit a reviewed plan", "state", "plan")
+    status = command("status", _status, "show Task and allocation status", "state")
+    flag(status, "--offline", "do not contact Slurm")
+    logs = command("logs", _logs, "write a bounded raw log tail (sensitive)", "state")
+    logs.add_argument("--task", metavar="KEY")
+    logs.add_argument("--allocation", metavar="ID")
+    logs.add_argument("--bytes", type=int, default=65_536, metavar="N")
+    logs.add_argument("--output", type=Path, metavar="FILE", help="write a new 0600 file")
+    text = "resolve an allocation from Slurm evidence"
+    command("reconcile", _reconcile, text, "state", "allocation")
+    text = "record a job you found yourself"
+    accepted = command("mark-accepted", _mark_accepted, text, "state", "allocation", "job_id")
+    accepted.add_argument("--cluster", metavar="NAME")
+    text = "record an allocation Slurm proves it never received"
+    command("mark-not-submitted", _mark_not_submitted, text, "state", "allocation")
+    cancel = command("cancel", _cancel, "scancel the matching accepted allocations", "state")
+    cancel.add_argument("--task", **_KEYS)
+    cancel.add_argument("--allocation", action="append", default=[], metavar="ID")
+    profile_options(command("doctor", _doctor, "check the profile and the scheduler connection"))
     return parser
 
 

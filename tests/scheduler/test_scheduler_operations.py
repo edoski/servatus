@@ -21,7 +21,7 @@ from scheduler_fixtures import (
 
 from servatus.campaign._evidence import AllocationState, JobRef, StepEvidence
 from servatus.campaign._remote import Completed
-from servatus.campaign._scheduler import AttemptQuery, Scheduler
+from servatus.campaign._scheduler import Scheduler
 from servatus.errors import (
     ConfigurationError,
     EvidenceConflict,
@@ -39,30 +39,6 @@ SACCT_FORMAT = (
 
 def scheduler(transport: Scripted) -> Scheduler:
     return Scheduler(transport, SLURM_BIN)
-
-
-# --- AttemptQuery ----------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("changes", "message"),
-    [
-        ({"allocation_id": "abc"}, "allocation_id"),
-        ({"intent_at": datetime(2030, 1, 1)}, "intent_at"),
-        ({"intent_at": datetime(2030, 1, 1, tzinfo=timezone(timedelta(hours=1)))}, "intent_at"),
-        ({"task_count": 0}, "task_count"),
-    ],
-)
-def test_attempt_query_rejects_invalid_values(changes: dict[str, object], message: str) -> None:
-    values: dict[str, object] = {
-        "allocation_id": ALLOCATION,
-        "job": JobRef(42),
-        "intent_at": INTENT,
-        "task_count": 1,
-    }
-    values.update(changes)
-    with pytest.raises(ConfigurationError, match=message):
-        AttemptQuery(**values)  # pyright: ignore[reportArgumentType]
 
 
 # --- observe ---------------------------------------------------------------------------------

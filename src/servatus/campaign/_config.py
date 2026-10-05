@@ -335,15 +335,6 @@ class Target:
                 "Slurm expands '%' patterns in output paths",
             ),
             "partitions": frozen_partitions,
-            "max_tasks_per_allocation": _integer(
-                max_tasks_per_allocation, "max_tasks_per_allocation", minimum=1
-            ),
-            "max_cpus_per_allocation": _integer(
-                max_cpus_per_allocation, "max_cpus_per_allocation", minimum=1
-            ),
-            "max_memory_mib_per_allocation": _integer(
-                max_memory_mib_per_allocation, "max_memory_mib_per_allocation", minimum=1
-            ),
             "max_time_limit": whole_minutes(duration(max_time_limit, "max_time_limit")),
             "host": host,
             "container": container,
@@ -352,11 +343,17 @@ class Target:
             "constraint": _optional_token(constraint, "constraint"),
             "gpu_gres": gpu_gres,
             "max_gpus_per_allocation": gpus,
-            "max_allocations_per_submit": None
-            if max_allocations_per_submit is None
-            else _integer(max_allocations_per_submit, "max_allocations_per_submit", minimum=1),
-            "max_script_bytes": _integer(max_script_bytes, "max_script_bytes", minimum=1),
         }
+        positive = {
+            "max_tasks_per_allocation": max_tasks_per_allocation,
+            "max_cpus_per_allocation": max_cpus_per_allocation,
+            "max_memory_mib_per_allocation": max_memory_mib_per_allocation,
+            "max_allocations_per_submit": max_allocations_per_submit,
+            "max_script_bytes": max_script_bytes,
+        }
+        for name, item in positive.items():
+            optional = name == "max_allocations_per_submit" and item is None
+            values[name] = None if optional else _integer(item, name, minimum=1)
         for name, item in values.items():
             object.__setattr__(self, name, item)
 
@@ -448,6 +445,10 @@ def _sections(mapping: dict[str, object], owner: str) -> dict[str, dict[str, obj
     return tables
 
 
+def _required(cls: type[Target] | type[Resources]) -> set[str]:
+    return {item.name for item in dataclasses.fields(cls) if item.default is dataclasses.MISSING}
+
+
 def _missing(values: Mapping[str, object], required: Iterable[str], section: str) -> None:
     if missing := sorted(set(required) - values.keys()):
         raise ConfigurationError(f"missing {section} keys: {', '.join(missing)}")
@@ -463,24 +464,11 @@ def _target(values: dict[str, object]) -> Target:
             image=cast(PosixInput, container_values["image"]),
             binds=cast(Iterable[str], container_values.get("binds", ())),
         )
-    _missing(
-        values,
-        (
-            "slurm_bin",
-            "work_root",
-            "log_root",
-            "partitions",
-            "max_tasks_per_allocation",
-            "max_cpus_per_allocation",
-            "max_memory_mib_per_allocation",
-            "max_time_limit",
-        ),
-        "target",
-    )
+    _missing(values, _required(Target) - {"container"}, "target")
     _require(isinstance(values["partitions"], list), "partitions must be an array of strings")
     return Target(container=container, **values)  # pyright: ignore[reportArgumentType]
 
 
 def _resources(values: dict[str, object]) -> Resources:
-    _missing(values, ("cpus", "memory_mib", "time_limit"), "resources")
+    _missing(values, _required(Resources), "resources")
     return Resources(**values)  # pyright: ignore[reportArgumentType]

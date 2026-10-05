@@ -171,7 +171,6 @@ def project(
         raise ConfigurationError("observed_at must be an aware UTC datetime")
     attempts: list[AttemptStatus] = []
     current: dict[str, tuple[AttemptStatus, int]] = {}
-    unresolved: set[str] = set()
     for attempt in state.attempts:
         accepted = attempt.acceptance is AcceptanceState.ACCEPTED
         observation = observations.get(attempt.allocation_id) if accepted else None
@@ -188,43 +187,20 @@ def project(
             steps=() if observation is None else observation.steps,
         )
         attempts.append(projected)
-        if attempt.acceptance is AcceptanceState.UNRESOLVED:
-            unresolved.update(attempt.task_keys)
         if attempt.acceptance is not AcceptanceState.NOT_SUBMITTED:
             # The State invariant makes an unresolved Attempt the last one naming its Tasks.
-            for slot, key in enumerate(attempt.task_keys):
-                current[key] = (projected, slot)
-    tasks: list[TaskStatus] = []
-    for task in state.tasks:
-        owner = current.get(task.key)
-        execution: AllocationState | None = None
-        exit_code: str | None = None
-        if owner is not None and owner[0].acceptance is AcceptanceState.ACCEPTED:
-            observation = observations.get(owner[0].allocation_id)
-            if observation is not None:
-                execution, exit_code = task_execution(
-                    observation, owner[1], len(owner[0].task_keys)
-                )
-        tasks.append(
-            TaskStatus(
-                key=task.key,
-                result=results.get(task.key, ResultState.UNOBSERVED),
-                current_allocation_id=None if owner is None else owner[0].allocation_id,
-                execution=execution,
-                exit_code=exit_code,
-                unresolved=task.key in unresolved,
-            )
-        )
-    quiescent = (
-        scheduler_observed
-        and not unresolved
-        and all(
+            current.update((key, (projected, slot)) for slot, key in enumerate(attempt.task_keys))
+    tasks = tuple(
+        _task_status(task.key, current.get(task.key), observations, results) for task in state.tasks
+    )
+    quiescent = scheduler_observed and all(
+        attempt.acceptance is AcceptanceState.NOT_SUBMITTED
+        or (
             attempt.scheduler is not None
             and attempt.scheduler.state.terminal
             and not attempt.scheduler.retained
-            for attempt in attempts
-            if attempt.acceptance is AcceptanceState.ACCEPTED
         )
+        for attempt in attempts
     )
     return Status(
         campaign_id=state.campaign_id,
@@ -232,8 +208,32 @@ def project(
         sealed=state.sealed,
         observed_at=observed_at,
         scheduler_observed=scheduler_observed,
-        tasks=tuple(tasks),
+        tasks=tasks,
         attempts=tuple(attempts),
         results_ready=state.sealed and all(task.result is ResultState.VALID for task in tasks),
         quiescent=quiescent,
+    )
+
+
+def _task_status(
+    key: str,
+    owner: tuple[AttemptStatus, int] | None,
+    observations: Mapping[str, Observation],
+    results: Mapping[str, ResultState],
+) -> TaskStatus:
+    """One Task, owned by the Attempt (and slot) that holds its current execution, if any."""
+    execution: AllocationState | None = None
+    exit_code: str | None = None
+    attempt, slot = owner if owner is not None else (None, 0)
+    accepted = attempt is not None and attempt.acceptance is AcceptanceState.ACCEPTED
+    observation = observations.get(attempt.allocation_id) if attempt and accepted else None
+    if attempt is not None and observation is not None:
+        execution, exit_code = task_execution(observation, slot, len(attempt.task_keys))
+    return TaskStatus(
+        key=key,
+        result=results.get(key, ResultState.UNOBSERVED),
+        current_allocation_id=None if attempt is None else attempt.allocation_id,
+        execution=execution,
+        exit_code=exit_code,
+        unresolved=attempt is not None and attempt.acceptance is AcceptanceState.UNRESOLVED,
     )
