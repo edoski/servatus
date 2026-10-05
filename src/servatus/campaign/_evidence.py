@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
 from ..errors import ConfigurationError, EvidenceConflict, ReconciliationError
-from ._config import TOKEN
+from ._config import CONTROL, TOKEN
 
 
 class AllocationState(StrEnum):
@@ -111,12 +111,11 @@ WINDOW = timedelta(hours=1)
 MAX_REPLY_LINES = 4096
 MAX_FIELD_BYTES = 4096
 MISSING_JOBS_STDERR = b"slurm_load_jobs error: Invalid job id specified\n"
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _DECIMAL = re.compile(r"[1-9][0-9]*\Z")
 _STEP_ID = re.compile(r"([1-9][0-9]*)\.[0-9]+\Z")
 _SLOT = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 _EXIT_CODE = re.compile(r"[0-9]+:[0-9]+\Z")
-_RECEIPT = re.compile(rb"([1-9][0-9]*)(?:;([A-Za-z0-9][A-Za-z0-9._-]*))?\n?\Z")
+_RECEIPT = re.compile(rb"([1-9][0-9]*)(?:;(%s))?\n?\Z" % TOKEN.pattern.removesuffix(r"\Z").encode())
 _NULL = frozenset({"", "None", "Unknown", "N/A"})
 FOREIGN_JOB = "job number is held by a foreign job"
 
@@ -251,7 +250,7 @@ def reply_fields(line: bytes, count: int) -> tuple[str, ...]:
         fields = tuple(field.decode("utf-8") for field in raw)
     except UnicodeDecodeError:
         raise EvidenceConflict("scheduler row is malformed") from None
-    if any(_CONTROL.search(field) for field in fields):
+    if any(CONTROL.search(field) for field in fields):
         raise EvidenceConflict("scheduler row is malformed")
     return fields
 

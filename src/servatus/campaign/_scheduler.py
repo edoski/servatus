@@ -7,13 +7,13 @@ Every method issues fixed, absolute argument vectors and parses replies with the
 
 from __future__ import annotations
 
-import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import PurePosixPath
 
 from ..errors import ConfigurationError, EvidenceConflict, ReconciliationError, Unavailable
+from ._config import CONTROL
 from ._evidence import (
     Expectation,
     JobRef,
@@ -41,7 +41,6 @@ SACCT_ALLOCATION_FORMAT = (
 SACCT_STEP_FORMAT = "--format=JobIDRaw%64,JobName%256,State%256,ExitCode%32"
 SACCT_IDENTITY_FORMAT = "--format=JobIDRaw,JobName,Comment,Cluster"
 _NOTHING_TO_CANCEL = (b"already completing or completed", b"Invalid job id specified")
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,7 +65,7 @@ class AttemptQuery:
 def _diagnostic(completed: Completed) -> str:
     """The first stderr line, bounded and printable, for operator-facing messages."""
     first = completed.stderr.decode("utf-8", "replace").strip().partition("\n")[0]
-    text = _CONTROL.sub("?", first)[:200]
+    text = CONTROL.sub("?", first)[:200]
     return f"exit status {completed.returncode}" + (f": {text}" if text else "")
 
 
@@ -270,7 +269,7 @@ class Scheduler:
         if type(max_bytes) is not int or not 1 <= max_bytes <= MAX_STREAM_BYTES:
             raise ConfigurationError(f"max_bytes must be an integer from 1 to {MAX_STREAM_BYTES}")
         text = str(path)
-        if not PurePosixPath(text).is_absolute() or _CONTROL.search(text):
+        if not PurePosixPath(text).is_absolute() or CONTROL.search(text):
             raise ConfigurationError("log path must be an absolute POSIX path")
         limit = max_bytes + 1
         try:

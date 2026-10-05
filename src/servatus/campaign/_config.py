@@ -21,7 +21,7 @@ PosixInput = str | PurePosixPath
 
 TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _HOST = re.compile(r"(?:[A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9._-]*\Z")
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _GRES = re.compile(r"gpu(?::(?![0-9]+\Z)[A-Za-z0-9][A-Za-z0-9._-]*)?\Z")
 RESERVED_ENV_PREFIX = "SERVATUS_"
@@ -79,7 +79,7 @@ def _absolute(value: object, name: str) -> PurePosixPath:
     raw = _text(str(cast(PosixInput, value)), name)
     path = PurePosixPath(raw)
     _require(
-        _CONTROL.search(raw) is None and path.is_absolute() and ".." not in path.parts,
+        CONTROL.search(raw) is None and path.is_absolute() and ".." not in path.parts,
         f"{name} must be an absolute POSIX path without parent traversal or control characters",
     )
     return path

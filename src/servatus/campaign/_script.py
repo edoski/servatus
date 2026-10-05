@@ -9,17 +9,15 @@ it to the allocation identity and slot.
 
 from __future__ import annotations
 
-import re
 import shlex
 from collections.abc import Sequence
 from datetime import timedelta
 from pathlib import PurePosixPath
 
 from ..errors import ConfigurationError
-from ._codec import format_duration
+from ._codec import format_duration, is_hex
 from ._config import Apptainer, Resources, Target, Task
 
-_ALLOCATION = re.compile(r"[0-9a-f]{24}\Z")
 # Printable ASCII is copied verbatim except printf's own metacharacters and the quote itself.
 _VERBATIM = frozenset(range(0x20, 0x7F)) - {ord("%"), ord("\\"), ord("'")}
 _ENV = "/usr/bin/env"
@@ -64,7 +62,7 @@ def check_command(argv: Sequence[str]) -> tuple[str, ...]:
 
 
 def _check_allocation(allocation_id: str) -> str:
-    if not isinstance(allocation_id, str) or _ALLOCATION.fullmatch(allocation_id) is None:
+    if not is_hex(allocation_id, 24):
         raise ConfigurationError("allocation_id must be 24 lowercase hexadecimal digits")
     return allocation_id
 

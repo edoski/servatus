@@ -18,21 +18,17 @@ from datetime import datetime, timedelta
 from enum import Enum
 from functools import cache
 from pathlib import PurePosixPath
-from typing import Any, TypeVar, Union, cast, get_args, get_origin, get_type_hints
+from typing import Any, TypeGuard, TypeVar, Union, cast, get_args, get_origin, get_type_hints
 
 T = TypeVar("T")
 FLATTEN: Mapping[str, object] = {"codec.flatten": True}
 
+_HEX = re.compile(r"[0-9a-f]+\Z")
 _DURATION = re.compile(r"(?:(0|[1-9][0-9]*)-)?([0-9]+):([0-5][0-9]):([0-5][0-9])\Z")
 
 
 class CodecError(ValueError):
     """A document does not match the expected structure."""
-
-
-def key(name: str) -> Mapping[str, object]:
-    """Field metadata that stores an attribute under a different document key."""
-    return {"codec.key": name}
 
 
 # --- Durations -------------------------------------------------------------------------------
@@ -81,6 +77,11 @@ def digest(value: object) -> str:
     return hashlib.sha256(canonical(value)).hexdigest()
 
 
+def is_hex(value: object, length: int) -> TypeGuard[str]:
+    """Whether ``value`` is exactly ``length`` lowercase hexadecimal digits (an identity)."""
+    return isinstance(value, str) and len(value) == length and _HEX.fullmatch(value) is not None
+
+
 def decode_json(data: bytes) -> object:
     """Parse strict JSON, rejecting duplicate object keys, NaN/Infinity, and runaway nesting."""
 
@@ -104,24 +105,12 @@ def decode_json(data: bytes) -> object:
 # --- Encoding --------------------------------------------------------------------------------
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class _Slot:
-    attr: str
-    key: str
-    hint: Any
-    flatten: bool
-
-
 @cache
-def _slots(cls: type) -> tuple[_Slot, ...]:
+def _slots(cls: type) -> tuple[tuple[str, Any, bool], ...]:
+    """Each field's name, type hint, and whether its keys are flattened into the parent."""
     hints = get_type_hints(cls)
     return tuple(
-        _Slot(
-            field.name,
-            cast(str, field.metadata.get("codec.key", field.name)),
-            hints[field.name],
-            bool(field.metadata.get("codec.flatten")),
-        )
+        (field.name, hints[field.name], bool(field.metadata.get("codec.flatten")))
         for field in dataclasses.fields(cls)
     )
 
@@ -129,8 +118,8 @@ def _slots(cls: type) -> tuple[_Slot, ...]:
 @cache
 def _keys(cls: type) -> frozenset[str]:
     names: set[str] = set()
-    for slot in _slots(cls):
-        names.update(_keys(slot.hint) if slot.flatten else {slot.key})
+    for name, hint, flatten in _slots(cls):
+        names.update(_keys(hint) if flatten else {name})
     return frozenset(names)
 
 
@@ -170,12 +159,12 @@ def _encoder(tp: type[Any]) -> Callable[[Any], object]:
     if issubclass(tp, timedelta):
         return format_duration
     if dataclasses.is_dataclass(tp):
-        plan = tuple((slot.attr, slot.key, slot.flatten) for slot in _slots(tp))
+        plan = _slots(tp)
 
         def encode(value: object) -> dict[str, object]:
             out: dict[str, object] = {}
-            for attr, name, flatten in plan:
-                item: object = getattr(value, attr)
+            for name, _, flatten in plan:
+                item: object = getattr(value, name)
                 if flatten:
                     out.update(cast(dict[str, object], dump(item)))
                 else:
@@ -270,12 +259,12 @@ def _object(cls: type, data: object, path: str) -> object:
     if unknown := mapping.keys() - _keys(cls):
         raise CodecError(f"{path}: unknown keys {sorted(unknown)}")
     values: dict[str, object] = {}
-    for slot in _slots(cls):
-        if slot.flatten:
-            inner = {name: mapping[name] for name in _keys(slot.hint) if name in mapping}
-            values[slot.attr] = _object(slot.hint, inner, path)
-        elif slot.key in mapping:
-            values[slot.attr] = _load(slot.hint, mapping[slot.key], f"{path}.{slot.key}")
+    for name, hint, flatten in _slots(cls):
+        if flatten:
+            inner = {key: mapping[key] for key in _keys(hint) & mapping.keys()}
+            values[name] = _object(hint, inner, path)
+        elif name in mapping:
+            values[name] = _load(hint, mapping[name], f"{path}.{name}")
         else:
-            raise CodecError(f"{path}: missing key {slot.key!r}")
+            raise CodecError(f"{path}: missing key {name!r}")
     return cls(**values)

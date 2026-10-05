@@ -6,7 +6,6 @@ written or read. Transitions are pure functions that return a new ``State``.
 
 from __future__ import annotations
 
-import re
 from collections.abc import Generator, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
@@ -21,8 +20,6 @@ from ._config import Profile, Task
 from ._evidence import JobRef
 
 SCHEMA_VERSION = 7
-_HEX24 = re.compile(r"[0-9a-f]{24}\Z")
-_HEX32 = re.compile(r"[0-9a-f]{32}\Z")
 
 
 class _Invalid(ValueError):
@@ -70,7 +67,7 @@ class Attempt:
     outcome_revision: int | None = None
 
     def __post_init__(self) -> None:
-        _require(_HEX24.fullmatch(self.allocation_id) is not None, "invalid allocation identity")
+        _require(_codec.is_hex(self.allocation_id, 24), "invalid allocation identity")
         _require(self.intent_revision >= 1, "invalid intent revision")
         _require(self.intent_at.utcoffset() == timedelta(0), "intent time must be UTC")
         keys = self.task_keys
@@ -130,7 +127,7 @@ class State:
 def check(state: State) -> None:
     """The single Campaign invariant, linear in tasks plus attempted Task references."""
     revision, sealed = state.revision, state.sealed_revision
-    _require(_HEX32.fullmatch(state.campaign_id) is not None, "invalid campaign identity")
+    _require(_codec.is_hex(state.campaign_id, 32), "invalid campaign identity")
     _require(revision >= 0, "invalid revision")
     _require(sealed is None or 0 <= sealed <= revision, "invalid seal revision")
     events: set[int] = set()

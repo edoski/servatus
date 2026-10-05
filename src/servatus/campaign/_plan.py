@@ -10,7 +10,6 @@ can always be rebuilt and compared with what was reviewed.
 from __future__ import annotations
 
 import hashlib
-import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
@@ -26,8 +25,6 @@ from ._script import check_command, render_batch, sbatch_argv
 from ._state import AcceptanceState, State
 
 PLAN_FORMAT = "servatus.plan/1"
-_HEX32 = re.compile(r"[0-9a-f]{32}\Z")
-_HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def _keys(value: tuple[str, ...], name: str) -> None:
@@ -61,7 +58,7 @@ class Decision:
     def __post_init__(self) -> None:
         if not isinstance(self.profile, Profile):
             raise ConfigurationError("plan profile must be a Profile")
-        if _HEX32.fullmatch(self.nonce) is None or _HEX32.fullmatch(self.campaign_id) is None:
+        if not (_codec.is_hex(self.nonce, 32) and _codec.is_hex(self.campaign_id, 32)):
             raise ConfigurationError("plan identities must be 32 lowercase hexadecimal digits")
         if type(self.revision) is not int or self.revision < 0:
             raise ConfigurationError("plan revision must be a non-negative integer")
@@ -183,7 +180,7 @@ def decode_decision(data: bytes) -> tuple[Decision, str]:
         if document.pop("format", None) != PLAN_FORMAT:
             raise _codec.CodecError(f"expected format {PLAN_FORMAT!r}")
         digest = document.pop("digest", None)
-        if not isinstance(digest, str) or _HEX64.fullmatch(digest) is None:
+        if not _codec.is_hex(digest, 64):
             raise _codec.CodecError("expected a 64-digit hexadecimal digest")
         return _codec.load(Decision, document), digest
     except (ValueError, TypeError, ConfigurationError) as error:
