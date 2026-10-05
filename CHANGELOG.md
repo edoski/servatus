@@ -6,6 +6,8 @@ All notable changes to Servatus are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-10-05
+
 ### Fixed
 
 - Batch scripts export `PATH=/usr/bin:/bin`. Under `--export=NIL` they had none, so Apptainer's
@@ -195,5 +197,6 @@ A clean break: no compatibility aliases and no migration of earlier campaign sta
 
 Versions before 0.12.0 had no changelog. See the git history for their changes.
 
-[Unreleased]: https://github.com/edoski/servatus/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/edoski/servatus/compare/v0.12.1...HEAD
+[0.12.1]: https://github.com/edoski/servatus/releases/tag/v0.12.1
 [0.12.0]: https://github.com/edoski/servatus/releases/tag/v0.12.0
