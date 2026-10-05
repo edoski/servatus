@@ -195,9 +195,10 @@ def split(destination: StrPath) -> tuple[Path, str]:
 # -- durability ------------------------------------------------------------------------------
 def sync(fd: int) -> None:
     """Flush one descriptor to stable storage (`F_FULLFSYNC` on macOS, where fsync does not)."""
-    if sys.platform == "darwin":
+    full: int | None = getattr(fcntl, "F_FULLFSYNC", None)
+    if sys.platform == "darwin" and full is not None:
         try:
-            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            fcntl.fcntl(fd, full)
         except OSError:
             pass  # some filesystems reject F_FULLFSYNC; fsync is the best remaining request
         else:
