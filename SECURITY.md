@@ -105,9 +105,8 @@ prints scripts verbatim, including any control characters in Task arguments or e
 Campaign state is an owner-only directory. It keeps complete Task arguments, stdin, and environment
 for retry; keep it private.
 
-Plan files (`servatus.plan/1`) retain the resolved Target and Resources, Task keys with their hold
-reasons, retry choices, duplicate-risk acknowledgements, and the nonce from which allocation
-identities derive. They exclude Task arguments, stdin, and environment
+Plan files (`servatus.plan/2`) retain the resolved Target and Resources, Task keys with their hold
+reasons, retry choices, and the nonce from which allocation identities derive. They exclude Task arguments, stdin, and environment
 but remain private operational data. `Plan.save` and `servatus plan --output` write them with mode
 `0600` and never overwrite an existing file. `--show-scripts` prints complete scripts, including
 Task payloads; treat that output as sensitive. Submission rebuilds each plan from its decision and
@@ -115,8 +114,7 @@ the current state and refuses a plan that does not match.
 
 `Status.to_json()` (`servatus status --json`) is a diagnostic snapshot, not a redacted record. It
 includes Task keys, result states, allocation identities, retry choices, Profile labels, Slurm job
-ids and clusters, raw scheduler and accounting states, exit codes, scheduler reasons, timestamps,
-and any evidence problem text. It excludes Task arguments, stdin, environment values, Target values,
+ids, raw `squeue` states, run-marker facts, exit codes, timestamps, and warnings. It excludes Task arguments, stdin, environment values, Target values,
 scripts, log content, and application output. Scheduler text, keys, and labels may themselves
 identify private work; keep snapshots private. Snapshots carry no execution authority.
 
@@ -124,15 +122,19 @@ Submission checks the scheduler connection and the plan's eligibility before rec
 then syncs unresolved intent before each `sbatch`. A failure after launch does not prove rejection.
 `SubmissionInterrupted.result` distinguishes confirmed receipts, unresolved work, unattempted
 allocations, and a job observed but not durably recorded. Reconcile uncertain acceptance before
-retrying; unknown accepted work is retried only after an explicit duplicate-risk acknowledgement.
+retrying; `LOST` work (a job that vanished without recording how it ended) is retried only when its
+Task key is named explicitly.
 
-`mark_not_submitted` (`servatus mark-not-submitted`) releases Tasks for resubmission, so it
-requires proof: it first asks the allocation's original target for every job carrying the
-allocation's identity, raises `Conflict` if any exists, `Unavailable` if the query fails, and
-`ReconciliationError` for an untrustworthy reply, and records the outcome only on proven absence.
-The proof is bounded by Slurm's own retention (queue plus accounting near the intent time).
-`mark_accepted` may replace a not-submitted record only when the original target proves exactly
-that job and no later allocation already includes the Tasks.
+`reconcile` releases Tasks for resubmission only when the allocation's original target shows no
+job with its identity in `squeue` and no run marker in `log_root`, at least 15 minutes after the
+intent. A failed query raises `Unavailable` and records nothing; an untrustworthy reply (two jobs
+for one identity, a malformed marker) raises `EvidenceConflict`. If a job appears later anyway,
+every observation reports it and holds its Tasks until it leaves the queue.
+
+Run markers are empty files named after facts (allocation, job, slot, exit code) in `log_root`.
+Servatus trusts that directory as it trusts the logs in it: anyone who can write there as the
+cluster account can forge an outcome. Keep `log_root` owner-only (the batch script runs under
+`umask 077`).
 
 ## Logs
 

@@ -6,6 +6,44 @@ All notable changes to Servatus are recorded here. The format follows
 
 ## [Unreleased]
 
+Servatus no longer needs Slurm accounting. See
+[ADR 0007](https://github.com/edoski/servatus/blob/main/docs/adr/0007-run-markers.md).
+
+### Breaking
+
+- Campaign state uses schema 8 and saved plans are tagged `servatus.plan/2`. Schema 7 state and
+  `servatus.plan/1` files from 0.12 are rejected; finish or abandon 0.12 campaigns with 0.12.
+- Observation reads `squeue --me --all --states=all` and empty run markers that each batch script
+  writes to `log_root` (`<allocation>.<job>.start`, `<allocation>.<job>.<slot>.<exit code>.end`,
+  `<allocation>.<job>.stop`), never `sacct`. An outcome is decided only after Slurm purges the job
+  (`MinJobAge`), so `--retry-failed` picks failed work up a few minutes after it ends.
+- Executions are `QUEUED`, `RUNNING`, `SUCCEEDED`, `FAILED`, `STOPPED` (interrupted or never
+  started), and `LOST` (vanished without recording an outcome). `AllocationState`, `UNKNOWN`,
+  `CANCELLED`, `SchedulerEvidence`, `StepEvidence`, and `JobRef` are replaced by `Execution` and
+  `Observation`; job numbers are plain integers and `TaskStatus.exit_code` is the step's exit code.
+- The `UNOBSERVABLE` hold, duplicate-risk acknowledgement (`allow_duplicate_risk`,
+  `--allow-duplicate-risk`, `Decision.duplicate_risk`), federation clusters (`--cluster`), and
+  `SERVATUS_RESTART_COUNT` are removed. `ACTIVE` means Slurm still lists earlier work, finished but
+  not yet purged included. `Retry.FAILED` selects `FAILED` and `STOPPED` work, never `LOST`; an
+  explicit `--retry KEY` refuses live work and accepts `LOST`.
+- `Campaign.reconcile()` (`servatus reconcile STATE`) takes no allocation and resolves every
+  unresolved allocation from a queue row, then a run marker, then records it as not submitted once
+  its intent is 15 minutes old. It returns `ReconcileResult`; the CLI exits 75 while some wait.
+  `mark_accepted`, `mark_not_submitted`, their CLI commands, and `ReconciliationError` are removed.
+- Jobs are submitted with `--no-requeue` and without `--comment`; `sbatch --parsable` must print a
+  bare job number. `cancel` runs `scancel --me --name=<identity>` without a job number.
+- `servatus.testing.FakeScheduler` models the new protocol: queue rows that settle until `purge`,
+  run markers in an in-memory `log_root`, `scancel` by name, and `find`. Its controls are `start`,
+  `finish_step`, `finish`, `interrupt`, `lose`, `purge`, `write_file`, and `remove_file`.
+
+### Added
+
+- `Status.warnings`: a job Slurm lists for an allocation recorded as not submitted holds its
+  Tasks `ACTIVE`, keeps the campaign non-quiescent, and is named until it leaves the queue.
+  `cancel --allocation` can stop it.
+- `TaskStatus.detail` (`"never started"` for a stopped job that started no Task).
+- `scripts/cluster_e2e.py`, a live end-to-end check against a real cluster, never run by CI.
+
 ## [0.12.1] - 2026-10-05
 
 ### Fixed

@@ -28,68 +28,70 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   `Completed`; every failure surfaces as `Unavailable`. Any callable from Target to Transport (for
   example `servatus.testing.FakeScheduler`) can replace `connect`. `ping(target)` proves a Target's
   scheduler answers (`sbatch --version`).
-- **Allocation:** one single-node Slurm job named `servatus-<allocation_id>` running its Tasks as
-  concurrent exact steps. Each step is named `servatus-<allocation_id>-<slot>`.
+- **Allocation:** one single-node Slurm job named `servatus-<allocation_id>`, submitted with
+  `--no-requeue`, running its Tasks as concurrent exact steps. Each step is named
+  `servatus-<allocation_id>-<slot>`.
+- **Run marker:** an empty file the batch script creates in `log_root`:
+  `<allocation_id>.<job>.start` before any step, `<allocation_id>.<job>.<slot>.<exit code>.end`
+  when that slot's step returns, and `<allocation_id>.<job>.stop` when the script is interrupted.
 - **Capacity (`capacity`):** how many Tasks of one Resources fit one allocation under every Target
   ceiling, optionally lowered by `tasks_per_allocation`.
 - **Slot:** a Task's zero-based position within its allocation.
 - **Decision (`Decision`):** the reviewed part of a plan: Campaign identity and revision, Profile,
-  selected, held, and deferred Tasks, retry choices, duplicate-risk acknowledgements, packing,
-  whether a probe was used, and a random nonce from which allocation identities derive.
+  selected, held, and deferred Tasks, retry choices, packing, whether a probe was used, and a
+  random nonce from which allocation identities derive.
 - **Plan (`Plan`):** a Decision (`plan.decision`) plus its derived `PlannedAllocation`s (Task
-  keys, totals, batch script, `sbatch` argv) and digest, with `warnings` for acknowledged duplicate
-  risk and deferred work. A saved plan (`servatus.plan/1`) holds only the Decision and digest.
+  keys, totals, batch script, `sbatch` argv) and digest, with `warnings` for deferred work. A saved
+  plan (`servatus.plan/2`) holds only the Decision and digest.
   Submission rebuilds the plan from its Decision and the current state and refuses it when it
   differs.
 - **Hold (`Hold`):** why a Task is not selected: `VALID` (valid result), `UNRESOLVED` (intent
   without outcome), `SUBMITTED` (accepted work and not requested for retry; the scheduler is not
-  consulted), `ACTIVE` (retry requested, but Slurm still holds earlier work), `UNOBSERVABLE`
-  (evidence for earlier work is missing, or the Task's execution is `UNKNOWN`), or `NOT_REQUESTED`
-  (outside `only`).
+  consulted), `ACTIVE` (Slurm still lists earlier work of the Task, finished but not yet purged
+  included, or a job of an allocation recorded as not submitted), or `NOT_REQUESTED` (outside
+  `only`).
 - **Deferred Task:** eligible work beyond the plan's `max_allocations_per_submit` batch.
 - **Retry selector (`Retry`):** a bulk retry choice. `Retry.FAILED` selects Tasks whose current
-  (latest accepted) execution failed or was cancelled; `Retry.INCOMPLETE` selects terminal Tasks
-  whose probed result is missing and requires a probe. Explicit retry keys name single Tasks and are
-  checked strictly (`PlanRefused`).
-- **Duplicate-risk acknowledgement:** an explicit decision, for an explicitly retried key only,
-  allowing retry when earlier accepted work has `UNKNOWN` evidence. It never claims the earlier
-  work stopped.
+  (latest accepted) execution is `FAILED` or `STOPPED`, never `LOST`; `Retry.INCOMPLETE` selects
+  Tasks whose current execution is terminal and whose probed result is missing, and requires a
+  probe. Explicit retry keys name single Tasks and are checked strictly (`PlanRefused` for unknown
+  keys, valid results, Tasks never accepted, and live work); they accept `LOST`.
 - **Attempt:** one durable allocation record: Profile, Task keys, retry choices, intent revision
   and time, then exactly one outcome (accepted with a job, or not submitted).
 - **Intent:** the synced unresolved Attempt recorded before scheduler contact.
-- **Receipt (`Receipt`):** a Slurm job identity (`JobRef`) proving acceptance, not completion.
-- **Unresolved allocation:** an intent without an outcome. It blocks its Tasks until `reconcile`,
-  `mark_accepted`, or `mark_not_submitted` resolves it. `mark_not_submitted` records only proven
-  absence: the original target must report no job carrying the allocation's identity.
+- **Receipt (`Receipt`):** a positive Slurm job number proving acceptance, not completion.
+- **Unresolved allocation:** an intent without an outcome. It blocks its Tasks until `reconcile`
+  resolves it: a queue row, else a run marker, records acceptance with its job; with neither, an
+  intent at least 15 minutes old is recorded as not submitted, and a younger one is reported as
+  waiting (`ReconcileResult`).
+- **Stray:** a job Slurm lists for an allocation recorded as not submitted. It holds its Tasks
+  `ACTIVE` and `status` warns about it until it leaves the queue.
 - **Submit result (`SubmitResult`):** receipts, unresolved, and unattempted allocations from one
   submission. `SubmissionInterrupted` carries it when submission stops early.
 - **Shape check (`ShapeCheck`):** one time-specific `sbatch --test-only` answer for a distinct
   allocation shape.
 - **Result probe:** a caller function that receives Tasks and returns the keys whose canonical
   results are valid. It is bound to a Campaign handle, called once per operation, and never stored.
-- **Scheduler evidence (`SchedulerEvidence`):** transient allocation state normalized from `squeue`
-  and anchored `sacct` history to an `AllocationState` (queued, running, succeeded, failed,
-  cancelled, or unknown), with raw state, exit code, reason, whether Slurm retains the work, and
-  any per-allocation `problem` (for example, a foreign job now holding the job number).
-- **Step evidence (`StepEvidence`):** the state and exit code of one Task's own `srun` step, when
-  accounting reports it. An observation holds one entry per slot (`None`: step not found), or none
-  at all when the step query failed (step evidence unavailable).
-- **Task execution:** a Task's state in its current allocation: its own step when known, else the
-  allocation's state. `UNKNOWN` or contradictory (`problem`) allocation evidence makes it `UNKNOWN`
-  whatever the steps say, and so does a failed or cancelled allocation of several Tasks without the
-  Task's step (that Task may have finished first). Exit codes accompany terminal executions only.
-- **Observation scope:** the accepted Attempts a plan needs to observe: only those whose Tasks
-  could be retried. Plans of fresh Tasks observe nothing.
+- **Observation (`Observation`):** one accepted allocation's transient evidence: its `squeue`
+  state while Slurm lists the job (`None` once purged; a terminal state is still settling and
+  live), whether its start and stop markers exist, and one exit code per slot from its end markers.
+- **Execution (`Execution`):** a Task's state in its current allocation, from its slot:
+  `QUEUED`, `RUNNING` (also while a finished job settles without the slot's end marker),
+  `SUCCEEDED` or `FAILED` (from the end marker's exit code), `STOPPED` (interrupted, or never
+  started), or `LOST` (started, then vanished without a stop marker). `LOST` is not terminal.
+  Exit codes accompany `SUCCEEDED` and `FAILED` only.
+- **Observation scope:** the Attempts a plan needs to observe: the accepted and not-submitted
+  Attempts of Tasks that could be retried, and the not-submitted Attempts of Tasks never accepted.
+  Plans of fresh Tasks without such history observe nothing.
 - **Status (`Status`):** one transient revision-bound projection of Tasks (`TaskStatus`) and
   Attempts (`AttemptStatus`), with counts, result readiness, and quiescence. `to_json()` exports
   it as a `servatus.status/1` document; `to_document` encodes other results for JSON.
 - **Result readiness:** the sealed roster has valid results for every Task.
-- **Quiescence:** scheduler evidence was requested, every accepted Attempt is terminal and no
-  longer retained by Slurm, and no acceptance is unresolved. It is independent from result
-  readiness.
-- **Cancellation:** `scancel` of accepted allocations not known to be terminal, by allocation or
-  for every accepted allocation of a Task. Every chosen allocation is tried. It is a request; it
-  retries nothing.
+- **Quiescence:** scheduler evidence was requested, Slurm lists no job of any accepted allocation
+  and no stray, and no acceptance is unresolved. It is independent from result readiness.
+- **Cancellation:** `scancel --me --name=servatus-<allocation_id>` of the chosen accepted or
+  not-submitted allocations that Slurm lists as queued or running, by allocation or for every such
+  allocation of a Task. Every chosen allocation is tried. It is a request; it retries nothing.
 - **Log snapshot (`LogSnapshot`):** a bounded binary suffix of an allocation or Task log. It is
   sensitive, untrusted, and has no lifecycle authority.
 

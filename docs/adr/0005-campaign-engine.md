@@ -1,6 +1,8 @@
 # ADR 0005: Keep one Campaign execution authority
 
-Status: accepted (rewritten for 0.12)
+Status: accepted (rewritten for 0.12); recovery, duplicate risk, the hold and retry rules that
+depend on scheduler evidence, and the status rule are superseded by
+[ADR 0007](0007-run-markers.md), and the state document is schema 8
 
 Campaign owns generic execution lifecycle facts. Applications own Task meaning, result schemas,
 aggregate validation, and publication. One typed persisted state and explicit atomic transactions
@@ -17,6 +19,9 @@ clock, and runs remote work and application callbacks outside store locks. Tests
 through `servatus.testing.FakeScheduler`, passed as `connect`, instead of patching remote calls.
 
 ## State
+
+> Superseded in part by [ADR 0007](0007-run-markers.md): the document is schema 8, with integer job
+> numbers and no duplicate-risk field; schema 7 is rejected.
 
 `State` validates its complete invariant whenever it is constructed, in time linear in Tasks plus
 attempted Task references, so an invalid state can be neither written nor read. Transitions are
@@ -49,6 +54,10 @@ appended in order. `append` accepts only new keys; `seal` irreversibly ends auth
 an optional `probe`, `connect`, and `clock` bound to the handle; callbacks are never serialized.
 
 ## Planning
+
+> Superseded in part by [ADR 0007](0007-run-markers.md): `UNOBSERVABLE` and duplicate-risk
+> acknowledgement are gone, `ACTIVE` means Slurm still lists earlier work, `Retry.FAILED` selects
+> `FAILED` and `STOPPED`, and explicit keys refuse live work and accept `LOST`.
 
 `Campaign.plan(profile, *, retry=(), allow_duplicate_risk=(), only=None,
 tasks_per_allocation=None)` produces a `Plan` from a `Decision`: Campaign identity and revision,
@@ -88,6 +97,10 @@ state and requires the same digest.
 
 ## Submission
 
+> Superseded in part by [ADR 0007](0007-run-markers.md): recovery is one idempotent `reconcile`
+> that uses queue rows, then run markers, then a 15-minute wait; `mark_accepted` and
+> `mark_not_submitted` are gone.
+
 `submit(plan)` and `validate(plan)` first rebuild the plan from its stored Decision and the current
 state and compare it with the given plan: a changed campaign raises `StalePlan` and a tampered plan
 `ConfigurationError`, before any claim. `validate` runs `sbatch --test-only` once per distinct
@@ -121,6 +134,9 @@ exactly that job, refusing with `Conflict` when a later Attempt already includes
 automatic retry hides ambiguity; history is never erased.
 
 ## Status
+
+> Superseded by [ADR 0007](0007-run-markers.md): a Task's execution follows the queue row and its
+> slot's run markers, and quiescence means Slurm lists no work of the campaign.
 
 `Campaign.status(*, scheduler=True)` projects all Tasks and Attempts at one revision. Each
 `TaskStatus` carries the result state, current allocation, execution state, exit code, and whether

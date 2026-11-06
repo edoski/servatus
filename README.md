@@ -59,8 +59,8 @@ checks that the profile loads and fits its ceilings, and that `sbatch --version`
 ### 2. Write the worker
 
 Each Task runs one process in its own `srun` step. The process gets its Task's arguments, stdin
-bytes, and environment, plus `SERVATUS_TASK_KEY`, `SERVATUS_ALLOCATION_ID`, `SERVATUS_SLOT`,
-`SERVATUS_JOB_ID`, and `SERVATUS_RESTART_COUNT`.
+bytes, and environment, plus `SERVATUS_TASK_KEY`, `SERVATUS_ALLOCATION_ID`, `SERVATUS_SLOT`, and
+`SERVATUS_JOB_ID`.
 
 ```python
 # train.py, in work_root
@@ -104,8 +104,9 @@ def main() -> int:
 sys.exit(main())
 ```
 
-The `Workspace` directory is bound to the identity bytes and survives failure, preemption, and
-requeue: a requeued or resubmitted Task reopens it and resumes. `publish` commits `results/<key>`
+The `Workspace` directory is bound to the identity bytes and survives failure, preemption, and time
+limits: a resubmitted Task reopens it and resumes. Slurm never requeues Servatus jobs on its own
+(`--no-requeue`); a rerun is always a new, explicit plan. `publish` commits `results/<key>`
 atomically and only then removes the private work.
 
 ### 3. Define the Tasks
@@ -162,13 +163,21 @@ servatus plan state --output plan.json     # shows selected, held, deferred; sav
 servatus submit state plan.json
 servatus status state
 servatus logs state --task lr-1e-3 --output lr-1e-3.log
-servatus plan state --retry-failed --output retry.json    # later: rerun failed or cancelled Tasks
+servatus plan state --retry-failed --output retry.json    # later: rerun failed or stopped Tasks
 ```
 
 Without `--output`, `plan` only prints. `submit` rebuilds the reviewed plan, refuses it with
 `StalePlan` if the campaign changed, and pings Slurm and rechecks eligibility before recording
-anything. `status` shows each Task's own step when Slurm reports it; a contradictory or `UNKNOWN`
-allocation makes its Tasks `UNKNOWN`, and exit codes appear only once execution is terminal.
+anything. `status` shows each Task's execution: `QUEUED`, `RUNNING`, `SUCCEEDED` or `FAILED` with
+its step's exit code, `STOPPED` (cancelled, out of time, or never started), or `LOST` (the job
+vanished without recording how it ended, for example on a node failure).
+
+Servatus needs no Slurm accounting (`sacct`). It reads `squeue` for work Slurm still lists, and
+the empty run markers each batch script writes to `log_root`: a start marker before any step, one
+end marker per step as soon as it returns, and a stop marker when the job is interrupted. A
+finished job stays in `squeue` for the cluster's `MinJobAge` (typically 5 minutes); Servatus
+decides how it ended only after that, when every marker is visible on the login node, so
+`--retry-failed` picks failed work up a few minutes after it ends.
 
 ## Concepts
 
@@ -177,25 +186,25 @@ them. A **Profile** pairs a **Target** (where and how to run, with ceilings that
 mistakes) with **Resources** (what each Task needs). A **Plan** packs eligible Tasks into
 single-node **allocations** of concurrent steps. Before each `sbatch`, submission durably records an
 **intent**; Slurm's job number becomes a **Receipt**. Acceptance is not completion: Servatus reads
-`squeue` and `sacct`, and an optional **result probe** says which results are valid. Unselected
+`squeue` and the run markers in `log_root`, and an optional **result probe** says which results
+are valid. Unselected
 Tasks are **held** ([glossary](https://github.com/edoski/servatus/blob/main/docs/CONTEXT.md)).
 
 | Hold | Meaning | What to do |
 | --- | --- | --- |
 | `VALID` | The probe reports a valid result. | Nothing. |
 | `SUBMITTED` | The Task has accepted work and was not requested for retry. Slurm is not consulted. | `status`; to rerun, `--retry KEY` or `--retry-failed`. |
-| `ACTIVE` | Retry requested, but Slurm still holds earlier work (queued, running, held, requeued). | Wait, or `cancel`. |
-| `UNRESOLVED` | An intent has no recorded outcome. | See the recovery playbook. |
-| `UNOBSERVABLE` | Slurm's evidence for earlier work is missing or `UNKNOWN`. | `--retry KEY --allow-duplicate-risk KEY`. |
+| `ACTIVE` | Slurm still lists earlier work of the Task: queued, running, or finished but not yet purged. | Wait a few minutes, or `cancel`. |
+| `UNRESOLVED` | An intent has no recorded outcome. | `servatus reconcile STATE`. |
 | `NOT_REQUESTED` | Excluded by `--only`. | Nothing. |
 
-`--retry-failed` selects Tasks whose latest accepted work failed or was cancelled, judged by the
-Task's own step when known. A failed or cancelled allocation of several Tasks says nothing about a
-Task whose step Slurm does not report (it may have finished first), so that Task is `UNKNOWN` and
-held `UNOBSERVABLE`. Explicit `--retry` keys are strict: an unknown key, a valid result, a Task
-never accepted, or `UNKNOWN` evidence without `--allow-duplicate-risk` refuses the whole plan
-(`PlanRefused`, listing every key). Duplicate risk can only be acknowledged for explicit keys.
-Eligible Tasks beyond the target's `max_allocations_per_submit` are **deferred** to the next plan.
+`--retry-failed` selects Tasks whose latest accepted work is `FAILED` or `STOPPED`. It never selects
+`LOST` work: the job vanished without recording an outcome, and during a network partition its
+step may even still run. Rerun a `LOST` Task by naming it, `--retry KEY`; naming it is your
+acknowledgement. Explicit `--retry` keys are strict: an unknown key, a valid result, a Task never
+accepted, or a Task whose earlier work Slurm still lists refuses the whole plan (`PlanRefused`,
+listing every key). Eligible Tasks beyond the target's `max_allocations_per_submit` are
+**deferred** to the next plan.
 
 ## Recovery playbook
 
@@ -205,27 +214,30 @@ Eligible Tasks beyond the target's `max_allocations_per_submit` are **deferred**
 | 1 | Error: bad input, refused or stale plan, a shape `validate` rejected, conflicting or corrupt state, or an unexpected error (one line, never a traceback). | Read the message. `StalePlan`: plan again. |
 | 2 | Usage error. | Check `servatus COMMAND --help`. |
 | 3 | Submission interrupted. Some allocations may be unresolved. | Run `status`, then resolve them as below. |
-| 75 | Cluster unavailable, campaign busy, or a transient filesystem failure (no space, quota, I/O). | Retry later. A failed ping records nothing. |
+| 75 | Cluster unavailable, campaign busy, a transient filesystem failure (no space, quota, I/O), or `reconcile` still waiting for evidence. | Retry later. A failed ping records nothing. |
 | 130 | Interrupted (Ctrl-C). Recorded intent survives. | Run `status`. |
 
 An **unresolved allocation** has a durable intent but no receipt: the `sbatch` call may or may not
 have reached Slurm. Servatus holds its Tasks until you resolve it.
 
-1. `servatus reconcile state ALLOCATION_ID` records the receipt if Slurm holds exactly one job
-   with that allocation's identity (an already accepted allocation just prints its receipt).
-2. Otherwise check `squeue`/`sacct` yourself and record a job you find with
-   `servatus mark-accepted state ALLOCATION_ID JOB_ID [--cluster NAME]`.
-   `servatus mark-not-submitted state ALLOCATION_ID` asks the original target and records only
-   proven absence: a job with that identity is a `Conflict`; an unreachable target exits 75.
-3. Plan again. History is never erased; a new Attempt is added.
+1. `servatus reconcile state` resolves every unresolved allocation from Slurm's evidence. A job
+   that `squeue` lists with the allocation's identity, or else one named by its run markers, is
+   recorded as accepted. With neither, an intent at least 15 minutes old is recorded as not
+   submitted; a younger one waits, and `reconcile` prints when to run it again and exits 75.
+   Rerunning it is always safe.
+2. Plan again. History is never erased; a new Attempt is added.
 
-`mark-accepted` also corrects an allocation marked not submitted, but only when Slurm proves
-exactly that job and no later allocation includes its Tasks.
+If Slurm later lists a job for an allocation recorded as not submitted (an `sbatch` that arrived
+very late), `status` warns, names the allocation and job, and holds its Tasks `ACTIVE` until the job
+leaves the queue, so nothing new is submitted beside it. `servatus cancel state --allocation ID`
+stops it.
 
-`servatus cancel state --task KEY` runs `scancel` for every accepted allocation of that Task not
-already known to be finished (`--allocation ID` names one); a packed allocation stops all its
-Tasks. Every allocation is tried; failures exit 75, naming what was and was not cancelled. Nothing
-is retried; once Slurm reports the work cancelled, `--retry-failed` selects it (as above).
+`servatus cancel state --task KEY` runs `scancel --me --name=servatus-<allocation id>` for every
+allocation of that Task that Slurm still lists as queued or running (`--allocation ID` names one);
+a packed allocation stops all its Tasks. Cancelling by name can never hit an unrelated job that
+reused a job number, and a job that already ended is not an error. Every allocation is tried;
+failures exit 75, naming what was and was not cancelled. Nothing is retried; once Slurm purges the
+cancelled job, its Tasks are `STOPPED` and `--retry-failed` selects them.
 
 ## Publication
 
@@ -314,9 +326,9 @@ times the per-Task CPUs, memory, and GPUs, for the per-Task time limit.
 | `[target]` key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `host` | string | omitted | SSH destination (`[user@]host` or ssh_config alias). Omitted: run Slurm locally. |
-| `slurm_bin` | absolute path | required | Directory holding `sbatch`, `squeue`, `sacct`, `scancel`, `srun`. |
+| `slurm_bin` | absolute path | required | Directory holding `sbatch`, `squeue`, `scancel`, `srun`. |
 | `work_root` | absolute path | required | Working directory of every Task step; no `,` or `:`. |
-| `log_root` | absolute path | required | Slurm log directory (must exist); no `%`. |
+| `log_root` | absolute path | required | Slurm logs and run markers (must exist, shared with the login node); no `%`. |
 | `partitions` | array of strings | required | Partitions the job may use. |
 | `max_tasks_per_allocation`, `max_cpus_per_allocation`, `max_memory_mib_per_allocation` | int | required | Ceilings per allocation. |
 | `max_time_limit` | duration | required | Wall-time ceiling. |
@@ -362,9 +374,10 @@ example via `ssh-agent`.
 `--config PATH` is given. Output is human-readable, with every non-printable character escaped
 (except `--show-scripts`); every command except `logs` accepts `--json` for exact machine output.
 `status --json` prints a `servatus.status/1` document (`tasks`, `attempts`, `counts`, `quiescent`,
-`results_ready`); saved plans are `servatus.plan/1` documents. Receipts, submit results, shape
-checks, and planned allocations are encoded with `servatus.campaign.to_document`; a receipt is
-`{"allocation_id", "job": {"job_id", "cluster"}, "task_keys"}`.
+`results_ready`, `warnings`); saved plans are `servatus.plan/2` documents. Receipts, submit and
+reconcile results, shape checks, and planned allocations are encoded with
+`servatus.campaign.to_document`; a receipt is `{"allocation_id", "job", "task_keys"}` with an
+integer job number.
 
 | Command | Purpose |
 | --- | --- |
@@ -373,17 +386,14 @@ checks, and planned allocations are encoded with `servatus.campaign.to_document`
 | `append STATE TASKS.jsonl` | Append new Tasks to an appendable campaign. |
 | `seal STATE` | End authoring irreversibly. |
 | `plan STATE [--profile NAME] [--output FILE]` | Show selected, held, and deferred Tasks; `--output` saves the plan (0600, never overwrites). |
-| `  --retry KEY`, `--retry-failed` | Retry named Tasks, or every Task whose latest work failed or was cancelled. |
-| `  --allow-duplicate-risk KEY` | Retry a named Task whose earlier work has `UNKNOWN` evidence. |
+| `  --retry KEY`, `--retry-failed` | Retry named Tasks (`LOST` ones included), or every Task whose latest work failed or stopped. |
 | `  --only KEY`, `--tasks-per-allocation N`, `--show-scripts` | Restrict the plan; lower packing; print batch scripts (sensitive). |
 | `validate STATE PLAN` | `sbatch --test-only` once per distinct allocation shape; exit 1 if any is rejected. |
 | `submit STATE PLAN` | Submit the reviewed plan. Exit 3 if interrupted. |
 | `status STATE [--offline]` | Task and allocation status; `--offline` skips Slurm. |
 | `logs STATE [--task KEY] [--allocation ID] [--bytes N] [--output FILE]` | Bounded log tail; writes 0600; refuses a terminal. |
-| `reconcile STATE ALLOCATION` | Resolve an unresolved allocation from Slurm evidence. |
-| `mark-accepted STATE ALLOCATION JOB_ID [--cluster NAME]` | Record a job you found yourself. |
-| `mark-not-submitted STATE ALLOCATION` | Record an allocation that its original target proves never reached Slurm. |
-| `cancel STATE [--task KEY]... [--allocation ID]...` | `scancel` matching accepted allocations not known to be finished. |
+| `reconcile STATE` | Resolve every unresolved allocation from Slurm evidence; exit 75 while some still wait. |
+| `cancel STATE [--task KEY]... [--allocation ID]...` | `scancel` matching allocations that Slurm lists as queued or running. |
 | `doctor [--profile NAME]` | Check the profile and run `sbatch --version`; a failure shows Slurm's first stderr line. |
 
 `logs --task KEY` reads that Task's step log in its latest accepted allocation, `--allocation ID`
@@ -393,11 +403,12 @@ the allocation log, and both that Task's step log in that allocation; `--bytes` 
 ## Guarantees
 
 - Intent is durable before each `sbatch`. An uncertain submission blocks its Tasks until it is
-  resolved, and is recorded as never submitted only on Slurm's proof; nothing is retried without
-  an explicit decision.
+  resolved, and is recorded as never submitted only after Slurm and the run markers show nothing
+  for 15 minutes; nothing is retried without an explicit decision.
 - Submission executes exactly the reviewed plan, or refuses it as stale or tampered.
 - Campaign state is owner-only, validated on every read, atomically replaced, and synced.
 - Scheduler evidence is bounded, identity-checked, and read from each Attempt's original target.
+  No Slurm accounting is needed, and an outcome is decided only after Slurm forgets the job.
 - A published destination is absent or complete and is never overwritten. Content is synced before
   commit and the parent after it.
 - Private work survives failure and is removed only after a durable publication.

@@ -1,6 +1,7 @@
 # ADR 0003: Own one native Slurm campaign
 
-Status: accepted (revised for 0.12)
+Status: accepted (revised for 0.12); the Evidence section and the batch script's step aggregation
+are superseded by [ADR 0007](0007-run-markers.md)
 
 Servatus supports one concrete lane: an unprivileged user runs absolute Slurm executables, either
 through OpenSSH from a workstation or directly on a login node, and each Task starts through one of
@@ -78,6 +79,9 @@ Target is built: `%` in `log_root` (Slurm filename patterns), `,` or `:` in `wor
 syntax), and `:` in the Apptainer image (Apptainer reads it as a URI such as `docker://`).
 
 ## Evidence
+
+> Superseded by [ADR 0007](0007-run-markers.md): Servatus no longer reads Slurm accounting. Liveness
+> comes from `squeue`, outcomes from run markers in `log_root`, and cancel uses the name alone.
 
 Observation batches at most 16 jobs per query, grouped by each Attempt's original Target and
 cluster; reused job numbers are queried separately. Each batch runs `squeue`, anchored
