@@ -8,14 +8,13 @@ from __future__ import annotations
 
 from collections.abc import Generator, Iterable, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, fields, replace
 from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any, cast
 
 from ..errors import ConfigurationError, Conflict, CorruptState, NotFound
 from . import _codec
-from ._codec import FLATTEN
 from ._config import Profile, Task
 
 SCHEMA_VERSION = 8
@@ -30,11 +29,6 @@ def _require(condition: bool, message: str) -> None:
         raise _Invalid(message)
 
 
-def _subsequence(part: tuple[str, ...], whole: tuple[str, ...]) -> bool:
-    remaining = iter(whole)
-    return all(any(item == other for other in remaining) for item in part)
-
-
 class AcceptanceState(StrEnum):
     UNRESOLVED = "UNRESOLVED"
     ACCEPTED = "ACCEPTED"
@@ -43,59 +37,43 @@ class AcceptanceState(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class RegisteredTask:
-    task: Task = field(metadata=FLATTEN)
+    task: Task
     revision: int
-
-    def __post_init__(self) -> None:
-        _require(type(self.revision) is int and self.revision >= 0, "invalid task revision")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Attempt:
-    """One allocation's durable record: intent before scheduler contact, then one outcome."""
+    """One allocation's durable record: intent before scheduler contact, then one outcome.
+
+    The outcome is its revision plus the accepted ``job``, or ``None`` for not submitted.
+    """
 
     allocation_id: str
     task_keys: tuple[str, ...]
     profile: Profile
-    retry: tuple[str, ...]
     intent_revision: int
     intent_at: datetime
-    acceptance: AcceptanceState = AcceptanceState.UNRESOLVED
     job: int | None = None
     outcome_revision: int | None = None
 
     def __post_init__(self) -> None:
         _require(_codec.is_hex(self.allocation_id, 24), "invalid allocation identity")
-        _require(self.intent_revision >= 1, "invalid intent revision")
         _require(self.intent_at.utcoffset() == timedelta(0), "intent time must be UTC")
         keys = self.task_keys
         _require(bool(keys) and len(set(keys)) == len(keys), "invalid attempt task references")
-        _require(_subsequence(self.retry, keys), "invalid retry references")
-        if self.acceptance is AcceptanceState.UNRESOLVED:
-            _require(
-                self.outcome_revision is None and self.job is None, "unresolved intent has outcome"
-            )
+        if self.outcome_revision is None:
+            _require(self.job is None, "unresolved intent has a job")
         else:
-            _require(
-                self.outcome_revision is not None and self.intent_revision < self.outcome_revision,
-                "invalid outcome revision",
-            )
-            _require(
-                (self.job is not None) == (self.acceptance is AcceptanceState.ACCEPTED),
-                "job identity disagrees with acceptance",
-            )
-            _require(
-                self.job is None or (type(self.job) is int and self.job >= 1), "invalid job number"
-            )
-        target, resources, count = self.profile.target, self.profile.resources, len(keys)
+            _require(self.intent_revision < self.outcome_revision, "invalid outcome revision")
         _require(
-            count <= target.max_tasks_per_allocation
-            and count * resources.cpus <= target.max_cpus_per_allocation
-            and count * resources.memory_mib <= target.max_memory_mib_per_allocation
-            and count * resources.gpus <= target.max_gpus_per_allocation
-            and resources.time_limit <= target.max_time_limit,
-            "attempt exceeds its target capacity",
+            self.job is None or (type(self.job) is int and self.job >= 1), "invalid job number"
         )
+
+    @property
+    def acceptance(self) -> AcceptanceState:
+        if self.outcome_revision is None:
+            return AcceptanceState.UNRESOLVED
+        return AcceptanceState.NOT_SUBMITTED if self.job is None else AcceptanceState.ACCEPTED
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,7 +85,7 @@ class State:
     attempts: tuple[Attempt, ...] = ()
 
     def __post_init__(self) -> None:
-        check(self)
+        _check(self)
 
     @property
     def tasks(self) -> tuple[Task, ...]:
@@ -117,16 +95,6 @@ class State:
     def sealed(self) -> bool:
         return self.sealed_revision is not None
 
-    @property
-    def accepted_keys(self) -> frozenset[str]:
-        """Task keys with accepted work in any Attempt."""
-        return frozenset(
-            key
-            for attempt in self.attempts
-            if attempt.acceptance is AcceptanceState.ACCEPTED
-            for key in attempt.task_keys
-        )
-
     def attempt(self, allocation_id: str) -> Attempt:
         for attempt in self.attempts:
             if attempt.allocation_id == allocation_id:
@@ -134,7 +102,41 @@ class State:
         raise NotFound(f"unknown allocation: {allocation_id}")
 
 
-def check(state: State) -> None:
+@dataclass(frozen=True, slots=True)
+class TaskHistory:
+    """One Task's Attempts in state order: accepted ones (with the Task's slot in each), ones
+    recorded as not submitted, and the unresolved one, which the invariant makes the last."""
+
+    accepted: tuple[tuple[Attempt, int], ...] = ()
+    not_submitted: tuple[Attempt, ...] = ()
+    unresolved: Attempt | None = None
+
+
+def history(state: State) -> dict[str, TaskHistory]:
+    """Every roster Task's history, from one pass over the Attempts."""
+    accepted: dict[str, list[tuple[Attempt, int]]] = {}
+    not_submitted: dict[str, list[Attempt]] = {}
+    unresolved: dict[str, Attempt] = {}
+    for attempt in state.attempts:
+        acceptance = attempt.acceptance
+        for slot, key in enumerate(attempt.task_keys):
+            if acceptance is AcceptanceState.ACCEPTED:
+                accepted.setdefault(key, []).append((attempt, slot))
+            elif acceptance is AcceptanceState.NOT_SUBMITTED:
+                not_submitted.setdefault(key, []).append(attempt)
+            else:
+                unresolved[key] = attempt
+    return {
+        task.key: TaskHistory(
+            tuple(accepted.get(task.key, ())),
+            tuple(not_submitted.get(task.key, ())),
+            unresolved.get(task.key),
+        )
+        for task in state.tasks
+    }
+
+
+def _check(state: State) -> None:
     """The single Campaign invariant, linear in tasks plus attempted Task references."""
     revision, sealed = state.revision, state.sealed_revision
     _require(_codec.is_hex(state.campaign_id, 32), "invalid campaign identity")
@@ -162,7 +164,6 @@ def check(state: State) -> None:
 
     identities: set[str] = set()
     busy_until: dict[str, float] = {}
-    accepted: set[str] = set()
     last_intent = 0
     for attempt in state.attempts:
         intent, keys = attempt.intent_revision, attempt.task_keys
@@ -181,15 +182,9 @@ def check(state: State) -> None:
             _require(position[name] > last, "attempt tasks are not in roster order")
             last = position[name]
             _require(busy_until.get(name, 0) < intent, "attempt overlaps unresolved intent")
-        _require(
-            tuple(name for name in keys if name in accepted) == attempt.retry,
-            "retry choices disagree with prior accepted work",
-        )
         until = float("inf") if attempt.outcome_revision is None else attempt.outcome_revision
         for name in keys:
             busy_until[name] = max(busy_until.get(name, 0), until)
-        if attempt.acceptance is AcceptanceState.ACCEPTED:
-            accepted.update(keys)
     _require(revision == max(events, default=0), "revision does not match recorded mutations")
 
 
@@ -253,36 +248,30 @@ def record_intent(
     allocation_id: str,
     task_keys: tuple[str, ...],
     profile: Profile,
-    retry: tuple[str, ...],
     at: datetime,
-) -> tuple[State, Attempt]:
+) -> State:
     with _rejected():
         attempt = Attempt(
             allocation_id=allocation_id,
             task_keys=task_keys,
             profile=profile,
-            retry=retry,
             intent_revision=state.revision + 1,
             intent_at=at,
         )
-    changed = _changed(
-        state, revision=attempt.intent_revision, attempts=state.attempts + (attempt,)
-    )
-    return changed, attempt
+    return _changed(state, revision=attempt.intent_revision, attempts=state.attempts + (attempt,))
 
 
 def record_outcome(state: State, allocation_id: str, job: int | None) -> State:
     """Record acceptance of ``job`` or non-submission (``None``) at the next revision. Identical
     repeats are idempotent; a conflicting outcome raises ``Conflict``."""
     attempt = state.attempt(allocation_id)
-    acceptance = AcceptanceState.NOT_SUBMITTED if job is None else AcceptanceState.ACCEPTED
-    if attempt.acceptance is not AcceptanceState.UNRESOLVED:
-        if attempt.acceptance is acceptance and attempt.job == job:
+    if attempt.outcome_revision is not None:
+        if attempt.job == job:
             return state
         raise Conflict(f"allocation {allocation_id} already has a conflicting outcome")
     revision = state.revision + 1
     with _rejected():
-        resolved = replace(attempt, acceptance=acceptance, job=job, outcome_revision=revision)
+        resolved = replace(attempt, job=job, outcome_revision=revision)
     attempts = tuple(resolved if item is attempt else item for item in state.attempts)
     return _changed(state, revision=revision, attempts=attempts)
 
@@ -295,10 +284,8 @@ class _AttemptDocument:
     allocation_id: str
     task_keys: tuple[str, ...]
     profile: str
-    retry: tuple[str, ...]
     intent_revision: int
     intent_at: datetime
-    acceptance: AcceptanceState
     job: int | None
     outcome_revision: int | None
 
@@ -319,12 +306,12 @@ def _fields(value: Attempt | _AttemptDocument, **changes: object) -> dict[str, A
     return {item.name: getattr(value, item.name) for item in fields(value)} | changes
 
 
-def profile_key(profile: Profile) -> str:
+def _profile_key(profile: Profile) -> str:
     return _codec.digest(_codec.dump(profile))[:16]
 
 
 def encode(state: State) -> bytes:
-    profiles = {profile_key(attempt.profile): attempt.profile for attempt in state.attempts}
+    profiles = {_profile_key(attempt.profile): attempt.profile for attempt in state.attempts}
     document = _StateDocument(
         schema_version=SCHEMA_VERSION,
         campaign_id=state.campaign_id,
@@ -333,7 +320,7 @@ def encode(state: State) -> bytes:
         tasks=state.roster,
         profiles=profiles,
         attempts=tuple(
-            _AttemptDocument(**_fields(attempt, profile=profile_key(attempt.profile)))
+            _AttemptDocument(**_fields(attempt, profile=_profile_key(attempt.profile)))
             for attempt in state.attempts
         ),
     )
@@ -355,7 +342,7 @@ def decode(data: bytes) -> State:
         document = _codec.load(_StateDocument, cast(object, raw))
         profiles = dict(document.profiles)
         for name, profile in profiles.items():
-            _require(profile_key(profile) == name, "profile key does not match its content")
+            _require(_profile_key(profile) == name, "profile key does not match its content")
         used = {item.profile for item in document.attempts}
         _require(used == profiles.keys(), "profiles do not match attempt references")
         state = State(

@@ -41,11 +41,12 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   ceiling, optionally lowered by `tasks_per_allocation`.
 - **Slot:** a Task's zero-based position within its allocation.
 - **Decision (`Decision`):** the reviewed part of a plan: Campaign identity and revision, Profile,
-  selected, held, and deferred Tasks, retry choices, packing, whether a probe was used, and a
-  random nonce from which allocation identities derive.
-- **Plan (`Plan`):** a Decision (`plan.decision`) plus its derived `PlannedAllocation`s (Task
-  keys, totals, batch script, `sbatch` argv) and digest, with `warnings` for deferred work. A saved
-  plan (`servatus.plan/2`) holds only the Decision and digest.
+  selected, held, and deferred Tasks, packing, whether a probe was used, and a random nonce from
+  which allocation identities derive.
+- **Plan (`Plan`):** a Decision (`plan.decision`) plus what it derives from the current state:
+  `PlannedAllocation`s (Task keys, totals, batch script, `sbatch` argv), the digest, and `retry`
+  (the selected or deferred Tasks that resubmit accepted work), with `warnings` for deferred work.
+  A saved plan (`servatus.plan/2`) holds only the Decision and digest.
   Submission rebuilds the plan from its Decision and the current state and refuses it when it
   differs.
 - **Hold (`Hold`):** why a Task is not selected: `VALID` (valid result), `UNRESOLVED` (intent
@@ -59,8 +60,9 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   Tasks whose current execution is terminal and whose probed result is missing, and requires a
   probe. Explicit retry keys name single Tasks and are checked strictly (`PlanRefused` for unknown
   keys, valid results, Tasks never accepted, and live work); they accept `LOST`.
-- **Attempt:** one durable allocation record: Profile, Task keys, retry choices, intent revision
-  and time, then exactly one outcome (accepted with a job, or not submitted).
+- **Attempt:** one durable allocation record: Profile, Task keys, intent revision and time, then
+  exactly one outcome revision with the accepted job, or with none for not submitted. Its
+  `acceptance` follows from those, and an Attempt's retried Tasks are those accepted earlier.
 - **Intent:** the synced unresolved Attempt recorded before scheduler contact.
 - **Receipt (`Receipt`):** a positive Slurm job number proving acceptance, not completion.
 - **Unresolved allocation:** an intent without an outcome. It blocks its Tasks until `reconcile`
@@ -87,7 +89,10 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   Attempts of Tasks that could be retried, and the not-submitted Attempts of Tasks never accepted.
   Plans of fresh Tasks without such history observe nothing.
 - **Status (`Status`):** one transient revision-bound projection of Tasks (`TaskStatus`) and
-  Attempts (`AttemptStatus`), with counts, result readiness, and quiescence. `to_json()` exports
+  Attempts (`AttemptStatus`), with counts, result readiness, and quiescence. A Task's
+  `execution` is `UNRESOLVED` while one of its Attempts is, else the observed `Execution` of its
+  latest accepted Attempt (`ACCEPTED` when the scheduler was not observed), else `NOT_SUBMITTED`
+  (never accepted). `to_json()` exports
   it as a `servatus.status/1` document; `to_document` encodes other results for JSON.
 - **Result readiness:** the sealed roster has valid results for every Task.
 - **Quiescence:** scheduler evidence was requested, Slurm lists no job of any accepted allocation

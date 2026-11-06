@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import PurePosixPath
@@ -13,7 +13,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from servatus.campaign import _codec
-from servatus.campaign._codec import FLATTEN, CodecError
+from servatus.campaign._codec import CodecError
 
 
 class Color(Enum):
@@ -30,7 +30,7 @@ class Inner:
 @dataclass(frozen=True, slots=True)
 class Outer:
     name: str
-    inner: Inner = field(metadata=FLATTEN)
+    inner: Inner
     payload: bytes
     path: PurePosixPath
     at: datetime
@@ -69,11 +69,10 @@ def dumped(**changes: object) -> dict[str, object]:
     return document
 
 
-def test_dump_flattens_and_uses_canonical_scalars() -> None:
+def test_dump_nests_dataclasses_and_uses_canonical_scalars() -> None:
     assert _codec.dump(outer()) == {
         "name": "ä",
-        "count": 3,
-        "flag": True,
+        "inner": {"count": 3, "flag": True},
         "payload": "AP8=",
         "path": "/a/b",
         "at": "2030-01-02T03:04:05+00:00",
@@ -104,8 +103,9 @@ def test_canonical_json_is_sorted_compact_utf8_and_digest_is_stable() -> None:
     ("changes", "message"),
     [
         ({"extra": 1}, r"unknown keys \['extra'\]"),
-        ({"count": True}, r"\$\.count: expected int"),
-        ({"flag": 1}, r"\$\.flag: expected bool"),
+        ({"inner": {"count": True, "flag": True}}, r"\$\.inner\.count: expected int"),
+        ({"inner": {"count": 3, "flag": 1}}, r"\$\.inner\.flag: expected bool"),
+        ({"inner": {"count": 3}}, r"\$\.inner: missing key 'flag'"),
         ({"name": 3}, r"\$\.name: expected str"),
         ({"items": [1, "2"]}, r"\$\.items\[1\]: expected int"),
         ({"items": {"0": 1}}, r"\$\.items: expected array"),
@@ -134,8 +134,8 @@ def test_load_rejects_structural_and_noncanonical_values(
         _codec.load(Outer, dumped(**changes))
 
 
-@pytest.mark.parametrize("missing", ["name", "count", "renamed", "maybe"])
-def test_load_rejects_missing_keys_including_flattened_and_optional(missing: str) -> None:
+@pytest.mark.parametrize("missing", ["name", "inner", "renamed", "maybe"])
+def test_load_rejects_missing_keys_including_optional(missing: str) -> None:
     document = dumped()
     del document[missing]
     with pytest.raises(CodecError, match=f"missing key '{missing}'"):

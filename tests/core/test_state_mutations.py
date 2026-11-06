@@ -17,7 +17,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Any
 
-from core_helpers import CAMPAIGN_ID, intend, reencode
+from core_helpers import CAMPAIGN_ID, intend, reencode, unresolved_keys
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 from support.builders import profile, resources, target, tasks
@@ -36,15 +36,14 @@ TOP = {
     "profiles",
     "attempts",
 }
-TASK = {"key", "args", "stdin", "env", "revision"}
+ROSTER_ENTRY = {"task", "revision"}
+TASK = {"key", "args", "stdin", "env"}
 ATTEMPT = {
     "allocation_id",
     "task_keys",
     "profile",
-    "retry",
     "intent_revision",
     "intent_at",
-    "acceptance",
     "job",
     "outcome_revision",
 }
@@ -146,11 +145,13 @@ def check(doc: Any) -> None:
     introduced: dict[str, int] = {}
     order: list[str] = []
     for item in doc["tasks"]:
-        need(is_dict(item) and set(item) == TASK)
-        need(is_text(item["key"]) and item["key"] != "")
-        need(is_strings(item["args"]) and all(is_text(arg) for arg in item["args"]))
-        need(canonical_base64(item["stdin"]))
-        env = item["env"]
+        need(is_dict(item) and set(item) == ROSTER_ENTRY)
+        task = item["task"]
+        need(is_dict(task) and set(task) == TASK)
+        need(is_text(task["key"]) and task["key"] != "")
+        need(is_strings(task["args"]) and all(is_text(arg) for arg in task["args"]))
+        need(canonical_base64(task["stdin"]))
+        env = task["env"]
         need(is_dict(env))
         for name, value in env.items():
             need(ENV_NAME.fullmatch(name) is not None and not name.startswith("SERVATUS_"))
@@ -159,9 +160,9 @@ def check(doc: Any) -> None:
         need(is_int(when) and 0 <= when <= revision)
         need(not order or when >= introduced[order[-1]])
         need(sealed is None or when <= sealed)
-        need(item["key"] not in introduced)
-        introduced[item["key"]] = when
-        order.append(item["key"])
+        need(task["key"] not in introduced)
+        introduced[task["key"]] = when
+        order.append(task["key"])
     events = {when for when in introduced.values() if when}
     if sealed:
         need(sealed not in events)
@@ -186,19 +187,11 @@ def check(doc: Any) -> None:
         need(is_int(intent) and 1 <= intent <= revision and intent not in events)
         need(not prior or intent > prior[-1]["intent_revision"])
         events.add(intent)
-        keys, retry = raw["task_keys"], raw["retry"]
-        need(is_strings(keys) and is_strings(retry))
+        keys = raw["task_keys"]
+        need(is_strings(keys))
         need(bool(keys) and len(set(keys)) == len(keys))
         need(all(key in introduced and introduced[key] < intent for key in keys))
         need([key for key in order if key in keys] == keys)
-        need([key for key in keys if key in retry] == retry)
-        earlier = {
-            key
-            for other in prior
-            if other["acceptance"] == "ACCEPTED" and other["outcome_revision"] < intent
-            for key in other["task_keys"]
-        }
-        need([key for key in keys if key in earlier] == retry)
         need(
             not any(
                 set(other["task_keys"]) & set(keys)
@@ -207,26 +200,15 @@ def check(doc: Any) -> None:
             )
         )
         need(canonical_utc(raw["intent_at"]))
-        acceptance, outcome, job = raw["acceptance"], raw["outcome_revision"], raw["job"]
-        need(acceptance in ("UNRESOLVED", "ACCEPTED", "NOT_SUBMITTED"))
-        if acceptance == "UNRESOLVED":
-            need(outcome is None and job is None)
+        outcome, job = raw["outcome_revision"], raw["job"]
+        need(job is None or (is_int(job) and job >= 1))
+        if outcome is None:
+            need(job is None)
         else:
             need(is_int(outcome) and intent < outcome <= revision and outcome not in events)
             events.add(outcome)
-            if acceptance == "ACCEPTED":
-                need(is_int(job) and job >= 1)
-            else:
-                need(job is None)
         need(isinstance(raw["profile"], str) and raw["profile"] in loaded)
         used.add(raw["profile"])
-        chosen = loaded[raw["profile"]]
-        count, request, route = len(keys), chosen.resources, chosen.target
-        need(count <= route.max_tasks_per_allocation)
-        need(count * request.cpus <= route.max_cpus_per_allocation)
-        need(count * request.memory_mib <= route.max_memory_mib_per_allocation)
-        need(count * request.gpus <= route.max_gpus_per_allocation)
-        need(request.time_limit <= route.max_time_limit)
         prior.append(raw)
     need(used == set(doc["profiles"]))
     need(revision == max(events, default=0))
@@ -242,7 +224,7 @@ def histories(draw: st.DrawFn) -> State:
     extra = 0
     for _ in range(draw(st.integers(0, 10))):
         operation = draw(st.sampled_from(["append", "seal", "intent", "intent", "outcome"]))
-        unresolved = [a for a in state.attempts if a.acceptance.value == "UNRESOLVED"]
+        unresolved = [a for a in state.attempts if a.outcome_revision is None]
         if operation == "append" and not state.sealed:
             env = draw(st.sampled_from([{}, {"A": "1"}, {"Z_9": "é"}]))
             state = append(state, [Task(f"extra-{extra}", ("run",), stdin=b"\x00x", env=env)])
@@ -250,8 +232,7 @@ def histories(draw: st.DrawFn) -> State:
         elif operation == "seal":
             state = seal(state)
         elif operation == "intent":
-            busy = {key for attempt in unresolved for key in attempt.task_keys}
-            free = [task.key for task in state.tasks if task.key not in busy]
+            free = [task.key for task in state.tasks if task.key not in unresolved_keys(state)]
             if not free:
                 continue
             chosen_profile = draw(st.sampled_from(PROFILES))
@@ -309,6 +290,10 @@ def paths(node: Any, prefix: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
     return found
 
 
+def clone(value: Any) -> Any:
+    return json.loads(json.dumps(value))
+
+
 def walk(doc: Any, path: tuple[Any, ...]) -> Any:
     for step in path:
         doc = doc[step]
@@ -331,7 +316,7 @@ def open_gap(doc: Any, rng: random.Random) -> None:
 
 
 def mutate(base: Any, rng: random.Random) -> Any:
-    doc = json.loads(json.dumps(base))
+    doc = clone(base)
     for _ in range(rng.choice((1, 1, 2, 3))):
         every = [path for path in paths(doc) if path]
         path = rng.choice(every)
@@ -350,18 +335,16 @@ def mutate(base: Any, rng: random.Random) -> Any:
         elif operation == 2 and isinstance(parent, list):
             del parent[leaf]
         elif operation == 3 and isinstance(parent, list):
-            parent.insert(leaf, json.loads(json.dumps(value)))
+            parent.insert(leaf, clone(value))
         elif operation == 4 and isinstance(parent, dict):
             del parent[leaf]
         elif operation == 5 and isinstance(parent, dict):
             parent["extra"] = 1
         else:
-            same = [
-                json.loads(json.dumps(walk(doc, other)))
-                for other in every
-                if other[-1] == leaf and other != path
-            ]
-            parent[leaf] = rng.choice(same) if same and rng.random() < 0.6 else rng.choice(SCALARS)
+            same = [walk(doc, other) for other in every if other[-1] == leaf and other != path]
+            # A shared SCALARS list or dict edited in place would change later examples.
+            pool = same if same and rng.random() < 0.6 else SCALARS
+            parent[leaf] = clone(rng.choice(pool))
     return doc
 
 

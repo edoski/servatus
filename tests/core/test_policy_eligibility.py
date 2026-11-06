@@ -3,16 +3,16 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping
 
 import pytest
-from core_helpers import NOW, evidence, intend, roster, seen, submit
+from core_helpers import NOW, evidence, intend, roster, scenarios, seen, submit
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from support.builders import profile
 
 from servatus.campaign._evidence import Execution, Observation, Observed
-from servatus.campaign._policy import Hold, Retry, Selection, decide, observation_scope
+from servatus.campaign._policy import Hold, Request, Retry, Selection, decide, scope
 from servatus.campaign._state import AcceptanceState, Attempt, State, record_intent
 from servatus.campaign._status import ResultState
-from servatus.errors import ConfigurationError, PlanRefused
+from servatus.errors import PlanRefused
 
 R = ResultState
 KEY = "task-0"
@@ -35,7 +35,14 @@ def choose(
     retry: Collection[str] | Retry = (),
     only: Collection[str] | None = None,
 ) -> Selection:
-    return decide(state, evidence(observations, strays), results or {}, retry=retry, only=only)
+    request = Request.parse(retry, only)
+    return decide(state, evidence(observations, strays), results or {}, request)
+
+
+def observed_ids(
+    state: State, retry: Collection[str] | Retry = (), only: Collection[str] | None = None
+) -> tuple[str, ...]:
+    return scope(state, Request.parse(retry, only))[1]
 
 
 def once(observation: Observation) -> tuple[State, dict[str, Observation]]:
@@ -44,10 +51,8 @@ def once(observation: Observation) -> tuple[State, dict[str, Observation]]:
 
 
 def outcome(selection: Selection) -> str | Hold:
-    """``selected``, ``retry`` (selected resubmission), or the hold reason for ``KEY``."""
-    if KEY in selection.selected:
-        return "retry" if KEY in selection.retry else "selected"
-    return selection.held[KEY]
+    """``selected`` or the hold reason for ``KEY``."""
+    return "selected" if KEY in selection.selected else selection.held[KEY]
 
 
 # --- hold order ------------------------------------------------------------------------------
@@ -64,7 +69,7 @@ def test_holds_apply_in_their_documented_order() -> None:
     accepted, identity = submit(roster(1), [KEY])
     assert outcome(choose(accepted, {identity: RUNNING})) == Hold.SUBMITTED
     assert outcome(choose(accepted, {identity: RUNNING}, retry=Retry.FAILED)) == Hold.ACTIVE
-    assert outcome(choose(accepted, {identity: FAILED}, retry=Retry.FAILED)) == "retry"
+    assert outcome(choose(accepted, {identity: FAILED}, retry=Retry.FAILED)) == "selected"
 
 
 # --- fresh work ------------------------------------------------------------------------------
@@ -102,7 +107,7 @@ def test_only_limits_the_plan_and_overrides_retry() -> None:
     state, identity = submit(roster(3), ["task-1"])
     observations = {identity: FAILED}
     selection = choose(state, observations, only=["task-0", "task-1"], retry=["task-1", "task-2"])
-    assert (selection.selected, selection.retry) == (("task-0", "task-1"), ("task-1",))
+    assert selection.selected == ("task-0", "task-1")
     assert dict(selection.held) == {"task-2": Hold.NOT_REQUESTED}
     assert choose(state, only=()).held == {
         "task-0": Hold.NOT_REQUESTED,
@@ -122,7 +127,7 @@ def test_unrequested_accepted_work_is_submitted_without_observing_it(
     state, other = submit(state, ["task-1"])
     observations = {other: FAILED} if retry else {}
     assert outcome(choose(state, observations, retry=retry)) == Hold.SUBMITTED
-    assert observation_scope(state) == ()
+    assert observed_ids(state) == ()
 
 
 # --- live work -------------------------------------------------------------------------------
@@ -147,14 +152,14 @@ def test_any_live_accepted_attempt_holds_the_task_not_only_the_current_one() -> 
     assert outcome(choose(state, observations, retry=Retry.FAILED)) == Hold.ACTIVE
     with pytest.raises(PlanRefused, match="Slurm still lists earlier work"):
         choose(state, observations, retry=[KEY])
-    assert outcome(choose(state, {first: LOST, second: FAILED}, retry=Retry.FAILED)) == "retry"
+    assert outcome(choose(state, {first: LOST, second: FAILED}, retry=Retry.FAILED)) == "selected"
 
 
 def test_a_stray_holds_a_retried_task_active() -> None:
     state, first = submit(roster(1), [KEY])
     state, stray = submit(state, [KEY], accepted=False)
     observations = {first: FAILED}
-    assert outcome(choose(state, observations, retry=Retry.FAILED)) == "retry"
+    assert outcome(choose(state, observations, retry=Retry.FAILED)) == "selected"
     strays = {stray: 501}
     assert outcome(choose(state, observations, strays=strays, retry=Retry.FAILED)) == Hold.ACTIVE
     assert outcome(choose(state, observations, strays=strays)) == Hold.SUBMITTED
@@ -168,9 +173,9 @@ def test_a_stray_holds_a_retried_task_active() -> None:
 @pytest.mark.parametrize(
     ("observation", "expected"),
     [
-        (FAILED, "retry"),
-        (STOPPED, "retry"),
-        (NEVER_STARTED, "retry"),
+        (FAILED, "selected"),
+        (STOPPED, "selected"),
+        (NEVER_STARTED, "selected"),
         (LOST, Hold.SUBMITTED),
         (SUCCEEDED, Hold.SUBMITTED),
     ],
@@ -185,9 +190,9 @@ def test_retry_failed_selects_failed_and_stopped_work(
 @pytest.mark.parametrize(
     ("observation", "result", "expected"),
     [
-        (SUCCEEDED, R.MISSING, "retry"),
-        (FAILED, R.MISSING, "retry"),
-        (STOPPED, R.MISSING, "retry"),
+        (SUCCEEDED, R.MISSING, "selected"),
+        (FAILED, R.MISSING, "selected"),
+        (STOPPED, R.MISSING, "selected"),
         (LOST, R.MISSING, Hold.SUBMITTED),
         (SUCCEEDED, R.UNOBSERVED, Hold.SUBMITTED),
         (SUCCEEDED, None, Hold.SUBMITTED),
@@ -210,7 +215,7 @@ def test_the_current_execution_is_the_latest_accepted_attempts() -> None:
         Hold.SUBMITTED
     )
     assert outcome(choose(state, {first: SUCCEEDED, second: STOPPED}, retry=Retry.FAILED)) == (
-        "retry"
+        "selected"
     )
 
 
@@ -221,7 +226,6 @@ def test_bulk_selection_mixes_fresh_and_resubmitted_work_in_roster_order() -> No
     observations = {first: seen(None, 1, 0), second: STOPPED}
     selection = choose(state, observations, retry=Retry.FAILED)
     assert selection.selected == ("task-0", "task-1", "task-3")
-    assert selection.retry == ("task-1", "task-3")
     assert dict(selection.held) == {"task-2": Hold.SUBMITTED}
     with pytest.raises(TypeError, match="does not support item assignment"):
         selection.held["x"] = Hold.VALID  # pyright: ignore[reportIndexIssue]
@@ -246,7 +250,7 @@ def test_an_explicit_key_selects_any_purged_work_without_a_valid_result(
     state, observations = once(observation)
     results = {} if result is None else {KEY: result}
     selection = choose(state, observations, results, retry=[KEY])
-    assert selection.selected == selection.retry == (KEY,)
+    assert selection.selected == (KEY,)
 
 
 def test_unresolved_work_is_held_even_when_retried() -> None:
@@ -256,7 +260,7 @@ def test_unresolved_work_is_held_even_when_retried() -> None:
         assert outcome(choose(state, {first: FAILED}, retry=retry)) == Hold.UNRESOLVED
     pending, _ = intend(roster(1), [KEY])
     assert outcome(choose(pending, retry=[KEY])) == Hold.UNRESOLVED
-    assert observation_scope(state, [KEY]) == () == observation_scope(state, Retry.FAILED)
+    assert observed_ids(state, [KEY]) == () == observed_ids(state, Retry.FAILED)
 
 
 def test_valid_results_are_never_resubmitted() -> None:
@@ -298,7 +302,7 @@ def test_all_offending_keys_are_refused_together() -> None:
 # --- observation scope and inputs ------------------------------------------------------------
 
 
-def test_observation_scope_covers_only_attempts_decide_may_consult() -> None:
+def test_scope_observes_only_attempts_decide_may_consult() -> None:
     state = roster(5)
     state, first = submit(state, ["task-0", "task-1"])
     state, second = submit(state, ["task-2"], accepted=False)
@@ -306,93 +310,27 @@ def test_observation_scope_covers_only_attempts_decide_may_consult() -> None:
     state, fourth = submit(state, ["task-0"])
     state, fifth = submit(state, ["task-3"], accepted=False)
     state, _ = intend(state, ["task-4"])
-    assert observation_scope(state) == (fifth,)
-    assert observation_scope(state, ["task-4"]) == (fifth,)
-    assert observation_scope(state, ["task-1"]) == (first, fifth)
-    assert observation_scope(state, ["task-0"]) == (first, fourth, fifth)
-    assert observation_scope(state, ["task-2", "ghost"]) == (second, third, fifth)
-    assert observation_scope(state, Retry.FAILED) == (first, second, third, fourth, fifth)
-    assert observation_scope(state, Retry.INCOMPLETE, only=["task-2"]) == (second, third)
-    assert observation_scope(state, ["task-0"], only=["task-1"]) == ()
+    assert observed_ids(state) == (fifth,)
+    assert observed_ids(state, ["task-4"]) == (fifth,)
+    assert observed_ids(state, ["task-1"]) == (first, fifth)
+    assert observed_ids(state, ["task-0"]) == (first, fourth, fifth)
+    assert observed_ids(state, ["task-2", "ghost"]) == (second, third, fifth)
+    assert observed_ids(state, Retry.FAILED) == (first, second, third, fourth, fifth)
+    assert observed_ids(state, Retry.INCOMPLETE, only=["task-2"]) == (second, third)
+    assert observed_ids(state, ["task-0"], only=["task-1"]) == ()
 
 
 def test_a_plain_plan_without_such_history_observes_nothing() -> None:
-    assert observation_scope(roster(2)) == ()
+    assert observed_ids(roster(2)) == ()
     state, _ = submit(roster(2), [KEY])
     state, _ = intend(state, ["task-1"])
-    assert observation_scope(state) == ()
+    assert observed_ids(state) == ()
     assert choose(state).selected == ()
-
-
-@pytest.mark.parametrize(
-    ("options", "message"),
-    [
-        ({"retry": "task-0"}, "retry must be a collection"),
-        ({"retry": [1]}, "retry must contain only Task key strings"),
-        ({"retry": None}, "retry must be a collection"),
-        ({"only": "task-0"}, "only must be a collection"),
-        ({"only": [b"task-0"]}, "only must contain only"),
-    ],
-)
-def test_malformed_requests_are_configuration_errors(
-    options: dict[str, object], message: str
-) -> None:
-    with pytest.raises(ConfigurationError, match=message):
-        choose(roster(1), **options)  # pyright: ignore[reportArgumentType]
-
-
-def test_observation_scope_validates_request_types() -> None:
-    with pytest.raises(ConfigurationError, match="retry must be a collection"):
-        observation_scope(roster(1), "task-0")
-    with pytest.raises(ConfigurationError, match="only must be a collection"):
-        observation_scope(roster(1), (), "task-0")
 
 
 # --- properties ------------------------------------------------------------------------------
 
 KEYS = ("task-0", "task-1", "task-2")
-SLURM_STATES = st.sampled_from([None, None, None, "PENDING", "RUNNING", "COMPLETED"])
-
-
-@st.composite
-def observations_of(draw: st.DrawFn, task_count: int) -> Observation:
-    return Observation(
-        draw(SLURM_STATES),
-        draw(st.booleans()),
-        draw(st.booleans()),
-        tuple(draw(st.none() | st.sampled_from([0, 1])) for _ in range(task_count)),
-    )
-
-
-@st.composite
-def scenarios(draw: st.DrawFn) -> tuple[State, Observed, dict[str, ResultState]]:
-    state = roster(len(KEYS))
-    for _ in range(draw(st.integers(0, 5))):
-        busy = {
-            key
-            for attempt in state.attempts
-            if attempt.acceptance is AcceptanceState.UNRESOLVED
-            for key in attempt.task_keys
-        }
-        free = [key for key in KEYS if key not in busy]
-        if not free:
-            break
-        chosen = draw(st.lists(st.sampled_from(free), min_size=1, max_size=3, unique=True))
-        keys = [key for key in free if key in chosen]
-        kind = draw(st.sampled_from(["accept", "accept", "reject", "pending"]))
-        if kind == "pending":
-            state, _ = intend(state, keys)
-        else:
-            state, _ = submit(state, keys, accepted=kind == "accept")
-    attempts: dict[str, Observation] = {}
-    strays: dict[str, int] = {}
-    for attempt in state.attempts:
-        if attempt.acceptance is AcceptanceState.ACCEPTED:
-            attempts[attempt.allocation_id] = draw(observations_of(len(attempt.task_keys)))
-        elif attempt.acceptance is AcceptanceState.NOT_SUBMITTED and draw(st.integers(0, 3)) == 0:
-            strays[attempt.allocation_id] = 9000
-    results = {key: draw(st.sampled_from(list(ResultState))) for key in KEYS if draw(st.booleans())}
-    return state, Observed(attempts, strays), results
 
 
 subsets = st.sets(st.sampled_from(KEYS)).map(lambda chosen: tuple(k for k in KEYS if k in chosen))
@@ -447,7 +385,7 @@ def expected_refusals(
 
 
 @settings(max_examples=2000, deadline=None)
-@given(scenarios(), requests, onlys)
+@given(scenarios(every_accepted_observed=True), requests, onlys)
 def test_policy_safety_properties(
     scenario: tuple[State, Observed, dict[str, ResultState]],
     retry: tuple[str, ...] | Retry,
@@ -456,7 +394,7 @@ def test_policy_safety_properties(
     state, observed, results = scenario
     expected = expected_refusals(state, observed, results, retry, only)
     try:
-        selection = decide(state, observed, results, retry=retry, only=only)
+        selection = decide(state, observed, results, Request.parse(retry, only))
     except PlanRefused as refusal:
         assert set(refusal.keys) == expected and expected
         assert len(refusal.keys) == len(set(refusal.keys))
@@ -465,15 +403,12 @@ def test_policy_safety_properties(
     assert set(selection.selected).isdisjoint(selection.held)
     assert set(selection.selected) | set(selection.held) == set(KEYS)
     assert selection.selected == tuple(key for key in KEYS if key in selection.selected)
-    assert selection.retry == tuple(
-        key for key in selection.selected if history(state, key, AcceptanceState.ACCEPTED)
-    )
     for key in selection.selected:
         assert only is None or key in only
         assert results.get(key) is not ResultState.VALID
         assert not history(state, key, AcceptanceState.UNRESOLVED)
         assert not busy(state, observed, key)
-        if key not in selection.retry:
+        if not history(state, key, AcceptanceState.ACCEPTED):
             continue
         assert isinstance(retry, Retry) or key in retry
         if retry is Retry.FAILED:
@@ -481,29 +416,33 @@ def test_policy_safety_properties(
         if retry is Retry.INCOMPLETE:
             assert current(state, observed, key).terminal
             assert results.get(key) is ResultState.MISSING
-    scope = set(observation_scope(state, retry, only))
+    request = Request.parse(retry, only)
+    probed, consulted = scope(state, request)
     narrowed = Observed(
-        {name: value for name, value in observed.attempts.items() if name in scope},
-        {name: job for name, job in observed.strays.items() if name in scope},
+        {name: value for name, value in observed.attempts.items() if name in consulted},
+        {name: job for name, job in observed.strays.items() if name in consulted},
     )
-    assert decide(state, narrowed, results, retry=retry, only=only) == selection
+    assert decide(state, narrowed, results, request) == selection
+    asked = {task.key for task in probed}
+    answered = {key: value for key, value in results.items() if key in asked}
+    # An unprobed Task can only change from VALID to SUBMITTED; it is never selectable.
+    assert decide(state, observed, answered, request).selected == selection.selected
     if selection.selected:
         record_intent(
             state,
             allocation_id="f" * 24,
             task_keys=selection.selected,
             profile=profile(),
-            retry=selection.retry,
             at=NOW,
         )
 
 
 @settings(max_examples=1000, deadline=None)
-@given(scenarios(), st.sampled_from(list(Retry)), onlys)
+@given(scenarios(every_accepted_observed=True), st.sampled_from(list(Retry)), onlys)
 def test_bulk_selectors_never_raise(
     scenario: tuple[State, Observed, dict[str, ResultState]],
     retry: Retry,
     only: tuple[str, ...] | None,
 ) -> None:
     state, observed, results = scenario
-    decide(state, observed, results, retry=retry, only=only)
+    decide(state, observed, results, Request.parse(retry, only))

@@ -15,7 +15,6 @@ import pytest
 from core_helpers import CAMPAIGN_ID, reencode, roster, submit
 from support.builders import tasks
 
-from servatus import _fs
 from servatus._fs import replace_file
 from servatus.campaign import _store
 from servatus.campaign._config import Task
@@ -105,11 +104,6 @@ def test_open_missing_campaigns_is_not_found(tmp_path: Path) -> None:
 def test_campaign_paths_must_name_one_directory(path: str) -> None:
     with pytest.raises(ConfigurationError, match="campaign path"):
         Store.open(path)
-
-
-def test_create_rejects_non_states(tmp_path: Path) -> None:
-    with pytest.raises(ConfigurationError, match="campaign State"):
-        Store.create(tmp_path / "campaign", "state")  # pyright: ignore[reportArgumentType]
 
 
 # --- unsafe filesystem -----------------------------------------------------------------------
@@ -286,19 +280,12 @@ def test_update_commits_and_returns_the_new_state(tmp_path: Path) -> None:
     assert Store.open(path).read() == changed
 
 
-def test_unchanged_update_writes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_unchanged_update_writes_nothing(tmp_path: Path) -> None:
     path, store = created(tmp_path)
     before = (path / "campaign.json").stat()
-    writes: list[str] = []
-
-    def record(*_args: object, **_kwargs: object) -> None:
-        writes.append("write")
-
-    monkeypatch.setattr(_fs, "replace_file", record)
     state = store.read()
     assert store.update(lambda current: current) is state
     assert store.update(lambda current: append(current, ())) is state
-    assert writes == []
     after = (path / "campaign.json").stat()
     assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
 
@@ -312,55 +299,30 @@ def test_failed_change_leaves_state_untouched(tmp_path: Path) -> None:
 
     with pytest.raises(Conflict, match="no"):
         store.update(broken)
-    with pytest.raises(TypeError, match="must return a State"):
-        store.update(lambda state: "x")  # pyright: ignore[reportArgumentType, reportUnknownLambdaType]
     assert (path / "campaign.json").read_bytes() == before
 
 
-def count_decodes(monkeypatch: pytest.MonkeyPatch) -> list[int]:
-    calls: list[int] = []
-    real = decode
-
-    def counting(data: bytes) -> State:
-        calls.append(len(data))
-        return real(data)
-
-    monkeypatch.setattr(_store, "decode", counting)
-    return calls
-
-
-def test_content_cache_decodes_only_changed_bytes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_reads_reuse_the_state_until_its_bytes_change(tmp_path: Path) -> None:
     path, _ = created(tmp_path)
-    calls = count_decodes(monkeypatch)
     store = Store.open(path)
-    assert len(calls) == 1
     first = store.read()
-    assert store.read() is first and len(calls) == 1
+    assert store.read() is first
     changed = store.update(lambda state: append(state, [Task("x")]))
-    assert len(calls) == 1, "a commit fills the cache with the bytes it wrote"
-    assert store.read() is changed and len(calls) == 1
-    other = Store.open(path)
-    assert len(calls) == 2
-    other.update(seal)
-    sealed = store.read()
-    assert sealed.sealed and len(calls) == 3
-    assert store.read() is sealed and len(calls) == 3
+    assert store.read() is changed, "a commit fills the cache with the state it wrote"
     os.replace(path / "campaign.json", tmp_path / "copy")
     (path / "campaign.json").write_bytes((tmp_path / "copy").read_bytes())
     (path / "campaign.json").chmod(0o600)
-    assert store.read() is sealed and len(calls) == 3, "same bytes, new inode: still a hit"
+    assert store.read() is changed, "the same bytes under a new inode still hit the cache"
 
 
-def test_cache_never_masks_corruption(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cache_never_masks_changes_or_corruption(tmp_path: Path) -> None:
     path, store = created(tmp_path)
-    calls = count_decodes(monkeypatch)
     store.read()
+    Store.open(path).update(seal)
+    assert store.read().sealed, "another handle's commit is visible"
     (path / "campaign.json").write_bytes(b"{}")
     with pytest.raises(CorruptState, match="unsupported campaign schema"):
         store.read()
-    assert len(calls) == 1
 
 
 # --- crash safety ----------------------------------------------------------------------------

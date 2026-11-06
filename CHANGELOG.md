@@ -13,6 +13,9 @@ Servatus no longer needs Slurm accounting. See
 
 - Campaign state uses schema 8 and saved plans are tagged `servatus.plan/2`. Schema 7 state and
   `servatus.plan/1` files from 0.12 are rejected; finish or abandon 0.12 campaigns with 0.12.
+  Schema 8 stores only what history cannot derive: an Attempt keeps its job and outcome revision
+  (no `acceptance` or `retry`), and each roster entry nests its Task under `"task"`. A saved
+  plan's Decision has no `retry`; `Plan.retry` derives it, and `servatus plan --json` shows it.
 - Observation reads `squeue --me --all --states=all` and empty run markers that each batch script
   writes to `log_root` (`<allocation>.<job>.start`, `<allocation>.<job>.<slot>.<exit code>.end`,
   `<allocation>.<job>.stop`), never `sacct`. An outcome is decided only after Slurm purges the job
@@ -32,6 +35,10 @@ Servatus no longer needs Slurm accounting. See
   `mark_accepted`, `mark_not_submitted`, their CLI commands, and `ReconciliationError` are removed.
 - Jobs are submitted with `--no-requeue` and without `--comment`; `sbatch --parsable` must print a
   bare job number. `cancel` runs `scancel --me --name=<identity>` without a job number.
+- `TaskStatus.execution` is the one field for a Task's state: its observed `Execution`, or
+  `AcceptanceState.UNRESOLVED`, `ACCEPTED` (scheduler not observed), or `NOT_SUBMITTED`.
+  `TaskStatus.unresolved` is removed, the `status` table shows these names instead of `-`, and
+  the `unsubmitted` count is now `not_submitted`.
 - `servatus.testing.FakeScheduler` models the new protocol: queue rows that settle until `purge`,
   run markers in an in-memory `log_root`, `scancel` by name, and `find`. Its controls are `start`,
   `finish_step`, `finish`, `interrupt`, `lose`, `purge`, `write_file`, and `remove_file`.

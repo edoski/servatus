@@ -206,6 +206,7 @@ def _plan_document(plan: Plan, scripts: bool, saved: Path | None) -> dict[str, o
             del entry["script"], entry["argv"]
         allocations.append(entry)
     document.update(
+        retry=list(plan.retry),
         allocations=allocations,
         warnings=list(plan.warnings),
         saved=None if saved is None else str(saved),
@@ -225,8 +226,8 @@ def _print_plan(plan: Plan, scripts: bool, saved: Path | None) -> None:
     for item in plan.allocations:
         print(f"  {item.allocation_id}  {_plural(len(item.task_keys), 'Task')}, {_shape(item)}")
         print(f"    {_keys(item.task_keys)}")
-    if decision.retry:
-        print(f"retry: {_keys(decision.retry)}")
+    if plan.retry:
+        print(f"retry: {_keys(plan.retry)}")
     print(f"held: {_plural(len(decision.held), 'Task')}")
     reasons: dict[str, list[str]] = {}
     for key, hold in decision.held.items():
@@ -336,12 +337,7 @@ def _print_status(status: Status, path: Path) -> None:
     print(f"at {status.observed_at.isoformat(timespec='seconds')}; scheduler {observed}")
     rows = [("KEY", "RESULT", "EXECUTION", "EXIT", "ALLOCATION")]
     for task in status.tasks:
-        if task.unresolved:
-            execution = "UNRESOLVED"
-        elif task.current_allocation_id is None:
-            execution = "-"
-        else:
-            execution = "ACCEPTED" if task.execution is None else task.execution.value
+        execution = task.execution.value
         if task.detail is not None:
             execution = f"{execution} ({task.detail})"
         exit_code = "-" if task.exit_code is None else str(task.exit_code)
@@ -370,7 +366,7 @@ def _print_status(status: Status, path: Path) -> None:
         hints.append(f"servatus plan {state} --retry-failed --output PLAN.json")
     if counts["lost"]:
         hints.append(f"servatus plan {state} --retry KEY --output PLAN.json  (LOST Tasks)")
-    if counts["unsubmitted"]:
+    if counts["not_submitted"]:
         hints.append(f"servatus plan {state} --output PLAN.json")
     if not status.scheduler_observed and status.attempts:
         hints.append(f"servatus status {state}")

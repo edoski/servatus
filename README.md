@@ -148,7 +148,7 @@ tasks = [
 ]
 campaign = Campaign.ensure("state", tasks, probe=finished)
 plan = campaign.plan(Profile.load("SERVATUS.toml"))
-decision = plan.decision  # what you review: selected, held, deferred, retry choices
+decision = plan.decision  # what you review: selected, held, and deferred Tasks
 print(f"{len(decision.selected)} selected, {len(decision.held)} held")
 receipts = campaign.submit(plan).receipts
 ```
@@ -171,7 +171,9 @@ Without `--output`, `plan` only prints. `submit` rebuilds the reviewed plan, ref
 `StalePlan` if the campaign changed, and pings Slurm and rechecks eligibility before recording
 anything. `status` shows each Task's execution: `QUEUED`, `RUNNING`, `SUCCEEDED` or `FAILED` with
 its step's exit code, `STOPPED` (cancelled, out of time, or never started), or `LOST` (the job
-vanished without recording how it ended, for example on a node failure).
+vanished without recording how it ended, for example on a node failure). A Task without an
+observed execution shows `NOT_SUBMITTED`, `UNRESOLVED` (reconcile it), or `ACCEPTED` (with
+`--offline`).
 
 Servatus needs no Slurm accounting (`sacct`). It reads `squeue` for work Slurm still lists, and
 the empty run markers each batch script writes to `log_root`: a start marker before any step, one

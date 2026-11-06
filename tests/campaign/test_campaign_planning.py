@@ -102,7 +102,7 @@ def test_batch_cap_defers_eligible_tasks_and_keeps_retry_intent(world: World) ->
     retry = campaign.plan(single, retry=Retry.FAILED, tasks_per_allocation=2)
     assert retry.decision.selected == keys(0, 1)
     assert retry.decision.deferred == keys(*range(2, 11))
-    assert retry.decision.retry == keys(*range(6))  # deferred retries stay visible
+    assert retry.retry == keys(*range(6))  # deferred retries stay visible
     campaign.submit(retry)
     following = campaign.plan(single, retry=Retry.FAILED, tasks_per_allocation=2)
     assert following.decision.selected == keys(2, 3)
@@ -179,7 +179,7 @@ def test_every_hold_reason_is_reported(world: World) -> None:
         "task-5": Hold.UNRESOLVED,
     }
     only = campaign.plan(cpu_profile(), retry=["task-2", "task-3"], only=["task-2", "task-3"])
-    assert only.decision.selected == only.decision.retry == ("task-2", "task-3")
+    assert only.decision.selected == only.retry == ("task-2", "task-3")
     assert only.decision.held["task-4"] is Hold.NOT_REQUESTED
     incomplete = campaign.plan(cpu_profile(), retry=Retry.INCOMPLETE)
     assert incomplete.decision.selected == ("task-2", "task-4")
@@ -199,7 +199,7 @@ def test_retry_failed_waits_for_slurm_to_forget_the_job(world: World) -> None:
     world.fake.purge(1000)
     world.fake.purge(1001)
     plan = campaign.plan(cpu_profile(), retry=Retry.FAILED)
-    assert plan.decision.selected == plan.decision.retry == ("task-0", "task-1")
+    assert plan.decision.selected == plan.retry == ("task-0", "task-1")
 
 
 def test_lost_work_is_retried_only_by_its_explicit_key(world: World) -> None:
@@ -211,7 +211,7 @@ def test_lost_work_is_retried_only_by_its_explicit_key(world: World) -> None:
     bulk = campaign.plan(cpu_profile(), retry=Retry.FAILED)
     assert bulk.decision.selected == () and bulk.decision.held["task-0"] is Hold.SUBMITTED
     explicit = campaign.plan(cpu_profile(), retry=["task-0"])
-    assert explicit.decision.selected == explicit.decision.retry == ("task-0",)
+    assert explicit.decision.selected == explicit.retry == ("task-0",)
     assert campaign.submit(explicit).receipts[0].job == 1001
 
 
@@ -271,12 +271,26 @@ def test_valid_results_are_never_retried(world: World) -> None:
         campaign.plan(cpu_profile(), retry=["task-0"])
 
 
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"retry": "task-0"}, "retry must be a collection"),
+        ({"retry": [1]}, "retry must contain only Task key strings"),
+        ({"retry": None}, "retry must be a collection"),
+        ({"only": "task-0"}, "only must be a collection"),
+        ({"only": [1]}, "only must contain only Task key strings"),
+    ],
+)
+def test_malformed_requests_are_configuration_errors(
+    world: World, options: dict[str, Any], message: str
+) -> None:
+    campaign = world.create(jobs(1))
+    with pytest.raises(ConfigurationError, match=message):
+        campaign.plan(cpu_profile(), **options)
+
+
 def test_selector_shapes_and_probe_requirements_are_checked(world: World) -> None:
     campaign = world.create(jobs(1))
-    with pytest.raises(ConfigurationError, match="retry must be a collection"):
-        campaign.plan(cpu_profile(), retry="task-0")
-    with pytest.raises(ConfigurationError, match="only must contain only Task key strings"):
-        campaign.plan(cpu_profile(), only=[1])  # pyright: ignore[reportArgumentType]
     with pytest.raises(ConfigurationError, match="Retry.INCOMPLETE needs a result probe"):
         campaign.plan(cpu_profile(), retry=Retry.INCOMPLETE)
     with pytest.raises(ConfigurationError, match="profile must be a Profile"):
@@ -345,7 +359,6 @@ def test_plans_of_the_same_state_have_distinct_identities(world: World) -> None:
         ("selected", ["task-0"], ConfigurationError, "partition the campaign roster"),
         ("probe_required", True, ConfigurationError, "digest does not match"),
         ("nonce", "c" * 32, ConfigurationError, "digest does not match"),
-        ("retry", ["task-0"], ConfigurationError, "retry keys disagree"),
         ("format", "servatus.plan/1", ConfigurationError, "expected format"),
         ("surprise", 1, ConfigurationError, "unknown keys"),
     ],
@@ -357,6 +370,19 @@ def test_changed_plan_documents_are_refused(
     document = json.loads(campaign.plan(cpu_profile()).to_json())
     document[field] = value
     with pytest.raises(error, match=message):
+        campaign.load_plan(json.dumps(document).encode())
+
+
+def test_saved_plans_out_of_roster_order_or_over_the_batch_bound_are_refused(
+    world: World,
+) -> None:
+    campaign = world.create(jobs(2))
+    document = json.loads(campaign.plan(cpu_profile(), tasks_per_allocation=1).to_json())
+    reordered = dict(document, selected=["task-1", "task-0"])
+    with pytest.raises(ConfigurationError, match="not in roster order"):
+        campaign.load_plan(json.dumps(reordered).encode())
+    document["profile"]["target"]["max_allocations_per_submit"] = 1
+    with pytest.raises(ConfigurationError, match="exceeds the target's max_allocations_per_submit"):
         campaign.load_plan(json.dumps(document).encode())
 
 

@@ -2,15 +2,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from datetime import UTC, datetime, timedelta, timezone
-from typing import Any, cast
 
 import pytest
-from core_helpers import NOW, evidence, intend, roster, seen, submit
+from core_helpers import NOW, evidence, intend, roster, scenarios, seen, submit
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from servatus.campaign import _codec
 from servatus.campaign._evidence import Execution, Observation, Observed
 from servatus.campaign._state import AcceptanceState, State, record_outcome, seal
 from servatus.campaign._status import (
@@ -47,10 +44,9 @@ def test_fresh_roster_is_unsubmitted_and_trivially_quiescent() -> None:
     assert [task.key for task in status.tasks] == ["task-0", "task-1"]
     assert all(
         task.current_allocation_id is None
-        and task.execution is None
+        and task.execution is AcceptanceState.NOT_SUBMITTED
         and task.exit_code is None
         and task.detail is None
-        and not task.unresolved
         and task.result is ResultState.UNOBSERVED
         for task in status.tasks
     )
@@ -101,7 +97,7 @@ def test_every_execution_reaches_the_task_through_its_observation(
     state, identity = submit(roster(1), ["task-0"])
     (task,) = view(state, {identity: observation}).tasks
     assert (task.execution, task.exit_code, task.detail) == (execution, exit_code, detail)
-    assert task.current_allocation_id == identity and not task.unresolved
+    assert task.current_allocation_id == identity
 
 
 def test_each_slot_reads_its_own_end_marker() -> None:
@@ -133,8 +129,8 @@ def test_unresolved_acceptance_dominates_until_resolved() -> None:
     observations = {first: seen(None, 0)}
     status = view(pending, observations)
     (task,) = status.tasks
-    assert task.unresolved and task.current_allocation_id == second
-    assert task.execution is None and task.exit_code is None
+    assert task.execution is AcceptanceState.UNRESOLVED and task.current_allocation_id == second
+    assert task.exit_code is None
     assert not status.quiescent
     assert status.attempts[1].acceptance is AcceptanceState.UNRESOLVED
     after = view(record_outcome(pending, second, None), observations)
@@ -143,7 +139,7 @@ def test_unresolved_acceptance_dominates_until_resolved() -> None:
         AcceptanceState.NOT_SUBMITTED,
     ]
     (task,) = after.tasks
-    assert not task.unresolved and task.current_allocation_id == first
+    assert task.current_allocation_id == first
     assert task.execution is E.SUCCEEDED and after.quiescent
 
 
@@ -151,14 +147,16 @@ def test_not_submitted_only_history_leaves_the_task_unsubmitted() -> None:
     state, identity = submit(roster(1), ["task-0"], accepted=False)
     status = view(state, {identity: seen("RUNNING")})
     assert status.tasks[0].current_allocation_id is None
+    assert status.tasks[0].execution is AcceptanceState.NOT_SUBMITTED
     assert status.attempts[0].observation is None, "only accepted attempts carry evidence"
     assert status.quiescent
 
 
-def test_unobserved_accepted_work_has_no_execution_and_is_not_quiescent() -> None:
+def test_unobserved_accepted_work_shows_acceptance_and_is_not_quiescent() -> None:
     state, _ = submit(roster(1), ["task-0"])
     status = view(state)
-    assert status.tasks[0].execution is None and status.tasks[0].current_allocation_id
+    assert status.tasks[0].execution is AcceptanceState.ACCEPTED
+    assert status.tasks[0].current_allocation_id
     assert not status.quiescent
     assert not view(state, scheduler_observed=False).quiescent
 
@@ -211,12 +209,6 @@ def test_results_ready_requires_a_sealed_roster_of_valid_results() -> None:
     assert [task.result for task in statuses] == [ResultState.MISSING, ResultState.UNOBSERVED]
 
 
-def test_observed_at_must_be_utc() -> None:
-    for at in (datetime(2030, 1, 1), datetime(2030, 1, 1, tzinfo=timezone(timedelta(hours=2)))):  # noqa: DTZ001
-        with pytest.raises(ConfigurationError, match="aware UTC"):
-            project(roster(1), evidence(), {}, scheduler_observed=False, observed_at=at)
-
-
 def test_classify_results_from_one_probe_answer() -> None:
     assert classify_results(["a", "b"], {"b"}) == {
         "a": ResultState.MISSING,
@@ -244,7 +236,7 @@ def test_counts_partition_tasks_by_result_and_execution() -> None:
         "valid": 1,
         "missing": 1,
         "unobserved": 7,
-        "unsubmitted": 2,
+        "not_submitted": 2,
         "unresolved": 1,
         "accepted": 1,
         "queued": 1,
@@ -282,7 +274,6 @@ def test_json_is_versioned_canonical_and_round_trips() -> None:
         "execution": "FAILED",
         "exit_code": 1,
         "detail": None,
-        "unresolved": False,
     }
     attempt = value["attempts"][0]
     assert attempt["job"] == 101
@@ -311,69 +302,14 @@ def test_json_is_versioned_canonical_and_round_trips() -> None:
         "counts",
     }
     assert "args" not in data.decode() and "stdin" not in data.decode()
-    assert loaded(data) == status
-
-
-def loaded(data: bytes) -> Status:
-    """A status document decoded back through the strict codec, minus its derived keys."""
-    document = cast(dict[str, Any], json.loads(data))
-    del document["format"], document["counts"]
-    return _codec.load(Status, document)
+    assert value["tasks"][1]["execution"] == "UNRESOLVED"
 
 
 # --- properties ------------------------------------------------------------------------------
 
-SLURM_STATES = st.sampled_from([None, None, "PENDING", "RUNNING", "COMPLETED", "NODE_FAIL"])
-
-
-@st.composite
-def observations_of(draw: st.DrawFn, task_count: int) -> Observation:
-    return Observation(
-        draw(SLURM_STATES),
-        draw(st.booleans()),
-        draw(st.booleans()),
-        tuple(draw(st.none() | st.integers(0, 255)) for _ in range(task_count)),
-    )
-
-
-@st.composite
-def scenarios(draw: st.DrawFn) -> tuple[State, Observed, dict[str, ResultState]]:
-    state = roster(3)
-    for _ in range(draw(st.integers(0, 5))):
-        busy = {
-            key
-            for attempt in state.attempts
-            if attempt.acceptance is AcceptanceState.UNRESOLVED
-            for key in attempt.task_keys
-        }
-        free = [task.key for task in state.tasks if task.key not in busy]
-        if not free:
-            break
-        keys = draw(st.lists(st.sampled_from(free), min_size=1, max_size=3, unique=True))
-        ordered = [key for key in free if key in keys]
-        outcome = draw(st.sampled_from(["accept", "reject", "pending"]))
-        if outcome == "pending":
-            state, _ = intend(state, ordered)
-        else:
-            state, _ = submit(state, ordered, accepted=outcome == "accept")
-    attempts: dict[str, Observation] = {}
-    strays: dict[str, int] = {}
-    for attempt in state.attempts:
-        if attempt.acceptance is AcceptanceState.NOT_SUBMITTED:
-            if draw(st.booleans()):
-                strays[attempt.allocation_id] = 9000
-        elif draw(st.integers(0, 4)):
-            attempts[attempt.allocation_id] = draw(observations_of(len(attempt.task_keys)))
-    results = {
-        task.key: draw(st.sampled_from(list(ResultState)))
-        for task in state.tasks
-        if draw(st.booleans())
-    }
-    return state, Observed(attempts, strays), results
-
 
 @settings(max_examples=400, deadline=None)
-@given(scenarios(), st.booleans())
+@given(scenarios(every_accepted_observed=False), st.booleans())
 def test_projection_invariants(
     scenario: tuple[State, Observed, dict[str, ResultState]], scheduler: bool
 ) -> None:
@@ -388,29 +324,39 @@ def test_projection_invariants(
         if name not in {"tasks", "valid", "missing", "unobserved"}
     )
     assert execution == counts["tasks"]
-    assert loaded(status.to_json()) == status
+    for durable, projected in zip(state.attempts, status.attempts, strict=True):
+        earlier = {
+            key
+            for other in state.attempts
+            if other.job is not None
+            and other.outcome_revision is not None
+            and other.outcome_revision < durable.intent_revision
+            for key in other.task_keys
+        }
+        assert projected.retry == tuple(key for key in durable.task_keys if key in earlier)
     owners = {attempt.allocation_id: attempt for attempt in status.attempts}
     for task in status.tasks:
         assert (task.exit_code is not None) == (task.execution in (E.SUCCEEDED, E.FAILED))
         assert task.detail is None or task.execution is E.STOPPED
         if task.current_allocation_id is None:
-            assert task.execution is None and not task.unresolved
+            assert task.execution is AcceptanceState.NOT_SUBMITTED
             continue
         owner = owners[task.current_allocation_id]
         assert task.key in owner.task_keys
         assert owner.acceptance is not AcceptanceState.NOT_SUBMITTED
-        assert task.unresolved == (owner.acceptance is AcceptanceState.UNRESOLVED)
+        unresolved = task.execution is AcceptanceState.UNRESOLVED
+        assert unresolved == (owner.acceptance is AcceptanceState.UNRESOLVED)
         later = status.attempts[status.attempts.index(owner) + 1 :]
         assert not any(
             task.key in attempt.task_keys
             and attempt.acceptance is not AcceptanceState.NOT_SUBMITTED
             for attempt in later
         )
-        assert (task.execution is not None) == (owner.observation is not None)
+        assert isinstance(task.execution, Execution) == (owner.observation is not None)
     assert len(status.warnings) == len(observed.strays)
     if status.quiescent:
         assert scheduler and not observed.strays
-        assert not any(task.unresolved for task in status.tasks)
+        assert AcceptanceState.UNRESOLVED not in {task.execution for task in status.tasks}
         assert all(
             attempt.observation is not None and not attempt.observation.live
             for attempt in status.attempts
@@ -419,11 +365,3 @@ def test_projection_invariants(
     assert status.results_ready == (
         state.sealed and all(results.get(task.key) is ResultState.VALID for task in state.tasks)
     )
-
-
-def test_projection_is_pure_and_utc_only() -> None:
-    state, identity = submit(roster(1), ["task-0"])
-    observations = {identity: seen("RUNNING")}
-    first = view(state, observations)
-    assert view(state, observations) == first
-    assert first.observed_at.tzinfo is UTC

@@ -26,8 +26,8 @@ from ..errors import (
 )
 from ._config import Profile, StrPath, Target, Task, task_keys
 from ._evidence import Marker, Observation, Observed, QueueRow, evidenced_job, observe, queue_row
-from ._plan import Decision, Plan, PlannedAllocation, build_plan, capacity, decode_decision
-from ._policy import Retry, decide, observation_scope, result_scope
+from ._plan import Decision, Plan, PlannedAllocation, batch, build_plan, capacity, decode_decision
+from ._policy import Request, Retry, decide, scope
 from ._remote import Transport
 from ._remote import connect as connect_target
 from ._results import (
@@ -48,6 +48,7 @@ from ._state import (
     State,
     append,
     create,
+    history,
     record_intent,
     record_outcome,
     seal,
@@ -273,27 +274,23 @@ class Campaign:
         """
         if not isinstance(profile, Profile):
             raise ConfigurationError("profile must be a Profile")
-        chosen = retry if isinstance(retry, Retry) else task_keys(retry, "retry")
-        scope = None if only is None else task_keys(only, "only")
-        if chosen is Retry.INCOMPLETE and self._probe is None:
+        request = Request.parse(retry, only)
+        if request.retry is Retry.INCOMPLETE and self._probe is None:
             raise ConfigurationError("Retry.INCOMPLETE needs a result probe")
         cap = capacity(profile.target, profile.resources, tasks_per_allocation)
         state = self._store.read()
-        results = self._results(result_scope(state, chosen, scope))
-        observed = self._observe(state, observation_scope(state, chosen, scope))
+        observed, results = self._consult(state, request)
         self._unchanged(state)
-        selection = decide(state, observed, results, retry=chosen, only=scope)
-        limit = profile.target.max_allocations_per_submit
-        bound = len(selection.selected) if limit is None else cap * limit
+        selection = decide(state, observed, results, request)
+        selected, deferred = batch(selection.selected, profile.target, cap)
         decision = Decision(
             campaign_id=state.campaign_id,
             revision=state.revision,
             nonce=secrets.token_hex(16),
             profile=profile,
-            selected=selection.selected[:bound],
+            selected=selected,
             held=selection.held,
-            deferred=selection.selected[bound:],
-            retry=selection.retry,
+            deferred=deferred,
             tasks_per_allocation=cap,
             probe_required=self._probe is not None,
         )
@@ -350,12 +347,12 @@ class Campaign:
         scheduler.ping()
         self._still_eligible(decision)
         receipts: list[Receipt] = []
-        expected: int | None = decision.revision
         for index, item in enumerate(plan.allocations):
             later = plan.allocations[index + 1 :]
             unresolved = (UnresolvedSubmission(item.allocation_id, item.task_keys),)
             try:
-                claimed = self._claim(decision, item, expected)
+                # Each allocation adds an intent and a receipt; any other change is stale.
+                self._claim(decision, item, decision.revision + 2 * index)
             except Exception as error:
                 if self._recorded(item.allocation_id):  # durable, though the commit failed
                     stop = "recording the intent failed after it became durable"
@@ -377,12 +374,7 @@ class Campaign:
                 stop = f"Slurm accepted job {job} but recording the receipt failed"
                 observed = UnresolvedSubmission(item.allocation_id, item.task_keys, job)
                 raise _interrupted(stop, error, receipts, (observed,), later) from error
-            attempt = state.attempt(item.allocation_id)
-            receipts.append(_receipt(attempt))
-            # Continue only if this receipt is the one change since the intent; any other
-            # change makes the next claim stale.
-            unchanged = attempt.outcome_revision == state.revision == claimed + 1
-            expected = state.revision if unchanged else None
+            receipts.append(_receipt(state.attempt(item.allocation_id)))
         return SubmitResult(tuple(receipts))
 
     def reconcile(self) -> ReconcileResult:
@@ -536,18 +528,22 @@ class Campaign:
             raise Busy("the campaign changed while it was being observed; try again")
 
     def _current(self, state: State, key: str) -> Attempt:
-        if key not in {task.key for task in state.tasks}:
+        if (past := history(state).get(key)) is None:
             raise NotFound(f"unknown Task: {key!r}")
-        for attempt in reversed(state.attempts):
-            if attempt.acceptance is _ACCEPTED and key in attempt.task_keys:
-                return attempt
-        raise NotFound(f"Task {key!r} has no accepted allocation")
+        if not past.accepted:
+            raise NotFound(f"Task {key!r} has no accepted allocation")
+        return past.accepted[-1][0]
 
     def _verified(self, plan: Plan) -> Plan:
-        """Rebuild ``plan`` from its Decision; refuse it unless it is exactly what was reviewed."""
+        """Rebuild ``plan`` the way a saved plan is loaded; refuse it unless it is exactly what
+        was reviewed."""
         if not isinstance(plan, Plan) or not isinstance(plan.decision, Decision):
             raise ConfigurationError("plan must be a Plan")
-        rebuilt = build_plan(self._store.read(), plan.decision)
+        try:
+            data = plan.to_json()
+        except ValueError as error:
+            raise ConfigurationError(f"invalid plan: {error}") from None
+        rebuilt = self.load_plan(data)
         if rebuilt != plan:
             raise ConfigurationError("the plan does not match its decision; plan again")
         return rebuilt
@@ -558,11 +554,11 @@ class Campaign:
         if state.revision != decision.revision:
             raise StalePlan("the campaign changed after planning; plan again")
         keys = decision.selected
-        retry = tuple(key for key in decision.retry if key in keys)
-        results = self._results(tuple(task for task in state.tasks if task.key in keys))
-        observed = self._observe(state, observation_scope(state, retry, keys))
+        past = history(state)
+        request = Request(frozenset(key for key in keys if past[key].accepted), frozenset(keys))
+        observed, results = self._consult(state, request)
         try:
-            selection = decide(state, observed, results, retry=retry, only=keys)
+            selection = decide(state, observed, results, request)
         except PlanRefused as error:
             raise StalePlan(f"the plan no longer holds ({error}); plan again") from error
         if selection.selected != keys:
@@ -571,27 +567,28 @@ class Campaign:
             )
             raise StalePlan(f"planned Tasks are no longer eligible: {held}; plan again")
 
-    def _claim(self, decision: Decision, item: PlannedAllocation, expected: int | None) -> int:
-        """Record intent if the campaign is still at ``expected``; return the committed revision.
+    def _consult(self, state: State, request: Request) -> tuple[Observed, dict[str, ResultState]]:
+        """Probe and observe, once, exactly what ``decide`` may consult for ``request``."""
+        tasks, allocation_ids = scope(state, request)
+        results = self._results(tasks)
+        return self._observe(state, allocation_ids), results
 
-        ``expected`` is None once the campaign is known to have changed during submission.
-        """
+    def _claim(self, decision: Decision, item: PlannedAllocation, expected: int) -> None:
+        """Record intent if the campaign is still at revision ``expected``."""
         keys = item.task_keys
 
         def claim(state: State) -> State:
-            if expected is None or state.revision != expected:
+            if state.revision != expected:
                 raise StalePlan("the campaign changed during submission; plan again")
-            changed, _ = record_intent(
+            return record_intent(
                 state,
                 allocation_id=item.allocation_id,
                 task_keys=keys,
                 profile=decision.profile,
-                retry=tuple(key for key in keys if key in decision.retry),
                 at=self._time(),
             )
-            return changed
 
-        return self._store.update(claim).revision
+        self._store.update(claim)
 
     def _recorded(self, allocation_id: str) -> bool:
         """Whether an intent is durable; an unreadable campaign counts as recorded."""
