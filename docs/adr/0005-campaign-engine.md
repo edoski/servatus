@@ -22,8 +22,7 @@ through `servatus.testing.FakeScheduler`, passed as `connect`, instead of patchi
 
 > Superseded in part by [ADR 0007](0007-run-markers.md): the document is schema 8, with integer job
 > numbers and no duplicate-risk field; schema 7 is rejected. Schema 8 also stores no fact that
-> history derives: an Attempt has no `acceptance` or `retry` field, and a plan's Decision has no
-> `retry` field.
+> history derives: an Attempt has no `acceptance` or `retry` field.
 
 `State` validates its complete invariant whenever it is constructed, in time linear in Tasks plus
 attempted Task references, so an invalid state can be neither written nor read. Transitions are
@@ -59,7 +58,8 @@ an optional `probe`, `connect`, and `clock` bound to the handle; callbacks are n
 
 > Superseded in part by [ADR 0007](0007-run-markers.md): `UNOBSERVABLE` and duplicate-risk
 > acknowledgement are gone, `ACTIVE` means Slurm still lists earlier work, `Retry.FAILED` selects
-> `FAILED` and `STOPPED`, and explicit keys refuse live work and accept `LOST`.
+> `FAILED` and `STOPPED`, and explicit keys refuse live work and accept `LOST`. The Decision no
+> longer records retry choices; `Plan.retry` derives them from the campaign history.
 
 `Campaign.plan(profile, *, retry=(), allow_duplicate_risk=(), only=None,
 tasks_per_allocation=None)` produces a `Plan` from a `Decision`: Campaign identity and revision,

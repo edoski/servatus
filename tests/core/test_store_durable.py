@@ -302,6 +302,19 @@ def test_failed_change_leaves_state_untouched(tmp_path: Path) -> None:
     assert (path / "campaign.json").read_bytes() == before
 
 
+def test_reads_reuse_the_state_until_its_bytes_change(tmp_path: Path) -> None:
+    path, _ = created(tmp_path)
+    store = Store.open(path)
+    first = store.read()
+    assert store.read() is first
+    changed = store.update(lambda state: append(state, [Task("x")]))
+    assert store.read() is changed, "a commit fills the cache with the state it wrote"
+    os.replace(path / "campaign.json", tmp_path / "copy")
+    (path / "campaign.json").write_bytes((tmp_path / "copy").read_bytes())
+    (path / "campaign.json").chmod(0o600)
+    assert store.read() is changed, "the same bytes under a new inode still hit the cache"
+
+
 def test_cache_never_masks_changes_or_corruption(tmp_path: Path) -> None:
     path, store = created(tmp_path)
     store.read()

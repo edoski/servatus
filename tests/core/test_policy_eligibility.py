@@ -39,7 +39,7 @@ def choose(
     return decide(state, evidence(observations, strays), results or {}, request)
 
 
-def observation_scope(
+def observed_ids(
     state: State, retry: Collection[str] | Retry = (), only: Collection[str] | None = None
 ) -> tuple[str, ...]:
     return scope(state, Request.parse(retry, only))[1]
@@ -127,7 +127,7 @@ def test_unrequested_accepted_work_is_submitted_without_observing_it(
     state, other = submit(state, ["task-1"])
     observations = {other: FAILED} if retry else {}
     assert outcome(choose(state, observations, retry=retry)) == Hold.SUBMITTED
-    assert observation_scope(state) == ()
+    assert observed_ids(state) == ()
 
 
 # --- live work -------------------------------------------------------------------------------
@@ -260,7 +260,7 @@ def test_unresolved_work_is_held_even_when_retried() -> None:
         assert outcome(choose(state, {first: FAILED}, retry=retry)) == Hold.UNRESOLVED
     pending, _ = intend(roster(1), [KEY])
     assert outcome(choose(pending, retry=[KEY])) == Hold.UNRESOLVED
-    assert observation_scope(state, [KEY]) == () == observation_scope(state, Retry.FAILED)
+    assert observed_ids(state, [KEY]) == () == observed_ids(state, Retry.FAILED)
 
 
 def test_valid_results_are_never_resubmitted() -> None:
@@ -302,7 +302,7 @@ def test_all_offending_keys_are_refused_together() -> None:
 # --- observation scope and inputs ------------------------------------------------------------
 
 
-def test_observation_scope_covers_only_attempts_decide_may_consult() -> None:
+def test_scope_observes_only_attempts_decide_may_consult() -> None:
     state = roster(5)
     state, first = submit(state, ["task-0", "task-1"])
     state, second = submit(state, ["task-2"], accepted=False)
@@ -310,21 +310,21 @@ def test_observation_scope_covers_only_attempts_decide_may_consult() -> None:
     state, fourth = submit(state, ["task-0"])
     state, fifth = submit(state, ["task-3"], accepted=False)
     state, _ = intend(state, ["task-4"])
-    assert observation_scope(state) == (fifth,)
-    assert observation_scope(state, ["task-4"]) == (fifth,)
-    assert observation_scope(state, ["task-1"]) == (first, fifth)
-    assert observation_scope(state, ["task-0"]) == (first, fourth, fifth)
-    assert observation_scope(state, ["task-2", "ghost"]) == (second, third, fifth)
-    assert observation_scope(state, Retry.FAILED) == (first, second, third, fourth, fifth)
-    assert observation_scope(state, Retry.INCOMPLETE, only=["task-2"]) == (second, third)
-    assert observation_scope(state, ["task-0"], only=["task-1"]) == ()
+    assert observed_ids(state) == (fifth,)
+    assert observed_ids(state, ["task-4"]) == (fifth,)
+    assert observed_ids(state, ["task-1"]) == (first, fifth)
+    assert observed_ids(state, ["task-0"]) == (first, fourth, fifth)
+    assert observed_ids(state, ["task-2", "ghost"]) == (second, third, fifth)
+    assert observed_ids(state, Retry.FAILED) == (first, second, third, fourth, fifth)
+    assert observed_ids(state, Retry.INCOMPLETE, only=["task-2"]) == (second, third)
+    assert observed_ids(state, ["task-0"], only=["task-1"]) == ()
 
 
 def test_a_plain_plan_without_such_history_observes_nothing() -> None:
-    assert observation_scope(roster(2)) == ()
+    assert observed_ids(roster(2)) == ()
     state, _ = submit(roster(2), [KEY])
     state, _ = intend(state, ["task-1"])
-    assert observation_scope(state) == ()
+    assert observed_ids(state) == ()
     assert choose(state).selected == ()
 
 
@@ -416,12 +416,17 @@ def test_policy_safety_properties(
         if retry is Retry.INCOMPLETE:
             assert current(state, observed, key).terminal
             assert results.get(key) is ResultState.MISSING
-    scope = set(observation_scope(state, retry, only))
+    request = Request.parse(retry, only)
+    probed, consulted = scope(state, request)
     narrowed = Observed(
-        {name: value for name, value in observed.attempts.items() if name in scope},
-        {name: job for name, job in observed.strays.items() if name in scope},
+        {name: value for name, value in observed.attempts.items() if name in consulted},
+        {name: job for name, job in observed.strays.items() if name in consulted},
     )
-    assert decide(state, narrowed, results, Request.parse(retry, only)) == selection
+    assert decide(state, narrowed, results, request) == selection
+    asked = {task.key for task in probed}
+    answered = {key: value for key, value in results.items() if key in asked}
+    # An unprobed Task can only change from VALID to SUBMITTED; it is never selectable.
+    assert decide(state, observed, answered, request).selected == selection.selected
     if selection.selected:
         record_intent(
             state,

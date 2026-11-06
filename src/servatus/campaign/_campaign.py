@@ -27,7 +27,7 @@ from ..errors import (
 from ._config import Profile, StrPath, Target, Task, task_keys
 from ._evidence import Marker, Observation, Observed, QueueRow, evidenced_job, observe, queue_row
 from ._plan import Decision, Plan, PlannedAllocation, batch, build_plan, capacity, decode_decision
-from ._policy import Request, Retry, Selection, decide, scope
+from ._policy import Request, Retry, decide, scope
 from ._remote import Transport
 from ._remote import connect as connect_target
 from ._results import (
@@ -289,8 +289,9 @@ class Campaign:
             raise ConfigurationError("Retry.INCOMPLETE needs a result probe")
         cap = capacity(profile.target, profile.resources, tasks_per_allocation)
         state = self._store.read()
-        selection = self._select(state, request)
+        observed, results = self._consult(state, request)
         self._unchanged(state)
+        selection = decide(state, observed, results, request)
         selected, deferred = batch(selection.selected, profile.target, cap)
         decision = Decision(
             campaign_id=state.campaign_id,
@@ -566,7 +567,8 @@ class Campaign:
         past = history(state)
         retry = frozenset(key for key in keys if past[key].accepted)
         try:
-            selection = self._select(state, Request(retry, frozenset(keys)))
+            request = Request(retry, frozenset(keys))
+            selection = decide(state, *self._consult(state, request), request)
         except PlanRefused as error:
             raise StalePlan(f"the plan no longer holds ({error}); plan again") from error
         if selection.selected != keys:
@@ -575,11 +577,11 @@ class Campaign:
             )
             raise StalePlan(f"planned Tasks are no longer eligible: {held}; plan again")
 
-    def _select(self, state: State, request: Request) -> Selection:
-        """Probe and observe what ``request`` may consult, once, and decide."""
+    def _consult(self, state: State, request: Request) -> tuple[Observed, dict[str, ResultState]]:
+        """Probe and observe, once, exactly what ``decide`` may consult for ``request``."""
         tasks, allocation_ids = scope(state, request)
         results = self._results(tasks)
-        return decide(state, self._observe(state, allocation_ids), results, request)
+        return self._observe(state, allocation_ids), results
 
     def _claim(self, decision: Decision, item: PlannedAllocation, expected: int) -> None:
         """Record intent if the campaign is still at revision ``expected``."""

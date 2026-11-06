@@ -87,8 +87,9 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   Plans of fresh Tasks without such history observe nothing.
 - **Status (`Status`):** one transient revision-bound projection of Tasks (`TaskStatus`) and
   Attempts (`AttemptStatus`), with counts, result readiness, and quiescence. A Task's
-  `execution` is its observed `Execution`, or else its current Attempt's `AcceptanceState`:
-  `UNRESOLVED`, `ACCEPTED` (not observed), or `NOT_SUBMITTED` (never accepted). `to_json()` exports
+  `execution` is `UNRESOLVED` while one of its Attempts is, else the observed `Execution` of its
+  latest accepted Attempt (`ACCEPTED` when the scheduler was not observed), else `NOT_SUBMITTED`
+  (never accepted). `to_json()` exports
   it as a `servatus.status/1` document; `to_document` encodes other results for JSON.
 - **Result readiness:** the sealed roster has valid results for every Task.
 - **Quiescence:** scheduler evidence was requested, Slurm lists no job of any accepted allocation

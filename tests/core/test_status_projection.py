@@ -324,6 +324,16 @@ def test_projection_invariants(
         if name not in {"tasks", "valid", "missing", "unobserved"}
     )
     assert execution == counts["tasks"]
+    for durable, projected in zip(state.attempts, status.attempts, strict=True):
+        earlier = {
+            key
+            for other in state.attempts
+            if other.job is not None
+            and other.outcome_revision is not None
+            and other.outcome_revision < durable.intent_revision
+            for key in other.task_keys
+        }
+        assert projected.retry == tuple(key for key in durable.task_keys if key in earlier)
     owners = {attempt.allocation_id: attempt for attempt in status.attempts}
     for task in status.tasks:
         assert (task.exit_code is not None) == (task.execution in (E.SUCCEEDED, E.FAILED))

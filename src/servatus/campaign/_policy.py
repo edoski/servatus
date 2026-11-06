@@ -42,7 +42,12 @@ from ._status import ResultState
 
 
 class Hold(StrEnum):
-    """Why a plan does not submit a Task; the module docstring gives the rules."""
+    """Why a plan does not submit a Task.
+
+    ``VALID``: the probe reports a valid result. ``UNRESOLVED``: an intent has no recorded
+    outcome. ``ACTIVE``: Slurm still lists earlier work. ``SUBMITTED``: the Task has accepted
+    work and was not selected for retry. ``NOT_REQUESTED``: excluded by ``only``.
+    """
 
     VALID = "VALID"
     UNRESOLVED = "UNRESOLVED"

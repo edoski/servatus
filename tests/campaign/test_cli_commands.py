@@ -369,6 +369,8 @@ def test_plan_reports_holds_deferrals_and_scripts(cli: Cli[str]) -> None:
     assert "not saved; pass --output PLAN.json to save it" in out
     shown = cli.json("plan", "state", "--retry-failed", "--only", "two", "--show-scripts")
     assert shown["selected"] == ["two"] and shown["held"] == {"one": "NOT_REQUESTED"}
+    assert shown["retry"] == ["two"]
+    assert "retry" not in json.loads((cli.root / "first.json").read_bytes())
     assert shown["allocations"][0]["script"].startswith("#!/bin/sh")
     code, _, err = cli("plan", "state", "--retry", "ghost")
     assert code == 1 and "unknown Task keys: 'ghost'" in err
