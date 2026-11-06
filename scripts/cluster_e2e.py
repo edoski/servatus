@@ -13,7 +13,7 @@ It drives small sweeps through the ``servatus`` CLI over SSH, one Task per alloc
 - ``--gpu-partition``: one one-GPU Task runs ``nvidia-smi -L`` through the direct launcher and must
   list exactly one GPU.
 - ``--image-partition``: a compute node pulls a tiny image, then one Task runs in it through the
-  Apptainer launcher. Nodes without network access skip this and the summary says why.
+  Apptainer launcher. A failed pull fails the check, so leave this off where nodes have no network.
 - Both: one one-GPU Task runs ``nvidia-smi -L`` inside the image through ``--nv``. It must list
   exactly one GPU and see Slurm's step-local ``CUDA_VISIBLE_DEVICES``.
 
@@ -220,8 +220,8 @@ def gpu_check(root: Path, deadline: float) -> dict[str, Any]:
     return {"job": job, "gpus": one_gpu(text)}
 
 
-def pull_image(arguments: argparse.Namespace, run: PurePosixPath) -> str | None:
-    """Pull the tiny image on a compute node, or the reason it could not be pulled."""
+def pull_image(arguments: argparse.Namespace, run: PurePosixPath) -> None:
+    """Pull the tiny image on a compute node."""
     pull = (
         f"{arguments.slurm_bin}/srun",
         f"--partition={arguments.image_partition}",
@@ -249,13 +249,10 @@ def pull_image(arguments: argparse.Namespace, run: PurePosixPath) -> str | None:
             timeout=PULL_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        cancel = f"{arguments.slurm_bin}/scancel --me --name={PULL_JOB}"
-        subprocess.run(["ssh", "-o", "BatchMode=yes", arguments.host, cancel], check=False)
-        return f"the image pull took over {PULL_SECONDS} s"
+        raise SystemExit(f"the image pull took over {PULL_SECONDS} s") from None
     if completed.returncode != 0:
         tail = completed.stderr.strip().splitlines()[-1:]
-        return f"the image pull exited {completed.returncode}: {' '.join(tail)}"
-    return None
+        raise SystemExit(f"the image pull exited {completed.returncode}: {' '.join(tail)}")
 
 
 def image_check(root: Path, run: PurePosixPath, deadline: float) -> dict[str, Any]:
@@ -279,8 +276,9 @@ def sweep(arguments: argparse.Namespace, root: Path, run: PurePosixPath) -> dict
     deadline = started + arguments.timeout
     (root / "SERVATUS.toml").write_text(configuration(arguments, run, False))
     doctor = diagnose(root, "e2e")
-    skipped = None if arguments.image_partition is None else pull_image(arguments, run)
-    image = arguments.image_partition is not None and skipped is None
+    image = arguments.image_partition is not None
+    if image:
+        pull_image(arguments, run)
     (root / "SERVATUS.toml").write_text(configuration(arguments, run, image))
     (root / "tasks.jsonl").write_text(
         "".join(
@@ -335,11 +333,27 @@ def sweep(arguments: argparse.Namespace, root: Path, run: PurePosixPath) -> dict
         summary["apptainer"] = image_check(root, run, deadline)
         if image_gpu:
             summary["apptainer_gpu"] = image_gpu_check(root, deadline)
-    elif skipped is not None:
-        log(f"apptainer skipped: {skipped}")
-        summary["apptainer"] = {"skipped": skipped}
     summary["seconds"] = round(time.monotonic() - started)
     return summary
+
+
+def cancel_leftovers(arguments: argparse.Namespace, root: Path) -> None:
+    """Stop what this run may have left. Each Task is cancelled on its own, because one without an
+    accepted allocation refuses a whole cancel."""
+    if arguments.image_partition is not None:
+        pull = f"{arguments.slurm_bin}/scancel --me --name={PULL_JOB}"
+        subprocess.run(["ssh", "-o", "BatchMode=yes", arguments.host, pull], check=False)
+    for state, keys in (
+        ("state", tuple(TASKS)),
+        ("gpu", ("gpu",)),
+        ("image", ("image",)),
+        ("image-gpu", ("image-gpu",)),
+    ):
+        if (root / state).exists():
+            for key in keys:
+                cancelled = servatus(root, "cancel", state, "--task", key, check=False)
+                if cancelled.returncode != 0:
+                    log(f"could not cancel {key}: {cancelled.stderr.strip()}")
 
 
 def main() -> None:
@@ -369,15 +383,7 @@ def main() -> None:
         try:
             summary = sweep(arguments, root, run)
         finally:
-            for state, keys in (
-                ("state", tuple(TASKS)),
-                ("gpu", ("gpu",)),
-                ("image", ("image",)),
-                ("image-gpu", ("image-gpu",)),
-            ):
-                if (root / state).exists():
-                    options = [option for key in keys for option in ("--task", key)]
-                    servatus(root, "cancel", state, *options, check=False)
+            cancel_leftovers(arguments, root)
     print(json.dumps(summary, sort_keys=True))
 
 
