@@ -53,8 +53,6 @@ class Store:
         stopped before writing). ``Conflict`` if state already exists; ``NotFound`` if the parent
         is missing and ``parents`` is false.
         """
-        if not isinstance(state, State):
-            raise ConfigurationError("state must be a campaign State")
         location = _location(path)
         with _fs.Boundary(location, missing=NotFound), ExitStack() as stack:
             if parents:
@@ -108,8 +106,6 @@ class Store:
             changed = boundary.passthrough(change)(current)
             if changed is current:
                 return current
-            if not isinstance(changed, State):
-                raise TypeError("a campaign state change must return a State")
             self._commit(directory, changed)
             return changed
 

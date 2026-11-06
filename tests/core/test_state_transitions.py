@@ -144,7 +144,7 @@ def _intent(state: State, **changes: Any) -> State:
         "at": NOW,
     }
     values.update(changes)
-    return record_intent(state, **values)[0]
+    return record_intent(state, **values)
 
 
 @pytest.mark.parametrize(
@@ -422,7 +422,7 @@ def test_noncanonical_values_that_decode_are_rejected() -> None:
         decode(reencode(raw))
 
 
-def test_direct_construction_checks_attempt_time_and_task_revision() -> None:
+def test_direct_construction_checks_attempt_time_and_job() -> None:
     with pytest.raises(ValueError, match="intent time must be UTC"):
         Attempt(
             allocation_id=allocation_id(1),
@@ -432,8 +432,6 @@ def test_direct_construction_checks_attempt_time_and_task_revision() -> None:
             intent_revision=1,
             intent_at=datetime(2030, 1, 1),  # noqa: DTZ001
         )
-    with pytest.raises(ValueError, match="invalid task revision"):
-        RegisteredTask(Task("a"), -1)
     with pytest.raises(ValueError, match="invalid job number"):
         Attempt(
             allocation_id=allocation_id(1),

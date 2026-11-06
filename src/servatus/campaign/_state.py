@@ -46,9 +46,6 @@ class RegisteredTask:
     task: Task = field(metadata=FLATTEN)
     revision: int
 
-    def __post_init__(self) -> None:
-        _require(type(self.revision) is int and self.revision >= 0, "invalid task revision")
-
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Attempt:
@@ -66,7 +63,6 @@ class Attempt:
 
     def __post_init__(self) -> None:
         _require(_codec.is_hex(self.allocation_id, 24), "invalid allocation identity")
-        _require(self.intent_revision >= 1, "invalid intent revision")
         _require(self.intent_at.utcoffset() == timedelta(0), "intent time must be UTC")
         keys = self.task_keys
         _require(bool(keys) and len(set(keys)) == len(keys), "invalid attempt task references")
@@ -255,7 +251,7 @@ def record_intent(
     profile: Profile,
     retry: tuple[str, ...],
     at: datetime,
-) -> tuple[State, Attempt]:
+) -> State:
     with _rejected():
         attempt = Attempt(
             allocation_id=allocation_id,
@@ -265,10 +261,7 @@ def record_intent(
             intent_revision=state.revision + 1,
             intent_at=at,
         )
-    changed = _changed(
-        state, revision=attempt.intent_revision, attempts=state.attempts + (attempt,)
-    )
-    return changed, attempt
+    return _changed(state, revision=attempt.intent_revision, attempts=state.attempts + (attempt,))
 
 
 def record_outcome(state: State, allocation_id: str, job: int | None) -> State:

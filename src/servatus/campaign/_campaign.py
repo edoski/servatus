@@ -360,12 +360,12 @@ class Campaign:
         scheduler.ping()
         self._still_eligible(decision)
         receipts: list[Receipt] = []
-        expected: int | None = decision.revision
         for index, item in enumerate(plan.allocations):
             later = plan.allocations[index + 1 :]
             unresolved = (UnresolvedSubmission(item.allocation_id, item.task_keys),)
             try:
-                claimed = self._claim(decision, item, expected)
+                # Each allocation adds an intent and a receipt; any other change is stale.
+                self._claim(decision, item, decision.revision + 2 * index)
             except Exception as error:
                 if self._recorded(item.allocation_id):  # durable, though the commit failed
                     stop = "recording the intent failed after it became durable"
@@ -387,12 +387,7 @@ class Campaign:
                 stop = f"Slurm accepted job {job} but recording the receipt failed"
                 observed = UnresolvedSubmission(item.allocation_id, item.task_keys, job)
                 raise _interrupted(stop, error, receipts, (observed,), later) from error
-            attempt = state.attempt(item.allocation_id)
-            receipts.append(_receipt(attempt))
-            # Continue only if this receipt is the one change since the intent; any other
-            # change makes the next claim stale.
-            unchanged = attempt.outcome_revision == state.revision == claimed + 1
-            expected = state.revision if unchanged else None
+            receipts.append(_receipt(state.attempt(item.allocation_id)))
         return SubmitResult(tuple(receipts))
 
     def reconcile(self) -> ReconcileResult:
@@ -581,17 +576,14 @@ class Campaign:
             )
             raise StalePlan(f"planned Tasks are no longer eligible: {held}; plan again")
 
-    def _claim(self, decision: Decision, item: PlannedAllocation, expected: int | None) -> int:
-        """Record intent if the campaign is still at ``expected``; return the committed revision.
-
-        ``expected`` is None once the campaign is known to have changed during submission.
-        """
+    def _claim(self, decision: Decision, item: PlannedAllocation, expected: int) -> None:
+        """Record intent if the campaign is still at revision ``expected``."""
         keys = item.task_keys
 
         def claim(state: State) -> State:
-            if expected is None or state.revision != expected:
+            if state.revision != expected:
                 raise StalePlan("the campaign changed during submission; plan again")
-            changed, _ = record_intent(
+            return record_intent(
                 state,
                 allocation_id=item.allocation_id,
                 task_keys=keys,
@@ -599,9 +591,8 @@ class Campaign:
                 retry=tuple(key for key in keys if key in decision.retry),
                 at=self._time(),
             )
-            return changed
 
-        return self._store.update(claim).revision
+        self._store.update(claim)
 
     def _recorded(self, allocation_id: str) -> bool:
         """Whether an intent is durable; an unreadable campaign counts as recorded."""

@@ -31,7 +31,7 @@ def intend(
     chosen = tuple(keys)
     retry = tuple(key for key in chosen if key in state.accepted_keys)
     identity = allocation_id(len(state.attempts) + 1)
-    changed, _ = record_intent(
+    changed = record_intent(
         state,
         allocation_id=identity,
         task_keys=chosen,

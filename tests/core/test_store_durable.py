@@ -107,11 +107,6 @@ def test_campaign_paths_must_name_one_directory(path: str) -> None:
         Store.open(path)
 
 
-def test_create_rejects_non_states(tmp_path: Path) -> None:
-    with pytest.raises(ConfigurationError, match="campaign State"):
-        Store.create(tmp_path / "campaign", "state")  # pyright: ignore[reportArgumentType]
-
-
 # --- unsafe filesystem -----------------------------------------------------------------------
 
 
@@ -312,8 +307,6 @@ def test_failed_change_leaves_state_untouched(tmp_path: Path) -> None:
 
     with pytest.raises(Conflict, match="no"):
         store.update(broken)
-    with pytest.raises(TypeError, match="must return a State"):
-        store.update(lambda state: "x")  # pyright: ignore[reportArgumentType, reportUnknownLambdaType]
     assert (path / "campaign.json").read_bytes() == before
 
 

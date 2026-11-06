@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC
 from typing import Any, cast
 
 import pytest
@@ -209,12 +209,6 @@ def test_results_ready_requires_a_sealed_roster_of_valid_results() -> None:
     assert not view(roster(2), results={"task-0": ResultState.VALID}).results_ready
     statuses = view(roster(2), results={"task-0": ResultState.MISSING}).tasks
     assert [task.result for task in statuses] == [ResultState.MISSING, ResultState.UNOBSERVED]
-
-
-def test_observed_at_must_be_utc() -> None:
-    for at in (datetime(2030, 1, 1), datetime(2030, 1, 1, tzinfo=timezone(timedelta(hours=2)))):  # noqa: DTZ001
-        with pytest.raises(ConfigurationError, match="aware UTC"):
-            project(roster(1), evidence(), {}, scheduler_observed=False, observed_at=at)
 
 
 def test_classify_results_from_one_probe_answer() -> None:

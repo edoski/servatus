@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import StrEnum
 from typing import cast
 
@@ -148,8 +148,6 @@ def project(
 ) -> Status:
     """Project ``state`` with scheduler evidence and probe ``results`` (by Task key; absent keys
     are UNOBSERVED) into one ``Status``."""
-    if not isinstance(observed_at, datetime) or observed_at.utcoffset() != timedelta(0):
-        raise ConfigurationError("observed_at must be an aware UTC datetime")
     attempts: list[AttemptStatus] = []
     current: dict[str, tuple[AttemptStatus, int]] = {}
     for attempt in state.attempts:
