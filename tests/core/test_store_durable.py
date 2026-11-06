@@ -88,9 +88,16 @@ def test_open_missing_campaigns_is_not_found(tmp_path: Path) -> None:
         Store.open(tmp_path / "bare")
 
 
-@pytest.mark.parametrize("path", ["", "a\0b", "/"])
-def test_campaign_paths_must_name_one_directory(path: str) -> None:
-    with pytest.raises(ConfigurationError, match="path"):
+@pytest.mark.parametrize(
+    ("path", "message"),
+    [
+        ("", "campaign path must name one directory"),
+        ("/", "campaign path must name one directory"),
+        ("a\0b", "embedded NUL"),
+    ],
+)
+def test_campaign_paths_must_name_one_directory(path: str, message: str) -> None:
+    with pytest.raises(ConfigurationError, match=message):
         Store.open(path)
 
 

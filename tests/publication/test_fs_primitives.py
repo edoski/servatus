@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from support.posix import Syscalls, mode_of
+from support.posix import Syscalls, mode_of, open_descriptors
 
 from servatus import _fs
 from servatus.errors import ConfigurationError, UnsafeFilesystem
@@ -154,10 +154,10 @@ def test_open_rejects_a_child_on_another_device(tmp_path: Path, syscalls: Syscal
 
     syscalls.os("fstat", fstat)
     with _fs.open_path(tmp_path) as directory:
-        before = len(os.listdir("/dev/fd"))
+        before = open_descriptors()
         with pytest.raises(ConfigurationError, match="filesystem boundary: mounted"):
             directory.open("mounted")
-        assert len(os.listdir("/dev/fd")) == before
+        assert open_descriptors() == before
 
 
 def test_walk_rejects_an_entry_on_another_device(tmp_path: Path, syscalls: Syscalls) -> None:

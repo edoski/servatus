@@ -1,9 +1,9 @@
 """The ``servatus`` command line: a thin adapter over the public API.
 
 Exit codes: 0 success, 1 error, 2 usage (argparse), 3 submission interrupted, 75 cluster
-unavailable, campaign busy, or reconcile still waiting for evidence, 130 interrupted. Errors are
-one ``servatus: error: ...`` line on stderr. Human output escapes non-printable characters;
-``--json`` output is exact.
+unavailable, campaign busy, a transient filesystem failure, or reconcile still waiting for
+evidence, 130 interrupted. Errors are one ``servatus: error: ...`` line on stderr. Human output
+escapes non-printable characters; ``--json`` output is exact.
 """
 
 from __future__ import annotations
