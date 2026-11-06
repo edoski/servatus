@@ -209,6 +209,7 @@ def _plan_document(plan: Plan, scripts: bool, saved: Path | None) -> dict[str, o
             del entry["script"], entry["argv"]
         allocations.append(entry)
     document.update(
+        retry=list(plan.retry),
         allocations=allocations,
         warnings=list(plan.warnings),
         saved=None if saved is None else str(saved),
@@ -228,8 +229,8 @@ def _print_plan(plan: Plan, scripts: bool, saved: Path | None) -> None:
     for item in plan.allocations:
         print(f"  {item.allocation_id}  {_plural(len(item.task_keys), 'Task')}, {_shape(item)}")
         print(f"    {_keys(item.task_keys)}")
-    if decision.retry:
-        print(f"retry: {_keys(decision.retry)}")
+    if plan.retry:
+        print(f"retry: {_keys(plan.retry)}")
     print(f"held: {_plural(len(decision.held), 'Task')}")
     reasons: dict[str, list[str]] = {}
     for key, hold in decision.held.items():

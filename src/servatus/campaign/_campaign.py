@@ -300,7 +300,6 @@ class Campaign:
             selected=selected,
             held=selection.held,
             deferred=deferred,
-            retry=selection.retry,
             tasks_per_allocation=cap,
             probe_required=self._probe is not None,
         )
@@ -564,7 +563,8 @@ class Campaign:
         if state.revision != decision.revision:
             raise StalePlan("the campaign changed after planning; plan again")
         keys = decision.selected
-        retry = frozenset(decision.retry).intersection(keys)
+        past = history(state)
+        retry = frozenset(key for key in keys if past[key].accepted)
         try:
             selection = self._select(state, Request(retry, frozenset(keys)))
         except PlanRefused as error:
@@ -593,7 +593,6 @@ class Campaign:
                 allocation_id=item.allocation_id,
                 task_keys=keys,
                 profile=decision.profile,
-                retry=tuple(key for key in keys if key in decision.retry),
                 at=self._time(),
             )
 

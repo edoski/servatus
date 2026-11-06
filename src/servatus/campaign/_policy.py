@@ -93,12 +93,10 @@ class Request:
 
 @dataclass(frozen=True, slots=True)
 class Selection:
-    """Selected Task keys in roster order, the reason for every other Task, and the subset of
-    ``selected`` that resubmits accepted work (``retry``)."""
+    """Selected Task keys in roster order and the reason for every other Task."""
 
     selected: tuple[str, ...]
     held: Mapping[str, Hold]
-    retry: tuple[str, ...]
 
 
 def scope(state: State, request: Request) -> tuple[tuple[Task, ...], tuple[str, ...]]:
@@ -155,11 +153,7 @@ def decide(
         ]
         keys = tuple(dict.fromkeys(key for keys in refused.values() for key in keys))
         raise PlanRefused("plan refused; " + "; ".join(reasons), keys=keys)
-    return Selection(
-        selected=tuple(selected),
-        held=MappingProxyType(held),
-        retry=tuple(key for key in selected if past[key].accepted),
-    )
+    return Selection(tuple(selected), MappingProxyType(held))
 
 
 def _judge(

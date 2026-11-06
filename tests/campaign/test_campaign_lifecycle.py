@@ -97,7 +97,7 @@ def test_sweep_from_creation_through_failure_retry_and_saved_plans(world: World)
     world.fake.purge(1001)
     assert campaign.status().quiescent
     retry = campaign.plan(cpu_profile(), retry=Retry.FAILED)
-    assert retry.decision.selected == retry.decision.retry == ("task-4",)
+    assert retry.decision.selected == retry.retry == ("task-4",)
     assert dict(retry.decision.held) == {
         **dict.fromkeys(keys(4), Hold.VALID),
         "task-5": Hold.SUBMITTED,

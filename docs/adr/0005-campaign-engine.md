@@ -21,7 +21,9 @@ through `servatus.testing.FakeScheduler`, passed as `connect`, instead of patchi
 ## State
 
 > Superseded in part by [ADR 0007](0007-run-markers.md): the document is schema 8, with integer job
-> numbers and no duplicate-risk field; schema 7 is rejected.
+> numbers and no duplicate-risk field; schema 7 is rejected. Schema 8 also stores no fact that
+> history derives: an Attempt has no `acceptance` or `retry` field, and a plan's Decision has no
+> `retry` field.
 
 `State` validates its complete invariant whenever it is constructed, in time linear in Tasks plus
 attempted Task references, so an invalid state can be neither written nor read. Transitions are

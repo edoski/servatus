@@ -51,10 +51,8 @@ def once(observation: Observation) -> tuple[State, dict[str, Observation]]:
 
 
 def outcome(selection: Selection) -> str | Hold:
-    """``selected``, ``retry`` (selected resubmission), or the hold reason for ``KEY``."""
-    if KEY in selection.selected:
-        return "retry" if KEY in selection.retry else "selected"
-    return selection.held[KEY]
+    """``selected`` or the hold reason for ``KEY``."""
+    return "selected" if KEY in selection.selected else selection.held[KEY]
 
 
 # --- hold order ------------------------------------------------------------------------------
@@ -71,7 +69,7 @@ def test_holds_apply_in_their_documented_order() -> None:
     accepted, identity = submit(roster(1), [KEY])
     assert outcome(choose(accepted, {identity: RUNNING})) == Hold.SUBMITTED
     assert outcome(choose(accepted, {identity: RUNNING}, retry=Retry.FAILED)) == Hold.ACTIVE
-    assert outcome(choose(accepted, {identity: FAILED}, retry=Retry.FAILED)) == "retry"
+    assert outcome(choose(accepted, {identity: FAILED}, retry=Retry.FAILED)) == "selected"
 
 
 # --- fresh work ------------------------------------------------------------------------------
@@ -109,7 +107,7 @@ def test_only_limits_the_plan_and_overrides_retry() -> None:
     state, identity = submit(roster(3), ["task-1"])
     observations = {identity: FAILED}
     selection = choose(state, observations, only=["task-0", "task-1"], retry=["task-1", "task-2"])
-    assert (selection.selected, selection.retry) == (("task-0", "task-1"), ("task-1",))
+    assert selection.selected == ("task-0", "task-1")
     assert dict(selection.held) == {"task-2": Hold.NOT_REQUESTED}
     assert choose(state, only=()).held == {
         "task-0": Hold.NOT_REQUESTED,
@@ -154,14 +152,14 @@ def test_any_live_accepted_attempt_holds_the_task_not_only_the_current_one() -> 
     assert outcome(choose(state, observations, retry=Retry.FAILED)) == Hold.ACTIVE
     with pytest.raises(PlanRefused, match="Slurm still lists earlier work"):
         choose(state, observations, retry=[KEY])
-    assert outcome(choose(state, {first: LOST, second: FAILED}, retry=Retry.FAILED)) == "retry"
+    assert outcome(choose(state, {first: LOST, second: FAILED}, retry=Retry.FAILED)) == "selected"
 
 
 def test_a_stray_holds_a_retried_task_active() -> None:
     state, first = submit(roster(1), [KEY])
     state, stray = submit(state, [KEY], accepted=False)
     observations = {first: FAILED}
-    assert outcome(choose(state, observations, retry=Retry.FAILED)) == "retry"
+    assert outcome(choose(state, observations, retry=Retry.FAILED)) == "selected"
     strays = {stray: 501}
     assert outcome(choose(state, observations, strays=strays, retry=Retry.FAILED)) == Hold.ACTIVE
     assert outcome(choose(state, observations, strays=strays)) == Hold.SUBMITTED
@@ -175,9 +173,9 @@ def test_a_stray_holds_a_retried_task_active() -> None:
 @pytest.mark.parametrize(
     ("observation", "expected"),
     [
-        (FAILED, "retry"),
-        (STOPPED, "retry"),
-        (NEVER_STARTED, "retry"),
+        (FAILED, "selected"),
+        (STOPPED, "selected"),
+        (NEVER_STARTED, "selected"),
         (LOST, Hold.SUBMITTED),
         (SUCCEEDED, Hold.SUBMITTED),
     ],
@@ -192,9 +190,9 @@ def test_retry_failed_selects_failed_and_stopped_work(
 @pytest.mark.parametrize(
     ("observation", "result", "expected"),
     [
-        (SUCCEEDED, R.MISSING, "retry"),
-        (FAILED, R.MISSING, "retry"),
-        (STOPPED, R.MISSING, "retry"),
+        (SUCCEEDED, R.MISSING, "selected"),
+        (FAILED, R.MISSING, "selected"),
+        (STOPPED, R.MISSING, "selected"),
         (LOST, R.MISSING, Hold.SUBMITTED),
         (SUCCEEDED, R.UNOBSERVED, Hold.SUBMITTED),
         (SUCCEEDED, None, Hold.SUBMITTED),
@@ -217,7 +215,7 @@ def test_the_current_execution_is_the_latest_accepted_attempts() -> None:
         Hold.SUBMITTED
     )
     assert outcome(choose(state, {first: SUCCEEDED, second: STOPPED}, retry=Retry.FAILED)) == (
-        "retry"
+        "selected"
     )
 
 
@@ -228,7 +226,6 @@ def test_bulk_selection_mixes_fresh_and_resubmitted_work_in_roster_order() -> No
     observations = {first: seen(None, 1, 0), second: STOPPED}
     selection = choose(state, observations, retry=Retry.FAILED)
     assert selection.selected == ("task-0", "task-1", "task-3")
-    assert selection.retry == ("task-1", "task-3")
     assert dict(selection.held) == {"task-2": Hold.SUBMITTED}
     with pytest.raises(TypeError, match="does not support item assignment"):
         selection.held["x"] = Hold.VALID  # pyright: ignore[reportIndexIssue]
@@ -253,7 +250,7 @@ def test_an_explicit_key_selects_any_purged_work_without_a_valid_result(
     state, observations = once(observation)
     results = {} if result is None else {KEY: result}
     selection = choose(state, observations, results, retry=[KEY])
-    assert selection.selected == selection.retry == (KEY,)
+    assert selection.selected == (KEY,)
 
 
 def test_unresolved_work_is_held_even_when_retried() -> None:
@@ -448,15 +445,12 @@ def test_policy_safety_properties(
     assert set(selection.selected).isdisjoint(selection.held)
     assert set(selection.selected) | set(selection.held) == set(KEYS)
     assert selection.selected == tuple(key for key in KEYS if key in selection.selected)
-    assert selection.retry == tuple(
-        key for key in selection.selected if history(state, key, AcceptanceState.ACCEPTED)
-    )
     for key in selection.selected:
         assert only is None or key in only
         assert results.get(key) is not ResultState.VALID
         assert not history(state, key, AcceptanceState.UNRESOLVED)
         assert not busy(state, observed, key)
-        if key not in selection.retry:
+        if not history(state, key, AcceptanceState.ACCEPTED):
             continue
         assert isinstance(retry, Retry) or key in retry
         if retry is Retry.FAILED:
@@ -476,7 +470,6 @@ def test_policy_safety_properties(
             allocation_id="f" * 24,
             task_keys=selection.selected,
             profile=profile(),
-            retry=selection.retry,
             at=NOW,
         )
 

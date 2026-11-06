@@ -150,11 +150,12 @@ def project(
     are UNOBSERVED) into one ``Status``."""
     attempts: list[AttemptStatus] = []
     current: dict[str, tuple[AttemptStatus, int]] = {}
+    accepted: set[str] = set()
     for attempt in state.attempts:
         projected = AttemptStatus(
             allocation_id=attempt.allocation_id,
             task_keys=attempt.task_keys,
-            retry=attempt.retry,
+            retry=tuple(key for key in attempt.task_keys if key in accepted),
             profile_label=attempt.profile.label,
             acceptance=attempt.acceptance,
             job=attempt.job,
@@ -164,6 +165,8 @@ def project(
             ),
         )
         attempts.append(projected)
+        if attempt.acceptance is AcceptanceState.ACCEPTED:
+            accepted.update(attempt.task_keys)
         if attempt.acceptance is not AcceptanceState.NOT_SUBMITTED:
             # The State invariant makes an unresolved Attempt the last one naming its Tasks.
             current.update((key, (projected, slot)) for slot, key in enumerate(attempt.task_keys))

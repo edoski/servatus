@@ -147,7 +147,7 @@ tasks = [
 ]
 campaign = Campaign.ensure("state", tasks, probe=finished)
 plan = campaign.plan(Profile.load("SERVATUS.toml"))
-decision = plan.decision  # what you review: selected, held, deferred, retry choices
+decision = plan.decision  # what you review: selected, held, and deferred Tasks
 print(f"{len(decision.selected)} selected, {len(decision.held)} held")
 receipts = campaign.submit(plan).receipts
 ```

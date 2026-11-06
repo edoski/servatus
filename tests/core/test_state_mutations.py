@@ -36,15 +36,14 @@ TOP = {
     "profiles",
     "attempts",
 }
-TASK = {"key", "args", "stdin", "env", "revision"}
+ROSTER_ENTRY = {"task", "revision"}
+TASK = {"key", "args", "stdin", "env"}
 ATTEMPT = {
     "allocation_id",
     "task_keys",
     "profile",
-    "retry",
     "intent_revision",
     "intent_at",
-    "acceptance",
     "job",
     "outcome_revision",
 }
@@ -146,11 +145,13 @@ def check(doc: Any) -> None:
     introduced: dict[str, int] = {}
     order: list[str] = []
     for item in doc["tasks"]:
-        need(is_dict(item) and set(item) == TASK)
-        need(is_text(item["key"]) and item["key"] != "")
-        need(is_strings(item["args"]) and all(is_text(arg) for arg in item["args"]))
-        need(canonical_base64(item["stdin"]))
-        env = item["env"]
+        need(is_dict(item) and set(item) == ROSTER_ENTRY)
+        task = item["task"]
+        need(is_dict(task) and set(task) == TASK)
+        need(is_text(task["key"]) and task["key"] != "")
+        need(is_strings(task["args"]) and all(is_text(arg) for arg in task["args"]))
+        need(canonical_base64(task["stdin"]))
+        env = task["env"]
         need(is_dict(env))
         for name, value in env.items():
             need(ENV_NAME.fullmatch(name) is not None and not name.startswith("SERVATUS_"))
@@ -159,9 +160,9 @@ def check(doc: Any) -> None:
         need(is_int(when) and 0 <= when <= revision)
         need(not order or when >= introduced[order[-1]])
         need(sealed is None or when <= sealed)
-        need(item["key"] not in introduced)
-        introduced[item["key"]] = when
-        order.append(item["key"])
+        need(task["key"] not in introduced)
+        introduced[task["key"]] = when
+        order.append(task["key"])
     events = {when for when in introduced.values() if when}
     if sealed:
         need(sealed not in events)
@@ -186,19 +187,11 @@ def check(doc: Any) -> None:
         need(is_int(intent) and 1 <= intent <= revision and intent not in events)
         need(not prior or intent > prior[-1]["intent_revision"])
         events.add(intent)
-        keys, retry = raw["task_keys"], raw["retry"]
-        need(is_strings(keys) and is_strings(retry))
+        keys = raw["task_keys"]
+        need(is_strings(keys))
         need(bool(keys) and len(set(keys)) == len(keys))
         need(all(key in introduced and introduced[key] < intent for key in keys))
         need([key for key in order if key in keys] == keys)
-        need([key for key in keys if key in retry] == retry)
-        earlier = {
-            key
-            for other in prior
-            if other["acceptance"] == "ACCEPTED" and other["outcome_revision"] < intent
-            for key in other["task_keys"]
-        }
-        need([key for key in keys if key in earlier] == retry)
         need(
             not any(
                 set(other["task_keys"]) & set(keys)
@@ -207,26 +200,15 @@ def check(doc: Any) -> None:
             )
         )
         need(canonical_utc(raw["intent_at"]))
-        acceptance, outcome, job = raw["acceptance"], raw["outcome_revision"], raw["job"]
-        need(acceptance in ("UNRESOLVED", "ACCEPTED", "NOT_SUBMITTED"))
-        if acceptance == "UNRESOLVED":
-            need(outcome is None and job is None)
+        outcome, job = raw["outcome_revision"], raw["job"]
+        need(job is None or (is_int(job) and job >= 1))
+        if outcome is None:
+            need(job is None)
         else:
             need(is_int(outcome) and intent < outcome <= revision and outcome not in events)
             events.add(outcome)
-            if acceptance == "ACCEPTED":
-                need(is_int(job) and job >= 1)
-            else:
-                need(job is None)
         need(isinstance(raw["profile"], str) and raw["profile"] in loaded)
         used.add(raw["profile"])
-        chosen = loaded[raw["profile"]]
-        count, request, route = len(keys), chosen.resources, chosen.target
-        need(count <= route.max_tasks_per_allocation)
-        need(count * request.cpus <= route.max_cpus_per_allocation)
-        need(count * request.memory_mib <= route.max_memory_mib_per_allocation)
-        need(count * request.gpus <= route.max_gpus_per_allocation)
-        need(request.time_limit <= route.max_time_limit)
         prior.append(raw)
     need(used == set(doc["profiles"]))
     need(revision == max(events, default=0))

@@ -102,7 +102,7 @@ def test_batch_cap_defers_eligible_tasks_and_keeps_retry_intent(world: World) ->
     retry = campaign.plan(single, retry=Retry.FAILED, tasks_per_allocation=2)
     assert retry.decision.selected == keys(0, 1)
     assert retry.decision.deferred == keys(*range(2, 11))
-    assert retry.decision.retry == keys(*range(6))  # deferred retries stay visible
+    assert retry.retry == keys(*range(6))  # deferred retries stay visible
     campaign.submit(retry)
     following = campaign.plan(single, retry=Retry.FAILED, tasks_per_allocation=2)
     assert following.decision.selected == keys(2, 3)
@@ -179,7 +179,7 @@ def test_every_hold_reason_is_reported(world: World) -> None:
         "task-5": Hold.UNRESOLVED,
     }
     only = campaign.plan(cpu_profile(), retry=["task-2", "task-3"], only=["task-2", "task-3"])
-    assert only.decision.selected == only.decision.retry == ("task-2", "task-3")
+    assert only.decision.selected == only.retry == ("task-2", "task-3")
     assert only.decision.held["task-4"] is Hold.NOT_REQUESTED
     incomplete = campaign.plan(cpu_profile(), retry=Retry.INCOMPLETE)
     assert incomplete.decision.selected == ("task-2", "task-4")
@@ -199,7 +199,7 @@ def test_retry_failed_waits_for_slurm_to_forget_the_job(world: World) -> None:
     world.fake.purge(1000)
     world.fake.purge(1001)
     plan = campaign.plan(cpu_profile(), retry=Retry.FAILED)
-    assert plan.decision.selected == plan.decision.retry == ("task-0", "task-1")
+    assert plan.decision.selected == plan.retry == ("task-0", "task-1")
 
 
 def test_lost_work_is_retried_only_by_its_explicit_key(world: World) -> None:
@@ -211,7 +211,7 @@ def test_lost_work_is_retried_only_by_its_explicit_key(world: World) -> None:
     bulk = campaign.plan(cpu_profile(), retry=Retry.FAILED)
     assert bulk.decision.selected == () and bulk.decision.held["task-0"] is Hold.SUBMITTED
     explicit = campaign.plan(cpu_profile(), retry=["task-0"])
-    assert explicit.decision.selected == explicit.decision.retry == ("task-0",)
+    assert explicit.decision.selected == explicit.retry == ("task-0",)
     assert campaign.submit(explicit).receipts[0].job == 1001
 
 
@@ -359,7 +359,6 @@ def test_plans_of_the_same_state_have_distinct_identities(world: World) -> None:
         ("selected", ["task-0"], ConfigurationError, "partition the campaign roster"),
         ("probe_required", True, ConfigurationError, "digest does not match"),
         ("nonce", "c" * 32, ConfigurationError, "digest does not match"),
-        ("retry", ["task-0"], ConfigurationError, "retry keys disagree"),
         ("format", "servatus.plan/1", ConfigurationError, "expected format"),
         ("surprise", 1, ConfigurationError, "unknown keys"),
     ],

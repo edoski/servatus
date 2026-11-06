@@ -27,16 +27,13 @@ def roster(count: int = 3, *, appendable: bool = False) -> State:
 def intend(
     state: State, keys: Iterable[str], *, profile_value: Profile | None = None
 ) -> tuple[State, str]:
-    """Record intent for ``keys`` with the retry choices the invariant demands."""
-    chosen = tuple(keys)
-    retry = tuple(key for key in chosen if key in state.accepted_keys)
+    """Record intent for ``keys``; the identity numbers the Attempt."""
     identity = allocation_id(len(state.attempts) + 1)
     changed = record_intent(
         state,
         allocation_id=identity,
-        task_keys=chosen,
+        task_keys=tuple(keys),
         profile=profile_value or profile(),
-        retry=retry,
         at=NOW + timedelta(minutes=len(state.attempts)),
     )
     return changed, identity

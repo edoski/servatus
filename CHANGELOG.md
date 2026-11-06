@@ -13,6 +13,9 @@ Servatus no longer needs Slurm accounting. See
 
 - Campaign state uses schema 8 and saved plans are tagged `servatus.plan/2`. Schema 7 state and
   `servatus.plan/1` files from 0.12 are rejected; finish or abandon 0.12 campaigns with 0.12.
+  Schema 8 stores only what history cannot derive: an Attempt keeps its job and outcome revision
+  (no `acceptance` or `retry`), and each roster entry nests its Task under `"task"`. A saved
+  plan's Decision has no `retry`; `Plan.retry` derives it, and `servatus plan --json` shows it.
 - Observation reads `squeue --me --all --states=all` and empty run markers that each batch script
   writes to `log_root` (`<allocation>.<job>.start`, `<allocation>.<job>.<slot>.<exit code>.end`,
   `<allocation>.<job>.stop`), never `sacct`. An outcome is decided only after Slurm purges the job

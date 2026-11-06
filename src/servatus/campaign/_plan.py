@@ -22,7 +22,7 @@ from . import _codec
 from ._config import Profile, Resources, StrPath, Target, Task
 from ._policy import Hold
 from ._script import check_command, render_batch, sbatch_argv
-from ._state import State
+from ._state import State, history
 
 PLAN_FORMAT = "servatus.plan/2"
 
@@ -33,9 +33,8 @@ class Decision:
 
     ``selected`` Tasks are packed into this plan's allocations; ``deferred`` Tasks were eligible
     but exceed the target's ``max_allocations_per_submit``; every other Task is ``held`` with
-    one reason. ``retry`` lists the selected or deferred Tasks that resubmit accepted work.
-    ``nonce`` makes every plan's
-    allocation identities unique, even for copies of the same Campaign state.
+    one reason. ``nonce`` makes every plan's allocation identities unique, even for copies of
+    the same Campaign state.
     """
 
     campaign_id: str
@@ -45,7 +44,6 @@ class Decision:
     selected: tuple[str, ...]
     held: Mapping[str, Hold]
     deferred: tuple[str, ...]
-    retry: tuple[str, ...]
     tasks_per_allocation: int
     probe_required: bool
 
@@ -69,7 +67,8 @@ class PlannedAllocation:
 
 @dataclass(frozen=True, slots=True)
 class Plan:
-    """A reviewed ``decision`` plus its derived allocations and digest.
+    """A reviewed ``decision`` plus what it derives: allocations, the digest, and ``retry``, the
+    selected or deferred Tasks that resubmit accepted work.
 
     Scripts and argv contain Task arguments, environment, and stdin: treat them as sensitive.
     ``to_json`` and ``save`` write only the Decision and digest.
@@ -78,6 +77,7 @@ class Plan:
     decision: Decision
     allocations: tuple[PlannedAllocation, ...]
     digest: str
+    retry: tuple[str, ...]
 
     @property
     def warnings(self) -> tuple[str, ...]:
@@ -194,11 +194,8 @@ def _check(state: State, decision: Decision) -> None:
     parts = (decision.selected, tuple(decision.held), decision.deferred)
     if sorted(key for part in parts for key in part) != sorted(roster):
         raise ConfigurationError("plan Tasks do not partition the campaign roster")
-    eligible = decision.selected + decision.deferred
-    if frozenset(decision.retry) != state.accepted_keys.intersection(eligible):
-        raise ConfigurationError("plan retry keys disagree with accepted Campaign history")
     position = {key: index for index, key in enumerate(roster)}
-    for part in (decision.selected, decision.deferred, decision.retry):
+    for part in (decision.selected, decision.deferred):
         if list(part) != sorted(part, key=position.__getitem__):
             raise ConfigurationError("plan Task keys are not in roster order")
     _, over = batch(decision.selected, decision.profile.target, decision.tasks_per_allocation)
@@ -243,4 +240,6 @@ def build_plan(state: State, decision: Decision) -> Plan:
         )
     scripts = [hashlib.sha256(item.script).hexdigest() for item in allocations]
     digest = _codec.digest({"decision": document, "scripts": scripts})
-    return Plan(decision, tuple(allocations), digest)
+    past = history(state)
+    retry = tuple(key for key in decision.selected + decision.deferred if past[key].accepted)
+    return Plan(decision, tuple(allocations), digest, retry)

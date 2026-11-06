@@ -21,7 +21,6 @@ from pathlib import PurePosixPath
 from typing import Any, TypeGuard, TypeVar, Union, cast, get_args, get_origin, get_type_hints
 
 T = TypeVar("T")
-FLATTEN: Mapping[str, object] = {"codec.flatten": True}
 
 _HEX = re.compile(r"[0-9a-f]+\Z")
 _DURATION = re.compile(r"(?:(0|[1-9][0-9]*)-)?([0-9]+):([0-5][0-9]):([0-5][0-9])\Z")
@@ -106,21 +105,10 @@ def decode_json(data: bytes) -> object:
 
 
 @cache
-def _slots(cls: type) -> tuple[tuple[str, Any, bool], ...]:
-    """Each field's name, type hint, and whether its keys are flattened into the parent."""
+def _fields(cls: type) -> dict[str, Any]:
+    """Each field's name and type hint, in declaration order."""
     hints = get_type_hints(cls)
-    return tuple(
-        (field.name, hints[field.name], bool(field.metadata.get("codec.flatten")))
-        for field in dataclasses.fields(cls)
-    )
-
-
-@cache
-def _keys(cls: type) -> frozenset[str]:
-    names: set[str] = set()
-    for name, hint, flatten in _slots(cls):
-        names.update(_keys(hint) if flatten else {name})
-    return frozenset(names)
+    return {field.name: hints[field.name] for field in dataclasses.fields(cls)}
 
 
 def dump(value: object) -> object:
@@ -159,19 +147,8 @@ def _encoder(tp: type[Any]) -> Callable[[Any], object]:
     if issubclass(tp, timedelta):
         return format_duration
     if dataclasses.is_dataclass(tp):
-        plan = _slots(tp)
-
-        def encode(value: object) -> dict[str, object]:
-            out: dict[str, object] = {}
-            for name, _, flatten in plan:
-                item: object = getattr(value, name)
-                if flatten:
-                    out.update(cast(dict[str, object], dump(item)))
-                else:
-                    out[name] = dump(item)
-            return out
-
-        return encode
+        names = tuple(_fields(tp))
+        return lambda value: {name: dump(getattr(value, name)) for name in names}
     if issubclass(tp, (tuple, list)):
         return lambda value: [dump(item) for item in cast(Sequence[object], value)]
     if issubclass(tp, Mapping):
@@ -200,8 +177,8 @@ def _load(hint: Any, data: object, path: str) -> object:
         if len(args) != 2 or len(inner) != 1:
             raise TypeError(f"unsupported union {hint!r}")
         return None if data is None else _load(inner[0], data, path)
-    if origin in (tuple, Sequence):
-        if origin is tuple and (len(args) != 2 or args[1] is not Ellipsis):
+    if origin is tuple:
+        if len(args) != 2 or args[1] is not Ellipsis:
             raise TypeError(f"unsupported tuple {hint!r}")
         if type(data) is not list:
             raise _fail(path, "array")
@@ -256,15 +233,11 @@ def _object(cls: type, data: object, path: str) -> object:
     if type(data) is not dict:
         raise _fail(path, "object")
     mapping = cast(dict[str, object], data)
-    if unknown := mapping.keys() - _keys(cls):
+    hints = _fields(cls)
+    if unknown := mapping.keys() - hints.keys():
         raise CodecError(f"{path}: unknown keys {sorted(unknown)}")
-    values: dict[str, object] = {}
-    for name, hint, flatten in _slots(cls):
-        if flatten:
-            inner = {key: mapping[key] for key in _keys(hint) & mapping.keys()}
-            values[name] = _object(hint, inner, path)
-        elif name in mapping:
-            values[name] = _load(hint, mapping[name], f"{path}.{name}")
-        else:
-            raise CodecError(f"{path}: missing key {name!r}")
-    return cls(**values)
+    if missing := [name for name in hints if name not in mapping]:
+        raise CodecError(f"{path}: missing key {missing[0]!r}")
+    return cls(
+        **{name: _load(hint, mapping[name], f"{path}.{name}") for name, hint in hints.items()}
+    )

@@ -106,7 +106,7 @@ Campaign state is an owner-only directory. It keeps complete Task arguments, std
 for retry; keep it private.
 
 Plan files (`servatus.plan/2`) retain the resolved Target and Resources, Task keys with their hold
-reasons, retry choices, and the nonce from which allocation identities derive. They exclude Task
+reasons, and the nonce from which allocation identities derive. They exclude Task
 arguments, stdin, and environment but remain private operational data. `Plan.save` and `servatus plan --output` write them with mode
 `0600` and never overwrite an existing file. `--show-scripts` prints complete scripts, including
 Task payloads; treat that output as sensitive. Submission rebuilds each plan from its decision and
