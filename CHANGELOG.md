@@ -6,7 +6,7 @@ All notable changes to Servatus are recorded here. The format follows
 
 ## [Unreleased]
 
-## [0.13.0]
+## [0.13.0] - 2026-11-06
 
 Servatus no longer needs Slurm accounting, and a new cluster is a new profile, not new code. It
 observes work from `squeue` and empty run markers each batch script writes (see
