@@ -17,7 +17,7 @@ from support.builders import target
 
 from servatus.campaign._evidence import End, QueueRow, Start, Stop
 from servatus.campaign._remote import Completed
-from servatus.campaign._scheduler import WRITABLE_DIRECTORY, Scheduler
+from servatus.campaign._scheduler import WRITABLE_DIRECTORY, CommandFailed, Scheduler
 from servatus.errors import ConfigurationError, EvidenceConflict, Unavailable
 
 SBATCH = f"{SLURM_BIN}/sbatch"
@@ -45,7 +45,7 @@ FIND = (
 
 
 def scheduler(transport: Scripted) -> Scheduler:
-    return Scheduler(transport, target(slurm_bin=SLURM_BIN))
+    return Scheduler(transport, target(slurm_bin=SLURM_BIN, log_root=LOG_ROOT))
 
 
 def squeue_argv(*allocation_ids: str) -> tuple[str, ...]:
@@ -133,7 +133,7 @@ def test_markers_of_a_few_allocations_are_named_exactly_in_one_read() -> None:
         f"{allocation(7)}.44.start",
     )
     transport = Scripted().queue("find", ok(reply))
-    found = scheduler(transport).markers(ROOT, {ALLOCATION: 2, other: 1})
+    found = scheduler(transport).markers({ALLOCATION: 2, other: 1})
     names = tuple(sorted((f"{ALLOCATION}.*", f"{other}.*")))
     assert transport.calls == [(*FIND[:8], "-name", names[0], "-o", "-name", names[1], ")")]
     assert found == {ALLOCATION: (Start(42), End(42, 1, 3)), other: (Stop(43),)}
@@ -142,7 +142,7 @@ def test_markers_of_a_few_allocations_are_named_exactly_in_one_read() -> None:
 def test_exact_names_stay_within_the_argument_bound() -> None:
     ids = {allocation(index): 1 for index in range(8)}
     transport = Scripted()
-    scheduler(transport).markers(ROOT, ids)
+    scheduler(transport).markers(ids)
     assert len(transport.calls) == 1 and len(transport.calls[0]) == 32
     assert transport.calls[0][9::3] == tuple(sorted(f"{name}.*" for name in ids))
 
@@ -151,7 +151,7 @@ def test_markers_split_the_listing_by_leading_hex_digit_only_when_large() -> Non
     first, second, third = f"a{ALLOCATION[1:]}", f"3{ALLOCATION[1:]}", f"a{allocation(1)[1:]}"
     many = {allocation(index): 4 for index in range(10, 19)}
     small = Scripted()
-    scheduler(small).markers(ROOT, many)
+    scheduler(small).markers(many)
     assert small.calls == [FIND]
 
     large = Scripted().queue(
@@ -160,7 +160,7 @@ def test_markers_split_the_listing_by_leading_hex_digit_only_when_large() -> Non
         ok(listing(f"{first}.10.start", f"{third}.11.stop")),
     )
     extra = {f"a{allocation(index)[1:]}": 1 for index in range(20, 26)}
-    found = scheduler(large).markers(ROOT, {first: 20_000, second: 20_000, third: 1} | extra)
+    found = scheduler(large).markers({first: 20_000, second: 20_000, third: 1} | extra)
     assert [call[9::3] for call in large.calls] == [
         ("3*.start", "3*.stop", "3*.end"),
         ("a*.start", "a*.stop", "a*.end"),
@@ -189,13 +189,13 @@ def test_markers_split_the_listing_by_leading_hex_digit_only_when_large() -> Non
 )
 def test_marker_listing_failure_or_stderr_is_unavailable(failure: Completed, message: str) -> None:
     with pytest.raises(Unavailable, match=message):
-        scheduler(Scripted().queue("find", failure)).markers(ROOT, {ALLOCATION: 1})
+        scheduler(Scripted().queue("find", failure)).markers({ALLOCATION: 1})
 
 
 def test_malformed_marker_listing_is_a_conflict() -> None:
     transport = Scripted().queue("find", ok(listing(f"{ALLOCATION}.42.0.256.end")))
     with pytest.raises(EvidenceConflict, match=f"allocation {ALLOCATION} has a malformed"):
-        scheduler(transport).markers(ROOT, {ALLOCATION: 1})
+        scheduler(transport).markers({ALLOCATION: 1})
 
 
 # --- submit, test_only, ping -----------------------------------------------------------------
@@ -356,10 +356,13 @@ def test_config_failure_is_unavailable() -> None:
 
 
 def test_writable_directory_asks_a_shell_and_reads_its_status() -> None:
-    transport = Scripted().queue("sh", ok(""), Completed(1, b"", b""), Completed(2, b"", b"x\n"))
+    replies = (ok(""), Completed(1, b"", b""), Completed(2, b"", b"x\n"), Completed(-9, b"", b""))
+    transport = Scripted().queue("sh", *replies)
     path = PurePosixPath("/cluster/logs")
     assert scheduler(transport).writable_directory(path) is True
     assert transport.calls[0] == (*WRITABLE_DIRECTORY, str(path))
     assert scheduler(transport).writable_directory(path) is False
-    with pytest.raises(Unavailable, match="checking /cluster/logs failed with exit status 2: x"):
+    with pytest.raises(CommandFailed, match="checking /cluster/logs failed with exit status 2: x"):
+        scheduler(transport).writable_directory(path)
+    with pytest.raises(CommandFailed, match="exit status -9"):
         scheduler(transport).writable_directory(path)

@@ -79,9 +79,9 @@ on every client to use Servatus, and a mount with coherent `flock` and stable in
 ## Campaigns
 
 Task arguments, stdin, and environment values are written into the submitted batch script (stdin as
-`printf` literals, environment as `APPTAINERENV_*` assignments or `env -i` arguments). Cluster
-administrators and accounting systems may read them. Do not put credentials or other secrets in
-Tasks. The batch script creates no scratch files.
+`printf` literals, environment as `/usr/bin/env` arguments of each step). Cluster administrators,
+accounting systems, and other users on the node (process listings) may read them. Do not put
+credentials or other secrets in Tasks. The batch script creates no scratch files.
 
 Values in a repository-owned `SERVATUS.toml` are editable user-side guardrails, not an enforcement
 boundary; Profile labels are nonbinding provenance. Slurm remains authoritative for identity,

@@ -39,18 +39,19 @@ Servatus no longer needs Slurm accounting. See
   `fail`, or `unavailable`: Slurm 23.02 or later, `squeue` under the scrubbed environment, `MinJobAge`
   of at least 120 s, `proctrack/cgroup`, writable `work_root` and `log_root`, and a one-Task
   `sbatch --test-only`. It exits 1 if a check fails and 75 if one went unanswered. Its `--json`
-  document changes: `sbatch_version` becomes `slurm_version`, and `checks` and `verdict` are new.
+  document drops `sbatch_version` for `checks` and `verdict`.
 - `servatus.campaign.ping` is replaced by `servatus.campaign.diagnose(profile)`, which returns a
   `Diagnosis` of `Check`s with a `Verdict`.
 - Apptainer steps set their `APPTAINERENV_*` variables through `/usr/bin/env` after `srun`, the same
-  shape as the direct launcher. The `apptainer` path cannot contain `=`.
+  shape as the direct launcher, so a Task's environment now also shows in the step's command line
+  for other users on the node. The `apptainer` path cannot contain `=`.
 - `Scheduler` takes its `Target`, and the module-private checks of values only internal code produces
   are gone. `args` and `env` errors from a Task file now come from `Task`.
 
 ### Added
 
-- `constraint` accepts Slurm feature expressions (`a100|h100`, `[rack1|rack2]*2`), and `gpu_gres`
-  accepts any count-free GRES (`shard`, `mps`, `gpu:a100_80GB`).
+- `constraint` accepts Slurm feature expressions (`a100|h100`, `intel&ib`), and `gpu_gres` accepts
+  any count-free GRES (`shard`, `gpu:a100_80GB`).
 - A README section with a tested `SERVATUS.toml` for each DISI cluster and the steps to onboard a
   student on `giano`.
 - `Status.warnings`: a job Slurm lists for an allocation recorded as not submitted holds its
@@ -65,7 +66,7 @@ Servatus no longer needs Slurm accounting. See
 - A status poll over SSH could fail at the 30 s deadline when one TCP connection never opened, which
   happened about once in 50 connections from a laptop on a phone hotspot. `ssh` now gives each
   connection three attempts of 8 s. Only the connection is retried, never a command. The deadline
-  error names the command, and a failed connection reports `ssh`'s own message.
+  error names the command, and `ssh`'s own failure (exit 255) reports its message.
 
 ## [0.12.1] - 2026-10-05
 

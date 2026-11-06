@@ -30,10 +30,14 @@ MAX_NAME_PATTERNS = 8
 _MARKER_LINE_BYTES = 64
 
 
+class CommandFailed(Unavailable):
+    """The command ran and reported failure, unlike a transport that never got an answer."""
+
+
 def _require_ok(completed: Completed, what: str, *, quiet: bool = True) -> Completed:
     """``completed`` if it exited 0 (and, when ``quiet``, wrote nothing to stderr)."""
     if completed.returncode != 0 or (quiet and completed.stderr):
-        raise Unavailable(f"{what} failed with {diagnostic(completed)}")
+        raise CommandFailed(f"{what} failed with {diagnostic(completed)}")
     return completed
 
 
@@ -72,10 +76,10 @@ class Scheduler:
 
     def __init__(self, transport: Transport, target: Target) -> None:
         self._transport = transport
-        self._bin = target.slurm_bin
+        self._target = target
 
     def _command(self, name: str) -> str:
-        return str(self._bin / name)
+        return str(self._target.slurm_bin / name)
 
     def ping(self) -> str:
         """Prove the transport and Slurm client work: the ``sbatch --version`` text."""
@@ -116,8 +120,8 @@ class Scheduler:
     def writable_directory(self, path: PurePosixPath) -> bool:
         """Whether ``path`` is a directory this user can write to, without writing anything."""
         completed = self._transport.run((*WRITABLE_DIRECTORY, str(path)))
-        if completed.returncode > 1:
-            raise Unavailable(f"checking {path} failed with {diagnostic(completed)}")
+        if completed.returncode not in (0, 1):
+            raise CommandFailed(f"checking {path} failed with {diagnostic(completed)}")
         return completed.returncode == 0
 
     def queue(self, allocation_ids: Sequence[str]) -> dict[str, tuple[QueueRow, ...]]:
@@ -137,11 +141,10 @@ class Scheduler:
             rows.update((names[name], tuple(items)) for name, items in found.items())
         return rows
 
-    def markers(
-        self, log_root: PurePosixPath, task_counts: Mapping[str, int]
-    ) -> dict[str, tuple[Marker, ...]]:
-        """The run markers of each allocation (by id, with its Task count) in ``log_root``, read
-        as ``marker_patterns`` says."""
+    def markers(self, task_counts: Mapping[str, int]) -> dict[str, tuple[Marker, ...]]:
+        """The run markers of each allocation (by id, with its Task count) in the target's
+        ``log_root``, read as ``marker_patterns`` says."""
+        log_root = self._target.log_root
         allocation_ids = tuple(task_counts)
         found: dict[str, list[Marker]] = {allocation_id: [] for allocation_id in allocation_ids}
         if not allocation_ids:

@@ -15,7 +15,7 @@ _PROFILES = {
 }
 
 
-def test_every_profile_in_the_readme_loads_and_passes_doctor(tmp_path: Path) -> None:
+def test_every_profile_in_the_readme_loads_and_renders(tmp_path: Path) -> None:
     clusters = _README.read_text().partition("## Clusters")[2].partition("\n## ")[0]
     documents = re.findall(r"```toml\n(.*?)```", clusters, re.DOTALL)
     hosts = [re.search(r'^host = "(.*)"$', document, re.M) for document in documents]

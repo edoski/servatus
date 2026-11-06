@@ -191,7 +191,6 @@ def test_machine_output_for_every_data_command(cli: Cli) -> None:
         "profile": "cpu",
         "host": "login.example.edu",
         "slurm_bin": "/opt/slurm/bin",
-        "slurm_version": "slurm 23.11.4",
         "tasks_per_allocation": 4,
         "verdict": "pass",
     }
@@ -482,18 +481,20 @@ def test_cancel_needs_a_selector_and_doctor_reports_unavailable_clusters(cli: Cl
         code == 0 and "pass        slurm version: slurm 23.11.4" in out and "up to 4 Tasks" in out
     )
     cli.fake.fail_next("ping", Completed(127, b"", b"sbatch: not found\n"))
-    code, _, err = cli("doctor")
-    assert (code, err) == (
-        75,
-        "servatus: error: sbatch --version failed with exit status 127: sbatch: not found\n",
-    )
+    code, out, _ = cli("doctor")
+    assert code == 1
+    assert "fail        slurm version: sbatch --version failed with exit status 127: sbatch" in out
+    cli.fake.fail_next("ping")
+    code, out, _ = cli("doctor")
+    assert code == 75 and "unavailable slurm version: FakeScheduler" in out
+    assert "squeue" not in out
 
 
 def test_doctor_exits_by_its_worst_verdict(cli: Cli) -> None:
-    cli.fake.fail_next("squeue", Completed(1, b"", b"squeue: error: no controller\n"))
+    cli.fake.fail_next("squeue")
     code, out, _ = cli("doctor")
-    assert code == 75 and "unavailable squeue: squeue failed" in out
-    cli.fake.fail_next("squeue", Completed(1, b"", b"squeue: error: no controller\n"))
+    assert code == 75 and "unavailable squeue: FakeScheduler: injected failure" in out
+    cli.fake.fail_next("squeue")
     cli.fake.fail_next("sh", Completed(1, b"", b""))
     code, out, _ = cli("doctor")
     assert code == 1 and "fail        work_root: " in out and "unavailable squeue" in out

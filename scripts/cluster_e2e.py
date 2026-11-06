@@ -41,6 +41,8 @@ TASKS = {
 }
 POLL_SECONDS = 20
 IMAGE_SOURCE = "docker://alpine:3.20"
+PULL_JOB = "servatus-e2e-pull"
+PULL_SECONDS = 600
 IMAGE_TASK = 'cat /etc/alpine-release; printf "%s %s\\n" "$SERVATUS_TASK_KEY" "$PWD"'
 
 
@@ -165,7 +167,7 @@ def one_task(root: Path, profile: str, argv: list[str], deadline: float) -> tupl
     submitted = json.loads(servatus(root, "submit", profile, plan, "--json").stdout)
     job = submitted["receipts"][0]["job"]
     log(f"submitted {profile} as job {job}")
-    wait_for(
+    final = wait_for(
         root,
         f"{profile} to finish",
         deadline,
@@ -183,9 +185,8 @@ def one_task(root: Path, profile: str, argv: list[str], deadline: float) -> tupl
             raise SystemExit(f"cannot read the {profile} log:\n{read.stderr}")
         log(f"waiting for the {profile} log: {read.stderr.strip()}")
         time.sleep(POLL_SECONDS)
-    final = status(root, profile)
     text = output.read_text()
-    assert final is not None and executions(final)[profile] == "SUCCEEDED", (final, text)
+    assert executions(final)[profile] == "SUCCEEDED", (final, text)
     return job, text
 
 
@@ -206,7 +207,7 @@ def pull_image(arguments: argparse.Namespace, run: PurePosixPath) -> str | None:
         "--mem=2G",
         "--time=00:15:00",
         f"--chdir={run}",
-        "--job-name=servatus-e2e-pull",
+        f"--job-name={PULL_JOB}",
         arguments.apptainer,
         "pull",
         "--disable-cache",
@@ -220,10 +221,12 @@ def pull_image(arguments: argparse.Namespace, run: PurePosixPath) -> str | None:
             capture_output=True,
             text=True,
             check=False,
-            timeout=arguments.timeout,
+            timeout=PULL_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        return "the image pull timed out"
+        cancel = f"{arguments.slurm_bin}/scancel --me --name={PULL_JOB}"
+        subprocess.run(["ssh", "-o", "BatchMode=yes", arguments.host, cancel], check=False)
+        return f"the image pull took over {PULL_SECONDS} s"
     if completed.returncode != 0:
         tail = completed.stderr.strip().splitlines()[-1:]
         return f"the image pull exited {completed.returncode}: {' '.join(tail)}"
@@ -241,6 +244,8 @@ def image_check(root: Path, run: PurePosixPath, deadline: float) -> dict[str, An
 def sweep(arguments: argparse.Namespace, root: Path, run: PurePosixPath) -> dict[str, Any]:
     started = time.monotonic()
     deadline = started + arguments.timeout
+    (root / "SERVATUS.toml").write_text(configuration(arguments, run, False))
+    doctor = diagnose(root, "e2e")
     skipped = None if arguments.image_partition is None else pull_image(arguments, run)
     image = arguments.image_partition is not None and skipped is None
     (root / "SERVATUS.toml").write_text(configuration(arguments, run, image))
@@ -250,7 +255,6 @@ def sweep(arguments: argparse.Namespace, root: Path, run: PurePosixPath) -> dict
             for key, command in TASKS.items()
         )
     )
-    doctor = diagnose(root, "e2e")
     for profile in (*(("gpu",) if arguments.gpu_partition else ()), *(("image",) if image else ())):
         diagnose(root, profile)
     servatus(root, "create", "state", "tasks.jsonl")
@@ -281,7 +285,7 @@ def sweep(arguments: argparse.Namespace, root: Path, run: PurePosixPath) -> dict
     summary: dict[str, Any] = {
         "host": arguments.host,
         "run": str(run),
-        "slurm": doctor["slurm_version"],
+        "slurm": doctor["checks"][0]["detail"],
         "jobs": jobs,
         "executions": {key: list(value) for key, value in outcome.items()},
         "retry_failed": retry["selected"],

@@ -319,7 +319,7 @@ def test_constraint_accepts_slurm_feature_expressions(constraint: str) -> None:
     assert target(constraint=constraint).constraint == constraint
 
 
-@pytest.mark.parametrize("gres", ["gpu", "gpu:a100", "gpu:a100_80GB", "gpu:l40s", "shard", "mps"])
+@pytest.mark.parametrize("gres", ["gpu", "gpu:a100", "gpu:a100_80GB", "gpu:l40s", "shard"])
 def test_gpu_gres_accepts_any_count_free_gres(gres: str) -> None:
     assert target(gpu_gres=gres).gpu_gres == gres
 

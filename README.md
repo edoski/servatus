@@ -336,7 +336,7 @@ times the per-Task CPUs, memory, and GPUs, for the per-Task time limit.
 | `max_tasks_per_allocation`, `max_cpus_per_allocation`, `max_memory_mib_per_allocation` | int | required | Ceilings per allocation. |
 | `max_time_limit` | duration | required | Wall-time ceiling. |
 | `account`, `qos` | string | omitted | Passed to `sbatch` when set. |
-| `constraint` | string | omitted | Slurm feature expression (`a100\|h100`, `[rack1\|rack2]*2`), passed to `sbatch` as one argument. |
+| `constraint` | string | omitted | Slurm feature expression (`a100\|h100`, `intel&ib`), passed to `sbatch` as one argument. |
 | `gpu_gres`, `max_gpus_per_allocation` | string, int | omitted, 0 | Count-free GRES (`gpu`, `gpu:a100_80GB`, `shard`) and its ceiling; set both or neither. `gpus` counts units of it, and Slurm must set each step's `CUDA_VISIBLE_DEVICES`. |
 | `max_allocations_per_submit` | int | no cap | Allocations per plan; the rest are deferred. |
 | `max_script_bytes` | int | 1048576 | Batch script size bound. |
@@ -347,7 +347,7 @@ times the per-Task CPUs, memory, and GPUs, for the per-Task time limit.
 | --- | --- | --- | --- |
 | `cpus`, `memory_mib` | int | required | CPUs and MiB per Task. |
 | `time_limit` | duration | required | Wall time of the allocation. |
-| `gpus` | int | 0 | Whole GPUs per Task. |
+| `gpus` | int | 0 | Units of `gpu_gres` per Task: whole GPUs, or whole shards with `shard`. |
 | `signal_before_end` | duration | omitted | Send SIGUSR1 to each Task this long before the limit. |
 
 In Python these are `Target`, `Apptainer`, `Resources`, and `Profile`;
@@ -357,21 +357,23 @@ In Python these are `Target`, `Apptainer`, `Resources`, and `Profile`;
 **Launchers.** With Apptainer, each step runs `apptainer exec --cleanenv IMAGE ARGS...` from
 `work_root`, so the Task's `args` run directly and the image's runscript is ignored (a relative
 `args[0]` resolves on the container's `PATH`; empty `args` fail at planning). `work_root` plus
-`binds` are mounted and the Task's `env` passed as `APPTAINERENV_*`; GPU steps get `--nv` and
+`binds` are mounted and the Task's `env` passed as `APPTAINERENV_*` through `/usr/bin/env`; GPU steps get `--nv` and
 Slurm's step-local `CUDA_VISIBLE_DEVICES`. The batch script sets `PATH=/usr/bin:/bin`, which
 `--nv` needs to find the host's `nvidia-smi`, MPS daemon and `libcuda`. Without Apptainer, each step runs the Task's absolute
 `args[0]` under `env -i` with the same variables. Either way, Task stdin and environment are
-written into the batch script and are visible to cluster administrators: never put secrets in
-Tasks.
+written into the batch script and step command lines, so cluster administrators and other users on
+the node can read them: never put secrets in Tasks.
 
 **SSH.** Servatus runs `ssh -T -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=8 -o
 ConnectionAttempts=3 HOST`, so it never prompts, ignores login banners and shell-startup output,
 and retries a connection that never opens. Commands themselves are never retried, and each has 30 s
-to finish. From your environment it passes only `HOME`,
+to finish, connecting included. With `ProxyJump`, set those two options on the jump host too. From
+your environment it passes only `HOME`,
 `LOGNAME`, `USER`, `SSH_AUTH_SOCK`, `KRB5CCNAME`, and `KRB5_CONFIG`, so agent and Kerberos logins
-work. Give the host `ControlMaster auto`, `ControlPath ~/.ssh/control-%C`, and `ControlPersist 30m`
-in `~/.ssh/config`: a persistent master connection makes calls fast and, with multi-factor login,
-lets you authenticate once (`ssh hpc true`) first. Keys must load without a passphrase prompt, for
+work. Give the host `ControlMaster auto`, `ControlPath ~/.ssh/control-%C`, `ControlPersist 30m`,
+`ServerAliveInterval 10`, and `ServerAliveCountMax 2` in `~/.ssh/config`: a persistent master
+connection makes calls fast and, with multi-factor login, lets you authenticate once
+(`ssh hpc true`) first, and the keepalive ends a master whose network went away. Keys must load without a passphrase prompt, for
 example via `ssh-agent`.
 
 ## Clusters
@@ -442,8 +444,9 @@ time_limit = "04:00:00"
 
 Onboarding a student, in order:
 
-1. **Add the SSH alias.** A login is about 0.6 s and Servatus opens one connection per Slurm command,
-   so share one. Add this to `~/.ssh/config`, then run `ssh-copy-id university`:
+1. **Add the SSH alias.** A login takes about 0.6 s and Servatus opens one connection per Slurm
+   command, so share one. Add this to `~/.ssh/config`, then make a key if you have none
+   (`ssh-keygen -t ed25519`) and run `ssh-copy-id university`:
 
    ```ssh-config
    Host university
@@ -452,38 +455,55 @@ Onboarding a student, in order:
        ControlMaster auto
        ControlPath ~/.ssh/control-%C
        ControlPersist 30m
+       ServerAliveInterval 10
+       ServerAliveCountMax 2
    ```
 
 2. **Create the directories on scratch**, never in home:
 
    ```sh
-   ssh university 'mkdir -p -m 700 /scratch.hpc/$USER/sweep/logs /scratch.hpc/$USER/sweep/results /scratch.hpc/$USER/images'
+   ssh university 'umask 077 && mkdir -p /scratch.hpc/$USER/sweep/logs /scratch.hpc/$USER/sweep/results /scratch.hpc/$USER/images'
    ```
 
-3. **Get an image on a compute node.** The login node has no Apptainer. Keep Apptainer's cache out
-   of home:
+3. **Build the image on a compute node.** The login node has no Apptainer, and the nodes have
+   network access. Copy a definition like this to `/scratch.hpc/NAME.SURNAME/images/train.def`:
+
+   ```text
+   Bootstrap: docker
+   From: python:3.12-slim
+
+   %post
+       pip install --no-cache-dir servatus
+   ```
+
+   Then build it, keeping Apptainer's cache out of home:
 
    ```sh
    ssh university srun --partition=rtx2080 --cpus-per-task=2 --mem=4G --time=00:20:00 \
-     --chdir=/scratch.hpc/NAME.SURNAME/images /usr/bin/apptainer pull --disable-cache \
-     train.sif docker://python:3.12-slim
+     --chdir=/scratch.hpc/NAME.SURNAME/images \
+     /usr/bin/env APPTAINER_CACHEDIR=/scratch.hpc/NAME.SURNAME/images/cache \
+     /usr/bin/apptainer build train.sif train.def
    ```
 
    To run a virtual environment instead, make it under `work_root` with `pip3 install
    --no-cache-dir`, drop `apptainer` and `image` from `[target]`, and start each Task's `args` with
    the absolute path of its Python.
 
-4. **Check the profile**, then follow the [quickstart](#quickstart-a-sweep-in-10-minutes):
+4. **Save the configuration above as `SERVATUS.toml`** next to your launcher, with your
+   `NAME.SURNAME`, then check it:
 
    ```sh
    servatus doctor --profile rtx2080
    ```
 
+5. **Continue with the [quickstart](#quickstart-a-sweep-in-10-minutes)** from step 2. `doctor` cannot
+   see Apptainer or the image from the login node, so a first small Task proves those.
+
 ### Research cluster (`slogin`)
 
 Slurm 23.11, for DISI staff and PhD students. The onboarding steps are the same with the alias
-`research` (`HostName slogin.disi.unibo.it`). These profiles reserve memory and CPUs for other users
-on shared nodes.
+`research` (`HostName slogin.disi.unibo.it`), the partition `sbuild` for the image, and a profile
+from this file for `doctor`. These profiles leave CPUs and memory for other users on shared nodes.
 
 ```toml
 default_profile = "a100"
@@ -492,7 +512,7 @@ default_profile = "a100"
 host = "research"
 slurm_bin = "/usr/bin"
 apptainer = "/usr/bin/apptainer"
-image = "/scratch.hpc/NAME.SURNAME/sweep/image/runtime.sif"
+image = "/scratch.hpc/NAME.SURNAME/images/train.sif"
 work_root = "/scratch.hpc/NAME.SURNAME/sweep"
 log_root = "/scratch.hpc/NAME.SURNAME/sweep/logs"
 account = "default"
@@ -614,12 +634,14 @@ integer job number.
 | `doctor [--profile NAME]` | Check what the profile needs from its cluster, read-only; see below. Exit 1 if a check fails, 75 if one went unanswered. |
 
 `doctor` submits nothing and writes nothing. It refuses a profile that does not fit its ceilings,
-then runs every check and reports each one as `pass`, `fail`, or `unavailable`:
+then runs every check. Each one is `pass`, `fail` (the command ran and said no, or its output is
+unusable), or `unavailable` (no answer came back). A cluster that does not answer `sbatch --version`
+stops there, since every other command would wait for its deadline too:
 
 | Check | Passes when | Why Servatus needs it |
 | --- | --- | --- |
 | `slurm version` | `sbatch --version` reports 23.02 or later. | Every submission uses `--export=NIL`. |
-| `squeue` | `squeue` answers under the scrubbed environment. | Liveness comes from `squeue`, with only `PATH`, `LANG`, `LC_ALL`, and `TZ` set. |
+| `squeue` | `squeue` exits 0 under the scrubbed environment. | Liveness comes from `squeue`, with only `PATH`, `LANG`, `LC_ALL`, and `TZ` set. |
 | `MinJobAge` | `scontrol show config` reports at least 120 s. | Outcomes are read after the purge, which must outlast a cached directory listing. |
 | `ProctrackType` | `scontrol show config` reports `proctrack/cgroup`. | A job Slurm no longer lists must have no steps left. |
 | `work_root`, `log_root` | Each is a writable directory on the login host. | Steps start in one and write logs and run markers to the other. |
@@ -655,6 +677,6 @@ your launchers, pass `servatus.testing.FakeScheduler()`, an in-memory Slurm, as 
 - **No job arrays or multi-node jobs.** One Task may use several GPUs on its node (`torchrun`).
 - **No automatic retry, background polling, or scheduler plugins.** One native Slurm lane.
 - **Not an experiment tracker, workflow engine, or secrets manager.** Task meaning belongs to you.
-- **No raw Slurm options, fractional GPUs, or cross-filesystem copies.**
+- **No raw Slurm options, fractional GPU requests, or cross-filesystem copies.**
 
 See the [changelog](https://github.com/edoski/servatus/blob/main/CHANGELOG.md) for release notes.

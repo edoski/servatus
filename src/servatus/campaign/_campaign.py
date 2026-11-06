@@ -505,7 +505,7 @@ class Campaign:
             rows.update(self._scheduler(target).queue(names))
         found: dict[str, tuple[Marker, ...]] = {}
         for target, counts in roots.values():
-            found.update(self._scheduler(target).markers(target.log_root, counts))
+            found.update(self._scheduler(target).markers(counts))
         return rows, found
 
     def _observe(self, state: State, allocation_ids: Iterable[str]) -> Observed:

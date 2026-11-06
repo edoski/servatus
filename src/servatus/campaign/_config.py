@@ -318,6 +318,11 @@ class Target:
         )
         _require(bool(frozen_partitions), "partitions must be nonempty")
         _require(len(set(frozen_partitions)) == len(frozen_partitions), "partitions must be unique")
+        if constraint is not None:
+            _require(
+                isinstance(constraint, str) and _CONSTRAINT.fullmatch(constraint) is not None,
+                "constraint must be one Slurm feature expression such as a100|h100",
+            )
         if gpu_gres is not None:
             _require(
                 isinstance(gpu_gres, str) and _GRES.fullmatch(gpu_gres) is not None,
@@ -363,11 +368,6 @@ class Target:
         put("container", container)
         put("account", _optional_token(account, "account"))
         put("qos", _optional_token(qos, "qos"))
-        if constraint is not None:
-            _require(
-                isinstance(constraint, str) and _CONSTRAINT.fullmatch(constraint) is not None,
-                "constraint must be one Slurm feature expression such as a100|h100",
-            )
         put("constraint", constraint)
         put("gpu_gres", gpu_gres)
         put("max_gpus_per_allocation", gpus)

@@ -8,7 +8,7 @@ import pytest
 from support.builders import profile, resources, target
 
 from servatus.campaign import Check, Completed, Diagnosis, Verdict, diagnose
-from servatus.errors import ConfigurationError, Unavailable
+from servatus.errors import ConfigurationError
 from servatus.testing import FakeScheduler
 
 CHECKS = (
@@ -43,7 +43,6 @@ def test_a_capable_cluster_passes_every_check_and_nothing_is_submitted() -> None
     assert [check.name for check in diagnosis.checks] == list(CHECKS)
     assert {check.verdict for check in diagnosis.checks} == {Verdict.PASS}
     assert (diagnosis.profile, diagnosis.tasks_per_allocation) == ("test", 4)
-    assert diagnosis.slurm_version == "slurm 23.11.4"
     assert fake.jobs == () and fake.files == {}
     sbatch = [
         call for call in fake.calls if call[0].endswith("sbatch") and call[1:] != ("--version",)
@@ -79,14 +78,23 @@ def test_an_unreadable_version_fails_and_the_other_checks_still_run() -> None:
     assert answer(diagnosis, "sbatch --test-only").verdict is Verdict.PASS
 
 
-def test_squeue_that_does_not_answer_is_unavailable_and_names_the_scrubbed_environment() -> None:
+def test_squeue_that_exits_nonzero_fails_and_names_the_scrubbed_environment() -> None:
     fake = FakeScheduler()
     fake.fail_next("squeue", Completed(1, b"", b"squeue: error: no controller\n"))
     diagnosis = run(fake)
     check = answer(diagnosis, "squeue")
-    assert check.verdict is Verdict.UNAVAILABLE and diagnosis.verdict is Verdict.UNAVAILABLE
+    assert check.verdict is Verdict.FAIL and diagnosis.verdict is Verdict.FAIL
     assert "exit status 1: squeue: error: no controller" in check.detail
     assert "SLURM_CONF" in check.detail
+
+
+def test_squeue_that_gets_no_answer_is_unavailable_and_blames_no_environment() -> None:
+    fake = FakeScheduler()
+    fake.fail_next("squeue")
+    diagnosis = run(fake)
+    check = answer(diagnosis, "squeue")
+    assert check.verdict is Verdict.UNAVAILABLE and diagnosis.verdict is Verdict.UNAVAILABLE
+    assert "SLURM_CONF" not in check.detail
 
 
 def test_squeue_output_servatus_cannot_read_fails() -> None:
@@ -133,11 +141,20 @@ def test_settings_scontrol_omits_fail() -> None:
 
 def test_scontrol_that_does_not_answer_leaves_both_settings_unknown() -> None:
     fake = FakeScheduler()
-    fake.fail_next("scontrol", Completed(1, b"", b"scontrol: error: no\n"))
-    fake.fail_next("scontrol", Completed(1, b"", b"scontrol: error: no\n"))
+    fake.fail_next("scontrol")
+    fake.fail_next("scontrol")
     diagnosis = run(fake)
     assert answer(diagnosis, "MinJobAge").verdict is Verdict.UNAVAILABLE
     assert answer(diagnosis, "ProctrackType").verdict is Verdict.UNAVAILABLE
+
+
+def test_a_missing_scontrol_fails_both_settings() -> None:
+    fake = FakeScheduler()
+    for _ in range(2):
+        fake.fail_next("scontrol", Completed(127, b"", b"scontrol: not found\n"))
+    diagnosis = run(fake)
+    assert answer(diagnosis, "MinJobAge").verdict is Verdict.FAIL
+    assert "exit status 127: scontrol: not found" in answer(diagnosis, "ProctrackType").detail
 
 
 @pytest.mark.parametrize(
@@ -150,10 +167,7 @@ def test_roots_must_be_writable_directories(position: int, name: str, path: str)
         fake.fail_next("sh", Completed(0 if index < position else 1, b"", b""))
     check = answer(run(fake), name)
     assert check.verdict is Verdict.FAIL
-    assert (
-        check.detail
-        == f"{path} is not a writable directory on the login host; create it with mkdir -p"
-    )
+    assert check.detail == f"{path} is not a directory this user can write to on the login host"
 
 
 def test_a_refused_shape_fails_with_slurms_reason_and_a_failure_beats_unavailable() -> None:
@@ -187,9 +201,32 @@ def test_an_impossible_profile_is_refused_before_any_contact() -> None:
     assert fake.calls == ()
 
 
-def test_a_cluster_that_runs_no_slurm_client_is_unavailable_as_a_whole() -> None:
+def test_a_profile_that_cannot_render_is_refused_before_any_contact() -> None:
+    fake = FakeScheduler()
+    with pytest.raises(ConfigurationError, match="exceeds target max_script_bytes"):
+        diagnose(profile(target(max_script_bytes=10)), connect=fake)
+    assert fake.calls == ()
+
+
+def test_only_a_profile_can_be_diagnosed() -> None:
+    with pytest.raises(ConfigurationError, match="diagnose needs a Profile"):
+        diagnose("gpu", connect=FakeScheduler())  # pyright: ignore[reportArgumentType]
+
+
+def test_a_missing_slurm_client_fails_and_the_other_checks_still_run() -> None:
     fake = FakeScheduler()
     fake.fail_next("ping", Completed(127, b"", b"sbatch: not found\n"))
-    with pytest.raises(Unavailable, match="exit status 127: sbatch: not found"):
-        diagnose(profile(), connect=fake)
+    diagnosis = run(fake)
+    check = answer(diagnosis, "slurm version")
+    assert check.verdict is Verdict.FAIL
+    assert check.detail == "sbatch --version failed with exit status 127: sbatch: not found"
+    assert [item.name for item in diagnosis.checks] == list(CHECKS)
+
+
+def test_a_cluster_that_gives_no_answer_stops_at_the_first_check() -> None:
+    fake = FakeScheduler()
+    fake.fail_next("ping")
+    diagnosis = run(fake)
+    assert [item.name for item in diagnosis.checks] == ["slurm version"]
+    assert diagnosis.verdict is Verdict.UNAVAILABLE
     assert fake.count("squeue") == 0

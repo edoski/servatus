@@ -11,7 +11,7 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   creates or extends it idempotently, `append` registers only new Tasks, and `seal` ends authoring
   irreversibly.
 - **Revision:** a counter advanced by every durable mutation. Plans bind to one revision.
-- **Resources (`Resources`):** one homogeneous per-Task CPU, MiB, whole-GPU, wall-time, and optional
+- **Resources (`Resources`):** one homogeneous per-Task CPU, MiB, GPU (units of `gpu_gres`), wall-time, and optional
   `signal_before_end` request for one plan.
 - **Target (`Target`):** one concrete Slurm route: optional SSH host, absolute Slurm directory,
   work and log roots, partitions, site options, optional launcher, and conservative ceilings. A
@@ -28,7 +28,7 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   fixed bounds and return a `Completed`; every failure surfaces as `Unavailable`. Any callable from Target to Transport (for
   example `servatus.testing.FakeScheduler`) can replace `connect`.
 - **Diagnosis (`Diagnosis`):** what `diagnose(profile)` and `servatus doctor` found, read-only: one
-  `Check` with a `Verdict` (`pass`, `fail`, `unavailable`) for each capability Servatus needs from a
+  `Check` with a `Verdict` (`pass`, `fail` when a command ran and said no, `unavailable` when no answer came) for each capability Servatus needs from a
   profile's cluster: Slurm 23.02 or later, `squeue` under the scrubbed environment, `MinJobAge` of
   at least 120 s, `proctrack/cgroup`, writable roots, and a one-Task `sbatch --test-only`.
 - **Allocation:** one single-node Slurm job named `servatus-<allocation_id>`, submitted with

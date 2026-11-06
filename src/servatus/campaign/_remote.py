@@ -32,9 +32,9 @@ DEADLINE_SECONDS = 30.0
 # Login banners and shell start-up noise precede the output marker; bound them separately.
 NOISE_ALLOWANCE = 64 * 1024
 
-# Each connection attempt is a new TCP flow, made before any command runs, so a flow a NAT has lost
-# recovers and nothing can run twice. Three attempts take at most 26 s, inside the 30 s deadline;
-# the operating system alone would wait 75 s on the first flow.
+# Each connection attempt is a new TCP flow, made before any command runs, so a flow that never
+# opens recovers and nothing can run twice. Three attempts to one address take at most 26 s, inside
+# the 30 s deadline; the operating system alone can wait 75 s on the first flow.
 _SSH_OPTIONS = (
     "-T",
     "-o",
@@ -47,6 +47,7 @@ _SSH_OPTIONS = (
     "ConnectionAttempts=3",
     "--",
 )
+_SSH_FAILED = 255
 _ENVIRONMENT = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C", "TZ": "UTC"}
 _REMOTE_ENV = " ".join(f"{name}={value}" for name, value in _ENVIRONMENT.items())
 # What the ssh client needs to find its configuration, agent, and Kerberos (GSSAPI) credentials.
@@ -107,11 +108,13 @@ class Ssh:
             max_stderr=MAX_STREAM_BYTES + allowance,
             env=ssh_environment(),
         )
-        try:
-            stdout = after_marker(raw.stdout, marker)
-            stderr = after_marker(raw.stderr, marker)
-        except Unavailable as error:
-            raise Unavailable(f"{error}: {diagnostic(raw)}") from None
+        if raw.returncode == _SSH_FAILED:
+            noise = raw.stderr.replace(f"{marker}\n".encode(), b"")
+            raise Unavailable(
+                f"ssh failed with {diagnostic(Completed(raw.returncode, b'', noise))}"
+            )
+        stdout = after_marker(raw.stdout, marker)
+        stderr = after_marker(raw.stderr, marker)
         if len(stdout) > max_stdout or len(stderr) > MAX_STREAM_BYTES:
             raise Unavailable("remote command output exceeds its byte bound")
         return Completed(raw.returncode, stdout, stderr)
@@ -174,9 +177,9 @@ def run_bounded(
 ) -> Completed:
     """Run ``command`` with a deadline, concurrent bounded draining, and guaranteed reaping.
 
-    ``what`` names the command in errors. Stdin comes from an anonymous temporary file, so a child
-    that never reads cannot deadlock the parent. Any failure kills the child's process group, reaps
-    it, and raises ``Unavailable``.
+    ``what`` names the command in a deadline error. Stdin comes from an anonymous temporary file,
+    so a child that never reads cannot deadlock the parent. Any failure kills the child's process
+    group, reaps it, and raises ``Unavailable``.
     """
     try:
         with tempfile.TemporaryFile() as source:
@@ -206,7 +209,7 @@ def run_bounded(
         raise Unavailable(f"{what} exceeded its {DEADLINE_SECONDS:g} s deadline") from None
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         detail = getattr(error, "strerror", None) or type(error).__name__
-        raise Unavailable(f"{what} could not run: {detail}") from None
+        raise Unavailable(f"{command[0]} could not run: {detail}") from None
 
 
 def _drain(process: subprocess.Popen[bytes], max_stdout: int, max_stderr: int) -> Completed:

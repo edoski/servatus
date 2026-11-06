@@ -19,13 +19,15 @@ submit or observe work.
 the exit status and both output streams. `connect(target)` returns `Ssh(target.host)` when the
 Target has a host and `Local()` otherwise; callers and tests may supply their own `connect`.
 
-- `Ssh` runs `ssh -T -o BatchMode=yes -o LogLevel=ERROR HOST REMOTE`. The remote command prints a
+- `Ssh` runs `ssh -T -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=8 -o ConnectionAttempts=3
+  HOST REMOTE`. A connection is retried before any command runs; a command never is. Exit status
+  255 is `ssh`'s own failure and is `Unavailable`. The remote command prints a
   per-call random marker to stdout and stderr, then `exec`s `/usr/bin/env -i PATH=... LANG=C
   LC_ALL=C TZ=UTC` with the argv. Output before the markers (login banners, shell-startup noise) is
   discarded; a missing marker means the command did not run as intended and is `Unavailable`.
   Batch mode means Servatus never prompts; connection reuse and multi-factor login belong in the
-  user's ssh_config (`ControlMaster`/`ControlPersist`). The local `ssh` client gets a fixed `PATH`
-  and C locale plus only `HOME`, `LOGNAME`, `USER`, `SSH_AUTH_SOCK`, `KRB5CCNAME`, and
+  user's ssh_config (`ControlMaster`/`ControlPersist`). The local `ssh` client gets the same scrubbed
+  environment plus only `HOME`, `LOGNAME`, `USER`, `SSH_AUTH_SOCK`, `KRB5CCNAME`, and
   `KRB5_CONFIG` from the caller, enough for its configuration, agent, and Kerberos credentials.
 - `Local` runs the argv with the same scrubbed environment and no shell.
 

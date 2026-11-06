@@ -14,13 +14,13 @@ from enum import StrEnum
 from functools import cache
 from pathlib import PurePosixPath
 
-from ..errors import EvidenceConflict, Unavailable
+from ..errors import ConfigurationError, EvidenceConflict, Unavailable
 from ._config import Profile, Target, Task
 from ._plan import capacity
 from ._remote import Transport
 from ._remote import connect as connect_target
-from ._scheduler import Scheduler
-from ._script import render_batch, sbatch_argv
+from ._scheduler import CommandFailed, Scheduler
+from ._script import check_command, render_batch, sbatch_argv
 
 MIN_SLURM = (23, 2)
 """``sbatch --export=NIL`` first exists in Slurm 23.02."""
@@ -33,7 +33,8 @@ _SCRUBBED = "Servatus runs Slurm with only PATH=/usr/bin:/bin, LANG, LC_ALL, and
 
 
 class Verdict(StrEnum):
-    """One check's answer. ``UNAVAILABLE``: the cluster did not answer, so nothing is known."""
+    """One check's answer. ``FAIL``: the command ran and said no, or printed something unusable.
+    ``UNAVAILABLE``: no answer came back (SSH, a deadline), so nothing is known."""
 
     PASS = "pass"
     FAIL = "fail"
@@ -57,7 +58,6 @@ class Diagnosis:
     host: str | None
     slurm_bin: str
     tasks_per_allocation: int
-    slurm_version: str
     checks: tuple[Check, ...]
 
     @property
@@ -73,6 +73,8 @@ class Diagnosis:
 def _check(name: str, ask: Callable[[], tuple[bool, str]]) -> Check:
     try:
         passed, detail = ask()
+    except CommandFailed as error:
+        return Check(name, Verdict.FAIL, str(error))
     except Unavailable as error:
         return Check(name, Verdict.UNAVAILABLE, str(error))
     return Check(name, Verdict.PASS if passed else Verdict.FAIL, detail)
@@ -95,8 +97,8 @@ def _squeue(scheduler: Scheduler) -> tuple[bool, str]:
         scheduler.queue((_PROBE_ALLOCATION,))
     except EvidenceConflict as error:
         return False, f"squeue printed something Servatus cannot read: {error}"
-    except Unavailable as error:
-        raise Unavailable(f"{error}. {_SCRUBBED}, so SLURM_CONF and modules do not apply") from None
+    except CommandFailed as error:
+        return False, f"{error}. {_SCRUBBED}, so SLURM_CONF and modules do not apply"
     return True, "answers under the scrubbed environment"
 
 
@@ -126,16 +128,11 @@ def _proctrack(config: Mapping[str, str]) -> tuple[bool, str]:
 def _directory(scheduler: Scheduler, path: PurePosixPath) -> tuple[bool, str]:
     if scheduler.writable_directory(path):
         return True, f"{path} is a writable directory"
-    return False, f"{path} is not a writable directory on the login host; create it with mkdir -p"
+    return False, f"{path} is not a directory this user can write to on the login host"
 
 
-def _one_task_shape(scheduler: Scheduler, profile: Profile) -> tuple[bool, str]:
-    target, resources = profile.target, profile.resources
-    task = Task("doctor", ("/bin/true",))
-    accepted, stdout, stderr = scheduler.test_only(
-        sbatch_argv(target, resources, 1, _PROBE_ALLOCATION),
-        render_batch(target, resources, (task,), _PROBE_ALLOCATION),
-    )
+def _one_task_shape(scheduler: Scheduler, argv: tuple[str, ...], script: bytes) -> tuple[bool, str]:
+    accepted, stdout, stderr = scheduler.test_only(argv, script)
     answer = (stderr or stdout).partition("\n")[0][:200]
     if accepted:
         return True, answer
@@ -147,22 +144,30 @@ def diagnose(
 ) -> Diagnosis:
     """Check every capability Servatus needs from ``profile``'s cluster, read-only.
 
-    An impossible profile raises ``ConfigurationError`` before any contact, and a cluster that does
-    not run ``sbatch --version`` at all raises ``Unavailable``. Otherwise every check runs and the
-    result says what each one found. ``connect`` defaults to ``servatus.campaign.connect``.
+    A profile that cannot render one Task raises ``ConfigurationError`` before any contact.
+    Otherwise every check runs and the result says what each one found, except that a cluster
+    ``sbatch --version`` gets no answer from stops there: every other command would wait for its
+    deadline too. ``connect`` defaults to ``servatus.campaign.connect``.
     """
-    target = profile.target
-    fits = capacity(target, profile.resources)
+    if not isinstance(profile, Profile):
+        raise ConfigurationError("diagnose needs a Profile")
+    target, resources = profile.target, profile.resources
+    fits = capacity(target, resources)
+    task = Task("doctor", ("/bin/true",))
+    argv = check_command(sbatch_argv(target, resources, 1, _PROBE_ALLOCATION))
+    script = render_batch(target, resources, (task,), _PROBE_ALLOCATION)
     scheduler = Scheduler((connect or connect_target)(target), target)
-    version = scheduler.ping()
     config = cache(scheduler.config)
-    checks = (
-        _check("slurm version", lambda: _slurm_version(version)),
-        _check("squeue", lambda: _squeue(scheduler)),
-        _check("MinJobAge", lambda: _min_job_age(config())),
-        _check("ProctrackType", lambda: _proctrack(config())),
-        _check("work_root", lambda: _directory(scheduler, target.work_root)),
-        _check("log_root", lambda: _directory(scheduler, target.log_root)),
-        _check("sbatch --test-only", lambda: _one_task_shape(scheduler, profile)),
-    )
-    return Diagnosis(profile.label, target.host, str(target.slurm_bin), fits, version, checks)
+    later: dict[str, Callable[[], tuple[bool, str]]] = {
+        "squeue": lambda: _squeue(scheduler),
+        "MinJobAge": lambda: _min_job_age(config()),
+        "ProctrackType": lambda: _proctrack(config()),
+        "work_root": lambda: _directory(scheduler, target.work_root),
+        "log_root": lambda: _directory(scheduler, target.log_root),
+        "sbatch --test-only": lambda: _one_task_shape(scheduler, argv, script),
+    }
+    first = _check("slurm version", lambda: _slurm_version(scheduler.ping()))
+    checks = [first]
+    if first.verdict is not Verdict.UNAVAILABLE:
+        checks.extend(_check(name, ask) for name, ask in later.items())
+    return Diagnosis(profile.label, target.host, str(target.slurm_bin), fits, tuple(checks))

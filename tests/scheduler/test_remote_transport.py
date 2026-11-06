@@ -16,7 +16,7 @@ from support.builders import target
 import servatus.campaign._remote as _remote
 from servatus.campaign._evidence import End, QueueRow, Start
 from servatus.campaign._remote import Completed, Local, Ssh, after_marker, connect
-from servatus.campaign._scheduler import Scheduler
+from servatus.campaign._scheduler import CommandFailed, Scheduler
 from servatus.campaign._script import check_command
 from servatus.errors import ConfigurationError, Unavailable
 
@@ -295,16 +295,24 @@ def test_ssh_preserves_argv_and_binary_stdin_exactly(tmp_path: Path) -> None:
 @pytest.mark.parametrize("mode", ["unmarked", "refused", "quiet-stderr"])
 def test_ssh_without_both_markers_is_unavailable(tmp_path: Path, mode: str) -> None:
     ssh, _ = fake_ssh(tmp_path, mode)
-    with pytest.raises(Unavailable, match="output marker missing"):
+    with pytest.raises(Unavailable, match="output marker missing|ssh failed with exit status 255"):
         ssh.run(("/bin/echo", "42"))
 
 
-def test_a_connection_that_failed_reports_ssh_s_own_message(tmp_path: Path) -> None:
+def test_ssh_exit_255_reports_ssh_s_own_message_and_never_a_command_status(tmp_path: Path) -> None:
     executable = tmp_path / "ssh"
     executable.write_text("#!/bin/sh\necho 'ssh: connect to host h: timed out' >&2\nexit 255\n")
     executable.chmod(0o755)
-    with pytest.raises(Unavailable, match="exit status 255: ssh: connect to host h: timed out"):
+    with pytest.raises(
+        Unavailable, match="ssh failed with exit status 255: ssh: connect to host h: timed out"
+    ) as raised:
         Ssh("h", (str(executable),)).run(("/bin/true",))
+    assert not isinstance(raised.value, CommandFailed)
+
+
+def test_a_missing_local_ssh_is_named_as_the_program_that_could_not_run() -> None:
+    with pytest.raises(Unavailable, match="/nonexistent/ssh could not run: No such file"):
+        Ssh("h", ("/nonexistent/ssh",)).run(("/opt/slurm/bin/sbatch", "--version"))
 
 
 def test_ssh_deadline_is_unavailable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -425,11 +433,11 @@ def test_scheduler_over_noisy_ssh_reads_exact_replies(tmp_path: Path) -> None:
         stub.write_text(f"#!/bin/sh\n{body}\n")
         stub.chmod(0o700)
     ssh, _ = fake_ssh(tmp_path)
-    scheduler = Scheduler(ssh, target(slurm_bin=str(slurm)))
+    scheduler = Scheduler(ssh, target(slurm_bin=str(slurm), log_root=str(logs)))
     argv = (str(slurm / "sbatch"), "--parsable", f"--job-name={IDENTITY}")
     assert scheduler.submit(argv, b"#!/bin/sh\n") == 42
     assert scheduler.queue([ALLOCATION]) == {ALLOCATION: (QueueRow(42, "COMPLETED"),)}
-    markers = scheduler.markers(PurePosixPath(logs), {ALLOCATION: 1})
+    markers = scheduler.markers({ALLOCATION: 1})
     assert sorted(markers[ALLOCATION], key=repr) == [End(42, 0, 0), Start(42)]
 
 
@@ -444,7 +452,7 @@ def test_real_find_follows_a_symlinked_log_root(tmp_path: Path, many: bool) -> N
     counts = {ALLOCATION: 1}
     if many:
         counts |= {f"{index:024x}": 1 for index in range(8)}
-    markers = Scheduler(Local(), target(slurm_bin="/usr/bin")).markers(PurePosixPath(link), counts)
+    markers = Scheduler(Local(), target(slurm_bin="/usr/bin", log_root=link)).markers(counts)
     assert sorted(markers[ALLOCATION], key=repr) == [End(42, 0, 3), Start(42)]
 
 

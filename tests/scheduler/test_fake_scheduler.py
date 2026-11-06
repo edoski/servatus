@@ -36,7 +36,7 @@ class Harness:
 
     def observe(self, allocation_id: str, job: int, count: int = 2) -> Observation:
         rows = self.scheduler.queue([allocation_id])[allocation_id]
-        markers = self.scheduler.markers(self.root, {allocation_id: count})[allocation_id]
+        markers = self.scheduler.markers({allocation_id: count})[allocation_id]
         return observe(allocation_id, job, count, rows, markers)
 
     def executions(self, allocation_id: str, job: int, count: int = 2) -> list[object]:
@@ -227,7 +227,7 @@ def test_find_lists_only_marker_files_directly_in_the_root() -> None:
     harness.fake.remove_file(wanted[0])
     harness.fake.remove_file(f"{root}/{allocation(1)}.5.start.tmp")
     assert wanted[0] not in harness.fake.files
-    assert harness.scheduler.markers(harness.root, {allocation(1): 1}) == {allocation(1): ()}
+    assert harness.scheduler.markers({allocation(1): 1}) == {allocation(1): ()}
 
 
 @pytest.mark.parametrize(
@@ -305,7 +305,7 @@ def test_injected_failures_reach_observation_commands() -> None:
         harness.scheduler.queue([allocation(1)])
     harness.fake.fail_next("find", Completed(1, b"", b"find: /x: No such file or directory\n"))
     with pytest.raises(Unavailable, match="exit status 1: find: /x"):
-        harness.scheduler.markers(harness.root, {allocation(1): 1})
+        harness.scheduler.markers({allocation(1): 1})
     harness.fake.lose_next_reply("scancel")
     with pytest.raises(Unavailable, match="reply from scancel was lost"):
         harness.scheduler.cancel(allocation(1))

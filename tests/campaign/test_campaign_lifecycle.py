@@ -17,6 +17,7 @@ from servatus.campaign import (
     Retry,
     Status,
     Task,
+    Verdict,
     diagnose,
     to_document,
 )
@@ -40,10 +41,11 @@ def executions(status: Status) -> list[tuple[Execution | None, int | None]]:
 
 def test_diagnose_and_documents_for_results(world: World) -> None:
     profile = cpu_profile()
-    assert diagnose(profile, connect=world.wire).slurm_version == "slurm 23.11.4"
+    assert diagnose(profile, connect=world.wire).verdict is Verdict.PASS
     world.wire.down.add(profile.target.host)
-    with pytest.raises(Unavailable, match="Connection refused"):
-        diagnose(profile, connect=world.wire)
+    down = diagnose(profile, connect=world.wire)
+    assert down.verdict is Verdict.UNAVAILABLE and len(down.checks) == 1
+    assert "Connection refused" in down.checks[0].detail
     world.wire.down.clear()
     campaign = world.create(jobs(1))
     result = campaign.submit(campaign.plan(cpu_profile()))
