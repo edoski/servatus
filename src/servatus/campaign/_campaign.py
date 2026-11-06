@@ -72,16 +72,6 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def ping(target: Target, *, connect: Connect | None = None) -> str:
-    """Prove that ``target``'s scheduler answers; return its ``sbatch --version`` text.
-
-    ``connect`` defaults to ``servatus.campaign.connect``. Failures raise ``Unavailable``.
-    """
-    if not isinstance(target, Target):
-        raise ConfigurationError("ping needs a Target")
-    return Scheduler((connect or connect_target)(target), target).ping()
-
-
 def _receipt(attempt: Attempt) -> Receipt:
     if attempt.job is None:
         raise Conflict(f"allocation {attempt.allocation_id} has no accepted job")

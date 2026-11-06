@@ -2,10 +2,10 @@
 
 ``FakeScheduler`` is an in-memory Slurm with a shared log directory. Pass it wherever Servatus
 accepts ``connect``: it returns itself as the ``Transport`` and answers exactly the ``sbatch``,
-``squeue``, ``scancel``, ``find``, and ``tail`` commands Servatus issues, with the same output
-formats and the same local command bounds as the real transport. Controls move jobs through their
-lifecycle the way Slurm and the batch script would, writing the same run markers, and inject
-failures::
+``squeue``, ``scancel``, ``scontrol``, ``find``, ``sh``, and ``tail`` commands Servatus issues,
+with the same output formats and the same local command bounds as the real transport. Controls move
+jobs through their lifecycle the way Slurm and the batch script would, writing the same run markers,
+and inject failures::
 
     fake = FakeScheduler()
     campaign = Campaign.create(path, tasks, connect=fake)
@@ -31,7 +31,7 @@ from pathlib import PurePosixPath
 
 from .campaign._config import Resources, Target
 from .campaign._remote import MAX_STREAM_BYTES, Completed, Transport
-from .campaign._scheduler import SQUEUE_FORMAT, SQUEUE_OPTIONS, TAIL, find_argv
+from .campaign._scheduler import SQUEUE_FORMAT, SQUEUE_OPTIONS, TAIL, WRITABLE_DIRECTORY, find_argv
 from .campaign._script import check_command, sbatch_argv
 from .errors import ConfigurationError, Unavailable
 
@@ -105,6 +105,7 @@ def _sbatch_options() -> frozenset[str]:
 
 
 _SBATCH_OPTIONS = _sbatch_options()
+_SLURM_CONFIG = b"MinJobAge               = 300 sec\nProctrackType           = proctrack/cgroup\n"
 _SBATCH_REQUIRED = ("--parsable", "--no-requeue", "--export", "--ntasks", "--job-name", "--output")
 
 
@@ -161,7 +162,9 @@ class FakeScheduler:
             "sbatch": self._sbatch,
             "squeue": self._squeue,
             "scancel": self._scancel,
+            "scontrol": self._scontrol,
             "find": self._find_files,
+            "sh": self._writable_directory,
             "tail": self._tail,
         }
         if command not in handlers:
@@ -360,6 +363,16 @@ class FakeScheduler:
         for job in self._jobs:
             if job.in_queue and job.name == name and job.state in (_PENDING, _RUNNING):
                 self._interrupt(job, "CANCELLED")
+        return Completed(0, b"", b"")
+
+    def _scontrol(self, argv: tuple[str, ...], _stdin: bytes) -> Completed:
+        if argv[1:] != ("show", "config"):
+            raise AssertionError(f"FakeScheduler does not understand {argv!r}")
+        return Completed(0, _SLURM_CONFIG, b"")
+
+    def _writable_directory(self, argv: tuple[str, ...], _stdin: bytes) -> Completed:
+        if argv[:-1] != WRITABLE_DIRECTORY:
+            raise AssertionError(f"FakeScheduler does not understand {argv!r}")
         return Completed(0, b"", b"")
 
     def _find_files(self, argv: tuple[str, ...], _stdin: bytes) -> Completed:

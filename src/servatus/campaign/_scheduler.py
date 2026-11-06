@@ -20,6 +20,7 @@ from ._script import job_name
 MAX_QUERY_NAMES = 100
 TAIL = "/usr/bin/tail"
 FIND = "/usr/bin/find"
+WRITABLE_DIRECTORY = ("/bin/sh", "-c", 'test -d "$1" && test -w "$1"', "servatus")
 SQUEUE_OPTIONS = ("--me", "--all", "--states=all", "--noheader")
 SQUEUE_FORMAT = "--format=%i|%j|%T"
 MARKER_SUFFIXES = (".start", ".stop", ".end")
@@ -109,6 +110,22 @@ class Scheduler:
             completed.stdout.decode("utf-8", "replace").rstrip("\n"),
             completed.stderr.decode("utf-8", "replace").rstrip("\n"),
         )
+
+    def config(self) -> dict[str, str]:
+        """``scontrol show config``: each setting's name and its value as Slurm prints it."""
+        argv = (self._command("scontrol"), "show", "config")
+        completed = _require_ok(self._transport.run(argv), "scontrol show config", quiet=False)
+        pairs = (
+            line.partition("=") for line in completed.stdout.decode("utf-8", "replace").split("\n")
+        )
+        return {name.strip(): value.strip() for name, equals, value in pairs if equals}
+
+    def writable_directory(self, path: PurePosixPath) -> bool:
+        """Whether ``path`` is a directory this user can write to, without writing anything."""
+        completed = self._transport.run((*WRITABLE_DIRECTORY, str(path)))
+        if completed.returncode > 1:
+            raise Unavailable(f"checking {path} failed with {_diagnostic(completed)}")
+        return completed.returncode == 0
 
     def queue(self, allocation_ids: Sequence[str]) -> dict[str, tuple[QueueRow, ...]]:
         """Every ``squeue`` row (terminal ones included) of this user's jobs named after the

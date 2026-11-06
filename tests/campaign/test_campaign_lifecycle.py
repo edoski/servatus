@@ -17,7 +17,7 @@ from servatus.campaign import (
     Retry,
     Status,
     Task,
-    ping,
+    diagnose,
     to_document,
 )
 from servatus.errors import (
@@ -38,14 +38,12 @@ def executions(status: Status) -> list[tuple[Execution | None, int | None]]:
     return [(task.execution, task.exit_code) for task in status.tasks]
 
 
-def test_ping_and_documents_for_results(world: World) -> None:
-    target = cpu_profile().target
-    assert ping(target, connect=world.wire) == "slurm 23.11.4"
-    with pytest.raises(ConfigurationError, match="ping needs a Target"):
-        ping("login.example.edu", connect=world.wire)  # pyright: ignore[reportArgumentType]
-    world.wire.down.add(target.host)
+def test_diagnose_and_documents_for_results(world: World) -> None:
+    profile = cpu_profile()
+    assert diagnose(profile, connect=world.wire).slurm_version == "slurm 23.11.4"
+    world.wire.down.add(profile.target.host)
     with pytest.raises(Unavailable, match="Connection refused"):
-        ping(target, connect=world.wire)
+        diagnose(profile, connect=world.wire)
     world.wire.down.clear()
     campaign = world.create(jobs(1))
     result = campaign.submit(campaign.plan(cpu_profile()))

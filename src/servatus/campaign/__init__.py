@@ -3,12 +3,14 @@
 Start with ``Campaign.create``, ``Campaign.open``, or ``Campaign.ensure``. A ``Profile`` pairs a
 ``Target`` with per-Task ``Resources``; ``Campaign.plan`` returns a reviewable ``Plan`` and
 ``Campaign.submit`` executes exactly that plan. ``connect``, ``Transport``, and ``Completed`` are
-the scheduler transport seam (see ``servatus.testing.FakeScheduler``); ``ping`` checks a Target's
-scheduler, and ``to_document`` turns results into JSON-compatible data.
+the scheduler transport seam (see ``servatus.testing.FakeScheduler``); ``diagnose`` checks that a
+profile's cluster has what Servatus needs, and ``to_document`` turns results into JSON-compatible
+data.
 """
 
-from ._campaign import Campaign, Connect, ResultProbe, ping
+from ._campaign import Campaign, Connect, ResultProbe
 from ._config import Apptainer, Profile, Resources, Target, Task
+from ._doctor import Check, Diagnosis, Verdict, diagnose
 from ._evidence import Execution, Observation
 from ._plan import Decision, Plan, PlannedAllocation, capacity
 from ._policy import Hold, Retry
@@ -32,9 +34,11 @@ __all__ = [
     "Apptainer",
     "AttemptStatus",
     "Campaign",
+    "Check",
     "Completed",
     "Connect",
     "Decision",
+    "Diagnosis",
     "Execution",
     "Hold",
     "LogSnapshot",
@@ -57,9 +61,10 @@ __all__ = [
     "Transport",
     "UnattemptedAllocation",
     "UnresolvedSubmission",
+    "Verdict",
     "WaitingAllocation",
     "capacity",
     "connect",
-    "ping",
+    "diagnose",
     "to_document",
 ]

@@ -434,3 +434,12 @@ def test_real_find_follows_a_symlinked_log_root(tmp_path: Path, many: bool) -> N
         counts |= {f"{index:024x}": 1 for index in range(8)}
     markers = Scheduler(Local(), target(slurm_bin="/usr/bin")).markers(PurePosixPath(link), counts)
     assert sorted(markers[ALLOCATION], key=repr) == [End(42, 0, 3), Start(42)]
+
+
+def test_writable_directory_tells_a_writable_directory_from_anything_else(tmp_path: Path) -> None:
+    scheduler = Scheduler(Local(), target(slurm_bin="/usr/bin"))
+    regular = tmp_path / "regular"
+    regular.touch()
+    assert scheduler.writable_directory(PurePosixPath(tmp_path)) is True
+    assert scheduler.writable_directory(PurePosixPath(regular)) is False
+    assert scheduler.writable_directory(PurePosixPath(tmp_path / "missing")) is False

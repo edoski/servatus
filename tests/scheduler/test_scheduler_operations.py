@@ -17,7 +17,7 @@ from support.builders import target
 
 from servatus.campaign._evidence import End, QueueRow, Start, Stop
 from servatus.campaign._remote import Completed
-from servatus.campaign._scheduler import Scheduler
+from servatus.campaign._scheduler import WRITABLE_DIRECTORY, Scheduler
 from servatus.errors import ConfigurationError, EvidenceConflict, Unavailable
 
 SBATCH = f"{SLURM_BIN}/sbatch"
@@ -328,3 +328,38 @@ def test_cancel_failure_is_unavailable(failure: Completed | Unavailable) -> None
     transport = Scripted().queue("scancel", failure)
     with pytest.raises(Unavailable, match="scancel failed with exit status 1: scancel: error|ssh"):
         scheduler(transport).cancel(ALLOCATION)
+
+
+# --- doctor facts ----------------------------------------------------------------------------
+
+
+def test_config_reads_each_setting_as_slurm_prints_it() -> None:
+    reply = ok(
+        "Configuration data as of 2026-11-06T17:00:00\n"
+        "MinJobAge               = 300 sec\n"
+        "SlurmctldParameters     = a=b,c\n"
+        "\n"
+        "Slurmctld(primary) at giano is UP\n"
+    )
+    transport = Scripted().queue("scontrol", reply)
+    assert scheduler(transport).config() == {
+        "MinJobAge": "300 sec",
+        "SlurmctldParameters": "a=b,c",
+    }
+    assert transport.calls == [(f"{SLURM_BIN}/scontrol", "show", "config")]
+
+
+def test_config_failure_is_unavailable() -> None:
+    transport = Scripted().queue("scontrol", Completed(1, b"", b"scontrol: error: no\n"))
+    with pytest.raises(Unavailable, match="scontrol show config failed .* no"):
+        scheduler(transport).config()
+
+
+def test_writable_directory_asks_a_shell_and_reads_its_status() -> None:
+    transport = Scripted().queue("sh", ok(""), Completed(1, b"", b""), Completed(2, b"", b"x\n"))
+    path = PurePosixPath("/cluster/logs")
+    assert scheduler(transport).writable_directory(path) is True
+    assert transport.calls[0] == (*WRITABLE_DIRECTORY, str(path))
+    assert scheduler(transport).writable_directory(path) is False
+    with pytest.raises(Unavailable, match="checking /cluster/logs failed with exit status 2: x"):
+        scheduler(transport).writable_directory(path)

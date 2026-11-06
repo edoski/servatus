@@ -29,8 +29,8 @@ from .campaign import (
     Status,
     SubmitResult,
     Task,
-    capacity,
-    ping,
+    Verdict,
+    diagnose,
     to_document,
 )
 from .errors import Busy, ConfigurationError, ServatusError, SubmissionInterrupted, Unavailable
@@ -451,26 +451,26 @@ def _cancel(arguments: argparse.Namespace) -> int:
     return _print_receipts(arguments, receipts, "cancelled")
 
 
+_DOCTOR_EXIT = {
+    Verdict.PASS: 0,
+    Verdict.FAIL: EXIT_ERROR,
+    Verdict.UNAVAILABLE: EXIT_UNAVAILABLE,
+}
+
+
 def _doctor(arguments: argparse.Namespace) -> int:
     profile = Profile.load(arguments.config, name=arguments.profile)
-    target = profile.target
-    fits = capacity(target, profile.resources)
-    version = ping(target, connect=arguments.connect)
+    diagnosis = diagnose(profile, connect=arguments.connect)
     if arguments.json:
-        _emit(
-            {
-                "profile": profile.label,
-                "host": target.host,
-                "slurm_bin": str(target.slurm_bin),
-                "sbatch_version": version,
-                "tasks_per_allocation": fits,
-            }
-        )
+        document = cast(dict[str, object], to_document(diagnosis))
+        _emit({**document, "verdict": diagnosis.verdict.value})
     else:
-        print(f"profile {_safe(profile.label)}: ok, up to {_plural(fits, 'Task')} per allocation")
-        print(f"target: {target.host or 'local'} ({target.slurm_bin})")
-        print(f"sbatch: {_safe(version)}")
-    return 0
+        fits = _plural(diagnosis.tasks_per_allocation, "Task")
+        print(f"profile {_safe(profile.label)}: up to {fits} per allocation")
+        print(f"target: {diagnosis.host or 'local'} ({diagnosis.slurm_bin})")
+        for check in diagnosis.checks:
+            print(f"{check.verdict.value:<11} {check.name}: {_safe(check.detail)}")
+    return _DOCTOR_EXIT[diagnosis.verdict]
 
 
 # --- Parser ----------------------------------------------------------------------------------
@@ -539,7 +539,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     cancel.add_argument("--task", **_KEYS)
     cancel.add_argument("--allocation", action="append", default=[], metavar="ID")
-    profile_options(command("doctor", _doctor, "check the profile and the scheduler connection"))
+    profile_options(command("doctor", _doctor, "check what the profile needs from its cluster"))
     return parser
 
 
