@@ -340,12 +340,7 @@ def _print_status(status: Status, path: Path) -> None:
     print(f"at {status.observed_at.isoformat(timespec='seconds')}; scheduler {observed}")
     rows = [("KEY", "RESULT", "EXECUTION", "EXIT", "ALLOCATION")]
     for task in status.tasks:
-        if task.unresolved:
-            execution = "UNRESOLVED"
-        elif task.current_allocation_id is None:
-            execution = "-"
-        else:
-            execution = "ACCEPTED" if task.execution is None else task.execution.value
+        execution = task.execution.value
         if task.detail is not None:
             execution = f"{execution} ({task.detail})"
         exit_code = "-" if task.exit_code is None else str(task.exit_code)
@@ -374,7 +369,7 @@ def _print_status(status: Status, path: Path) -> None:
         hints.append(f"servatus plan {state} --retry-failed --output PLAN.json")
     if counts["lost"]:
         hints.append(f"servatus plan {state} --retry KEY --output PLAN.json  (LOST Tasks)")
-    if counts["unsubmitted"]:
+    if counts["not_submitted"]:
         hints.append(f"servatus plan {state} --output PLAN.json")
     if not status.scheduler_observed and status.attempts:
         hints.append(f"servatus status {state}")

@@ -2,11 +2,11 @@
 
 Projection rules:
 
-- The latest accepted Attempt containing a Task owns that Task's current execution. An
-  unresolved Attempt (intent recorded, acceptance unknown) dominates instead: the Task is
-  ``unresolved`` and its execution is unknown (``None``).
-- A Task's execution and exit code follow ``Observation.execution`` for its slot: its queue row
-  while Slurm lists the job, then its run markers.
+- A Task's unresolved Attempt (intent recorded, acceptance unknown) dominates: its execution is
+  ``UNRESOLVED``. Otherwise the latest accepted Attempt containing it owns its execution, which
+  follows ``Observation.execution`` for its slot (its queue row while Slurm lists the job, then
+  its run markers), or is ``ACCEPTED`` when the scheduler was not observed. A Task never
+  accepted is ``NOT_SUBMITTED``.
 - ``results_ready`` means the roster is sealed and every Task has a VALID result.
 - ``quiescent`` means the scheduler was observed, no acceptance is unresolved, and Slurm lists no
   job of any accepted allocation, nor of one recorded as not submitted. Scheduler completion says
@@ -25,7 +25,7 @@ from ..errors import ConfigurationError
 from . import _codec
 from ._config import task_keys
 from ._evidence import Execution, Observation, Observed
-from ._state import AcceptanceState, State
+from ._state import AcceptanceState, Attempt, State, TaskHistory, history
 
 STATUS_FORMAT = "servatus.status/1"
 NEVER_STARTED = "never started"
@@ -41,13 +41,15 @@ class ResultState(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class TaskStatus:
+    """One Task: its observed ``Execution``, or the ``AcceptanceState`` of its current Attempt when
+    there is no execution to show (``NOT_SUBMITTED`` when it has none)."""
+
     key: str
     result: ResultState
     current_allocation_id: str | None
-    execution: Execution | None
+    execution: Execution | AcceptanceState
     exit_code: int | None
     detail: str | None
-    unresolved: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,8 +64,11 @@ class AttemptStatus:
     observation: Observation | None
 
 
-_EXECUTION_COUNTS = ("unsubmitted", "unresolved", "accepted") + tuple(
-    state.value.lower() for state in Execution
+_EXECUTIONS = (
+    AcceptanceState.NOT_SUBMITTED,
+    AcceptanceState.UNRESOLVED,
+    AcceptanceState.ACCEPTED,
+    *Execution,
 )
 
 
@@ -89,25 +94,16 @@ class Status:
     def counts(self) -> Mapping[str, int]:
         """Task counts with a fixed set of keys.
 
-        ``tasks`` is the total. ``valid``/``missing``/``unobserved`` partition Tasks by result.
-        The execution keys partition them again: ``unsubmitted`` (never accepted),
-        ``unresolved``, ``accepted`` (current execution not observed), then one key per
-        lowercased ``Execution``.
+        ``tasks`` is the total. ``valid``/``missing``/``unobserved`` partition Tasks by result,
+        and one lowercased key per ``TaskStatus.execution`` value partitions them again:
+        ``not_submitted``, ``unresolved``, ``accepted`` (not observed), then each ``Execution``.
         """
         counts = {"tasks": len(self.tasks)}
         counts.update((state.value.lower(), 0) for state in ResultState)
-        counts.update((name, 0) for name in _EXECUTION_COUNTS)
+        counts.update((state.value.lower(), 0) for state in _EXECUTIONS)
         for task in self.tasks:
             counts[task.result.value.lower()] += 1
-            if task.unresolved:
-                bucket = "unresolved"
-            elif task.current_allocation_id is None:
-                bucket = "unsubmitted"
-            elif task.execution is None:
-                bucket = "accepted"
-            else:
-                bucket = task.execution.value.lower()
-            counts[bucket] += 1
+            counts[task.execution.value.lower()] += 1
         return counts
 
     def to_json(self) -> bytes:
@@ -149,7 +145,6 @@ def project(
     """Project ``state`` with scheduler evidence and probe ``results`` (by Task key; absent keys
     are UNOBSERVED) into one ``Status``."""
     attempts: list[AttemptStatus] = []
-    current: dict[str, tuple[AttemptStatus, int]] = {}
     accepted: set[str] = set()
     for attempt in state.attempts:
         projected = AttemptStatus(
@@ -167,10 +162,10 @@ def project(
         attempts.append(projected)
         if attempt.acceptance is AcceptanceState.ACCEPTED:
             accepted.update(attempt.task_keys)
-        if attempt.acceptance is not AcceptanceState.NOT_SUBMITTED:
-            # The State invariant makes an unresolved Attempt the last one naming its Tasks.
-            current.update((key, (projected, slot)) for slot, key in enumerate(attempt.task_keys))
-    tasks = tuple(_task_status(task.key, current.get(task.key), results) for task in state.tasks)
+    tasks = tuple(
+        _task_status(key, past, observed, results.get(key, ResultState.UNOBSERVED))
+        for key, past in history(state).items()
+    )
     quiescent = (
         scheduler_observed
         and not observed.strays
@@ -195,24 +190,22 @@ def project(
 
 
 def _task_status(
-    key: str, owner: tuple[AttemptStatus, int] | None, results: Mapping[str, ResultState]
+    key: str, past: TaskHistory, observed: Observed, result: ResultState
 ) -> TaskStatus:
-    """One Task, owned by the Attempt (and slot) that holds its current execution, if any."""
-    attempt, slot = owner if owner is not None else (None, 0)
-    observation = None if attempt is None else attempt.observation
-    execution: Execution | None = None
+    owner: Attempt | None = past.unresolved
+    execution: Execution | AcceptanceState = AcceptanceState.UNRESOLVED
     exit_code: int | None = None
     detail: str | None = None
-    if observation is not None:
-        execution, exit_code = observation.execution(slot)
-        if execution is Execution.STOPPED and not observation.started:
-            detail = NEVER_STARTED
-    return TaskStatus(
-        key=key,
-        result=results.get(key, ResultState.UNOBSERVED),
-        current_allocation_id=None if attempt is None else attempt.allocation_id,
-        execution=execution,
-        exit_code=exit_code,
-        detail=detail,
-        unresolved=attempt is not None and attempt.acceptance is AcceptanceState.UNRESOLVED,
-    )
+    if owner is None and past.accepted:
+        owner, slot = past.accepted[-1]
+        observation = observed.attempts.get(owner.allocation_id)
+        if observation is None:
+            execution = AcceptanceState.ACCEPTED
+        else:
+            execution, exit_code = observation.execution(slot)
+            if execution is Execution.STOPPED and not observation.started:
+                detail = NEVER_STARTED
+    elif owner is None:
+        execution = AcceptanceState.NOT_SUBMITTED
+    allocation_id = None if owner is None else owner.allocation_id
+    return TaskStatus(key, result, allocation_id, execution, exit_code, detail)

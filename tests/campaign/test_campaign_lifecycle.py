@@ -9,6 +9,7 @@ import pytest
 from campaign_world import Probe, World, cpu_profile, jobs
 
 from servatus.campaign import (
+    AcceptanceState,
     Campaign,
     Execution,
     Hold,
@@ -34,7 +35,7 @@ def keys(count: int, prefix: str = "task") -> tuple[str, ...]:
     return tuple(f"{prefix}-{index}" for index in range(count))
 
 
-def executions(status: Status) -> list[tuple[Execution | None, int | None]]:
+def executions(status: Status) -> list[tuple[Execution | AcceptanceState, int | None]]:
     return [(task.execution, task.exit_code) for task in status.tasks]
 
 
@@ -314,7 +315,7 @@ def test_unresolved_acceptance_dominates_the_task(world: World) -> None:
     with pytest.raises(SubmissionInterrupted, match="acceptance is unresolved"):
         campaign.submit(plan)
     status = campaign.status()
-    assert all(task.unresolved and task.execution is None for task in status.tasks)
+    assert all(task.execution is AcceptanceState.UNRESOLVED for task in status.tasks)
     assert status.counts()["unresolved"] == 2 and not status.quiescent
 
 

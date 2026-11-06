@@ -187,7 +187,7 @@ def test_a_job_behind_a_not_submitted_allocation_holds_its_tasks(world: World) -
     (warning,) = status.warnings
     assert f"allocation {never}" in warning and f"job {job}" in warning
     assert not status.quiescent
-    assert status.counts()["unsubmitted"] == 2
+    assert status.counts()["not_submitted"] == 2
     held = campaign.plan(cpu_profile())
     assert held.decision.selected == ()
     assert dict(held.decision.held) == {"task-0": Hold.ACTIVE, "task-1": Hold.ACTIVE}

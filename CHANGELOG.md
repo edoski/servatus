@@ -35,6 +35,10 @@ Servatus no longer needs Slurm accounting. See
   `mark_accepted`, `mark_not_submitted`, their CLI commands, and `ReconciliationError` are removed.
 - Jobs are submitted with `--no-requeue` and without `--comment`; `sbatch --parsable` must print a
   bare job number. `cancel` runs `scancel --me --name=<identity>` without a job number.
+- `TaskStatus.execution` is the one field for a Task's state: its observed `Execution`, or
+  `AcceptanceState.UNRESOLVED`, `ACCEPTED` (scheduler not observed), or `NOT_SUBMITTED`.
+  `TaskStatus.unresolved` is removed, the `status` table shows these names instead of `-`, and
+  the `unsubmitted` count is now `not_submitted`.
 - `servatus.testing.FakeScheduler` models the new protocol: queue rows that settle until `purge`,
   run markers in an in-memory `log_root`, `scancel` by name, and `find`. Its controls are `start`,
   `finish_step`, `finish`, `interrupt`, `lose`, `purge`, `write_file`, and `remove_file`.
