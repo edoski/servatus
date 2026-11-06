@@ -549,10 +549,15 @@ class Campaign:
         raise NotFound(f"Task {key!r} has no accepted allocation")
 
     def _verified(self, plan: Plan) -> Plan:
-        """Rebuild ``plan`` from its Decision; refuse it unless it is exactly what was reviewed."""
+        """Rebuild ``plan`` the way a saved plan is loaded; refuse it unless it is exactly what
+        was reviewed."""
         if not isinstance(plan, Plan) or not isinstance(plan.decision, Decision):
             raise ConfigurationError("plan must be a Plan")
-        rebuilt = build_plan(self._store.read(), plan.decision)
+        try:
+            data = plan.to_json()
+        except ValueError as error:
+            raise ConfigurationError(f"invalid plan: {error}") from None
+        rebuilt = self.load_plan(data)
         if rebuilt != plan:
             raise ConfigurationError("the plan does not match its decision; plan again")
         return rebuilt

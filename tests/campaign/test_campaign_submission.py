@@ -69,6 +69,9 @@ def test_only_plans_are_submitted_or_validated(world: World) -> None:
             campaign.submit(value)  # pyright: ignore[reportArgumentType]
         with pytest.raises(ConfigurationError, match="plan must be a Plan"):
             campaign.validate(value)  # pyright: ignore[reportArgumentType]
+    unencodable = replace(plan, decision=replace(plan.decision, tasks_per_allocation=1.5))
+    with pytest.raises(ConfigurationError, match="invalid plan: cannot encode"):
+        campaign.submit(unencodable)  # pyright: ignore[reportArgumentType]
     assert world.scheduler_calls() == 0
 
 

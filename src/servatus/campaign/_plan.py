@@ -19,7 +19,7 @@ from typing import cast
 from ..errors import ConfigurationError, StalePlan
 from ..publication import publish_file
 from . import _codec
-from ._config import Profile, Resources, StrPath, Target, Task, task_keys
+from ._config import Profile, Resources, StrPath, Target, Task
 from ._policy import Hold
 from ._script import check_command, render_batch, sbatch_argv
 from ._state import State
@@ -50,26 +50,7 @@ class Decision:
     probe_required: bool
 
     def __post_init__(self) -> None:
-        if not isinstance(self.profile, Profile):
-            raise ConfigurationError("plan profile must be a Profile")
-        if not (_codec.is_hex(self.nonce, 32) and _codec.is_hex(self.campaign_id, 32)):
-            raise ConfigurationError("plan identities must be 32 lowercase hexadecimal digits")
-        if type(self.revision) is not int or self.revision < 0:
-            raise ConfigurationError("plan revision must be a non-negative integer")
-        if type(self.tasks_per_allocation) is not int or self.tasks_per_allocation < 1:
-            raise ConfigurationError("tasks_per_allocation must be a positive integer")
-        if type(self.probe_required) is not bool:
-            raise ConfigurationError("probe_required must be a bool")
-        for name in ("selected", "deferred", "retry"):
-            keys = task_keys(getattr(self, name), f"plan {name}")
-            if len(set(keys)) != len(keys):
-                raise ConfigurationError(f"plan {name} must be distinct Task keys")
-        held = dict(self.held)
-        if any(
-            not isinstance(key, str) or not isinstance(hold, Hold) for key, hold in held.items()
-        ):
-            raise ConfigurationError("plan held Tasks must map Task keys to Hold reasons")
-        object.__setattr__(self, "held", MappingProxyType(held))
+        object.__setattr__(self, "held", MappingProxyType(dict(self.held)))
 
 
 @dataclass(frozen=True, slots=True)
