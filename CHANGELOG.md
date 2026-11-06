@@ -35,14 +35,37 @@ Servatus no longer needs Slurm accounting. See
 - `servatus.testing.FakeScheduler` models the new protocol: queue rows that settle until `purge`,
   run markers in an in-memory `log_root`, `scancel` by name, and `find`. Its controls are `start`,
   `finish_step`, `finish`, `interrupt`, `lose`, `purge`, `write_file`, and `remove_file`.
+- `servatus doctor` checks what a profile needs from its cluster and reports each check as `pass`,
+  `fail`, or `unavailable`: Slurm 23.02 or later, `squeue` under the scrubbed environment, `MinJobAge`
+  of at least 120 s, `proctrack/cgroup`, writable `work_root` and `log_root`, and a one-Task
+  `sbatch --test-only`. It exits 1 if a check fails and 75 if one went unanswered. Its `--json`
+  document changes: `sbatch_version` becomes `slurm_version`, and `checks` and `verdict` are new.
+- `servatus.campaign.ping` is replaced by `servatus.campaign.diagnose(profile)`, which returns a
+  `Diagnosis` of `Check`s with a `Verdict`.
+- Apptainer steps set their `APPTAINERENV_*` variables through `/usr/bin/env` after `srun`, the same
+  shape as the direct launcher. The `apptainer` path cannot contain `=`.
+- `Scheduler` takes its `Target`, and the module-private checks of values only internal code produces
+  are gone. `args` and `env` errors from a Task file now come from `Task`.
 
 ### Added
 
+- `constraint` accepts Slurm feature expressions (`a100|h100`, `[rack1|rack2]*2`), and `gpu_gres`
+  accepts any count-free GRES (`shard`, `mps`, `gpu:a100_80GB`).
+- A README section with a tested `SERVATUS.toml` for each DISI cluster and the steps to onboard a
+  student on `giano`.
 - `Status.warnings`: a job Slurm lists for an allocation recorded as not submitted holds its
   Tasks `ACTIVE`, keeps the campaign non-quiescent, and is named until it leaves the queue.
   `cancel --allocation` can stop it.
 - `TaskStatus.detail` (`"never started"` for a stopped job that started no Task).
-- `scripts/cluster_e2e.py`, a live end-to-end check against a real cluster, never run by CI.
+- `scripts/cluster_e2e.py`, a live end-to-end check against a real cluster, never run by CI. It can
+  also run a one-GPU Task and an Apptainer Task.
+
+### Fixed
+
+- A status poll over SSH could fail at the 30 s deadline when one TCP connection never opened, which
+  happened about once in 50 connections from a laptop on a phone hotspot. `ssh` now gives each
+  connection three attempts of 8 s. Only the connection is retried, never a command. The deadline
+  error names the command, and a failed connection reports `ssh`'s own message.
 
 ## [0.12.1] - 2026-10-05
 

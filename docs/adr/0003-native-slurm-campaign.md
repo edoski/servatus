@@ -37,8 +37,9 @@ reads what is already buffered and stops waiting for end-of-file, because a desc
 overflow, missing-marker, and connection failures, and scheduler commands that fail where success is
 required, all surface as `Unavailable`: one error boundary. `check_command(argv)` applies the bounds
 purely, so planning rejects an oversized `sbatch` request before any intent exists.
-`servatus.campaign.ping(target)` runs `sbatch --version` through this seam for `servatus doctor`,
-and every submission runs the same check first; a failure reports Slurm's first stderr line.
+Every submission first runs `sbatch --version` through this seam; a failure reports Slurm's first
+stderr line. `servatus doctor` starts with the same check, then the capability checks of
+`servatus.campaign.diagnose`.
 
 ## Batch script and launchers
 

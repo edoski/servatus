@@ -110,7 +110,8 @@ Servatus works on any Slurm cluster where the user can run `squeue`, `scancel`, 
 login node sees `log_root`, and `MinJobAge` is nonzero and well above how long the login node may
 cache a directory listing (NFS `acdirmax`, about a minute by default). With `MinJobAge=0` Slurm
 never purges jobs, so their Tasks would stay `ACTIVE`; with a `MinJobAge` shorter than the cache, a
-stale listing could misread finished work as `STOPPED` or `LOST`. Nothing checks this yet. A Task's
+stale listing could misread finished work as `STOPPED` or `LOST`. `servatus doctor` refuses a
+`MinJobAge` under 120 s and any process tracking but `proctrack/cgroup`. A Task's
 outcome is known only after `MinJobAge`, so `--retry-failed` waits minutes longer than before.
 Markers accumulate in `log_root` like logs; a listing that names many allocations reads every
 marker there, so keep campaigns of tens of thousands of allocations in their own `log_root`. Markers stay in `log_root` beside the logs and are as private as

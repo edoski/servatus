@@ -54,7 +54,8 @@ signal_before_end = "0:10:00"               # SIGUSR1 ten minutes before the lim
 ```
 
 Create `work_root`, `log_root`, and `work_root/results` on the cluster once. `servatus doctor`
-checks that the profile loads and fits its ceilings, and that `sbatch --version` answers.
+checks that the profile fits its ceilings and that the cluster has what Servatus needs. See
+[Clusters](#clusters) for complete configurations and the steps to onboard a new user.
 
 ### 2. Write the worker
 
@@ -334,11 +335,12 @@ times the per-Task CPUs, memory, and GPUs, for the per-Task time limit.
 | `partitions` | array of strings | required | Partitions the job may use. |
 | `max_tasks_per_allocation`, `max_cpus_per_allocation`, `max_memory_mib_per_allocation` | int | required | Ceilings per allocation. |
 | `max_time_limit` | duration | required | Wall-time ceiling. |
-| `account`, `qos`, `constraint` | string | omitted | Passed to `sbatch` when set. |
-| `gpu_gres`, `max_gpus_per_allocation` | string, int | omitted, 0 | Count-free GPU GRES (`gpu:a100`) and its ceiling; set both or neither. |
+| `account`, `qos` | string | omitted | Passed to `sbatch` when set. |
+| `constraint` | string | omitted | Slurm feature expression (`a100\|h100`, `[rack1\|rack2]*2`), passed to `sbatch` as one argument. |
+| `gpu_gres`, `max_gpus_per_allocation` | string, int | omitted, 0 | Count-free GRES (`gpu`, `gpu:a100_80GB`, `shard`) and its ceiling; set both or neither. `gpus` counts units of it, and Slurm must set each step's `CUDA_VISIBLE_DEVICES`. |
 | `max_allocations_per_submit` | int | no cap | Allocations per plan; the rest are deferred. |
 | `max_script_bytes` | int | 1048576 | Batch script size bound. |
-| `apptainer`, `image` | absolute path | omitted | Apptainer launcher: set both, or neither for the direct launcher. `image` has no `:`. |
+| `apptainer`, `image` | absolute path | omitted | Apptainer launcher: set both, or neither for the direct launcher. `apptainer` has no `=` and `image` has no `:`. |
 | `binds` | array of strings | `[]` | Apptainer only: `SRC[:DST[:ro\|rw]]` mounts; `work_root` is always bound. |
 
 | `[resources]` key | Type | Default | Meaning |
@@ -350,7 +352,7 @@ times the per-Task CPUs, memory, and GPUs, for the per-Task time limit.
 
 In Python these are `Target`, `Apptainer`, `Resources`, and `Profile`;
 `servatus.campaign.capacity(target, resources)` returns how many Tasks fit one allocation, and
-`servatus.campaign.ping(target)` returns the `sbatch --version` text (`Unavailable` on failure).
+`servatus.campaign.diagnose(profile)` returns what `servatus doctor` prints as a `Diagnosis`.
 
 **Launchers.** With Apptainer, each step runs `apptainer exec --cleanenv IMAGE ARGS...` from
 `work_root`, so the Task's `args` run directly and the image's runscript is ignored (a relative
@@ -362,13 +364,226 @@ Slurm's step-local `CUDA_VISIBLE_DEVICES`. The batch script sets `PATH=/usr/bin:
 written into the batch script and are visible to cluster administrators: never put secrets in
 Tasks.
 
-**SSH.** Servatus runs `ssh -T -o BatchMode=yes -o LogLevel=ERROR HOST`, so it never prompts, and
-ignores login banners and shell-startup output. From your environment it passes only `HOME`,
+**SSH.** Servatus runs `ssh -T -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=8 -o
+ConnectionAttempts=3 HOST`, so it never prompts, ignores login banners and shell-startup output,
+and retries a connection that never opens. Commands themselves are never retried, and each has 30 s
+to finish. From your environment it passes only `HOME`,
 `LOGNAME`, `USER`, `SSH_AUTH_SOCK`, `KRB5CCNAME`, and `KRB5_CONFIG`, so agent and Kerberos logins
 work. Give the host `ControlMaster auto`, `ControlPath ~/.ssh/control-%C`, and `ControlPersist 30m`
 in `~/.ssh/config`: a persistent master connection makes calls fast and, with multi-factor login,
 lets you authenticate once (`ssh hpc true`) first. Keys must load without a passphrase prompt, for
 example via `ssh-agent`.
+
+## Clusters
+
+A new cluster is a new profile, not new code. Each configuration below passed `servatus doctor` for
+every profile, with `NAME.SURNAME` and the paths filled in. Both clusters run Slurm with `MinJobAge`
+of 300 s and `proctrack/cgroup`, and neither needs `sacct`. Apptainer exists only on their compute
+nodes, at `/usr/bin/apptainer`, so `doctor` cannot check it from the login node.
+
+### Student cluster (`giano`)
+
+Slurm 24.11. Partition `rtx2080` has 8 nodes of 4 CPUs, 42 GiB, and one RTX 2080 Ti. Partition `l40`
+has 4 nodes of 8 CPUs, 64 GiB, and one L40. Home has a 400 MB quota, so everything lives in
+`/scratch.hpc/NAME.SURNAME`, where files unread for 40 days are deleted. Publish what you want to
+keep somewhere else before then.
+
+```toml
+default_profile = "rtx2080"
+
+[target]
+host = "university"
+slurm_bin = "/usr/bin"
+work_root = "/scratch.hpc/NAME.SURNAME/sweep"
+log_root = "/scratch.hpc/NAME.SURNAME/sweep/logs"
+apptainer = "/usr/bin/apptainer"
+image = "/scratch.hpc/NAME.SURNAME/images/train.sif"
+max_tasks_per_allocation = 1
+max_time_limit = "3-00:00:00"
+
+[profiles.rtx2080.target]
+partitions = ["rtx2080"]
+gpu_gres = "gpu"
+max_gpus_per_allocation = 1
+max_cpus_per_allocation = 4
+max_memory_mib_per_allocation = 40960
+
+[profiles.rtx2080.resources]
+cpus = 4
+memory_mib = 40960
+gpus = 1
+time_limit = "12:00:00"
+
+[profiles.l40.target]
+partitions = ["l40"]
+gpu_gres = "gpu"
+max_gpus_per_allocation = 1
+max_cpus_per_allocation = 8
+max_memory_mib_per_allocation = 61440
+
+[profiles.l40.resources]
+cpus = 8
+memory_mib = 61440
+gpus = 1
+time_limit = "12:00:00"
+
+# CPU-only work on the same nodes. Two Tasks share a node.
+[profiles.cpu.target]
+partitions = ["rtx2080"]
+max_tasks_per_allocation = 2
+max_cpus_per_allocation = 4
+max_memory_mib_per_allocation = 32768
+
+[profiles.cpu.resources]
+cpus = 2
+memory_mib = 16384
+time_limit = "04:00:00"
+```
+
+Onboarding a student, in order:
+
+1. **Add the SSH alias.** A login is about 0.6 s and Servatus opens one connection per Slurm command,
+   so share one. Add this to `~/.ssh/config`, then run `ssh-copy-id university`:
+
+   ```ssh-config
+   Host university
+       HostName giano.cs.unibo.it
+       User NAME.SURNAME
+       ControlMaster auto
+       ControlPath ~/.ssh/control-%C
+       ControlPersist 30m
+   ```
+
+2. **Create the directories on scratch**, never in home:
+
+   ```sh
+   ssh university 'mkdir -p -m 700 /scratch.hpc/$USER/sweep/logs /scratch.hpc/$USER/sweep/results /scratch.hpc/$USER/images'
+   ```
+
+3. **Get an image on a compute node.** The login node has no Apptainer. Keep Apptainer's cache out
+   of home:
+
+   ```sh
+   ssh university srun --partition=rtx2080 --cpus-per-task=2 --mem=4G --time=00:20:00 \
+     --chdir=/scratch.hpc/NAME.SURNAME/images /usr/bin/apptainer pull --disable-cache \
+     train.sif docker://python:3.12-slim
+   ```
+
+   To run a virtual environment instead, make it under `work_root` with `pip3 install
+   --no-cache-dir`, drop `apptainer` and `image` from `[target]`, and start each Task's `args` with
+   the absolute path of its Python.
+
+4. **Check the profile**, then follow the [quickstart](#quickstart-a-sweep-in-10-minutes):
+
+   ```sh
+   servatus doctor --profile rtx2080
+   ```
+
+### Research cluster (`slogin`)
+
+Slurm 23.11, for DISI staff and PhD students. The onboarding steps are the same with the alias
+`research` (`HostName slogin.disi.unibo.it`). These profiles reserve memory and CPUs for other users
+on shared nodes.
+
+```toml
+default_profile = "a100"
+
+[target]
+host = "research"
+slurm_bin = "/usr/bin"
+apptainer = "/usr/bin/apptainer"
+image = "/scratch.hpc/NAME.SURNAME/sweep/image/runtime.sif"
+work_root = "/scratch.hpc/NAME.SURNAME/sweep"
+log_root = "/scratch.hpc/NAME.SURNAME/sweep/logs"
+account = "default"
+qos = "limitjob3node2"
+max_tasks_per_allocation = 1
+max_cpus_per_allocation = 128
+max_memory_mib_per_allocation = 262144
+max_gpus_per_allocation = 1
+max_time_limit = "72:00:00"
+
+[resources]
+cpus = 64
+memory_mib = 131072
+gpus = 1
+time_limit = "72:00:00"
+
+[profiles.a100.target]
+partitions = ["a100"]
+gpu_gres = "gpu:a100_80GB"
+
+# Two one-GPU runs per node, each on 104 CPUs: the 16 left over keep other users' small jobs from
+# holding the node out of reach.
+[profiles.l40s.target]
+partitions = ["l40s"]
+gpu_gres = "gpu:l40s"
+max_tasks_per_allocation = 2
+max_cpus_per_allocation = 208
+max_memory_mib_per_allocation = 393216
+max_gpus_per_allocation = 2
+
+[profiles.l40s.resources]
+cpus = 104
+memory_mib = 196608
+
+[profiles.l40.target]
+partitions = ["l40"]
+gpu_gres = "gpu:l40"
+max_tasks_per_allocation = 2
+max_gpus_per_allocation = 2
+max_memory_mib_per_allocation = 196608
+
+[profiles.l40.resources]
+memory_mib = 98304
+
+[profiles.h100.target]
+partitions = ["h100pcie"]
+gpu_gres = "gpu:h100pcie"
+
+[profiles.cpu.target]
+partitions = ["amdepyc9754"]
+max_gpus_per_allocation = 0
+
+[profiles.cpu.resources]
+gpus = 0
+cpus = 128
+memory_mib = 262144
+
+# CPU-only evaluations on the EPYC nodes, or the a100 node's idle CPUs when those are full.
+[profiles.eval.target]
+partitions = ["amdepyc9754", "a100"]
+max_gpus_per_allocation = 0
+max_time_limit = "06:00:00"
+max_tasks_per_allocation = 8
+max_cpus_per_allocation = 144
+
+[profiles.eval.resources]
+gpus = 0
+cpus = 18
+memory_mib = 32768
+time_limit = "06:00:00"
+
+[profiles.smoke.target]
+partitions = ["l40"]
+gpu_gres = "gpu:l40"
+max_time_limit = "00:30:00"
+
+[profiles.smoke.resources]
+cpus = 16
+memory_mib = 32768
+time_limit = "00:30:00"
+
+# One training task with most of the l40 node's CPUs, leaving two GPUs for other users.
+[profiles.l40-solo.target]
+partitions = ["l40"]
+gpu_gres = "gpu:l40"
+max_cpus_per_allocation = 112
+
+[profiles.l40-solo.resources]
+cpus = 112
+memory_mib = 98304
+```
 
 ## CLI reference
 
@@ -396,7 +611,19 @@ integer job number.
 | `logs STATE [--task KEY] [--allocation ID] [--bytes N] [--output FILE]` | Bounded log tail; writes 0600; refuses a terminal. |
 | `reconcile STATE` | Resolve every unresolved allocation from Slurm evidence; exit 75 while some still wait. |
 | `cancel STATE [--task KEY]... [--allocation ID]...` | `scancel` matching allocations that Slurm lists as queued or running. |
-| `doctor [--profile NAME]` | Check the profile and run `sbatch --version`; a failure shows Slurm's first stderr line. |
+| `doctor [--profile NAME]` | Check what the profile needs from its cluster, read-only; see below. Exit 1 if a check fails, 75 if one went unanswered. |
+
+`doctor` submits nothing and writes nothing. It refuses a profile that does not fit its ceilings,
+then runs every check and reports each one as `pass`, `fail`, or `unavailable`:
+
+| Check | Passes when | Why Servatus needs it |
+| --- | --- | --- |
+| `slurm version` | `sbatch --version` reports 23.02 or later. | Every submission uses `--export=NIL`. |
+| `squeue` | `squeue` answers under the scrubbed environment. | Liveness comes from `squeue`, with only `PATH`, `LANG`, `LC_ALL`, and `TZ` set. |
+| `MinJobAge` | `scontrol show config` reports at least 120 s. | Outcomes are read after the purge, which must outlast a cached directory listing. |
+| `ProctrackType` | `scontrol show config` reports `proctrack/cgroup`. | A job Slurm no longer lists must have no steps left. |
+| `work_root`, `log_root` | Each is a writable directory on the login host. | Steps start in one and write logs and run markers to the other. |
+| `sbatch --test-only` | Slurm accepts the profile's one-Task request. | It proves the partition, account, QOS, GRES, and limits go together. It says nothing about whether a job would start soon. |
 
 `logs --task KEY` reads that Task's step log in its latest accepted allocation, `--allocation ID`
 the allocation log, and both that Task's step log in that allocation; `--bytes` is 1 to 1048576

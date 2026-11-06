@@ -14,8 +14,8 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
 - **Resources (`Resources`):** one homogeneous per-Task CPU, MiB, whole-GPU, wall-time, and optional
   `signal_before_end` request for one plan.
 - **Target (`Target`):** one concrete Slurm route: optional SSH host, absolute Slurm directory,
-  work and log roots, partitions, site options, optional launcher, and conservative ceilings. Every
-  Attempt keeps its original Target for observation, recovery, logs, and cancellation.
+  work and log roots, partitions, site options, optional launcher, and conservative ceilings. A
+  second cluster is a second profile with its own Target. Every Attempt keeps its original Target for observation, recovery, logs, and cancellation.
 - **Launcher:** how a step starts a Task. The **Apptainer launcher** (`Apptainer`) runs the Task's
   `args` with `apptainer exec` in one immutable image with a clean environment (the image's
   runscript is never used; `args` must be nonempty); the **direct launcher** (no container) runs
@@ -26,8 +26,11 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   transport (OpenSSH in batch mode, output fenced by per-call markers) when the Target has a host,
   and a local one otherwise. Both run with a scrubbed environment and fixed bounds and return a
   `Completed`; every failure surfaces as `Unavailable`. Any callable from Target to Transport (for
-  example `servatus.testing.FakeScheduler`) can replace `connect`. `ping(target)` proves a Target's
-  scheduler answers (`sbatch --version`).
+  example `servatus.testing.FakeScheduler`) can replace `connect`.
+- **Diagnosis (`Diagnosis`):** what `diagnose(profile)` and `servatus doctor` found, read-only: one
+  `Check` with a `Verdict` (`pass`, `fail`, `unavailable`) for each capability Servatus needs from a
+  profile's cluster: Slurm 23.02 or later, `squeue` under the scrubbed environment, `MinJobAge` of
+  at least 120 s, `proctrack/cgroup`, writable roots, and a one-Task `sbatch --test-only`.
 - **Allocation:** one single-node Slurm job named `servatus-<allocation_id>`, submitted with
   `--no-requeue`, running its Tasks as concurrent exact steps. Each step is named
   `servatus-<allocation_id>-<slot>`.
