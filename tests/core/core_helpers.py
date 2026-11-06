@@ -5,12 +5,14 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 
+from hypothesis import strategies as st
 from support.builders import profile, tasks
 
 from servatus.campaign import _codec
 from servatus.campaign._config import Profile
 from servatus.campaign._evidence import Observation, Observed
-from servatus.campaign._state import State, create, record_intent, record_outcome
+from servatus.campaign._state import AcceptanceState, State, create, record_intent, record_outcome
+from servatus.campaign._status import ResultState
 
 NOW = datetime(2030, 1, 1, tzinfo=UTC)
 CAMPAIGN_ID = "c" * 32
@@ -72,3 +74,60 @@ def evidence(
 def reencode(value: object) -> bytes:
     """Canonical bytes of an edited state document, as the store would have written them."""
     return _codec.canonical(value) + b"\n"
+
+
+def unresolved_keys(state: State) -> set[str]:
+    """Keys an unresolved Attempt holds; no new intent may name them."""
+    return {
+        key
+        for attempt in state.attempts
+        if attempt.outcome_revision is None
+        for key in attempt.task_keys
+    }
+
+
+SLURM_STATES = st.sampled_from([None, None, "PENDING", "RUNNING", "COMPLETED", "NODE_FAIL"])
+
+
+@st.composite
+def observations_of(draw: st.DrawFn, task_count: int) -> Observation:
+    return Observation(
+        draw(SLURM_STATES),
+        draw(st.booleans()),
+        draw(st.booleans()),
+        tuple(draw(st.none() | st.integers(0, 255)) for _ in range(task_count)),
+    )
+
+
+@st.composite
+def scenarios(
+    draw: st.DrawFn, *, every_accepted_observed: bool
+) -> tuple[State, Observed, dict[str, ResultState]]:
+    """A three-Task history with evidence for its accepted Attempts (or only some of them),
+    strays for some not-submitted ones, and probe results for some Tasks."""
+    state = roster(3)
+    for _ in range(draw(st.integers(0, 5))):
+        free = [task.key for task in state.tasks if task.key not in unresolved_keys(state)]
+        if not free:
+            break
+        chosen = draw(st.lists(st.sampled_from(free), min_size=1, max_size=3, unique=True))
+        keys = [key for key in free if key in chosen]
+        kind = draw(st.sampled_from(["accept", "accept", "reject", "pending"]))
+        if kind == "pending":
+            state, _ = intend(state, keys)
+        else:
+            state, _ = submit(state, keys, accepted=kind == "accept")
+    attempts: dict[str, Observation] = {}
+    strays: dict[str, int] = {}
+    for attempt in state.attempts:
+        if attempt.acceptance is AcceptanceState.ACCEPTED:
+            if every_accepted_observed or draw(st.integers(0, 4)):
+                attempts[attempt.allocation_id] = draw(observations_of(len(attempt.task_keys)))
+        elif attempt.acceptance is AcceptanceState.NOT_SUBMITTED and draw(st.booleans()):
+            strays[attempt.allocation_id] = 9000
+    results = {
+        task.key: draw(st.sampled_from(list(ResultState)))
+        for task in state.tasks
+        if draw(st.booleans())
+    }
+    return state, Observed(attempts, strays), results

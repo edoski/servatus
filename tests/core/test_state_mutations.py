@@ -17,7 +17,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Any
 
-from core_helpers import CAMPAIGN_ID, intend, reencode
+from core_helpers import CAMPAIGN_ID, intend, reencode, unresolved_keys
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 from support.builders import profile, resources, target, tasks
@@ -224,7 +224,7 @@ def histories(draw: st.DrawFn) -> State:
     extra = 0
     for _ in range(draw(st.integers(0, 10))):
         operation = draw(st.sampled_from(["append", "seal", "intent", "intent", "outcome"]))
-        unresolved = [a for a in state.attempts if a.acceptance.value == "UNRESOLVED"]
+        unresolved = [a for a in state.attempts if a.outcome_revision is None]
         if operation == "append" and not state.sealed:
             env = draw(st.sampled_from([{}, {"A": "1"}, {"Z_9": "é"}]))
             state = append(state, [Task(f"extra-{extra}", ("run",), stdin=b"\x00x", env=env)])
@@ -232,8 +232,7 @@ def histories(draw: st.DrawFn) -> State:
         elif operation == "seal":
             state = seal(state)
         elif operation == "intent":
-            busy = {key for attempt in unresolved for key in attempt.task_keys}
-            free = [task.key for task in state.tasks if task.key not in busy]
+            free = [task.key for task in state.tasks if task.key not in unresolved_keys(state)]
             if not free:
                 continue
             chosen_profile = draw(st.sampled_from(PROFILES))

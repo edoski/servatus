@@ -4,7 +4,7 @@ import json
 from collections.abc import Mapping
 
 import pytest
-from core_helpers import NOW, evidence, intend, roster, seen, submit
+from core_helpers import NOW, evidence, intend, roster, scenarios, seen, submit
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -307,57 +307,9 @@ def test_json_is_versioned_canonical_and_round_trips() -> None:
 
 # --- properties ------------------------------------------------------------------------------
 
-SLURM_STATES = st.sampled_from([None, None, "PENDING", "RUNNING", "COMPLETED", "NODE_FAIL"])
-
-
-@st.composite
-def observations_of(draw: st.DrawFn, task_count: int) -> Observation:
-    return Observation(
-        draw(SLURM_STATES),
-        draw(st.booleans()),
-        draw(st.booleans()),
-        tuple(draw(st.none() | st.integers(0, 255)) for _ in range(task_count)),
-    )
-
-
-@st.composite
-def scenarios(draw: st.DrawFn) -> tuple[State, Observed, dict[str, ResultState]]:
-    state = roster(3)
-    for _ in range(draw(st.integers(0, 5))):
-        busy = {
-            key
-            for attempt in state.attempts
-            if attempt.acceptance is AcceptanceState.UNRESOLVED
-            for key in attempt.task_keys
-        }
-        free = [task.key for task in state.tasks if task.key not in busy]
-        if not free:
-            break
-        keys = draw(st.lists(st.sampled_from(free), min_size=1, max_size=3, unique=True))
-        ordered = [key for key in free if key in keys]
-        outcome = draw(st.sampled_from(["accept", "reject", "pending"]))
-        if outcome == "pending":
-            state, _ = intend(state, ordered)
-        else:
-            state, _ = submit(state, ordered, accepted=outcome == "accept")
-    attempts: dict[str, Observation] = {}
-    strays: dict[str, int] = {}
-    for attempt in state.attempts:
-        if attempt.acceptance is AcceptanceState.NOT_SUBMITTED:
-            if draw(st.booleans()):
-                strays[attempt.allocation_id] = 9000
-        elif draw(st.integers(0, 4)):
-            attempts[attempt.allocation_id] = draw(observations_of(len(attempt.task_keys)))
-    results = {
-        task.key: draw(st.sampled_from(list(ResultState)))
-        for task in state.tasks
-        if draw(st.booleans())
-    }
-    return state, Observed(attempts, strays), results
-
 
 @settings(max_examples=400, deadline=None)
-@given(scenarios(), st.booleans())
+@given(scenarios(every_accepted_observed=False), st.booleans())
 def test_projection_invariants(
     scenario: tuple[State, Observed, dict[str, ResultState]], scheduler: bool
 ) -> None:

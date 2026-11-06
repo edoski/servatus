@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping
 
 import pytest
-from core_helpers import NOW, evidence, intend, roster, seen, submit
+from core_helpers import NOW, evidence, intend, roster, scenarios, seen, submit
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from support.builders import profile
@@ -331,48 +331,6 @@ def test_a_plain_plan_without_such_history_observes_nothing() -> None:
 # --- properties ------------------------------------------------------------------------------
 
 KEYS = ("task-0", "task-1", "task-2")
-SLURM_STATES = st.sampled_from([None, None, None, "PENDING", "RUNNING", "COMPLETED"])
-
-
-@st.composite
-def observations_of(draw: st.DrawFn, task_count: int) -> Observation:
-    return Observation(
-        draw(SLURM_STATES),
-        draw(st.booleans()),
-        draw(st.booleans()),
-        tuple(draw(st.none() | st.sampled_from([0, 1])) for _ in range(task_count)),
-    )
-
-
-@st.composite
-def scenarios(draw: st.DrawFn) -> tuple[State, Observed, dict[str, ResultState]]:
-    state = roster(len(KEYS))
-    for _ in range(draw(st.integers(0, 5))):
-        busy = {
-            key
-            for attempt in state.attempts
-            if attempt.acceptance is AcceptanceState.UNRESOLVED
-            for key in attempt.task_keys
-        }
-        free = [key for key in KEYS if key not in busy]
-        if not free:
-            break
-        chosen = draw(st.lists(st.sampled_from(free), min_size=1, max_size=3, unique=True))
-        keys = [key for key in free if key in chosen]
-        kind = draw(st.sampled_from(["accept", "accept", "reject", "pending"]))
-        if kind == "pending":
-            state, _ = intend(state, keys)
-        else:
-            state, _ = submit(state, keys, accepted=kind == "accept")
-    attempts: dict[str, Observation] = {}
-    strays: dict[str, int] = {}
-    for attempt in state.attempts:
-        if attempt.acceptance is AcceptanceState.ACCEPTED:
-            attempts[attempt.allocation_id] = draw(observations_of(len(attempt.task_keys)))
-        elif attempt.acceptance is AcceptanceState.NOT_SUBMITTED and draw(st.integers(0, 3)) == 0:
-            strays[attempt.allocation_id] = 9000
-    results = {key: draw(st.sampled_from(list(ResultState))) for key in KEYS if draw(st.booleans())}
-    return state, Observed(attempts, strays), results
 
 
 subsets = st.sets(st.sampled_from(KEYS)).map(lambda chosen: tuple(k for k in KEYS if k in chosen))
@@ -427,7 +385,7 @@ def expected_refusals(
 
 
 @settings(max_examples=2000, deadline=None)
-@given(scenarios(), requests, onlys)
+@given(scenarios(every_accepted_observed=True), requests, onlys)
 def test_policy_safety_properties(
     scenario: tuple[State, Observed, dict[str, ResultState]],
     retry: tuple[str, ...] | Retry,
@@ -475,7 +433,7 @@ def test_policy_safety_properties(
 
 
 @settings(max_examples=1000, deadline=None)
-@given(scenarios(), st.sampled_from(list(Retry)), onlys)
+@given(scenarios(every_accepted_observed=True), st.sampled_from(list(Retry)), onlys)
 def test_bulk_selectors_never_raise(
     scenario: tuple[State, Observed, dict[str, ResultState]],
     retry: Retry,

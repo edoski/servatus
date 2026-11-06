@@ -6,7 +6,7 @@ import errno
 import fcntl
 import os
 import stat
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import replace
 
 import pytest
@@ -22,8 +22,6 @@ from servatus.campaign import (
     Task,
     UnattemptedAllocation,
 )
-from servatus.campaign._state import State
-from servatus.campaign._store import Store
 from servatus.errors import (
     ConfigurationError,
     StalePlan,
@@ -38,6 +36,26 @@ def unattempted(*allocations: PlannedAllocation) -> tuple[UnattemptedAllocation,
 
 def reset(_argv: tuple[str, ...]) -> Completed:
     raise Unavailable("connection reset by peer")
+
+
+def fail_next_directory_sync(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The next directory sync fails once, after its rename made the new state visible."""
+    real_fcntl, real_fsync = fcntl.fcntl, os.fsync
+    full_sync: int | None = getattr(fcntl, "F_FULLFSYNC", None)
+
+    def without_full_sync(descriptor: int, command: int, *args: int) -> object:
+        if command == full_sync:
+            raise OSError(errno.ENOTSUP, "F_FULLFSYNC disabled")
+        return real_fcntl(descriptor, command, *args)
+
+    def directory_sync_fails(descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            monkeypatch.undo()
+            raise OSError(errno.EIO, "directory sync failed")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(fcntl, "fcntl", without_full_sync)
+    monkeypatch.setattr(os, "fsync", directory_sync_fails)
 
 
 def test_submission_records_intent_before_contact_and_receipts_after(world: World) -> None:
@@ -173,17 +191,7 @@ def test_a_receipt_that_became_durable_despite_a_failed_commit_is_reported(
 ) -> None:
     campaign = world.create(jobs(2))
     plan = campaign.plan(cpu_profile(), tasks_per_allocation=1)
-    real_update = Store.update
-    commits: list[int] = []
-
-    def update(store: Store, change: Callable[[State], State]) -> State:
-        state = real_update(store, change)
-        commits.append(state.revision)
-        if len(commits) == 2:  # the first receipt is durable, then the commit "fails"
-            raise OSError(errno.EIO, "directory sync failed")
-        return state
-
-    monkeypatch.setattr(Store, "update", update)
+    world.wire.on("sbatch", lambda _argv: fail_next_directory_sync(monkeypatch))
     with pytest.raises(SubmissionInterrupted, match="receipt failed after it became durable") as e:
         campaign.submit(plan)
     result = e.value.result
@@ -191,26 +199,30 @@ def test_a_receipt_that_became_durable_despite_a_failed_commit_is_reported(
     assert result.unresolved == () and result.unattempted == unattempted(plan.allocations[1])
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
 def test_an_unreadable_campaign_after_a_failed_intent_counts_as_unresolved(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     campaign = world.create(jobs(1))
     plan = campaign.plan(cpu_profile())
 
-    def update(_store: Store, _change: Callable[[State], State]) -> State:
-        def unreadable(_store: Store) -> State:
-            raise OSError(errno.EIO, "read failed")
+    def locked_out(*_args: object, **_kwargs: object) -> None:
+        monkeypatch.undo()
+        world.path.chmod(0)
+        raise OSError(errno.EIO, "rename failed")
 
-        monkeypatch.setattr(Store, "read", unreadable)
-        raise OSError(errno.EIO, "write failed")
-
-    monkeypatch.setattr(Store, "update", update)
-    with pytest.raises(SubmissionInterrupted, match="intent failed after it became durable") as e:
-        campaign.submit(plan)
+    monkeypatch.setattr(os, "rename", locked_out)
+    try:
+        with pytest.raises(
+            SubmissionInterrupted, match="intent failed after it became durable"
+        ) as e:
+            campaign.submit(plan)
+    finally:
+        world.path.chmod(0o700)
     assert [item.allocation_id for item in e.value.result.unresolved] == [
         plan.allocations[0].allocation_id
     ]
-    assert world.fake.jobs == ()
+    assert world.fake.jobs == () and campaign.status(scheduler=False).attempts == ()
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
@@ -344,23 +356,8 @@ def test_an_empty_plan_submits_nothing(world: World) -> None:
 def test_an_intent_that_became_durable_despite_a_failed_commit_is_unresolved(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    real_fcntl, real_fsync = fcntl.fcntl, os.fsync
-    full_sync: int | None = getattr(fcntl, "F_FULLFSYNC", None)
-
-    def without_full_sync(descriptor: int, command: int, *args: int) -> object:
-        if command == full_sync:
-            raise OSError(errno.ENOTSUP, "F_FULLFSYNC disabled")
-        return real_fcntl(descriptor, command, *args)
-
-    def directory_sync_fails(descriptor: int) -> None:
-        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
-            monkeypatch.undo()
-            raise OSError(errno.EIO, "directory sync failed")
-        real_fsync(descriptor)
-
     def probe(tasks: Sequence[Task]) -> set[str]:
-        monkeypatch.setattr(fcntl, "fcntl", without_full_sync)
-        monkeypatch.setattr(os, "fsync", directory_sync_fails)
+        fail_next_directory_sync(monkeypatch)
         return set()
 
     world.create(jobs(2))

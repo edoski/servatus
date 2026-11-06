@@ -8,7 +8,7 @@ import stat
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Generic, TypeVar
 
 import pytest
 
@@ -44,12 +44,15 @@ partitions = ["wide"]
 """
 
 
-class Cli:
-    """Run commands from inside a synthetic project directory."""
+Output = TypeVar("Output", str, bytes)
 
-    def __init__(self, root: Path, capsys: pytest.CaptureFixture[str]) -> None:
+
+class Cli(Generic[Output]):
+    """Run commands from inside a synthetic project directory, capturing text or bytes."""
+
+    def __init__(self, root: Path, capture: pytest.CaptureFixture[Output]) -> None:
         self.root = root
-        self.capsys = capsys
+        self.capture = capture
         self.fake = FakeScheduler()
         (root / "stdin.bin").write_bytes(b"opaque\x00payload")
         (root / "SERVATUS.toml").write_text(PROFILE)
@@ -63,9 +66,9 @@ class Cli:
         path.write_text("".join(json.dumps(line) + "\n" for line in lines))
         return path
 
-    def __call__(self, *argv: str) -> tuple[int, str, str]:
+    def __call__(self, *argv: str) -> tuple[int, Output, Output]:
         code = main(list(argv), connect=self.fake)
-        captured = self.capsys.readouterr()
+        captured = self.capture.readouterr()
         return code, captured.out, captured.err
 
     def submit_failing_twenty_minutes_ago(self, **plan: Any) -> PlannedAllocation:
@@ -89,12 +92,22 @@ class Cli:
 
 
 @pytest.fixture
-def cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> Cli:
+def cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> Cli[str]:
     monkeypatch.chdir(tmp_path)
     return Cli(tmp_path, capsys)
 
 
-def test_version_help_and_usage_errors(cli: Cli) -> None:
+@pytest.fixture
+def raw_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsysbinary: pytest.CaptureFixture[bytes]
+) -> Cli[bytes]:
+    monkeypatch.chdir(tmp_path)
+    return Cli(tmp_path, capsysbinary)
+
+
+def test_version_help_and_usage_errors(cli: Cli[str]) -> None:
     assert cli("--version") == (0, f"servatus {__version__}\n", "")
     code, out, _ = cli("--help")
     assert code == 0 and "reconcile" in out and "mark-" not in out
@@ -113,13 +126,15 @@ def test_version_help_and_usage_errors(cli: Cli) -> None:
         ("reconcile", "state", "a" * 24),
     ],
 )
-def test_removed_commands_and_options_are_usage_errors(cli: Cli, argv: tuple[str, ...]) -> None:
+def test_removed_commands_and_options_are_usage_errors(
+    cli: Cli[str], argv: tuple[str, ...]
+) -> None:
     cli("create", "state", "tasks.jsonl")
     code, out, err = cli(*argv)
     assert (code, out) == (2, "") and "usage:" in err
 
 
-def test_human_workflow_from_creation_to_status(cli: Cli) -> None:
+def test_human_workflow_from_creation_to_status(cli: Cli[str]) -> None:
     code, out, err = cli("create", "state", "tasks.jsonl", "--appendable")
     assert (code, err) == (0, "") and out.startswith("created campaign ")
     assert "2 Tasks, appendable" in out
@@ -154,7 +169,7 @@ def test_human_workflow_from_creation_to_status(cli: Cli) -> None:
     assert "ACCEPTED" in out and "scheduler not observed" in out
 
 
-def test_machine_output_for_every_data_command(cli: Cli) -> None:
+def test_machine_output_for_every_data_command(cli: Cli[str]) -> None:
     created = cli.json("create", "state", "tasks.jsonl")
     assert created["tasks"] == 2 and created["sealed"] is True
     plan = cli.json("plan", "state", "--output", "plan.json")
@@ -195,7 +210,7 @@ def test_machine_output_for_every_data_command(cli: Cli) -> None:
     }
 
 
-def test_ensure_append_and_task_files(cli: Cli) -> None:
+def test_ensure_append_and_task_files(cli: Cli[str]) -> None:
     assert cli.json("ensure", "state", "tasks.jsonl")["sealed"] is False
     more = cli.tasks({"key": "three", "args": ["/bin/true"]}, name="more.jsonl")
     assert cli.json("append", "state", str(more))["tasks"] == 3
@@ -222,7 +237,9 @@ def test_ensure_append_and_task_files(cli: Cli) -> None:
         ([], "expected an object"),
     ],
 )
-def test_invalid_task_files_never_create_a_campaign(cli: Cli, line: object, message: str) -> None:
+def test_invalid_task_files_never_create_a_campaign(
+    cli: Cli[str], line: object, message: str
+) -> None:
     cli.tasks({"key": "fine", "args": []}, line, name="bad.jsonl")
     code, out, err = cli("create", "state", "bad.jsonl")
     assert (code, out) == (1, "")
@@ -232,14 +249,14 @@ def test_invalid_task_files_never_create_a_campaign(cli: Cli, line: object, mess
     assert not (cli.root / "state").exists()
 
 
-def test_duplicate_fields_and_unreadable_files_are_errors(cli: Cli) -> None:
+def test_duplicate_fields_and_unreadable_files_are_errors(cli: Cli[str]) -> None:
     (cli.root / "dup.jsonl").write_text('{"key": "a", "key": "b", "args": []}\n')
     assert cli("create", "state", "dup.jsonl")[2].endswith("duplicate field 'key'\n")
     assert "cannot read task file absent.jsonl" in cli("create", "state", "absent.jsonl")[2]
     assert cli("status", "nowhere")[:2] == (1, "")
 
 
-def test_task_lines_end_only_at_newlines(cli: Cli) -> None:
+def test_task_lines_end_only_at_newlines(cli: Cli[str]) -> None:
     # JSON allows raw U+2028, U+0085, and friends inside strings; they are not line breaks.
     (cli.root / "odd.jsonl").write_text(
         '{"key": "a b\x85c", "args": []}\r\n\n{"key": "d", "args": []}\n', newline=""
@@ -251,7 +268,7 @@ def test_task_lines_end_only_at_newlines(cli: Cli) -> None:
     ]
 
 
-def test_runaway_nesting_is_an_input_error(cli: Cli) -> None:
+def test_runaway_nesting_is_an_input_error(cli: Cli[str]) -> None:
     (cli.root / "deep.jsonl").write_text("[" * 100_000 + "]" * 100_000 + "\n")
     code, _, err = cli("create", "state", "deep.jsonl")
     assert code == 1 and err.startswith("servatus: error: invalid task file deep.jsonl line 1")
@@ -263,7 +280,7 @@ def test_runaway_nesting_is_an_input_error(cli: Cli) -> None:
 
 
 def test_unexpected_failures_are_one_line_and_interrupts_exit_130(
-    cli: Cli, monkeypatch: pytest.MonkeyPatch
+    cli: Cli[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cli("create", "state", "tasks.jsonl")
 
@@ -286,7 +303,7 @@ def test_unexpected_failures_are_one_line_and_interrupts_exit_130(
     assert code == 1 and err.startswith("servatus: error: cannot read TOML configuration")
 
 
-def test_human_output_escapes_untrusted_text(cli: Cli) -> None:
+def test_human_output_escapes_untrusted_text(cli: Cli[str]) -> None:
     cli.tasks({"key": "evil\x1b[2J\r", "args": ["/bin/true"]}, name="evil.jsonl")
     cli("create", "state", "evil.jsonl")
     code, out, _ = cli("plan", "state", "--output", "plan.json")
@@ -305,7 +322,7 @@ def test_human_output_escapes_untrusted_text(cli: Cli) -> None:
 
 
 @pytest.mark.parametrize("failure", ["missing_config", "bad_config", "occupied_output"])
-def test_planning_failures_never_author_the_campaign(cli: Cli, failure: str) -> None:
+def test_planning_failures_never_author_the_campaign(cli: Cli[str], failure: str) -> None:
     cli("create", "state", "tasks.jsonl")
     before = (cli.root / "state" / "campaign.json").read_bytes()
     output = cli.root / "plan.json"
@@ -322,7 +339,7 @@ def test_planning_failures_never_author_the_campaign(cli: Cli, failure: str) -> 
         assert output.read_bytes() == b"preserved"
 
 
-def test_profiles_are_selected_explicitly(cli: Cli, tmp_path: Path) -> None:
+def test_profiles_are_selected_explicitly(cli: Cli[str], tmp_path: Path) -> None:
     cli("create", "state", "tasks.jsonl")
     plan = cli.json("plan", "state", "--profile", "wide")
     assert plan["profile"]["label"] == "wide"
@@ -337,7 +354,7 @@ def test_profiles_are_selected_explicitly(cli: Cli, tmp_path: Path) -> None:
     assert code == 1 and "'absent' is not declared" in err
 
 
-def test_plan_reports_holds_deferrals_and_scripts(cli: Cli) -> None:
+def test_plan_reports_holds_deferrals_and_scripts(cli: Cli[str]) -> None:
     cli("create", "state", "tasks.jsonl")
     cli("plan", "state", "--output", "first.json")
     cli("submit", "state", "first.json")
@@ -357,7 +374,7 @@ def test_plan_reports_holds_deferrals_and_scripts(cli: Cli) -> None:
     assert code == 1 and "unknown Task keys: 'ghost'" in err
 
 
-def test_reconcile_reports_each_outcome_and_exits_75_while_waiting(cli: Cli) -> None:
+def test_reconcile_reports_each_outcome_and_exits_75_while_waiting(cli: Cli[str]) -> None:
     cli("create", "state", "tasks.jsonl")
     old = cli.submit_failing_twenty_minutes_ago(tasks_per_allocation=1).allocation_id
 
@@ -398,7 +415,7 @@ def test_reconcile_reports_each_outcome_and_exits_75_while_waiting(cli: Cli) -> 
     assert "next: servatus reconcile state" in out
 
 
-def test_status_explains_outcomes_warnings_and_next_steps(cli: Cli) -> None:
+def test_status_explains_outcomes_warnings_and_next_steps(cli: Cli[str]) -> None:
     cli.tasks(*({"key": key, "args": ["/bin/true"]} for key in "abc"), name="abc.jsonl")
     cli("create", "state", "abc.jsonl", "--appendable")
     cli("plan", "state", "--output", "plan.json", "--tasks-per-allocation", "1")
@@ -441,35 +458,31 @@ def test_status_explains_outcomes_warnings_and_next_steps(cli: Cli) -> None:
 
 
 def test_logs_write_raw_bytes_and_refuse_terminals(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsysbinary: pytest.CaptureFixture[bytes]
+    raw_cli: Cli[bytes], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.chdir(tmp_path)
-    fake = FakeScheduler()
-    (tmp_path / "tasks.jsonl").write_text('{"key": "one", "args": ["/bin/true"]}\n')
-    (tmp_path / "SERVATUS.toml").write_text(PROFILE)
-    assert main(["create", "state", "tasks.jsonl"], connect=fake) == 0
-    assert main(["plan", "state", "--output", "plan.json"], connect=fake) == 0
-    assert main(["submit", "state", "plan.json"], connect=fake) == 0
+    cli, fake = raw_cli, raw_cli.fake
+    for argv in (("create", "state", "tasks.jsonl"), ("plan", "state", "--output", "plan.json")):
+        assert cli(*argv)[0] == 0
+    assert cli("submit", "state", "plan.json")[0] == 0
     allocation = fake.jobs[0].name.removeprefix("servatus-")
     fake.write_file(f"/logs/{allocation}-1000-0.out", b"\xff\x00raw\x1b[2J")
-    capsysbinary.readouterr()
-    assert main(["logs", "state", "--task", "one", "--bytes", "5"], connect=fake) == 0
-    captured = capsysbinary.readouterr()
-    assert captured.out == b"raw\x1b[2J"[-5:]
-    assert captured.err == b"servatus: showing the last 5 bytes; earlier output exists\n"
-    assert main(["logs", "state", "--task", "one", "--output", "one.log"], connect=fake) == 0
-    assert (tmp_path / "one.log").read_bytes() == b"\xff\x00raw\x1b[2J"
-    assert stat.S_IMODE((tmp_path / "one.log").stat().st_mode) == 0o600
-    assert main(["logs", "state", "--task", "one", "--output", "one.log"], connect=fake) == 1
+    assert cli("logs", "state", "--task", "one", "--bytes", "5") == (
+        0,
+        b"raw\x1b[2J"[-5:],
+        b"servatus: showing the last 5 bytes; earlier output exists\n",
+    )
+    assert cli("logs", "state", "--task", "one", "--output", "one.log")[0] == 0
+    assert (cli.root / "one.log").read_bytes() == b"\xff\x00raw\x1b[2J"
+    assert stat.S_IMODE((cli.root / "one.log").stat().st_mode) == 0o600
+    assert cli("logs", "state", "--task", "one", "--output", "one.log")[0] == 1
     tails = fake.count("tail")
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
-    capsysbinary.readouterr()
-    assert main(["logs", "state", "--allocation", allocation], connect=fake) == 1
-    assert b"refusing to write raw log bytes to a terminal" in capsysbinary.readouterr().err
+    code, _, err = cli("logs", "state", "--allocation", allocation)
+    assert code == 1 and b"refusing to write raw log bytes to a terminal" in err
     assert fake.count("tail") == tails
 
 
-def test_cancel_needs_a_selector_and_doctor_reports_unavailable_clusters(cli: Cli) -> None:
+def test_cancel_needs_a_selector_and_doctor_reports_unavailable_clusters(cli: Cli[str]) -> None:
     cli("create", "state", "tasks.jsonl")
     code, _, err = cli("cancel", "state")
     assert code == 1 and "cancel needs Task keys or allocation ids" in err
