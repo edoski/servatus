@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-import os
 import re
 import tomllib
 from collections.abc import Collection, Iterable, Mapping
@@ -14,10 +13,10 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Self, cast
 
+from .._fs import StrPath
 from ..errors import ConfigurationError, NotFound
 from ._codec import parse_duration
 
-StrPath = str | os.PathLike[str]
 PosixInput = str | PurePosixPath
 
 TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")

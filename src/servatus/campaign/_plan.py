@@ -16,10 +16,11 @@ from datetime import timedelta
 from types import MappingProxyType
 from typing import cast
 
+from .._fs import StrPath
 from ..errors import ConfigurationError, StalePlan
 from ..publication import publish_file
 from . import _codec
-from ._config import Profile, Resources, StrPath, Target, Task
+from ._config import Profile, Resources, Target, Task
 from ._policy import Hold
 from ._script import check_command, render_batch, sbatch_argv
 from ._state import State, history

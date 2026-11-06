@@ -8,14 +8,14 @@ import stat
 import subprocess
 import sys
 import textwrap
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 from core_helpers import CAMPAIGN_ID, reencode, roster, submit
 from support.builders import tasks
+from support.posix import Syscalls, open_descriptors
 
-from servatus._fs import replace_file
 from servatus.campaign import _store
 from servatus.campaign._config import Task
 from servatus.campaign._state import State, append, decode, encode, seal
@@ -33,20 +33,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture(autouse=True)
-def plain_fsync(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Behave like a filesystem without ``F_FULLFSYNC`` so every durability request reaches
-    ``os.fsync`` exactly once, where these tests observe and inject faults."""
-    full_sync: int | None = getattr(fcntl, "F_FULLFSYNC", None)
-    real = fcntl.fcntl
-
-    def without_full_sync(descriptor: int, command: int, *args: int) -> object:
-        if command == full_sync:
-            raise OSError(errno.ENOTSUP, "F_FULLFSYNC disabled by the test")
-        return real(descriptor, command, *args)
-
-    if full_sync is not None:
-        monkeypatch.setattr(fcntl, "fcntl", without_full_sync)
-    yield
+def plain_fsync(monkeypatch: pytest.MonkeyPatch) -> None:
+    Syscalls(monkeypatch)
 
 
 def created(tmp_path: Path, state: State | None = None) -> tuple[Path, Store]:
@@ -102,7 +90,7 @@ def test_open_missing_campaigns_is_not_found(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("path", ["", "a\0b", "/"])
 def test_campaign_paths_must_name_one_directory(path: str) -> None:
-    with pytest.raises(ConfigurationError, match="campaign path"):
+    with pytest.raises(ConfigurationError, match="path"):
         Store.open(path)
 
 
@@ -447,18 +435,6 @@ def test_new_directory_is_synced_into_its_parent(
     assert synced[-1] == (tmp_path / "campaign").stat().st_ino
 
 
-def test_replace_file_never_overwrites_an_existing_stage(tmp_path: Path) -> None:
-    directory = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        replace_file(directory, "file", b"one")
-        replace_file(directory, "file", b"two", mode=0o640)
-    finally:
-        os.close(directory)
-    assert (tmp_path / "file").read_bytes() == b"two"
-    assert stat.S_IMODE((tmp_path / "file").stat().st_mode) == 0o640
-    assert os.listdir(tmp_path) == ["file"]
-
-
 # --- concurrency -----------------------------------------------------------------------------
 
 WORKER = textwrap.dedent(
@@ -513,10 +489,6 @@ def test_two_handles_in_one_process_see_each_other(tmp_path: Path) -> None:
 
 
 # --- error mapping and descriptors ------------------------------------------------------------
-
-
-def open_descriptors() -> int:
-    return len(os.listdir("/dev/fd"))
 
 
 def test_create_closes_every_descriptor_when_a_close_is_interrupted(

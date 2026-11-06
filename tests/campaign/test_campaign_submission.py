@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import errno
-import fcntl
 import os
 import stat
 from collections.abc import Sequence
@@ -11,6 +10,7 @@ from dataclasses import replace
 
 import pytest
 from campaign_world import Probe, World, cpu_profile, jobs
+from support.posix import Syscalls
 
 from servatus.campaign import (
     AcceptanceState,
@@ -40,13 +40,8 @@ def reset(_argv: tuple[str, ...]) -> Completed:
 
 def fail_next_directory_sync(monkeypatch: pytest.MonkeyPatch) -> None:
     """The next directory sync fails once, after its rename made the new state visible."""
-    real_fcntl, real_fsync = fcntl.fcntl, os.fsync
-    full_sync: int | None = getattr(fcntl, "F_FULLFSYNC", None)
-
-    def without_full_sync(descriptor: int, command: int, *args: int) -> object:
-        if command == full_sync:
-            raise OSError(errno.ENOTSUP, "F_FULLFSYNC disabled")
-        return real_fcntl(descriptor, command, *args)
+    Syscalls(monkeypatch)
+    real_fsync = os.fsync
 
     def directory_sync_fails(descriptor: int) -> None:
         if stat.S_ISDIR(os.fstat(descriptor).st_mode):
@@ -54,7 +49,6 @@ def fail_next_directory_sync(monkeypatch: pytest.MonkeyPatch) -> None:
             raise OSError(errno.EIO, "directory sync failed")
         real_fsync(descriptor)
 
-    monkeypatch.setattr(fcntl, "fcntl", without_full_sync)
     monkeypatch.setattr(os, "fsync", directory_sync_fails)
 
 

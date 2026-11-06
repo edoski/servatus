@@ -25,9 +25,8 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from .. import _fs
-from .._fs import Pin
+from .._fs import Pin, StrPath
 from ..errors import ConfigurationError, Conflict, CorruptState, NotFound, UnsafeFilesystem
-from ._config import StrPath
 from ._state import State, decode, encode
 
 MAX_STATE_BYTES = 256 * 1024 * 1024
@@ -147,12 +146,10 @@ class Store:
 
 
 def _location(path: StrPath) -> Path:
-    raw = os.fspath(path)
-    if not isinstance(raw, str) or not raw or "\0" in raw:
-        raise ConfigurationError("campaign path must be a nonempty text path without NUL")
+    raw = _fs.fspath(path)
     location = Path(os.path.abspath(raw))
-    if location.name in {"", ".", ".."}:
-        raise ConfigurationError(f"campaign path must name one directory: {raw}")
+    if not raw or not location.name:
+        raise ConfigurationError(f"campaign path must name one directory: {raw!r}")
     return location
 
 

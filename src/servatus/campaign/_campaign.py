@@ -14,6 +14,7 @@ from functools import reduce
 from pathlib import PurePosixPath
 from typing import Self, cast
 
+from .._fs import StrPath
 from ..errors import (
     Busy,
     ConfigurationError,
@@ -24,7 +25,7 @@ from ..errors import (
     SubmissionInterrupted,
     Unavailable,
 )
-from ._config import Profile, StrPath, Target, Task, task_keys
+from ._config import Profile, Target, Task, task_keys
 from ._evidence import Marker, Observation, Observed, QueueRow, evidenced_job, observe, queue_row
 from ._plan import Decision, Plan, PlannedAllocation, batch, build_plan, capacity, decode_decision
 from ._policy import Request, Retry, decide, scope
