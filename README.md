@@ -345,7 +345,7 @@ times the per-Task CPUs, memory, and GPUs, for the per-Task time limit.
 | `gpu_gres`, `max_gpus_per_allocation` | string, int | omitted, 0 | Count-free GRES (`gpu`, `gpu:a100_80GB`, `shard`) and its ceiling; set both or neither. `gpus` counts units of it, and Slurm must set each step's `CUDA_VISIBLE_DEVICES`. |
 | `max_allocations_per_submit` | int | no cap | Allocations per plan; the rest are deferred. |
 | `max_script_bytes` | int | 1048576 | Batch script size bound. |
-| `apptainer`, `image` | absolute path | omitted | Apptainer launcher: set both, or neither for the direct launcher. `apptainer` has no `=` and `image` has no `:`. |
+| `apptainer`, `image` | absolute path | omitted | Apptainer launcher: set both, or neither for the direct launcher. `image` has no `:`. |
 | `binds` | array of strings | `[]` | Apptainer only: `SRC[:DST[:ro\|rw]]` mounts; `work_root` is always bound. |
 
 | `[resources]` key | Type | Default | Meaning |
@@ -617,7 +617,7 @@ memory_mib = 98304
 `STATE` is the campaign directory. `plan` and `doctor` read `./SERVATUS.toml` unless
 `--config PATH` is given. Output is human-readable, with every non-printable character escaped
 (except `--show-scripts`); every command except `logs` accepts `--json` for exact machine output.
-`status --json` prints a `servatus.status/1` document (`tasks`, `attempts`, `counts`, `quiescent`,
+`status --json` prints a `servatus.status/2` document (`tasks`, `attempts`, `counts`, `quiescent`,
 `results_ready`, `warnings`); saved plans are `servatus.plan/2` documents. Receipts, submit and
 reconcile results, shape checks, and planned allocations are encoded with
 `servatus.campaign.to_document`; a receipt is `{"allocation_id", "job", "task_keys"}` with an

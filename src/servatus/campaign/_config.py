@@ -250,11 +250,8 @@ class Apptainer:
         self, *, executable: PosixInput, image: PosixInput, binds: Iterable[str] = ()
     ) -> None:
         container = _absolute(image, "image")
-        program = _plain(
-            _absolute(executable, "apptainer"), "apptainer", "=", "env reads it as a variable"
-        )
         use = "Apptainer reads it as a URI such as docker://"
-        object.__setattr__(self, "executable", program)
+        object.__setattr__(self, "executable", _absolute(executable, "apptainer"))
         object.__setattr__(self, "image", _plain(container, "image", ":", use))
         object.__setattr__(self, "binds", tuple(_bind(item) for item in _strings(binds, "binds")))
 
