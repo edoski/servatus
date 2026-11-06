@@ -373,6 +373,19 @@ def test_changed_plan_documents_are_refused(
         campaign.load_plan(json.dumps(document).encode())
 
 
+def test_saved_plans_out_of_roster_order_or_over_the_batch_bound_are_refused(
+    world: World,
+) -> None:
+    campaign = world.create(jobs(2))
+    document = json.loads(campaign.plan(cpu_profile(), tasks_per_allocation=1).to_json())
+    reordered = dict(document, selected=["task-1", "task-0"])
+    with pytest.raises(ConfigurationError, match="not in roster order"):
+        campaign.load_plan(json.dumps(reordered).encode())
+    document["profile"]["target"]["max_allocations_per_submit"] = 1
+    with pytest.raises(ConfigurationError, match="exceeds the target's max_allocations_per_submit"):
+        campaign.load_plan(json.dumps(document).encode())
+
+
 @pytest.mark.parametrize("data", [b"", b"[]", b"{", b'{"format": "servatus.plan/2"}'])
 def test_malformed_plan_documents_are_refused(world: World, data: bytes) -> None:
     campaign = world.create(jobs(1))
