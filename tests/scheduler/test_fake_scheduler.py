@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import PurePosixPath
 
 import pytest
+from scheduler_fixtures import allocation
 from support.builders import resources, target, tasks
 
 from servatus.campaign._config import Target
@@ -18,16 +19,12 @@ from servatus.testing import FakeJob, FakeScheduler
 SBATCH = "/opt/slurm/bin/sbatch"
 
 
-def allocation(index: int) -> str:
-    return f"{index:024x}"
-
-
 class Harness:
     def __init__(self) -> None:
         self.fake = FakeScheduler()
         self.target: Target = target()
         self.root = self.target.log_root
-        self.scheduler = Scheduler(self.fake(self.target), self.target.slurm_bin)
+        self.scheduler = Scheduler(self.fake(self.target), self.target)
 
     def request(self, allocation_id: str, count: int = 2) -> tuple[tuple[str, ...], bytes]:
         argv = sbatch_argv(self.target, resources(), count, allocation_id)

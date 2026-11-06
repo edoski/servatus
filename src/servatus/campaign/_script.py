@@ -17,7 +17,7 @@ from datetime import timedelta
 from pathlib import PurePosixPath
 
 from ..errors import ConfigurationError
-from ._codec import format_duration, is_hex
+from ._codec import format_duration
 from ._config import Apptainer, Resources, Target, Task
 
 # Printable ASCII is copied verbatim except printf's own metacharacters and the quote itself.
@@ -63,21 +63,13 @@ def check_command(argv: Sequence[str]) -> tuple[str, ...]:
     return fields
 
 
-def _check_allocation(allocation_id: str) -> str:
-    if not is_hex(allocation_id, 24):
-        raise ConfigurationError("allocation_id must be 24 lowercase hexadecimal digits")
-    return allocation_id
-
-
 def job_name(allocation_id: str) -> str:
     """The immutable Slurm job name of one allocation."""
-    return f"servatus-{_check_allocation(allocation_id)}"
+    return f"servatus-{allocation_id}"
 
 
 def step_name(allocation_id: str, slot: int) -> str:
     """The ``srun --job-name`` of the step that runs the Task in ``slot``."""
-    if type(slot) is not int or slot < 0:
-        raise ConfigurationError("slot must be a non-negative integer")
     return f"{job_name(allocation_id)}-{slot}"
 
 
@@ -88,12 +80,8 @@ def log_path(
 
     ``job`` is an accepted job number, or Slurm's ``%j`` placeholder inside rendered requests.
     """
-    if not (type(job) is int and job > 0) and job != "%j":
-        raise ConfigurationError("job must be a positive job number or '%j'")
-    if slot is not None and (type(slot) is not int or slot < 0):
-        raise ConfigurationError("slot must be a non-negative integer")
     suffix = "" if slot is None else f"-{slot}"
-    return log_root / f"{_check_allocation(allocation_id)}-{job}{suffix}.out"
+    return log_root / f"{allocation_id}-{job}{suffix}.out"
 
 
 def printf_literal(data: bytes) -> str:
@@ -104,18 +92,10 @@ def printf_literal(data: bytes) -> str:
     return "'" + "".join(chr(byte) if byte in _VERBATIM else f"\\{byte:03o}" for byte in data) + "'"
 
 
-def _gres(target: Target, gpus: int) -> str:
-    if target.gpu_gres is None:
-        raise ConfigurationError("GPU resources require a target gpu_gres")
-    return f"--gres={target.gpu_gres}:{gpus}"
-
-
 def sbatch_argv(
     target: Target, resources: Resources, task_count: int, allocation_id: str
 ) -> tuple[str, ...]:
     """The complete ``sbatch`` request for one single-node allocation of ``task_count`` Tasks."""
-    if type(task_count) is not int or task_count < 1:
-        raise ConfigurationError("task_count must be a positive integer")
     identity = job_name(allocation_id)
     output = log_path(target.log_root, allocation_id, "%j")
     argv = [
@@ -141,7 +121,7 @@ def sbatch_argv(
     if target.constraint is not None:
         argv.append(f"--constraint={target.constraint}")
     if resources.gpus:
-        argv.append(_gres(target, task_count * resources.gpus))
+        argv.append(f"--gres={target.gpu_gres}:{task_count * resources.gpus}")
     if resources.signal_before_end is not None:
         seconds = resources.signal_before_end // timedelta(seconds=1)
         argv.append(f"--signal=USR1@{seconds}")
@@ -199,55 +179,53 @@ def _environment(
     return tuple(words)
 
 
-def _apptainer_step(
-    container: Apptainer,
-    target: Target,
-    resources: Resources,
-    task: Task,
-    allocation_id: str,
-    slot: int,
-) -> tuple[Sequence[str], str]:
-    if not task.args:
-        raise ConfigurationError(
-            f"Task {task.key!r}: an Apptainer Task needs args; args[0] is the program to run "
-            "in the container (resolved on the container's PATH when relative)"
-        )
-    run = [str(container.executable), "exec", "--cleanenv"]
+def _apptainer_command(
+    container: Apptainer, target: Target, resources: Resources
+) -> tuple[str, ...]:
+    command = [str(container.executable), "exec", "--cleanenv"]
     for bind in (f"{target.work_root}:{target.work_root}", *container.binds):
-        run.extend(("--bind", bind))
-    run.extend(("--pwd", str(target.work_root)))
+        command.extend(("--bind", bind))
+    command.extend(("--pwd", str(target.work_root)))
     if resources.gpus:
-        run.append("--nv")
-    run.append(str(container.image))
-    run.extend(task.args)
+        command.append("--nv")
+    command.append(str(container.image))
+    return tuple(command)
+
+
+def _launch(target: Target, resources: Resources, task: Task, allocation_id: str, slot: int) -> str:
+    """What ``srun`` runs for one Task: ``env [-i] [PREFIX]NAME=VALUE... COMMAND...``.
+
+    The batch shell expands only ``"$job_id"`` here; everything else is single-quoted. A GPU step
+    runs through a shell that first reads the step-local visibility.
+    """
+    env: tuple[str, ...]
+    command: tuple[str, ...]
+    if target.container is None:
+        program = task.args[0] if task.args else ""
+        if not program.startswith("/") or "=" in program:
+            raise ConfigurationError(
+                f"Task {task.key!r}: without a container, args[0] must be an absolute program "
+                "path without '='"
+            )
+        env, prefix, command = (_ENV, "-i"), "", task.args
+    else:
+        if not task.args:
+            raise ConfigurationError(
+                f"Task {task.key!r}: an Apptainer Task needs args; args[0] is the program to run "
+                "in the container (resolved on the container's PATH when relative)"
+            )
+        launcher = _apptainer_command(target.container, target, resources)
+        env, prefix, command = (_ENV,), "APPTAINERENV_", (*launcher, *task.args)
     assignments = " ".join(
-        f"APPTAINERENV_{name}={word}"
+        f"{prefix}{name}={word}"
         for name, word in _environment(task, allocation_id, slot, resources.gpus)
     )
     if not resources.gpus:
-        return run, assignments
-    wrapper = f"APPTAINERENV_CUDA_VISIBLE_DEVICES={_GPU_VISIBILITY}; "
-    wrapper += 'export APPTAINERENV_CUDA_VISIBLE_DEVICES; exec "$@"'
-    return (_SHELL, "-c", wrapper, "servatus-gpu", *run), assignments
-
-
-def _direct_step(
-    resources: Resources, task: Task, allocation_id: str, slot: int
-) -> tuple[Sequence[str], str, Sequence[str]]:
-    program = task.args[0] if task.args else ""
-    if not program.startswith("/") or "=" in program:
-        raise ConfigurationError(
-            f"Task {task.key!r}: without a container, args[0] must be an absolute program path "
-            "without '='"
-        )
-    assignments = " ".join(
-        f"{name}={word}" for name, word in _environment(task, allocation_id, slot, resources.gpus)
-    )
-    if not resources.gpus:
-        return (_ENV, "-i"), assignments, task.args
-    wrapper = f"visible={_GPU_VISIBILITY}; "
-    wrapper += f'exec {_ENV} -i CUDA_VISIBLE_DEVICES="$visible" "$@"'
-    return (_SHELL, "-c", wrapper, "servatus-gpu"), assignments, task.args
+        return f"{shlex.join(env)} {assignments} {shlex.join(command)}"
+    visible = f'{prefix}CUDA_VISIBLE_DEVICES="$visible"'
+    wrapper = f'visible={_GPU_VISIBILITY}; exec {shlex.join(env)} {visible} "$@"'
+    shell = shlex.join((_SHELL, "-c", wrapper, "servatus-gpu"))
+    return f"{shell} {assignments} {shlex.join(command)}"
 
 
 def render_batch(
@@ -259,14 +237,10 @@ def render_batch(
     as soon as its step returns; the script then waits for every step and exits nonzero if any
     failed. An interrupt writes the stop marker, then terminates every step.
     """
-    frozen = tuple(tasks)
-    if not frozen or any(not isinstance(task, Task) for task in frozen):
-        raise ConfigurationError("an allocation needs at least one Task")
-    _check_allocation(allocation_id)
     srun = str(target.slurm_bin / "srun")
     marker = shlex.quote(str(target.log_root / allocation_id))
     lines: list[str] = [*_PRELUDE, f'marker={marker}."$job_id"', *_TRAP]
-    for slot, task in enumerate(frozen):
+    for slot, task in enumerate(tasks):
         path = log_path(target.log_root, allocation_id, "%j", slot)
         step = [
             srun,
@@ -283,18 +257,8 @@ def render_batch(
             f"--error={path}",
         ]
         if resources.gpus:
-            step.append(_gres(target, resources.gpus))
-        container = target.container
-        if container is None:
-            # Environment words follow `env -i`; the batch shell expands only "$job_id" there,
-            # everything else is single-quoted.
-            launcher, assignments, args = _direct_step(resources, task, allocation_id, slot)
-            words = f"{shlex.join((*step, *launcher))} {assignments} {shlex.join(args)}"
-        else:
-            command, assignments = _apptainer_step(
-                container, target, resources, task, allocation_id, slot
-            )
-            words = f"{assignments} {shlex.join((*step, *command))}"
+            step.append(f"--gres={target.gpu_gres}:{resources.gpus}")
+        words = f"{shlex.join(step)} {_launch(target, resources, task, allocation_id, slot)}"
         end = f'code=$?; command : > "$marker.{slot}.$code.end"; exit "$code"'
         lines.append(f"{{ printf {printf_literal(task.stdin)} | {words}; {end}; }} &")
         lines.append('pids="$pids $!"')

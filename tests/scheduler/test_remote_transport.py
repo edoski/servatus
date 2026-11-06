@@ -59,7 +59,7 @@ def fake_ssh(tmp_path: Path, mode: str = "banner") -> tuple[Ssh, Path]:
     executable = tmp_path / "fake-ssh"
     executable.write_text(FAKE_SSH.format(python=sys.executable, config=str(config)))
     executable.chmod(0o700)
-    return Ssh("login.example.edu", command=(str(executable),)), record
+    return Ssh("login.example.edu", (str(executable),)), record
 
 
 def recorded(record: Path) -> dict[str, Any]:
@@ -96,8 +96,6 @@ def test_check_command_accepts_the_largest_permitted_command() -> None:
 
 def test_stdout_bounds_and_markers_at_their_edges() -> None:
     assert Local().run(("/usr/bin/true",), max_stdout=0) == Completed(0, b"", b"")
-    with pytest.raises(ConfigurationError, match="max_stdout must be a non-negative integer"):
-        Local().run(("/usr/bin/true",), max_stdout=True)
     assert after_marker(b"servatus-m\nreply", "servatus-m") == b"reply"
     with pytest.raises(Unavailable, match="marker missing"):
         after_marker(b"servatus-m", "servatus-m")
@@ -112,8 +110,6 @@ def test_bound_violations_never_spawn(monkeypatch: pytest.MonkeyPatch, tmp_path:
     for transport in (Local(), ssh):
         with pytest.raises(ConfigurationError, match="bound of 32 arguments"):
             transport.run(("/bin/echo",) * 33)
-        with pytest.raises(ConfigurationError, match="max_stdout"):
-            transport.run(("/bin/echo",), max_stdout=-1)
 
 
 def test_connect_selects_ssh_or_local() -> None:
@@ -330,6 +326,7 @@ def test_ssh_client_environment_drops_scheduler_overrides(
         "PATH",
         "LANG",
         "LC_ALL",
+        "TZ",
         "HOME",
         "LOGNAME",
         "USER",
@@ -416,7 +413,7 @@ def test_scheduler_over_noisy_ssh_reads_exact_replies(tmp_path: Path) -> None:
         stub.write_text(f"#!/bin/sh\n{body}\n")
         stub.chmod(0o700)
     ssh, _ = fake_ssh(tmp_path)
-    scheduler = Scheduler(ssh, str(slurm))
+    scheduler = Scheduler(ssh, target(slurm_bin=str(slurm)))
     argv = (str(slurm / "sbatch"), "--parsable", f"--job-name={IDENTITY}")
     assert scheduler.submit(argv, b"#!/bin/sh\n") == 42
     assert scheduler.queue([ALLOCATION]) == {ALLOCATION: (QueueRow(42, "COMPLETED"),)}
@@ -435,5 +432,5 @@ def test_real_find_follows_a_symlinked_log_root(tmp_path: Path, many: bool) -> N
     counts = {ALLOCATION: 1}
     if many:
         counts |= {f"{index:024x}": 1 for index in range(8)}
-    markers = Scheduler(Local(), "/usr/bin").markers(PurePosixPath(link), counts)
+    markers = Scheduler(Local(), target(slurm_bin="/usr/bin")).markers(PurePosixPath(link), counts)
     assert sorted(markers[ALLOCATION], key=repr) == [End(42, 0, 3), Start(42)]

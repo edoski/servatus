@@ -13,6 +13,7 @@ from scheduler_fixtures import (
     listing,
     ok,
 )
+from support.builders import target
 
 from servatus.campaign._evidence import End, QueueRow, Start, Stop
 from servatus.campaign._remote import Completed
@@ -44,7 +45,7 @@ FIND = (
 
 
 def scheduler(transport: Scripted) -> Scheduler:
-    return Scheduler(transport, SLURM_BIN)
+    return Scheduler(transport, target(slurm_bin=SLURM_BIN))
 
 
 def squeue_argv(*allocation_ids: str) -> tuple[str, ...]:
@@ -226,21 +227,6 @@ def test_submit_failures_are_unavailable(reply: Completed | Unavailable, message
         scheduler(Scripted().queue("sbatch", reply)).submit(ARGV, b"#!/bin/sh\n")
 
 
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ("/usr/bin/sbatch", "--parsable"),
-        (),
-        (*ARGV, "--test-only"),
-    ],
-)
-def test_submit_refuses_foreign_argv_before_contact(argv: tuple[str, ...]) -> None:
-    transport = Scripted()
-    with pytest.raises(ConfigurationError, match="this target's sbatch"):
-        scheduler(transport).submit(argv, b"")
-    assert transport.calls == []
-
-
 def test_command_bounds_are_configuration_errors_before_contact() -> None:
     transport = Scripted()
     with pytest.raises(ConfigurationError, match="bound of 4096 bytes"):
@@ -267,11 +253,6 @@ def test_ping_reports_the_slurm_version() -> None:
     assert transport.calls == [(SBATCH, "--version")]
     with pytest.raises(Unavailable, match="exit status 127: no"):
         scheduler(transport).ping()
-
-
-def test_scheduler_requires_an_absolute_slurm_bin() -> None:
-    with pytest.raises(ConfigurationError, match="slurm_bin"):
-        Scheduler(Scripted(), "opt/slurm/bin")
 
 
 # --- tail ------------------------------------------------------------------------------------
@@ -325,12 +306,6 @@ def test_tail_byte_limit_is_a_positive_mib_or_less(maximum: object) -> None:
         scheduler(Scripted()).tail(PurePosixPath("/log"), maximum)  # pyright: ignore[reportArgumentType]
 
 
-@pytest.mark.parametrize("path", ["relative/log", "/log\nINJECT"])
-def test_tail_path_must_be_absolute_and_printable(path: str) -> None:
-    with pytest.raises(ConfigurationError, match="absolute POSIX path"):
-        scheduler(Scripted()).tail(PurePosixPath(path), 4)
-
-
 # --- cancel ----------------------------------------------------------------------------------
 
 
@@ -353,10 +328,3 @@ def test_cancel_failure_is_unavailable(failure: Completed | Unavailable) -> None
     transport = Scripted().queue("scancel", failure)
     with pytest.raises(Unavailable, match="scancel failed with exit status 1: scancel: error|ssh"):
         scheduler(transport).cancel(ALLOCATION)
-
-
-def test_cancel_rejects_a_malformed_allocation_before_contact() -> None:
-    transport = Scripted()
-    with pytest.raises(ConfigurationError, match="allocation_id"):
-        scheduler(transport).cancel("nope")
-    assert transport.calls == []

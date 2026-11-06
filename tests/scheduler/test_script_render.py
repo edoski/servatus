@@ -7,6 +7,7 @@ from pathlib import PurePosixPath
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
+from scheduler_fixtures import ALLOCATION
 from support.builders import resources, target
 
 from servatus.campaign._codec import format_duration, parse_duration
@@ -21,7 +22,6 @@ from servatus.campaign._script import (
 )
 from servatus.errors import ConfigurationError
 
-ALLOCATION = "00112233445566778899aabb"
 LOG = "/cluster/logs/project"
 
 
@@ -45,23 +45,6 @@ def test_names_and_log_paths_bind_the_allocation_identity() -> None:
     assert log_path(root, ALLOCATION, 42) == PurePosixPath(f"{LOG}/{ALLOCATION}-42.out")
     assert log_path(root, ALLOCATION, 42, 0) == PurePosixPath(f"{LOG}/{ALLOCATION}-42-0.out")
     assert log_path(root, ALLOCATION, "%j", 1) == PurePosixPath(f"{LOG}/{ALLOCATION}-%j-1.out")
-
-
-@pytest.mark.parametrize(
-    ("call", "message"),
-    [
-        (lambda: job_name("abc"), "allocation_id"),
-        (lambda: job_name(ALLOCATION.upper()), "allocation_id"),
-        (lambda: step_name(ALLOCATION, -1), "slot"),
-        (lambda: step_name(ALLOCATION, True), "slot"),  # a bool is not a slot number
-        (lambda: log_path(PurePosixPath(LOG), ALLOCATION, 0), "job must be"),
-        (lambda: log_path(PurePosixPath(LOG), ALLOCATION, "../x"), "job must be"),
-        (lambda: log_path(PurePosixPath(LOG), ALLOCATION, 1, -2), "slot"),
-    ],
-)
-def test_names_and_paths_reject_invalid_parts(call: object, message: str) -> None:
-    with pytest.raises(ConfigurationError, match=message):
-        call()  # pyright: ignore[reportCallIssue]
 
 
 # --- sbatch argv -----------------------------------------------------------------------------
@@ -107,24 +90,6 @@ def test_cpu_request_omits_gpu_account_and_signal_options() -> None:
 def test_time_limit_is_rounded_up_to_whole_minutes() -> None:
     request = Resources(cpus=1, memory_mib=1, time_limit="00:01:30")
     assert "--time=00:02:00" in sbatch_argv(target(), request, 1, ALLOCATION)
-
-
-@pytest.mark.parametrize(
-    ("call", "message"),
-    [
-        (lambda: sbatch_argv(target(), resources(), 0, ALLOCATION), "task_count"),
-        (lambda: sbatch_argv(target(), resources(), 1, "nope"), "allocation_id"),
-        (
-            lambda: sbatch_argv(
-                target(gpu_gres=None, max_gpus_per_allocation=0), resources(), 1, ALLOCATION
-            ),
-            "gpu_gres",
-        ),
-    ],
-)
-def test_sbatch_argv_rejects_invalid_requests(call: object, message: str) -> None:
-    with pytest.raises(ConfigurationError, match=message):
-        call()  # pyright: ignore[reportCallIssue]
 
 
 durations = st.builds(
@@ -323,21 +288,6 @@ def test_apptainer_tasks_need_a_program_regardless_of_the_runscript() -> None:
         render((Task("t"),))
 
 
-@pytest.mark.parametrize(
-    ("call", "message"),
-    [
-        (lambda: render(()), "at least one Task"),
-        (lambda: render((task(),), max_script_bytes=100), "exceeds target max_script_bytes"),
-        (
-            lambda: render((task(),), gpu_gres=None, max_gpus_per_allocation=0, gpus=1),
-            "gpu_gres",
-        ),
-        (
-            lambda: render_batch(target(), resources(), (task(),), "short"),
-            "allocation_id",
-        ),
-    ],
-)
-def test_render_rejects_invalid_allocations(call: object, message: str) -> None:
-    with pytest.raises(ConfigurationError, match=message):
-        call()  # pyright: ignore[reportCallIssue]
+def test_render_rejects_a_script_over_its_byte_bound() -> None:
+    with pytest.raises(ConfigurationError, match="exceeds target max_script_bytes"):
+        render((task(),), max_script_bytes=100)

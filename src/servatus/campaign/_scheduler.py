@@ -12,7 +12,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import PurePosixPath
 
 from ..errors import ConfigurationError, EvidenceConflict, Unavailable
-from ._config import CONTROL
+from ._config import CONTROL, Target
 from ._evidence import Marker, QueueRow, parse_markers, parse_queue, parse_receipt
 from ._remote import MAX_STREAM_BYTES, Completed, Transport
 from ._script import job_name
@@ -74,23 +74,14 @@ def marker_patterns(
 
 
 class Scheduler:
-    """Slurm commands under ``slurm_bin``, run through ``transport``."""
+    """Slurm commands of one ``target``, run through ``transport``."""
 
-    def __init__(self, transport: Transport, slurm_bin: PurePosixPath | str) -> None:
-        path = PurePosixPath(slurm_bin)
-        if not path.is_absolute():
-            raise ConfigurationError("slurm_bin must be an absolute POSIX path")
+    def __init__(self, transport: Transport, target: Target) -> None:
         self._transport = transport
-        self._bin = path
+        self._bin = target.slurm_bin
 
     def _command(self, name: str) -> str:
         return str(self._bin / name)
-
-    def _sbatch_request(self, argv: Sequence[str]) -> tuple[str, ...]:
-        fields = tuple(argv)
-        if not fields or fields[0] != self._command("sbatch") or "--test-only" in fields:
-            raise ConfigurationError("submission argv must start with this target's sbatch")
-        return fields
 
     def ping(self) -> str:
         """Prove the transport and Slurm client work: the ``sbatch --version`` text."""
@@ -103,7 +94,7 @@ class Scheduler:
 
         Any failure raises ``Unavailable``; the caller must treat acceptance as unresolved.
         """
-        completed = self._transport.run(self._sbatch_request(argv), stdin=script)
+        completed = self._transport.run(argv, stdin=script)
         _require_ok(completed, "sbatch", quiet=False)
         try:
             return parse_receipt(completed.stdout)
@@ -112,7 +103,7 @@ class Scheduler:
 
     def test_only(self, argv: Sequence[str], script: bytes) -> tuple[bool, str, str]:
         """Ask ``sbatch --test-only`` whether Slurm would accept this request now."""
-        completed = self._transport.run((*self._sbatch_request(argv), "--test-only"), stdin=script)
+        completed = self._transport.run((*argv, "--test-only"), stdin=script)
         return (
             completed.returncode == 0,
             completed.stdout.decode("utf-8", "replace").rstrip("\n"),
@@ -162,12 +153,11 @@ class Scheduler:
         """
         if type(max_bytes) is not int or not 1 <= max_bytes <= MAX_STREAM_BYTES:
             raise ConfigurationError(f"max_bytes must be an integer from 1 to {MAX_STREAM_BYTES}")
-        text = str(path)
-        if not PurePosixPath(text).is_absolute() or CONTROL.search(text):
-            raise ConfigurationError("log path must be an absolute POSIX path")
         limit = max_bytes + 1
         try:
-            completed = self._transport.run((TAIL, "-c", str(limit), "--", text), max_stdout=limit)
+            completed = self._transport.run(
+                (TAIL, "-c", str(limit), "--", str(path)), max_stdout=limit
+            )
         except Unavailable:
             raise Unavailable("log is unavailable") from None
         if completed.returncode != 0 or completed.stderr or len(completed.stdout) > limit:

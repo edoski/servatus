@@ -22,7 +22,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import IO, Protocol, cast
 
-from ..errors import ConfigurationError, Unavailable
+from ..errors import Unavailable
 from ._config import Target
 from ._script import check_command
 
@@ -31,10 +31,9 @@ DEADLINE_SECONDS = 30.0
 # Login banners and shell start-up noise precede the output marker; bound them separately.
 NOISE_ALLOWANCE = 64 * 1024
 
-_PATH = "/usr/bin:/bin"
 _SSH_OPTIONS = ("-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "--")
-_REMOTE_ENV = ("PATH=" + _PATH, "LANG=C", "LC_ALL=C", "TZ=UTC")
-_LOCAL_ENV = {"PATH": _PATH, "LANG": "C", "LC_ALL": "C", "TZ": "UTC"}
+_ENVIRONMENT = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C", "TZ": "UTC"}
+_REMOTE_ENV = " ".join(f"{name}={value}" for name, value in _ENVIRONMENT.items())
 # What the ssh client needs to find its configuration, agent, and Kerberos (GSSAPI) credentials.
 _SSH_PASSTHROUGH = ("HOME", "LOGNAME", "USER", "SSH_AUTH_SOCK", "KRB5CCNAME", "KRB5_CONFIG")
 # How often to check whether the child exited while its pipes stay open.
@@ -58,12 +57,7 @@ class Transport(Protocol):
     ) -> Completed: ...
 
 
-def _check_stdout_bound(max_stdout: int) -> None:
-    if type(max_stdout) is not int or max_stdout < 0:
-        raise ConfigurationError("max_stdout must be a non-negative integer")
-
-
-@dataclass(frozen=True, slots=True, init=False)
+@dataclass(frozen=True, slots=True)
 class Ssh:
     """Run commands on ``host`` through ``ssh -T -o BatchMode=yes -o LogLevel=ERROR``.
 
@@ -71,26 +65,21 @@ class Ssh:
     ``/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C TZ=UTC <argv>``. Anything before the
     markers (login banners, shell start-up noise) is discarded; a missing marker means the command
     never ran as requested and raises ``Unavailable``. ``command`` replaces the local ``ssh``
-    invocation, for example with a fake executable in tests.
+    invocation, for example with a fake executable in tests. ``Target`` validates ``host``, and
+    ``--`` keeps it from parsing as an option.
     """
 
     host: str
-    command: tuple[str, ...]
-
-    def __init__(self, host: str, *, command: Sequence[str] = ("ssh",)) -> None:
-        # ``Target`` validates the destination; ``--`` keeps it from parsing as an option.
-        object.__setattr__(self, "host", host)
-        object.__setattr__(self, "command", check_command(command))
+    command: tuple[str, ...] = ("ssh",)
 
     def run(
         self, argv: Sequence[str], *, stdin: bytes = b"", max_stdout: int = MAX_STREAM_BYTES
     ) -> Completed:
         fields = check_command(argv)
-        _check_stdout_bound(max_stdout)
         marker = f"servatus-{secrets.token_hex(16)}"
         script = (
             f"printf '%s\\n' {marker}; printf '%s\\n' {marker} >&2; "
-            f"exec /usr/bin/env -i {' '.join(_REMOTE_ENV)} {shlex.join(fields)}"
+            f"exec /usr/bin/env -i {_REMOTE_ENV} {shlex.join(fields)}"
         )
         remote = shlex.join(("/bin/sh", "-c", script))
         command = (*self.command, *_SSH_OPTIONS, self.host, remote)
@@ -117,13 +106,12 @@ class Local:
         self, argv: Sequence[str], *, stdin: bytes = b"", max_stdout: int = MAX_STREAM_BYTES
     ) -> Completed:
         fields = check_command(argv)
-        _check_stdout_bound(max_stdout)
         return run_bounded(
             fields,
             stdin=stdin,
             max_stdout=max_stdout,
             max_stderr=MAX_STREAM_BYTES,
-            env=dict(_LOCAL_ENV),
+            env=_ENVIRONMENT,
         )
 
 
@@ -134,11 +122,9 @@ def connect(target: Target) -> Transport:
 
 def ssh_environment() -> dict[str, str]:
     """The local environment for the ``ssh`` client: no scheduler overrides leak through."""
-    environment = {"PATH": _PATH, "LANG": "C", "LC_ALL": "C"}
-    for name in _SSH_PASSTHROUGH:
-        if value := os.environ.get(name):
-            environment[name] = value
-    return environment
+    return _ENVIRONMENT | {
+        name: os.environ[name] for name in _SSH_PASSTHROUGH if os.environ.get(name)
+    }
 
 
 def after_marker(output: bytes, marker: str) -> bytes:
@@ -163,8 +149,6 @@ def run_bounded(
     Stdin comes from an anonymous temporary file, so a child that never reads cannot deadlock the
     parent. Any failure kills the child's process group, reaps it, and raises ``Unavailable``.
     """
-    if not isinstance(stdin, bytes):
-        raise ConfigurationError("stdin must be bytes")
     try:
         with tempfile.TemporaryFile() as source:
             source.write(stdin)

@@ -22,12 +22,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from scheduler_fixtures import ALLOCATION
 from support.builders import target
 
 from servatus.campaign._config import Apptainer, Resources, Target, Task
 from servatus.campaign._script import render_batch
 
-ALLOCATION = "00112233445566778899aabb"
 JOB = "4242"
 SHELLS = [
     shell for shell in ("/bin/sh", "/bin/dash", "/bin/bash", "/bin/ksh") if Path(shell).exists()

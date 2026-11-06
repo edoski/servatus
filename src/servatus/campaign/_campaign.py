@@ -79,7 +79,7 @@ def ping(target: Target, *, connect: Connect | None = None) -> str:
     """
     if not isinstance(target, Target):
         raise ConfigurationError("ping needs a Target")
-    return Scheduler((connect or connect_target)(target), target.slurm_bin).ping()
+    return Scheduler((connect or connect_target)(target), target).ping()
 
 
 def _receipt(attempt: Attempt) -> Receipt:
@@ -487,7 +487,7 @@ class Campaign:
         return moment.astimezone(UTC)
 
     def _scheduler(self, target: Target) -> Scheduler:
-        return Scheduler(self._connect(target), target.slurm_bin)
+        return Scheduler(self._connect(target), target)
 
     def _results(self, tasks: tuple[Task, ...]) -> dict[str, ResultState]:
         """Call the probe once for ``tasks``; without a probe every result is UNOBSERVED."""
