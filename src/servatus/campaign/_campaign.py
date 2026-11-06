@@ -565,10 +565,10 @@ class Campaign:
             raise StalePlan("the campaign changed after planning; plan again")
         keys = decision.selected
         past = history(state)
-        retry = frozenset(key for key in keys if past[key].accepted)
+        request = Request(frozenset(key for key in keys if past[key].accepted), frozenset(keys))
+        observed, results = self._consult(state, request)
         try:
-            request = Request(retry, frozenset(keys))
-            selection = decide(state, *self._consult(state, request), request)
+            selection = decide(state, observed, results, request)
         except PlanRefused as error:
             raise StalePlan(f"the plan no longer holds ({error}); plan again") from error
         if selection.selected != keys:
