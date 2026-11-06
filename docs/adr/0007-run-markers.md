@@ -56,7 +56,8 @@ eight allocations and otherwise the three suffixes. Per slot:
 | --- | --- | --- |
 | live, queued | any | `QUEUED` |
 | live, running or settling | slot end | `SUCCEEDED` (0) or `FAILED` (exit code) |
-| live, running or settling | no slot end | `RUNNING` |
+| live, running | no slot end | `RUNNING` |
+| live, settling | no slot end | `ENDING` |
 | gone | slot end | `SUCCEEDED` or `FAILED` |
 | gone | start and stop, no slot end | `STOPPED` (cancel, time limit) |
 | gone | no start | `STOPPED`, never started |

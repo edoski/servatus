@@ -269,6 +269,7 @@ def test_how_an_allocation_ended_is_read_from_its_run_markers(
     settling = campaign.status()
     assert not settling.quiescent
     assert all(task.detail is None for task in settling.tasks)
+    assert settling.tasks[1].execution is Execution.ENDING
     world.fake.purge(receipt.job)
     status = campaign.status()
     assert status.quiescent

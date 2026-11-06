@@ -170,9 +170,10 @@ servatus plan state --retry-failed --output retry.json    # later: rerun failed 
 Without `--output`, `plan` only prints. `submit` rebuilds the reviewed plan, refuses it with
 `StalePlan` if the campaign changed, and pings Slurm and rechecks eligibility before recording
 anything. `status` shows each Task's execution: `QUEUED`, `RUNNING`, `ENDING` (Slurm
-says the job ended; the outcome is final a few minutes later, once Slurm forgets it), `SUCCEEDED`
-or `FAILED` with its step's exit code, `STOPPED` (cancelled, out of time, or never started), or `LOST` (the job
-vanished without recording how it ended, for example on a node failure). A Task without an
+says the job ended; the outcome is final a few minutes later, once Slurm forgets it),
+`SUCCEEDED` or `FAILED` with its step's exit code, `STOPPED` (cancelled, out of time, or never
+started), or `LOST` (the job vanished without recording how it ended, for example on a node
+failure). A Task without an
 observed execution shows `NOT_SUBMITTED`, `UNRESOLVED` (reconcile it), or `ACCEPTED` (with
 `--offline`).
 
@@ -181,7 +182,7 @@ the empty run markers each batch script writes to `log_root`: a start marker bef
 end marker per step as soon as it returns, and a stop marker when the job is interrupted. A step's
 end marker shows as `SUCCEEDED` or `FAILED` at once. A finished job stays in `squeue` for the
 cluster's `MinJobAge` (typically 5 minutes), and a missing marker means something only after that,
-when every marker is visible on the login node. Until then a cancelled Task still shows `RUNNING`
+when every marker is visible on the login node. Until then a cancelled Task shows `ENDING`
 and retries are held `ACTIVE`, so `--retry-failed` picks failed work up a few minutes after it ends.
 This needs a nonzero `MinJobAge` well above how long the login node caches directory listings (NFS:
 about a minute); `scontrol show config | grep MinJobAge` shows it.
