@@ -85,7 +85,7 @@ class State:
     attempts: tuple[Attempt, ...] = ()
 
     def __post_init__(self) -> None:
-        check(self)
+        _check(self)
 
     @property
     def tasks(self) -> tuple[Task, ...]:
@@ -136,7 +136,7 @@ def history(state: State) -> dict[str, TaskHistory]:
     }
 
 
-def check(state: State) -> None:
+def _check(state: State) -> None:
     """The single Campaign invariant, linear in tasks plus attempted Task references."""
     revision, sealed = state.revision, state.sealed_revision
     _require(_codec.is_hex(state.campaign_id, 32), "invalid campaign identity")
@@ -306,12 +306,12 @@ def _fields(value: Attempt | _AttemptDocument, **changes: object) -> dict[str, A
     return {item.name: getattr(value, item.name) for item in fields(value)} | changes
 
 
-def profile_key(profile: Profile) -> str:
+def _profile_key(profile: Profile) -> str:
     return _codec.digest(_codec.dump(profile))[:16]
 
 
 def encode(state: State) -> bytes:
-    profiles = {profile_key(attempt.profile): attempt.profile for attempt in state.attempts}
+    profiles = {_profile_key(attempt.profile): attempt.profile for attempt in state.attempts}
     document = _StateDocument(
         schema_version=SCHEMA_VERSION,
         campaign_id=state.campaign_id,
@@ -320,7 +320,7 @@ def encode(state: State) -> bytes:
         tasks=state.roster,
         profiles=profiles,
         attempts=tuple(
-            _AttemptDocument(**_fields(attempt, profile=profile_key(attempt.profile)))
+            _AttemptDocument(**_fields(attempt, profile=_profile_key(attempt.profile)))
             for attempt in state.attempts
         ),
     )
@@ -342,7 +342,7 @@ def decode(data: bytes) -> State:
         document = _codec.load(_StateDocument, cast(object, raw))
         profiles = dict(document.profiles)
         for name, profile in profiles.items():
-            _require(profile_key(profile) == name, "profile key does not match its content")
+            _require(_profile_key(profile) == name, "profile key does not match its content")
         used = {item.profile for item in document.attempts}
         _require(used == profiles.keys(), "profiles do not match attempt references")
         state = State(

@@ -4,7 +4,7 @@ Layout::
 
     <campaign>/            owner-only directory (0700, owned by the effective user)
         .lock              owner-only regular file; ``flock`` serializes every transaction
-        campaign.json      canonical schema-7 state, replaced atomically on each change
+        campaign.json      canonical schema-8 state, replaced atomically on each change
 
 Every operation reopens the directory without following a final symlink and checks that it is
 still the directory the store was opened on. Reads hold a shared lock and writes an exclusive one;
