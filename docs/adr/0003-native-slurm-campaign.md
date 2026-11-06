@@ -134,7 +134,8 @@ contained in the Attempt's `log_root`.
 
 This section predates 0.12 and records the live gate of the 0.11 candidate below. Since 0.13,
 `scripts/cluster_e2e.py` is the repeatable gate: it runs the direct and Apptainer launchers, CPU and
-one GPU, through the CLI on a real cluster.
+one GPU, through the CLI on a real cluster. On 2026-11-06 the 0.13.0 candidate passed it on Slurm
+24.11.5 (RTX 2080 Ti) and Slurm 23.11.4 (L40). A later release needs its own run.
 
 The following evidence concerns the tested candidate and site, not a live acceptance of every later
 release. On 2026-08-10, candidate `0c454bd38da4f3d5b0ba4f0777b708f8a2eb011c` passed the live gate as

@@ -45,9 +45,10 @@ steps and the batch shell separately, so a Task that exits on its own step's sig
 batch shell is signalled can still record an end marker and read as `FAILED`; `--retry-failed`
 selects both.
 
-**Outcomes are decided only after Slurm forgets the job.** `MinJobAge` keeps a finished job in
-`squeue` for minutes, far longer than an NFS client caches a directory listing (about a minute), so
-the one directory read that follows the purge sees every marker: `find -H LOG_ROOT -maxdepth 1
+**A missing marker counts only after Slurm forgets the job.** An end marker is conclusive as soon as
+it is visible. `MinJobAge` keeps a finished job in `squeue` for minutes, far longer than an NFS
+client caches a directory listing (about a minute), so the one directory read that follows the purge
+sees every marker: `find -H LOG_ROOT -maxdepth 1
 -type f`, with `-H` because `log_root` may be a symbolic link, naming `<id>.*` exactly for up to
 eight allocations and otherwise the three suffixes. Per slot:
 
@@ -112,8 +113,9 @@ login node sees `log_root`, and `MinJobAge` is nonzero and well above how long t
 cache a directory listing (NFS `acdirmax`, about a minute by default). With `MinJobAge=0` Slurm
 never purges jobs, so their Tasks would stay `ACTIVE`; with a `MinJobAge` shorter than the cache, a
 stale listing could misread finished work as `STOPPED` or `LOST`. `servatus doctor` refuses a
-`MinJobAge` under 120 s and any process tracking but `proctrack/cgroup`. A Task's
-outcome is known only after `MinJobAge`, so `--retry-failed` waits minutes longer than before.
+`MinJobAge` under 120 s and any process tracking but `proctrack/cgroup`. `STOPPED`, `LOST`, and
+every retry wait for `MinJobAge`, so a cancelled Task reads `RUNNING` until the purge and
+`--retry-failed` waits minutes longer than before.
 Markers accumulate in `log_root` like logs; a listing that names many allocations reads every
 marker there, so keep campaigns of tens of thousands of allocations in their own `log_root`. Markers
 stay in `log_root` beside the logs and are as private as they are. Campaigns from 0.12 (schema 7)

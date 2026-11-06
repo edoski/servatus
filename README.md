@@ -177,12 +177,13 @@ observed execution shows `NOT_SUBMITTED`, `UNRESOLVED` (reconcile it), or `ACCEP
 
 Servatus needs no Slurm accounting (`sacct`). It reads `squeue` for work Slurm still lists, and
 the empty run markers each batch script writes to `log_root`: a start marker before any step, one
-end marker per step as soon as it returns, and a stop marker when the job is interrupted. A
-finished job stays in `squeue` for the cluster's `MinJobAge` (typically 5 minutes); Servatus
-decides how it ended only after that, when every marker is visible on the login node, so
-`--retry-failed` picks failed work up a few minutes after it ends. This needs a nonzero
-`MinJobAge` well above how long the login node caches directory listings (NFS: about a minute);
-`scontrol show config | grep MinJobAge` shows it.
+end marker per step as soon as it returns, and a stop marker when the job is interrupted. A step's
+end marker shows as `SUCCEEDED` or `FAILED` at once. A finished job stays in `squeue` for the
+cluster's `MinJobAge` (typically 5 minutes), and a missing marker means something only after that,
+when every marker is visible on the login node. Until then a cancelled Task still shows `RUNNING`
+and retries are held `ACTIVE`, so `--retry-failed` picks failed work up a few minutes after it ends.
+This needs a nonzero `MinJobAge` well above how long the login node caches directory listings (NFS:
+about a minute); `scontrol show config | grep MinJobAge` shows it.
 
 ## Concepts
 
@@ -666,7 +667,7 @@ the allocation log, and both that Task's step log in that allocation; `--bytes` 
 - Submission executes exactly the reviewed plan, or refuses it as stale or tampered.
 - Campaign state is owner-only, validated on every read, atomically replaced, and synced.
 - Scheduler evidence is bounded, identity-checked, and read from each Attempt's original target.
-  No Slurm accounting is needed, and an outcome is decided only after Slurm forgets the job.
+  No Slurm accounting is needed, and a missing marker counts only after Slurm forgets the job.
 - A published destination is absent or complete and is never overwritten. Content is synced before
   commit and the parent after it.
 - Private work survives failure and is removed only after a durable publication.
