@@ -57,8 +57,18 @@ def servatus(root: Path, *arguments: str, check: bool = True) -> subprocess.Comp
     return completed
 
 
-def status(root: Path) -> dict[str, Any]:
-    return cast(dict[str, Any], json.loads(servatus(root, "status", "state", "--json").stdout))
+EXIT_UNAVAILABLE = 75
+
+
+def status(root: Path) -> dict[str, Any] | None:
+    """The status document, or None when the cluster was briefly unavailable (exit 75)."""
+    completed = servatus(root, "status", "state", "--json", check=False)
+    if completed.returncode == EXIT_UNAVAILABLE:
+        log(f"status unavailable, retrying: {completed.stderr.strip()}")
+        return None
+    if completed.returncode != 0:
+        raise SystemExit(f"servatus status exited {completed.returncode}:\n{completed.stderr}")
+    return cast(dict[str, Any], json.loads(completed.stdout))
 
 
 def executions(document: dict[str, Any]) -> dict[str, str | None]:
@@ -70,11 +80,12 @@ def wait_for(
 ) -> dict[str, Any]:
     while True:
         document = status(root)
-        if done(document):
+        if document is not None and done(document):
             return document
+        shown = "unavailable" if document is None else executions(document)
         if time.monotonic() > deadline:
-            raise SystemExit(f"timed out waiting for {what}: {executions(document)}")
-        log(f"waiting for {what}: {executions(document)}")
+            raise SystemExit(f"timed out waiting for {what}: {shown}")
+        log(f"waiting for {what}: {shown}")
         time.sleep(POLL_SECONDS)
 
 
