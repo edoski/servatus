@@ -23,9 +23,9 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
 - **Profile (`Profile`):** one nonbinding label plus a complete Target and Resources, loaded from
   `SERVATUS.toml` with document-level defaults overridden per key.
 - **Transport (`Transport`):** how scheduler commands reach Slurm. `connect(target)` returns an SSH
-  transport (OpenSSH in batch mode, output fenced by per-call markers) when the Target has a host,
-  and a local one otherwise. Both run with a scrubbed environment and fixed bounds and return a
-  `Completed`; every failure surfaces as `Unavailable`. Any callable from Target to Transport (for
+  transport (OpenSSH in batch mode, retrying only the connection, output fenced by per-call markers)
+  when the Target has a host, and a local one otherwise. Both run with a scrubbed environment and
+  fixed bounds and return a `Completed`; every failure surfaces as `Unavailable`. Any callable from Target to Transport (for
   example `servatus.testing.FakeScheduler`) can replace `connect`.
 - **Diagnosis (`Diagnosis`):** what `diagnose(profile)` and `servatus doctor` found, read-only: one
   `Check` with a `Verdict` (`pass`, `fail`, `unavailable`) for each capability Servatus needs from a
