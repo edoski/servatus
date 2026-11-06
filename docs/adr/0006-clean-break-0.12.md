@@ -1,6 +1,7 @@
 # ADR 0006: Make a clean break in 0.12
 
-Status: accepted
+Status: accepted; a record of 0.12. [ADR 0007](0007-run-markers.md) and the changelog cover what
+0.13 changed since.
 
 ## Context
 

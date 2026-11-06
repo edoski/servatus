@@ -74,8 +74,8 @@ Task arguments, stdin, and environment values are written into the submitted bat
 `printf` literals; environment as `/usr/bin/env` arguments of a direct step, or as `APPTAINERENV_*`
 assignments on an Apptainer step's `srun`, which keeps it out of process listings). Cluster
 administrators and accounting systems may read them, and other users on the node can read a direct
-step's command line. Do not put
-credentials or other secrets in Tasks. The batch script creates no scratch files.
+step's command line. Do not put credentials or other secrets in Tasks. The batch script creates no
+scratch files.
 
 Values in a repository-owned `SERVATUS.toml` are editable user-side guardrails, not an enforcement
 boundary; Profile labels are nonbinding provenance. Slurm remains authoritative for identity,
@@ -100,17 +100,18 @@ Campaign state is an owner-only directory. It keeps complete Task arguments, std
 for retry; keep it private.
 
 Plan files (`servatus.plan/2`) retain the resolved Target and Resources, Task keys with their hold
-reasons, and the nonce from which allocation identities derive. They exclude Task
-arguments, stdin, and environment but remain private operational data. `Plan.save` and `servatus plan --output` write them with mode
-`0600` and never overwrite an existing file. `--show-scripts` prints complete scripts, including
-Task payloads; treat that output as sensitive. Submission rebuilds each plan from its decision and
-the current state and refuses a plan that does not match.
+reasons, and the nonce from which allocation identities derive. They exclude Task arguments, stdin,
+and environment but remain private operational data. `Plan.save` and `servatus plan --output` write
+them with mode `0600` and never overwrite an existing file. `--show-scripts` prints complete
+scripts, including Task payloads; treat that output as sensitive. Submission rebuilds each plan from
+its decision and the current state and refuses a plan that does not match.
 
 `Status.to_json()` (`servatus status --json`) is a diagnostic snapshot, not a redacted record. It
 includes Task keys, result states, allocation identities, retry choices, Profile labels, Slurm job
 ids, raw `squeue` states, run-marker facts, exit codes, timestamps, and warnings. It excludes Task
-arguments, stdin, environment values, Target values, scripts, log content, and application output. Scheduler text, keys, and labels may themselves
-identify private work; keep snapshots private. Snapshots carry no execution authority.
+arguments, stdin, environment values, Target values, scripts, log content, and application output.
+Scheduler text, keys, and labels may themselves identify private work; keep snapshots private.
+Snapshots carry no execution authority.
 
 Submission checks the scheduler connection and the plan's eligibility before recording anything,
 then syncs unresolved intent before each `sbatch`. A failure after launch does not prove rejection.

@@ -11,11 +11,12 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   creates or extends it idempotently, `append` registers only new Tasks, and `seal` ends authoring
   irreversibly.
 - **Revision:** a counter advanced by every durable mutation. Plans bind to one revision.
-- **Resources (`Resources`):** one homogeneous per-Task CPU, MiB, GPU (units of `gpu_gres`), wall-time, and optional
-  `signal_before_end` request for one plan.
+- **Resources (`Resources`):** one homogeneous per-Task CPU, MiB, GPU (units of `gpu_gres`),
+  wall-time, and optional `signal_before_end` request for one plan.
 - **Target (`Target`):** one concrete Slurm route: optional SSH host, absolute Slurm directory,
   work and log roots, partitions, site options, optional launcher, and conservative ceilings. A
-  second cluster is a second profile with its own Target. Every Attempt keeps its original Target for observation, recovery, logs, and cancellation.
+  second cluster is a second profile with its own Target. Every Attempt keeps its original Target
+  for observation, recovery, logs, and cancellation.
 - **Launcher:** how a step starts a Task. The **Apptainer launcher** (`Apptainer`) runs the Task's
   `args` with `apptainer exec` in one immutable image with a clean environment (the image's
   runscript is never used; `args` must be nonempty); the **direct launcher** (no container) runs
@@ -25,12 +26,13 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
 - **Transport (`Transport`):** how scheduler commands reach Slurm. `connect(target)` returns an SSH
   transport (OpenSSH in batch mode, retrying only the connection, output fenced by per-call markers)
   when the Target has a host, and a local one otherwise. Both run with a scrubbed environment and
-  fixed bounds and return a `Completed`; every failure surfaces as `Unavailable`. Any callable from Target to Transport (for
-  example `servatus.testing.FakeScheduler`) can replace `connect`.
+  fixed bounds and return a `Completed`; every failure surfaces as `Unavailable`. Any callable from
+  Target to Transport (for example `servatus.testing.FakeScheduler`) can replace `connect`.
 - **Diagnosis (`Diagnosis`):** what `diagnose(profile)` and `servatus doctor` found, read-only: one
-  `Check` with a `Verdict` (`pass`, `fail` when a command ran and said no, `unavailable` when no answer came) for each capability Servatus needs from a
-  profile's cluster: Slurm 23.02 or later, `squeue` under the scrubbed environment, `MinJobAge` of
-  at least 120 s, `proctrack/cgroup`, writable roots, and a one-Task `sbatch --test-only`.
+  `Check` with a `Verdict` (`pass`, `fail` when a command ran and said no, `unavailable` when no
+  answer came) for each capability Servatus needs from a profile's cluster: Slurm 23.02 or later,
+  `squeue` under the scrubbed environment, `MinJobAge` of at least 120 s, `proctrack/cgroup`,
+  writable roots, and a one-Task `sbatch --test-only`.
 - **Allocation:** one single-node Slurm job named `servatus-<allocation_id>`, submitted with
   `--no-requeue`, running its Tasks as concurrent exact steps. Each step is named
   `servatus-<allocation_id>-<slot>`.
@@ -46,9 +48,8 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
 - **Plan (`Plan`):** a Decision (`plan.decision`) plus what it derives from the current state:
   `PlannedAllocation`s (Task keys, totals, batch script, `sbatch` argv), the digest, and `retry`
   (the selected or deferred Tasks that resubmit accepted work), with `warnings` for deferred work.
-  A saved plan (`servatus.plan/2`) holds only the Decision and digest.
-  Submission rebuilds the plan from its Decision and the current state and refuses it when it
-  differs.
+  A saved plan (`servatus.plan/2`) holds only the Decision and digest. Submission rebuilds the plan
+  from its Decision and the current state and refuses it when it differs.
 - **Hold (`Hold`):** why a Task is not selected: `VALID` (valid result), `UNRESOLVED` (intent
   without outcome), `SUBMITTED` (accepted work and not requested for retry; the scheduler is not
   consulted), `ACTIVE` (Slurm still lists earlier work of the Task, finished but not yet purged
@@ -92,8 +93,8 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   Attempts (`AttemptStatus`), with counts, result readiness, and quiescence. A Task's
   `execution` is `UNRESOLVED` while one of its Attempts is, else the observed `Execution` of its
   latest accepted Attempt (`ACCEPTED` when the scheduler was not observed), else `NOT_SUBMITTED`
-  (never accepted). `to_json()` exports
-  it as a `servatus.status/2` document; `to_document` encodes other results for JSON.
+  (never accepted). `to_json()` exports it as a `servatus.status/2` document; `to_document` encodes
+  other results for JSON.
 - **Result readiness:** the sealed roster has valid results for every Task.
 - **Quiescence:** scheduler evidence was requested, Slurm lists no job of any accepted allocation
   and no stray, and no acceptance is unresolved. It is independent from result readiness.

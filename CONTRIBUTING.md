@@ -38,12 +38,17 @@ live in `pyproject.toml`.
   (`builders.py`), POSIX helpers and fault injection (`posix.py`), and the spawned-process harness
   (`processes.py`).
 - `tests/core/`: codec, configuration, state invariant and transitions, store, status, policy.
-- `tests/scheduler/`: transport bounds, batch scripts, evidence parsing, and `FakeScheduler`.
+- `tests/scheduler/`: transport bounds, batch scripts, evidence parsing, `doctor`, and
+  `FakeScheduler`.
 - `tests/publication/`: publish, `publish_file`, Draft, Workspace, children, and POSIX fallbacks.
 - `tests/faults/`: injected failures, interruptions, and crash points.
 - `tests/campaign/`: Campaign behaviour and the CLI, driven through `FakeScheduler`.
 
 `tests/` is on the import path, so tests import helpers as `from support.builders import target`.
+
+`scripts/cluster_e2e.py` is the live check against a real cluster: direct and Apptainer launchers,
+CPU and one GPU. CI and pytest never run it. Run it before a release, and after any change to a
+Slurm command, a batch script, or a run marker.
 
 ## Rules
 

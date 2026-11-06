@@ -47,8 +47,9 @@ selects both.
 
 **Outcomes are decided only after Slurm forgets the job.** `MinJobAge` keeps a finished job in
 `squeue` for minutes, far longer than an NFS client caches a directory listing (about a minute), so
-the one directory read (`find LOG_ROOT -maxdepth 1 -type f` for the three suffixes) that follows
-the purge sees every marker. Per slot:
+the one directory read that follows the purge sees every marker: `find -H LOG_ROOT -maxdepth 1
+-type f`, with `-H` because `log_root` may be a symbolic link, naming `<id>.*` exactly for up to
+eight allocations and otherwise the three suffixes. Per slot:
 
 | Queue row | Markers | Execution |
 | --- | --- | --- |
@@ -114,5 +115,6 @@ stale listing could misread finished work as `STOPPED` or `LOST`. `servatus doct
 `MinJobAge` under 120 s and any process tracking but `proctrack/cgroup`. A Task's
 outcome is known only after `MinJobAge`, so `--retry-failed` waits minutes longer than before.
 Markers accumulate in `log_root` like logs; a listing that names many allocations reads every
-marker there, so keep campaigns of tens of thousands of allocations in their own `log_root`. Markers stay in `log_root` beside the logs and are as private as
-they are. Campaigns from 0.12 (schema 7) and their saved plans cannot be opened.
+marker there, so keep campaigns of tens of thousands of allocations in their own `log_root`. Markers
+stay in `log_root` beside the logs and are as private as they are. Campaigns from 0.12 (schema 7)
+and their saved plans cannot be opened.

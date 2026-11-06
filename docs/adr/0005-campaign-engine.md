@@ -138,7 +138,10 @@ automatic retry hides ambiguity; history is never erased.
 ## Status
 
 > Superseded by [ADR 0007](0007-run-markers.md): a Task's execution follows the queue row and its
-> slot's run markers, and quiescence means Slurm lists no work of the campaign.
+> slot's run markers, quiescence means Slurm lists no work of the campaign, and `cancel` is
+> `scancel --me --name=<identity>`, which also accepts an allocation recorded as not submitted.
+> `TaskStatus.execution` is the one field for a Task's state, and the document is
+> `servatus.status/2`.
 
 `Campaign.status(*, scheduler=True)` projects all Tasks and Attempts at one revision. Each
 `TaskStatus` carries the result state, current allocation, execution state, exit code, and whether

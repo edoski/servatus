@@ -11,5 +11,6 @@
 ADR 0002 defines the publication transaction and Workspace lifecycle; ADR 0004 extends it to
 concurrent children. ADR 0003 defines the transport, launchers, batch script, and scheduler
 evidence, and records the scope of prior production acceptance. ADR 0005 defines Campaign state,
-planning, submission, and status. ADR 0006 records what the 0.12 clean break changed and why. ADR 0007 replaces Slurm accounting with
-`squeue` and run markers, superseding the evidence parts of ADRs 0003 and 0005.
+planning, submission, and status. ADR 0006 records what the 0.12 clean break changed and why. ADR
+0007 replaces Slurm accounting with `squeue` and run markers in 0.13, superseding the evidence parts
+of ADRs 0003 and 0005.

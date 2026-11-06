@@ -192,8 +192,8 @@ mistakes) with **Resources** (what each Task needs). A **Plan** packs eligible T
 single-node **allocations** of concurrent steps. Before each `sbatch`, submission durably records an
 **intent**; Slurm's job number becomes a **Receipt**. Acceptance is not completion: Servatus reads
 `squeue` and the run markers in `log_root`, and an optional **result probe** says which results
-are valid. Unselected
-Tasks are **held** ([glossary](https://github.com/edoski/servatus/blob/main/docs/CONTEXT.md)).
+are valid. Unselected Tasks are **held**
+([glossary](https://github.com/edoski/servatus/blob/main/docs/CONTEXT.md)).
 
 | Hold | Meaning | What to do |
 | --- | --- | --- |
@@ -317,12 +317,12 @@ documented fallback ([SECURITY.md](https://github.com/edoski/servatus/blob/main/
 
 **Errors.** Only an existing destination raises `DestinationExists`. Bad input or an unusable
 location raises `ConfigurationError`: an unsafe draft path; a link onto an occupied draft path; a
-missing, unwritable, or overlong path; a missing link source; paths on different filesystems; a platform or
-filesystem without an atomic no-replace rename or a working lock; a writer that creates nothing; a
-`link_tree` source containing the draft; a file its owner cannot read; a bad `mode`. No space,
-quota, I/O errors, or too many open files raise `Unavailable`; `UnsafeFilesystem` means an entry
-was substituted or has the wrong type or owner. No raw `OSError` escapes, but exceptions from your
-builder or writer propagate unchanged.
+missing, unwritable, or overlong path; a missing link source; paths on different filesystems; a
+platform or filesystem without an atomic no-replace rename or a working lock; a writer that creates
+nothing; a `link_tree` source containing the draft; a file its owner cannot read; a bad `mode`. No
+space, quota, I/O errors, or too many open files raise `Unavailable`; `UnsafeFilesystem` means an
+entry was substituted or has the wrong type or owner. No raw `OSError` escapes, but exceptions from
+your builder or writer propagate unchanged.
 
 ## Configuration reference
 
@@ -374,14 +374,14 @@ secrets out of Tasks.
 **SSH.** Servatus runs `ssh -T -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=8 -o
 ConnectionAttempts=3 HOST`, so it never prompts, ignores login banners and shell-startup output,
 and retries a connection that never opens. A login that stalls after connecting is not retried, and
-commands themselves never are; each has 30 s to finish, connecting included. With `ProxyJump`, set those two options on the jump host too. From
-your environment it passes only `HOME`,
-`LOGNAME`, `USER`, `SSH_AUTH_SOCK`, `KRB5CCNAME`, and `KRB5_CONFIG`, so agent and Kerberos logins
-work. Give the host `ControlMaster auto`, `ControlPath ~/.ssh/control-%C`, `ControlPersist 30m`,
+commands themselves never are; each has 30 s to finish, connecting included. With `ProxyJump`, set
+those two options on the jump host too. From your environment it passes only `HOME`, `LOGNAME`,
+`USER`, `SSH_AUTH_SOCK`, `KRB5CCNAME`, and `KRB5_CONFIG`, so agent and Kerberos logins work. Give
+the host `ControlMaster auto`, `ControlPath ~/.ssh/control-%C`, `ControlPersist 30m`,
 `ServerAliveInterval 10`, and `ServerAliveCountMax 2` in `~/.ssh/config`: a persistent master
 connection makes calls fast and, with multi-factor login, lets you authenticate once
-(`ssh hpc true`) first, and the keepalive ends a master whose network went away. Keys must load without a passphrase prompt, for
-example via `ssh-agent`.
+(`ssh hpc true`) first, and the keepalive ends a master whose network went away. Keys must load
+without a passphrase prompt, for example via `ssh-agent`.
 
 ## Clusters
 
@@ -503,8 +503,8 @@ Onboarding a student, in order:
    servatus doctor --profile rtx2080
    ```
 
-5. **Continue with the [quickstart](#quickstart-a-sweep-in-10-minutes)** from step 2. `doctor` cannot
-   see Apptainer or the image from the login node, so a first small Task proves those.
+5. **Continue with the [quickstart](#quickstart-a-sweep-in-10-minutes)** from step 2. `doctor`
+   cannot see Apptainer or the image from the login node, so a first small Task proves those.
 
 ### Research cluster (`slogin`)
 
