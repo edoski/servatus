@@ -4,7 +4,7 @@ Layout::
 
     <campaign>/            owner-only directory (0700, owned by the effective user)
         .lock              owner-only regular file; ``flock`` serializes every transaction
-        campaign.json      canonical schema-7 state, replaced atomically on each change
+        campaign.json      canonical schema-8 state, replaced atomically on each change
 
 Every operation reopens the directory without following a final symlink and checks that it is
 still the directory the store was opened on. Reads hold a shared lock and writes an exclusive one;
@@ -25,9 +25,8 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from .. import _fs
-from .._fs import Pin
+from .._fs import Pin, StrPath
 from ..errors import ConfigurationError, Conflict, CorruptState, NotFound, UnsafeFilesystem
-from ._config import StrPath
 from ._state import State, decode, encode
 
 MAX_STATE_BYTES = 256 * 1024 * 1024
@@ -53,8 +52,6 @@ class Store:
         stopped before writing). ``Conflict`` if state already exists; ``NotFound`` if the parent
         is missing and ``parents`` is false.
         """
-        if not isinstance(state, State):
-            raise ConfigurationError("state must be a campaign State")
         location = _location(path)
         with _fs.Boundary(location, missing=NotFound), ExitStack() as stack:
             if parents:
@@ -108,8 +105,6 @@ class Store:
             changed = boundary.passthrough(change)(current)
             if changed is current:
                 return current
-            if not isinstance(changed, State):
-                raise TypeError("a campaign state change must return a State")
             self._commit(directory, changed)
             return changed
 
@@ -151,12 +146,10 @@ class Store:
 
 
 def _location(path: StrPath) -> Path:
-    raw = os.fspath(path)
-    if not isinstance(raw, str) or not raw or "\0" in raw:
-        raise ConfigurationError("campaign path must be a nonempty text path without NUL")
+    raw = _fs.fspath(path)
     location = Path(os.path.abspath(raw))
-    if location.name in {"", ".", ".."}:
-        raise ConfigurationError(f"campaign path must name one directory: {raw}")
+    if not raw or not location.name:
+        raise ConfigurationError(f"campaign path must name one directory: {raw!r}")
     return location
 
 

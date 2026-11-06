@@ -13,15 +13,7 @@ class ServatusError(Exception):
 
 
 class ConfigurationError(ServatusError):
-    """An input is invalid. Fix the Task, Profile, path, or argument and try again."""
-
-
-class CrossDeviceError(ConfigurationError):
-    """Work, sources, and destination must share one filesystem."""
-
-
-class UnsupportedPlatform(ConfigurationError):
-    """The platform or filesystem cannot provide the required atomic operation."""
+    """An input, or the platform it asks for, cannot work. Fix it and try again."""
 
 
 class NotFound(ServatusError):
@@ -57,7 +49,7 @@ class Busy(ServatusError):
 
 
 class Unavailable(ServatusError):
-    """The cluster or a remote command failed or timed out. Retry later."""
+    """A transient cluster or filesystem failure. Retry later."""
 
 
 class IntegrityError(ServatusError):
@@ -74,10 +66,6 @@ class UnsafeFilesystem(IntegrityError):
 
 class EvidenceConflict(IntegrityError):
     """Scheduler output is malformed, unrelated, or contradictory."""
-
-
-class ReconciliationError(ServatusError):
-    """Scheduler evidence could not prove one allocation identity. Resolve it explicitly."""
 
 
 class SubmissionInterrupted(ServatusError):

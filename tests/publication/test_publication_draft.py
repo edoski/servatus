@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from servatus.errors import ConfigurationError, DestinationExists, UnsafeFilesystem
+from servatus.errors import ConfigurationError, UnsafeFilesystem
 from servatus.publication import Draft, publish
 
 
@@ -64,16 +64,28 @@ def test_link_rejects_nul_source_path(tmp_path: Path) -> None:
         publish(tmp_path / "result", lambda draft: draft.link(f"{tmp_path}/a\0b", "a"))
 
 
-def test_link_rejects_occupied_draft_path(tmp_path: Path) -> None:
-    source = tmp_path / "source"
+@pytest.mark.parametrize("collide", ["file", "link", "link_tree"])
+def test_draft_path_collision_is_a_configuration_error(tmp_path: Path, collide: str) -> None:
+    # Regression: this was DestinationExists, which a worker takes to mean "already published".
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    source = tree / "value"
     source.write_text("value")
 
     def build(draft: Draft) -> None:
-        (draft.path / "value").write_text("occupied")
-        draft.link(source, "value")
+        if collide == "file":
+            (draft.path / "value").write_text("occupied")
+        else:
+            draft.link(source, "value")
+        if collide == "link_tree":
+            draft.link_tree(tree)
+        else:
+            draft.link(source, "value")
 
-    with pytest.raises(DestinationExists, match="draft path already exists"):
+    with pytest.raises(ConfigurationError, match="to draft path value .*File exists"):
         publish(tmp_path / "result", build)
+
+    assert not (tmp_path / "result").exists()
 
 
 @pytest.mark.parametrize("kind", ["symlink", "fifo", "directory"])
@@ -140,66 +152,53 @@ def test_link_tree_rejects_symlinks_and_special_files(tmp_path: Path, kind: str)
     assert not (tmp_path / "result").exists()
 
 
-def test_link_tree_rejects_symlinked_source_and_occupied_paths(tmp_path: Path) -> None:
+def test_link_tree_rejects_a_symlinked_source(tmp_path: Path) -> None:
     tree = tmp_path / "tree"
     tree.mkdir()
     (tree / "value").write_text("value")
     (tmp_path / "alias").symlink_to(tree, target_is_directory=True)
 
     with pytest.raises(UnsafeFilesystem, match="not a safe directory"):
-        publish(tmp_path / "first", lambda draft: draft.link_tree(tmp_path / "alias"))
-
-    def occupied(draft: Draft) -> None:
-        (draft.path / "value").write_text("occupied")
-        draft.link_tree(tree)
-
-    with pytest.raises(DestinationExists, match="draft path already exists"):
-        publish(tmp_path / "second", occupied)
+        publish(tmp_path / "result", lambda draft: draft.link_tree(tmp_path / "alias"))
 
 
+@pytest.mark.parametrize("ending", ["returns", "fails"])
 @pytest.mark.parametrize("operation", ["link", "link_tree", "path"])
-def test_draft_is_invalid_after_builder_returns(tmp_path: Path, operation: str) -> None:
+def test_draft_is_invalid_after_its_builder_ends(
+    tmp_path: Path, ending: str, operation: str
+) -> None:
     source = tmp_path / "source"
     source.write_text("value")
-    kept: list[Draft] = []
-
-    publish(tmp_path / "result", kept.append)
     (tmp_path / "victim").mkdir()
-    descriptor = os.open(tmp_path / "victim", os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        draft: Any = kept[0]
-        with pytest.raises(RuntimeError, match="no longer valid"):
-            if operation == "link":
-                draft.link(source, "injected")
-            elif operation == "link_tree":
-                draft.link_tree(tmp_path / "victim")
-            else:
-                _ = draft.path
-    finally:
-        os.close(descriptor)
+    kept: list[Any] = []
+
+    def build(draft: Draft) -> None:
+        kept.append(draft)
+        if ending == "fails":
+            raise ValueError("stop")
+
+    if ending == "fails":
+        with pytest.raises(ValueError, match="stop"):
+            publish(tmp_path / "result", build)
+    else:
+        publish(tmp_path / "result", build)
+
+    with pytest.raises(RuntimeError, match="no longer valid"):
+        if operation == "link":
+            kept[0].link(source, "injected")
+        elif operation == "link_tree":
+            kept[0].link_tree(tmp_path / "victim")
+        else:
+            _ = kept[0].path
 
     assert list((tmp_path / "victim").iterdir()) == []
-    assert list((tmp_path / "result").iterdir()) == []
-
-
-def test_draft_is_invalid_after_builder_fails(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.write_text("value")
-    kept: list[Draft] = []
-
-    def fail(draft: Draft) -> None:
-        kept.append(draft)
-        raise ValueError("stop")
-
-    with pytest.raises(ValueError, match="stop"):
-        publish(tmp_path / "result", fail)
-    with pytest.raises(RuntimeError, match="no longer valid"):
-        kept[0].link(source, "late")
+    result = tmp_path / "result"
+    assert list(result.iterdir()) == [] if ending == "returns" else not result.exists()
 
 
 def test_link_reports_a_missing_source_as_a_configuration_error(tmp_path: Path) -> None:
     def build(draft: Draft) -> None:
-        with pytest.raises(ConfigurationError, match="hard-link source does not exist"):
+        with pytest.raises(ConfigurationError, match="does not exist"):
             draft.link(tmp_path / "missing", "value")
         with pytest.raises(ConfigurationError, match="does not exist"):
             draft.link_tree(tmp_path / "missing")
@@ -217,7 +216,7 @@ def test_link_reports_an_inaccessible_source_as_a_configuration_error(tmp_path: 
     locked.chmod(0o000)
 
     def build(draft: Draft) -> None:
-        with pytest.raises(ConfigurationError, match="hard-link source is not accessible"):
+        with pytest.raises(ConfigurationError, match="not a usable location"):
             draft.link(locked / "weights.bin", "weights.bin")
 
     try:

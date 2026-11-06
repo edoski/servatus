@@ -1,8 +1,9 @@
 """The ``servatus`` command line: a thin adapter over the public API.
 
 Exit codes: 0 success, 1 error, 2 usage (argparse), 3 submission interrupted, 75 cluster
-unavailable or campaign busy, 130 interrupted. Errors are one ``servatus: error: ...`` line on
-stderr. Human output escapes non-printable characters; ``--json`` output is exact.
+unavailable, campaign busy, a transient filesystem failure, or reconcile still waiting for
+evidence, 130 interrupted. Errors are one ``servatus: error: ...`` line on stderr. Human output
+escapes non-printable characters; ``--json`` output is exact.
 """
 
 from __future__ import annotations
@@ -23,12 +24,13 @@ from .campaign import (
     Plan,
     Profile,
     Receipt,
+    ReconcileResult,
     Retry,
     Status,
     SubmitResult,
     Task,
-    capacity,
-    ping,
+    Verdict,
+    diagnose,
     to_document,
 )
 from .errors import Busy, ConfigurationError, ServatusError, SubmissionInterrupted, Unavailable
@@ -75,20 +77,17 @@ def _task(raw: object, base: Path) -> Task:
         raise ConfigurationError(f"unknown fields: {', '.join(unknown)}")
     if missing := sorted({"key", "args"} - fields.keys()):
         raise ConfigurationError(f"missing fields: {', '.join(missing)}")
-    args = fields["args"]
-    if not isinstance(args, list):
-        raise ConfigurationError("args must be an array of strings")
     stdin = b""
     if "stdin_file" in fields:
         name = fields["stdin_file"]
         if not isinstance(name, str) or not name:
             raise ConfigurationError("stdin_file must be a nonempty path")
         stdin = _read_bytes(base / name, "stdin_file")
-    env = fields.get("env", {})
-    if not isinstance(env, dict):
-        raise ConfigurationError("env must be an object mapping names to strings")
     return Task(
-        cast(str, fields["key"]), cast(list[str], args), stdin=stdin, env=cast(dict[str, str], env)
+        cast(str, fields["key"]),
+        cast(list[str], fields["args"]),
+        stdin=stdin,
+        env=cast(dict[str, str], fields.get("env", {})),
     )
 
 
@@ -207,6 +206,7 @@ def _plan_document(plan: Plan, scripts: bool, saved: Path | None) -> dict[str, o
             del entry["script"], entry["argv"]
         allocations.append(entry)
     document.update(
+        retry=list(plan.retry),
         allocations=allocations,
         warnings=list(plan.warnings),
         saved=None if saved is None else str(saved),
@@ -226,10 +226,8 @@ def _print_plan(plan: Plan, scripts: bool, saved: Path | None) -> None:
     for item in plan.allocations:
         print(f"  {item.allocation_id}  {_plural(len(item.task_keys), 'Task')}, {_shape(item)}")
         print(f"    {_keys(item.task_keys)}")
-    if decision.retry:
-        print(f"retry: {_keys(decision.retry)}")
-    if decision.duplicate_risk:
-        print(f"duplicate risk acknowledged: {_keys(decision.duplicate_risk)}")
+    if plan.retry:
+        print(f"retry: {_keys(plan.retry)}")
     print(f"held: {_plural(len(decision.held), 'Task')}")
     reasons: dict[str, list[str]] = {}
     for key, hold in decision.held.items():
@@ -256,7 +254,6 @@ def _plan(arguments: argparse.Namespace) -> int:
     plan = campaign.plan(
         profile,
         retry=Retry.FAILED if arguments.retry_failed else tuple(arguments.retry),
-        allow_duplicate_risk=tuple(arguments.allow_duplicate_risk),
         only=tuple(arguments.only) if arguments.only else None,
         tasks_per_allocation=arguments.tasks_per_allocation,
     )
@@ -306,17 +303,12 @@ def _print_result(result: SubmitResult, arguments: argparse.Namespace) -> None:
         return
     for receipt in result.receipts:
         print(f"submitted {_receipt_line(receipt)}")
-    state = _safe(arguments.state)
     for item in result.unresolved:
         print(f"UNRESOLVED allocation {item.allocation_id} ({_keys(item.task_keys)})")
-        if (job := item.observed_job) is None:
-            print(f"  next: servatus reconcile {state} {item.allocation_id}")
-        else:
-            option = "" if job.cluster is None else f" --cluster {job.cluster}"
-            print(f"  Slurm accepted job {job}; record it:")
-            print(
-                f"  next: servatus mark-accepted {state} {item.allocation_id} {job.job_id}{option}"
-            )
+        if item.observed_job is not None:
+            print(f"  Slurm accepted job {item.observed_job}, but recording it failed")
+    if result.unresolved:
+        print(f"next: servatus reconcile {_safe(arguments.state)}")
     for item in result.unattempted:
         print(f"not attempted: allocation {item.allocation_id} ({_keys(item.task_keys)})")
     if not result.receipts and result.complete:
@@ -345,16 +337,12 @@ def _print_status(status: Status, path: Path) -> None:
     print(f"at {status.observed_at.isoformat(timespec='seconds')}; scheduler {observed}")
     rows = [("KEY", "RESULT", "EXECUTION", "EXIT", "ALLOCATION")]
     for task in status.tasks:
-        if task.unresolved:
-            execution = "UNRESOLVED"
-        elif task.current_allocation_id is None:
-            execution = "-"
-        else:
-            execution = "ACCEPTED" if task.execution is None else task.execution.value
+        execution = task.execution.value
+        if task.detail is not None:
+            execution = f"{execution} ({task.detail})"
+        exit_code = "-" if task.exit_code is None else str(task.exit_code)
         allocation = task.current_allocation_id or "-"
-        rows.append(
-            (_safe(task.key), task.result.value, execution, task.exit_code or "-", allocation)
-        )
+        rows.append((_safe(task.key), task.result.value, execution, exit_code, allocation))
     widths = [max(len(row[column]) for row in rows) for column in range(4)]
     for row in rows:
         print(
@@ -369,14 +357,16 @@ def _print_status(status: Status, path: Path) -> None:
     print(f"counts: {shown}")
     quiescent = "yes" if status.quiescent else "no"
     print(f"quiescent: {quiescent}; results ready: {'yes' if status.results_ready else 'no'}")
-    hints = [
-        f"servatus reconcile {state} {attempt.allocation_id}"
-        for attempt in status.attempts
-        if attempt.acceptance is AcceptanceState.UNRESOLVED
-    ]
-    if counts["failed"] + counts["cancelled"]:
+    for warning in status.warnings:
+        print(f"warning: {_safe(warning)}")
+    hints: list[str] = []
+    if any(attempt.acceptance is AcceptanceState.UNRESOLVED for attempt in status.attempts):
+        hints.append(f"servatus reconcile {state}")
+    if counts["failed"] + counts["stopped"]:
         hints.append(f"servatus plan {state} --retry-failed --output PLAN.json")
-    if counts["unsubmitted"]:
+    if counts["lost"]:
+        hints.append(f"servatus plan {state} --retry KEY --output PLAN.json  (LOST Tasks)")
+    if counts["not_submitted"]:
         hints.append(f"servatus plan {state} --output PLAN.json")
     if not status.scheduler_observed and status.attempts:
         hints.append(f"servatus status {state}")
@@ -427,25 +417,27 @@ def _print_receipts(arguments: argparse.Namespace, receipts: Sequence[Receipt], 
     return 0
 
 
-def _reconcile(arguments: argparse.Namespace) -> int:
-    receipt = _open(arguments).reconcile(arguments.allocation)
-    return _print_receipts(arguments, (receipt,), "accepted")
-
-
-def _mark_accepted(arguments: argparse.Namespace) -> int:
-    receipt = _open(arguments).mark_accepted(
-        arguments.allocation, arguments.job_id, cluster=arguments.cluster
-    )
-    return _print_receipts(arguments, (receipt,), "accepted")
-
-
-def _mark_not_submitted(arguments: argparse.Namespace) -> int:
-    _open(arguments).mark_not_submitted(arguments.allocation)
+def _print_reconciled(result: ReconcileResult, arguments: argparse.Namespace) -> None:
     if arguments.json:
-        _emit({"allocation_id": arguments.allocation, "acceptance": "NOT_SUBMITTED"})
-    else:
-        print(f"allocation {_safe(arguments.allocation)}: recorded as not submitted")
-    return 0
+        document = cast(dict[str, object], to_document(result))
+        _emit({**document, "complete": result.complete})
+        return
+    for receipt in result.receipts:
+        print(f"accepted {_receipt_line(receipt)}")
+    for item in result.not_submitted:
+        print(f"not submitted: allocation {item.allocation_id} ({_keys(item.task_keys)})")
+    for item in result.waiting:
+        moment = item.decidable_at.isoformat(timespec="seconds")
+        print(f"waiting: allocation {item.allocation_id} ({_keys(item.task_keys)})")
+        print(f"  no evidence yet; reconcile again after {moment}")
+    if not (result.receipts or result.not_submitted or result.waiting):
+        print("nothing to reconcile")
+
+
+def _reconcile(arguments: argparse.Namespace) -> int:
+    result = _open(arguments).reconcile()
+    _print_reconciled(result, arguments)
+    return 0 if result.complete else EXIT_UNAVAILABLE
 
 
 def _cancel(arguments: argparse.Namespace) -> int:
@@ -455,26 +447,26 @@ def _cancel(arguments: argparse.Namespace) -> int:
     return _print_receipts(arguments, receipts, "cancelled")
 
 
+_DOCTOR_EXIT = {
+    Verdict.PASS: 0,
+    Verdict.FAIL: EXIT_ERROR,
+    Verdict.UNAVAILABLE: EXIT_UNAVAILABLE,
+}
+
+
 def _doctor(arguments: argparse.Namespace) -> int:
     profile = Profile.load(arguments.config, name=arguments.profile)
-    target = profile.target
-    fits = capacity(target, profile.resources)
-    version = ping(target, connect=arguments.connect)
+    diagnosis = diagnose(profile, connect=arguments.connect)
     if arguments.json:
-        _emit(
-            {
-                "profile": profile.label,
-                "host": target.host,
-                "slurm_bin": str(target.slurm_bin),
-                "sbatch_version": version,
-                "tasks_per_allocation": fits,
-            }
-        )
+        document = cast(dict[str, object], to_document(diagnosis))
+        _emit({**document, "verdict": diagnosis.verdict.value})
     else:
-        print(f"profile {_safe(profile.label)}: ok, up to {_plural(fits, 'Task')} per allocation")
-        print(f"target: {target.host or 'local'} ({target.slurm_bin})")
-        print(f"sbatch: {_safe(version)}")
-    return 0
+        fits = _plural(diagnosis.tasks_per_allocation, "Task")
+        print(f"profile {_safe(profile.label)}: up to {fits} per allocation")
+        print(f"target: {diagnosis.host or 'local'} ({diagnosis.slurm_bin})")
+        for check in diagnosis.checks:
+            print(f"{check.verdict.value:<11} {check.name}: {_safe(check.detail)}")
+    return _DOCTOR_EXIT[diagnosis.verdict]
 
 
 # --- Parser ----------------------------------------------------------------------------------
@@ -483,8 +475,6 @@ _POSITIONALS: dict[str, dict[str, Any]] = {
     "state": {"type": Path, "metavar": "STATE", "help": "campaign directory"},
     "tasks": {"type": Path, "metavar": "TASKS.jsonl"},
     "plan": {"type": Path, "metavar": "PLAN.json"},
-    "allocation": {"metavar": "ALLOCATION"},
-    "job_id": {"type": int, "metavar": "JOB_ID"},
 }
 _KEYS: dict[str, Any] = {"action": "append", "default": [], "metavar": "KEY"}
 
@@ -524,8 +514,7 @@ def _parser() -> argparse.ArgumentParser:
     profile_options(plan)
     retry = plan.add_mutually_exclusive_group()
     retry.add_argument("--retry", **_KEYS)
-    retry.add_argument("--retry-failed", action="store_true", help="retry failed or cancelled")
-    plan.add_argument("--allow-duplicate-risk", **_KEYS)
+    retry.add_argument("--retry-failed", action="store_true", help="retry failed or stopped")
     plan.add_argument("--only", **_KEYS)
     plan.add_argument("--tasks-per-allocation", type=int, metavar="N")
     flag(plan, "--show-scripts", "print batch scripts (sensitive)")
@@ -539,17 +528,14 @@ def _parser() -> argparse.ArgumentParser:
     logs.add_argument("--allocation", metavar="ID")
     logs.add_argument("--bytes", type=int, default=65_536, metavar="N")
     logs.add_argument("--output", type=Path, metavar="FILE", help="write a new 0600 file")
-    text = "resolve an allocation from Slurm evidence"
-    command("reconcile", _reconcile, text, "state", "allocation")
-    text = "record a job you found yourself"
-    accepted = command("mark-accepted", _mark_accepted, text, "state", "allocation", "job_id")
-    accepted.add_argument("--cluster", metavar="NAME")
-    text = "record an allocation Slurm proves it never received"
-    command("mark-not-submitted", _mark_not_submitted, text, "state", "allocation")
-    cancel = command("cancel", _cancel, "scancel the matching accepted allocations", "state")
+    text = "resolve every unresolved allocation from Slurm evidence"
+    command("reconcile", _reconcile, text, "state")
+    cancel = command(
+        "cancel", _cancel, "scancel the matching queued or running allocations", "state"
+    )
     cancel.add_argument("--task", **_KEYS)
     cancel.add_argument("--allocation", action="append", default=[], metavar="ID")
-    profile_options(command("doctor", _doctor, "check the profile and the scheduler connection"))
+    profile_options(command("doctor", _doctor, "check what the profile needs from its cluster"))
     return parser
 
 

@@ -6,9 +6,9 @@ import os
 import stat
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 import pytest
+from support.posix import Syscalls
 
 from servatus.errors import DestinationExists, Unavailable
 from servatus.publication import Workspace
@@ -16,7 +16,7 @@ from servatus.publication import Workspace
 
 @pytest.mark.parametrize("race", ["root", "child", "root-before-child"])
 def test_entry_rejects_publication_that_lands_before_the_lease(
-    tmp_path: Path, syscalls: Any, race: str
+    tmp_path: Path, syscalls: Syscalls, race: str
 ) -> None:
     destination = tmp_path / "result"
     root = Workspace(destination, identity=b"root")
@@ -58,7 +58,7 @@ def test_entry_rejects_publication_that_lands_before_the_lease(
 
 @pytest.mark.parametrize("code", [errno.EBADF, errno.ENOLCK, errno.EOPNOTSUPP, errno.EINVAL])
 def test_workspace_coordination_falls_back_to_a_lock_file(
-    tmp_path: Path, syscalls: Any, code: int
+    tmp_path: Path, syscalls: Syscalls, code: int
 ) -> None:
     # NFS refuses `flock` on a read-only directory descriptor; coordination must still work.
     def flock(real: Callable[[int, int], None], fd: int, operation: int) -> None:
@@ -79,7 +79,7 @@ def test_workspace_coordination_falls_back_to_a_lock_file(
     assert stat.S_IMODE((tmp_path / ".servatus.lock").stat().st_mode) == 0o600
 
 
-def test_other_directory_lock_failures_are_not_masked(tmp_path: Path, syscalls: Any) -> None:
+def test_other_directory_lock_failures_are_not_masked(tmp_path: Path, syscalls: Syscalls) -> None:
     def flock(real: Callable[[int, int], None], fd: int, operation: int) -> None:
         if stat.S_ISDIR(os.fstat(fd).st_mode):
             raise OSError(errno.EIO, os.strerror(errno.EIO))

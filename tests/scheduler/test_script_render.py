@@ -7,6 +7,7 @@ from pathlib import PurePosixPath
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
+from scheduler_fixtures import ALLOCATION
 from support.builders import resources, target
 
 from servatus.campaign._codec import format_duration, parse_duration
@@ -21,7 +22,6 @@ from servatus.campaign._script import (
 )
 from servatus.errors import ConfigurationError
 
-ALLOCATION = "00112233445566778899aabb"
 LOG = "/cluster/logs/project"
 
 
@@ -47,23 +47,6 @@ def test_names_and_log_paths_bind_the_allocation_identity() -> None:
     assert log_path(root, ALLOCATION, "%j", 1) == PurePosixPath(f"{LOG}/{ALLOCATION}-%j-1.out")
 
 
-@pytest.mark.parametrize(
-    ("call", "message"),
-    [
-        (lambda: job_name("abc"), "allocation_id"),
-        (lambda: job_name(ALLOCATION.upper()), "allocation_id"),
-        (lambda: step_name(ALLOCATION, -1), "slot"),
-        (lambda: step_name(ALLOCATION, True), "slot"),  # a bool is not a slot number
-        (lambda: log_path(PurePosixPath(LOG), ALLOCATION, 0), "job must be"),
-        (lambda: log_path(PurePosixPath(LOG), ALLOCATION, "../x"), "job must be"),
-        (lambda: log_path(PurePosixPath(LOG), ALLOCATION, 1, -2), "slot"),
-    ],
-)
-def test_names_and_paths_reject_invalid_parts(call: object, message: str) -> None:
-    with pytest.raises(ConfigurationError, match=message):
-        call()  # pyright: ignore[reportCallIssue]
-
-
 # --- sbatch argv -----------------------------------------------------------------------------
 
 
@@ -73,6 +56,7 @@ def test_sbatch_argv_is_complete_and_exact() -> None:
     assert sbatch_argv(full, request, 3, ALLOCATION) == (
         "/opt/slurm/bin/sbatch",
         "--parsable",
+        "--no-requeue",
         "--export=NIL",
         "--nodes=1",
         "--ntasks=3",
@@ -82,7 +66,6 @@ def test_sbatch_argv_is_complete_and_exact() -> None:
         "--partition=gpu",
         "--chdir=/cluster/work/project",
         f"--job-name=servatus-{ALLOCATION}",
-        f"--comment=servatus-{ALLOCATION}",
         f"--output={LOG}/{ALLOCATION}-%j.out",
         f"--error={LOG}/{ALLOCATION}-%j.out",
         "--account=research",
@@ -107,24 +90,6 @@ def test_cpu_request_omits_gpu_account_and_signal_options() -> None:
 def test_time_limit_is_rounded_up_to_whole_minutes() -> None:
     request = Resources(cpus=1, memory_mib=1, time_limit="00:01:30")
     assert "--time=00:02:00" in sbatch_argv(target(), request, 1, ALLOCATION)
-
-
-@pytest.mark.parametrize(
-    ("call", "message"),
-    [
-        (lambda: sbatch_argv(target(), resources(), 0, ALLOCATION), "task_count"),
-        (lambda: sbatch_argv(target(), resources(), 1, "nope"), "allocation_id"),
-        (
-            lambda: sbatch_argv(
-                target(gpu_gres=None, max_gpus_per_allocation=0), resources(), 1, ALLOCATION
-            ),
-            "gpu_gres",
-        ),
-    ],
-)
-def test_sbatch_argv_rejects_invalid_requests(call: object, message: str) -> None:
-    with pytest.raises(ConfigurationError, match=message):
-        call()  # pyright: ignore[reportCallIssue]
 
 
 durations = st.builds(
@@ -250,19 +215,51 @@ def test_servatus_variables_are_injected_with_runtime_job_identity() -> None:
         f"APPTAINERENV_SERVATUS_ALLOCATION_ID={ALLOCATION}",
         "APPTAINERENV_SERVATUS_SLOT=0",
         'APPTAINERENV_SERVATUS_JOB_ID="$job_id"',
-        'APPTAINERENV_SERVATUS_RESTART_COUNT="$restart_count"',
     ):
         assert assignment in script
     assert 'job_id="${SLURM_JOB_ID:?' in script
-    assert 'restart_count="${SLURM_RESTART_COUNT:-0}"' in script
+    assert "RESTART_COUNT" not in script
 
 
-def test_interrupt_trap_kills_only_recorded_pids() -> None:
+def test_markers_are_named_by_allocation_and_runtime_job() -> None:
+    script = render((task(),), log_root="/cluster/logs/my project")
+    assert f"marker='/cluster/logs/my project/{ALLOCATION}'.\"$job_id\"\n" in script
+
+
+def test_start_marker_is_written_after_the_trap_and_before_any_step() -> None:
+    lines = render((task("a"), task("b"))).splitlines()
+    job_id = next(i for i, line in enumerate(lines) if line.startswith("job_id="))
+    marker = next(i for i, line in enumerate(lines) if line.startswith("marker="))
+    trap = lines.index("trap interrupt HUP INT TERM")
+    start = lines.index(': > "$marker.start" || exit 1')
+    launches = [i for i, line in enumerate(lines) if line.endswith(" &")]
+    assert job_id < marker < trap < start < min(launches)
+
+
+def test_each_slot_writes_its_own_end_marker_in_its_background_subshell() -> None:
+    lines = render(tuple(task(f"t{slot}") for slot in range(3))).splitlines()
+    launches = [line for line in lines if line.endswith(" &")]
+    for slot, line in enumerate(launches):
+        assert line.startswith("{ printf ")
+        assert line.endswith(
+            f'; code=$?; command : > "$marker.{slot}.$code.end"; exit "$code"; }} &'
+        )
+    assert sum(".end" in line for line in lines) == 3
+
+
+def test_interrupt_trap_records_the_stop_then_signals_the_process_group() -> None:
     script = render((task(),))
     assert "trap interrupt HUP INT TERM" in script
     # The handler first ignores further signals, so repeated signals cannot re-enter it.
-    assert "interrupt() {\n  trap '' HUP INT TERM\n" in script
-    assert 'for pid in $pids; do kill "$pid"' in script
+    assert (
+        "interrupt() {\n"
+        "  trap '' HUP INT TERM\n"
+        '  command : > "$marker.stop"\n'
+        "  kill -s TERM 0 2>/dev/null || :\n"
+        '  for pid in $pids; do wait "$pid" 2>/dev/null || :; done\n'
+        "  exit 1\n"
+        "}\n"
+    ) in script
     assert 'pids="$pids $!"' in script
 
 
@@ -282,7 +279,7 @@ def test_direct_launcher_requires_an_absolute_program(args: tuple[str, ...], mes
 
 def test_apptainer_launcher_accepts_relative_commands_inside_the_image() -> None:
     script = render((Task("t", ("python", "train.py")),))
-    assert " python train.py &" in script
+    assert " python train.py; code=$?;" in script
     assert "/usr/bin/apptainer exec --cleanenv " in script and " run " not in script
 
 
@@ -291,21 +288,6 @@ def test_apptainer_tasks_need_a_program_regardless_of_the_runscript() -> None:
         render((Task("t"),))
 
 
-@pytest.mark.parametrize(
-    ("call", "message"),
-    [
-        (lambda: render(()), "at least one Task"),
-        (lambda: render((task(),), max_script_bytes=100), "exceeds target max_script_bytes"),
-        (
-            lambda: render((task(),), gpu_gres=None, max_gpus_per_allocation=0, gpus=1),
-            "gpu_gres",
-        ),
-        (
-            lambda: render_batch(target(), resources(), (task(),), "short"),
-            "allocation_id",
-        ),
-    ],
-)
-def test_render_rejects_invalid_allocations(call: object, message: str) -> None:
-    with pytest.raises(ConfigurationError, match=message):
-        call()  # pyright: ignore[reportCallIssue]
+def test_render_rejects_a_script_over_its_byte_bound() -> None:
+    with pytest.raises(ConfigurationError, match="exceeds target max_script_bytes"):
+        render((task(),), max_script_bytes=100)

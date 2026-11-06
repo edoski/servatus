@@ -54,13 +54,14 @@ signal_before_end = "0:10:00"               # SIGUSR1 ten minutes before the lim
 ```
 
 Create `work_root`, `log_root`, and `work_root/results` on the cluster once. `servatus doctor`
-checks that the profile loads and fits its ceilings, and that `sbatch --version` answers.
+checks that the profile fits its ceilings and that the cluster has what Servatus needs. See
+[Clusters](#clusters) for complete configurations and the steps to onboard a new user.
 
 ### 2. Write the worker
 
 Each Task runs one process in its own `srun` step. The process gets its Task's arguments, stdin
-bytes, and environment, plus `SERVATUS_TASK_KEY`, `SERVATUS_ALLOCATION_ID`, `SERVATUS_SLOT`,
-`SERVATUS_JOB_ID`, and `SERVATUS_RESTART_COUNT`.
+bytes, and environment, plus `SERVATUS_TASK_KEY`, `SERVATUS_ALLOCATION_ID`, `SERVATUS_SLOT`, and
+`SERVATUS_JOB_ID`.
 
 ```python
 # train.py, in work_root
@@ -104,8 +105,9 @@ def main() -> int:
 sys.exit(main())
 ```
 
-The `Workspace` directory is bound to the identity bytes and survives failure, preemption, and
-requeue: a requeued or resubmitted Task reopens it and resumes. `publish` commits `results/<key>`
+The `Workspace` directory is bound to the identity bytes and survives failure, preemption, and time
+limits: a resubmitted Task reopens it and resumes. Slurm never requeues Servatus jobs on its own
+(`--no-requeue`); a rerun is always a new, explicit plan. `publish` commits `results/<key>`
 atomically and only then removes the private work.
 
 ### 3. Define the Tasks
@@ -146,7 +148,7 @@ tasks = [
 ]
 campaign = Campaign.ensure("state", tasks, probe=finished)
 plan = campaign.plan(Profile.load("SERVATUS.toml"))
-decision = plan.decision  # what you review: selected, held, deferred, retry choices
+decision = plan.decision  # what you review: selected, held, and deferred Tasks
 print(f"{len(decision.selected)} selected, {len(decision.held)} held")
 receipts = campaign.submit(plan).receipts
 ```
@@ -162,13 +164,26 @@ servatus plan state --output plan.json     # shows selected, held, deferred; sav
 servatus submit state plan.json
 servatus status state
 servatus logs state --task lr-1e-3 --output lr-1e-3.log
-servatus plan state --retry-failed --output retry.json    # later: rerun failed or cancelled Tasks
+servatus plan state --retry-failed --output retry.json    # later: rerun failed or stopped Tasks
 ```
 
 Without `--output`, `plan` only prints. `submit` rebuilds the reviewed plan, refuses it with
 `StalePlan` if the campaign changed, and pings Slurm and rechecks eligibility before recording
-anything. `status` shows each Task's own step when Slurm reports it; a contradictory or `UNKNOWN`
-allocation makes its Tasks `UNKNOWN`, and exit codes appear only once execution is terminal.
+anything. `status` shows each Task's execution: `QUEUED`, `RUNNING`, `SUCCEEDED` or `FAILED` with
+its step's exit code, `STOPPED` (cancelled, out of time, or never started), or `LOST` (the job
+vanished without recording how it ended, for example on a node failure). A Task without an
+observed execution shows `NOT_SUBMITTED`, `UNRESOLVED` (reconcile it), or `ACCEPTED` (with
+`--offline`).
+
+Servatus needs no Slurm accounting (`sacct`). It reads `squeue` for work Slurm still lists, and
+the empty run markers each batch script writes to `log_root`: a start marker before any step, one
+end marker per step as soon as it returns, and a stop marker when the job is interrupted. A step's
+end marker shows as `SUCCEEDED` or `FAILED` at once. A finished job stays in `squeue` for the
+cluster's `MinJobAge` (typically 5 minutes), and a missing marker means something only after that,
+when every marker is visible on the login node. Until then a cancelled Task still shows `RUNNING`
+and retries are held `ACTIVE`, so `--retry-failed` picks failed work up a few minutes after it ends.
+This needs a nonzero `MinJobAge` well above how long the login node caches directory listings (NFS:
+about a minute); `scontrol show config | grep MinJobAge` shows it.
 
 ## Concepts
 
@@ -177,25 +192,25 @@ them. A **Profile** pairs a **Target** (where and how to run, with ceilings that
 mistakes) with **Resources** (what each Task needs). A **Plan** packs eligible Tasks into
 single-node **allocations** of concurrent steps. Before each `sbatch`, submission durably records an
 **intent**; Slurm's job number becomes a **Receipt**. Acceptance is not completion: Servatus reads
-`squeue` and `sacct`, and an optional **result probe** says which results are valid. Unselected
-Tasks are **held** ([glossary](https://github.com/edoski/servatus/blob/main/docs/CONTEXT.md)).
+`squeue` and the run markers in `log_root`, and an optional **result probe** says which results
+are valid. Unselected Tasks are **held**
+([glossary](https://github.com/edoski/servatus/blob/main/docs/CONTEXT.md)).
 
 | Hold | Meaning | What to do |
 | --- | --- | --- |
 | `VALID` | The probe reports a valid result. | Nothing. |
 | `SUBMITTED` | The Task has accepted work and was not requested for retry. Slurm is not consulted. | `status`; to rerun, `--retry KEY` or `--retry-failed`. |
-| `ACTIVE` | Retry requested, but Slurm still holds earlier work (queued, running, held, requeued). | Wait, or `cancel`. |
-| `UNRESOLVED` | An intent has no recorded outcome. | See the recovery playbook. |
-| `UNOBSERVABLE` | Slurm's evidence for earlier work is missing or `UNKNOWN`. | `--retry KEY --allow-duplicate-risk KEY`. |
+| `ACTIVE` | Slurm still lists earlier work of the Task: queued, running, or finished but not yet purged. | Wait a few minutes, or `cancel`. |
+| `UNRESOLVED` | An intent has no recorded outcome. | `servatus reconcile STATE`. |
 | `NOT_REQUESTED` | Excluded by `--only`. | Nothing. |
 
-`--retry-failed` selects Tasks whose latest accepted work failed or was cancelled, judged by the
-Task's own step when known. A failed or cancelled allocation of several Tasks says nothing about a
-Task whose step Slurm does not report (it may have finished first), so that Task is `UNKNOWN` and
-held `UNOBSERVABLE`. Explicit `--retry` keys are strict: an unknown key, a valid result, a Task
-never accepted, or `UNKNOWN` evidence without `--allow-duplicate-risk` refuses the whole plan
-(`PlanRefused`, listing every key). Duplicate risk can only be acknowledged for explicit keys.
-Eligible Tasks beyond the target's `max_allocations_per_submit` are **deferred** to the next plan.
+`--retry-failed` selects Tasks whose latest accepted work is `FAILED` or `STOPPED`. It never selects
+`LOST` work: the job vanished without recording an outcome, and during a network partition its
+step may even still run. Rerun a `LOST` Task by naming it, `--retry KEY`; naming it is your
+acknowledgement. Explicit `--retry` keys are strict: an unknown key, a valid result, a Task never
+accepted, or a Task whose earlier work Slurm still lists refuses the whole plan (`PlanRefused`,
+listing every key). Eligible Tasks beyond the target's `max_allocations_per_submit` are
+**deferred** to the next plan.
 
 ## Recovery playbook
 
@@ -205,34 +220,37 @@ Eligible Tasks beyond the target's `max_allocations_per_submit` are **deferred**
 | 1 | Error: bad input, refused or stale plan, a shape `validate` rejected, conflicting or corrupt state, or an unexpected error (one line, never a traceback). | Read the message. `StalePlan`: plan again. |
 | 2 | Usage error. | Check `servatus COMMAND --help`. |
 | 3 | Submission interrupted. Some allocations may be unresolved. | Run `status`, then resolve them as below. |
-| 75 | Cluster unavailable, campaign busy, or a transient filesystem failure (no space, quota, I/O). | Retry later. A failed ping records nothing. |
+| 75 | Cluster unavailable, campaign busy, a transient filesystem failure (no space, quota, I/O), or `reconcile` still waiting for evidence. | Retry later. A failed ping records nothing. |
 | 130 | Interrupted (Ctrl-C). Recorded intent survives. | Run `status`. |
 
 An **unresolved allocation** has a durable intent but no receipt: the `sbatch` call may or may not
 have reached Slurm. Servatus holds its Tasks until you resolve it.
 
-1. `servatus reconcile state ALLOCATION_ID` records the receipt if Slurm holds exactly one job
-   with that allocation's identity (an already accepted allocation just prints its receipt).
-2. Otherwise check `squeue`/`sacct` yourself and record a job you find with
-   `servatus mark-accepted state ALLOCATION_ID JOB_ID [--cluster NAME]`.
-   `servatus mark-not-submitted state ALLOCATION_ID` asks the original target and records only
-   proven absence: a job with that identity is a `Conflict`; an unreachable target exits 75.
-3. Plan again. History is never erased; a new Attempt is added.
+1. `servatus reconcile state` resolves every unresolved allocation from Slurm's evidence. A job
+   that `squeue` lists with the allocation's identity, or else one named by its run markers, is
+   recorded as accepted. With neither, an intent at least 15 minutes old is recorded as not
+   submitted; a younger one waits, and `reconcile` prints when to run it again and exits 75.
+   Rerunning it is always safe.
+2. Plan again. History is never erased; a new Attempt is added.
 
-`mark-accepted` also corrects an allocation marked not submitted, but only when Slurm proves
-exactly that job and no later allocation includes its Tasks.
+If Slurm later lists a job for an allocation recorded as not submitted (an `sbatch` that arrived
+very late), `status` warns, names the allocation and job, and holds its Tasks `ACTIVE` until the job
+leaves the queue, so nothing new is submitted beside it. `servatus cancel state --allocation ID`
+stops it.
 
-`servatus cancel state --task KEY` runs `scancel` for every accepted allocation of that Task not
-already known to be finished (`--allocation ID` names one); a packed allocation stops all its
-Tasks. Every allocation is tried; failures exit 75, naming what was and was not cancelled. Nothing
-is retried; once Slurm reports the work cancelled, `--retry-failed` selects it (as above).
+`servatus cancel state --task KEY` runs `scancel --me --name=servatus-<allocation id>` for every
+allocation of that Task that Slurm still lists as queued or running (`--allocation ID` names one);
+a packed allocation stops all its Tasks. Cancelling by name can never hit an unrelated job that
+reused a job number, and a job that already ended is not an error. Every allocation is tried;
+failures exit 75, naming what was and was not cancelled. Nothing is retried; once Slurm purges the
+cancelled job, its Tasks are `STOPPED` and `--retry-failed` selects them.
 
 ## Publication
 
 Publication works with or without a Campaign. Work, sources, stages, and destinations must share
 one filesystem; Servatus never copies.
 
-**`publish(destination, build, *, retire=None, mode=None)`** builds a directory in a private stage
+**`publish(destination, build, *, mode=None)`** builds a directory in a private stage
 and commits it with a no-replace rename. The builder receives a `Draft`, writes into `draft.path`,
 validates, and returns; using the draft afterwards raises `RuntimeError`.
 
@@ -283,6 +301,9 @@ with parent as workspace:
     workspace.publish(lambda draft: draft.link_tree(workspace.path / "method-a", "method-a"))
 ```
 
+Entering a finished child raises `DestinationExists` for that child only: the parent has not
+necessarily published, so do not read it as "the whole result exists".
+
 **Modes.** Stages stay owner-only (0700) until commit. Just before commit, `publish` sets every
 directory in the tree to `mode` (default `0o777 & ~umask`) and leaves file modes as written;
 `publish_file` sets the file to `mode` (default `0o666 & ~umask`), overriding the writer's choice.
@@ -290,19 +311,19 @@ directory in the tree to `mode` (default `0o777 & ~umask`) and leaves file modes
 **Hard links alias.** `Draft.link` and `link_tree` publish the *same inode* as their source, so
 rewrite sources only by replacement (a new file and `os.replace`), never in place.
 
-`retire=` removes one owner-only sibling directory after the destination is durably committed.
 Unprovable cleanup never fails a publication: it sets `cleanup_pending` and warns. Where a
 directory cannot be `flock`ed (NFS), Servatus locks an owner-only `.servatus.lock` file in it
 instead and leaves it there; another user's lock file is refused. Linux without `renameat2` uses a
 documented fallback ([SECURITY.md](https://github.com/edoski/servatus/blob/main/SECURITY.md)).
 
-**Errors.** An existing destination raises `DestinationExists`. Bad input or an unusable location
-raises `ConfigurationError`: an unsafe draft path; a missing, unwritable, or overlong path; a
-missing link or `retire` source; a non-sibling `retire`; a writer that creates nothing; a
-`link_tree` source containing the draft; a file its owner cannot read; a bad `mode`. No space,
-quota, I/O errors, or too many open files raise `Unavailable`; `UnsafeFilesystem` means an entry
-was substituted or has the wrong type or owner. No raw `OSError` escapes, but exceptions from your
-builder or writer propagate unchanged.
+**Errors.** Only an existing destination raises `DestinationExists`. Bad input or an unusable
+location raises `ConfigurationError`: an unsafe draft path; a link onto an occupied draft path; a
+missing, unwritable, or overlong path; a missing link source; paths on different filesystems; a
+platform or filesystem without an atomic no-replace rename or a working lock; a writer that creates
+nothing; a `link_tree` source containing the draft; a file its owner cannot read; a bad `mode`. No
+space, quota, I/O errors, or too many open files raise `Unavailable`; `UnsafeFilesystem` means an
+entry was substituted or has the wrong type or owner. No raw `OSError` escapes, but exceptions from
+your builder or writer propagate unchanged.
 
 ## Configuration reference
 
@@ -314,14 +335,15 @@ times the per-Task CPUs, memory, and GPUs, for the per-Task time limit.
 | `[target]` key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `host` | string | omitted | SSH destination (`[user@]host` or ssh_config alias). Omitted: run Slurm locally. |
-| `slurm_bin` | absolute path | required | Directory holding `sbatch`, `squeue`, `sacct`, `scancel`, `srun`. |
+| `slurm_bin` | absolute path | required | Directory holding `sbatch`, `squeue`, `scancel`, `srun`. |
 | `work_root` | absolute path | required | Working directory of every Task step; no `,` or `:`. |
-| `log_root` | absolute path | required | Slurm log directory (must exist); no `%`. |
+| `log_root` | absolute path | required | Slurm logs and run markers (must exist, shared with the login node); no `%`. |
 | `partitions` | array of strings | required | Partitions the job may use. |
 | `max_tasks_per_allocation`, `max_cpus_per_allocation`, `max_memory_mib_per_allocation` | int | required | Ceilings per allocation. |
 | `max_time_limit` | duration | required | Wall-time ceiling. |
-| `account`, `qos`, `constraint` | string | omitted | Passed to `sbatch` when set. |
-| `gpu_gres`, `max_gpus_per_allocation` | string, int | omitted, 0 | Count-free GPU GRES (`gpu:a100`) and its ceiling; set both or neither. |
+| `account`, `qos` | string | omitted | Passed to `sbatch` when set. |
+| `constraint` | string | omitted | Slurm feature expression (`a100\|h100`, `intel&ib`), passed to `sbatch` as one argument. |
+| `gpu_gres`, `max_gpus_per_allocation` | string, int | omitted, 0 | Count-free GRES (`gpu`, `gpu:a100_80GB`, `shard`) and its ceiling; set both or neither. `gpus` counts units of it, and Slurm must set each step's `CUDA_VISIBLE_DEVICES`. |
 | `max_allocations_per_submit` | int | no cap | Allocations per plan; the rest are deferred. |
 | `max_script_bytes` | int | 1048576 | Batch script size bound. |
 | `apptainer`, `image` | absolute path | omitted | Apptainer launcher: set both, or neither for the direct launcher. `image` has no `:`. |
@@ -331,40 +353,276 @@ times the per-Task CPUs, memory, and GPUs, for the per-Task time limit.
 | --- | --- | --- | --- |
 | `cpus`, `memory_mib` | int | required | CPUs and MiB per Task. |
 | `time_limit` | duration | required | Wall time of the allocation. |
-| `gpus` | int | 0 | Whole GPUs per Task. |
+| `gpus` | int | 0 | Units of `gpu_gres` per Task: whole GPUs, or whole shards with `shard`. |
 | `signal_before_end` | duration | omitted | Send SIGUSR1 to each Task this long before the limit. |
 
 In Python these are `Target`, `Apptainer`, `Resources`, and `Profile`;
 `servatus.campaign.capacity(target, resources)` returns how many Tasks fit one allocation, and
-`servatus.campaign.ping(target)` returns the `sbatch --version` text (`Unavailable` on failure).
+`servatus.campaign.diagnose(profile)` returns what `servatus doctor` prints as a `Diagnosis`.
 
 **Launchers.** With Apptainer, each step runs `apptainer exec --cleanenv IMAGE ARGS...` from
 `work_root`, so the Task's `args` run directly and the image's runscript is ignored (a relative
 `args[0]` resolves on the container's `PATH`; empty `args` fail at planning). `work_root` plus
-`binds` are mounted and the Task's `env` passed as `APPTAINERENV_*`; GPU steps get `--nv` and
-Slurm's step-local `CUDA_VISIBLE_DEVICES`. The batch script sets `PATH=/usr/bin:/bin`, which
-`--nv` needs to find the host's `nvidia-smi`, MPS daemon and `libcuda`. Without Apptainer, each step runs the Task's absolute
-`args[0]` under `env -i` with the same variables. Either way, Task stdin and environment are
-written into the batch script and are visible to cluster administrators: never put secrets in
-Tasks.
+`binds` are mounted, and the Task's `env` reaches the container as `APPTAINERENV_*` assignments
+on `srun`, never on a command line. GPU steps get `--nv` and Slurm's step-local
+`CUDA_VISIBLE_DEVICES`. The batch script sets `PATH=/usr/bin:/bin`, which `--nv` needs to find
+the host's `nvidia-smi`, MPS daemon and `libcuda`. Without Apptainer, each step runs the Task's
+absolute `args[0]` under `env -i` with the same variables passed as arguments. Either way, Task
+stdin and environment are written into the batch script, which cluster administrators can read,
+and a direct step's environment also shows in its command line to other users on the node. Keep
+secrets out of Tasks.
 
-**SSH.** Servatus runs `ssh -T -o BatchMode=yes -o LogLevel=ERROR HOST`, so it never prompts, and
-ignores login banners and shell-startup output. From your environment it passes only `HOME`,
-`LOGNAME`, `USER`, `SSH_AUTH_SOCK`, `KRB5CCNAME`, and `KRB5_CONFIG`, so agent and Kerberos logins
-work. Give the host `ControlMaster auto`, `ControlPath ~/.ssh/control-%C`, and `ControlPersist 30m`
-in `~/.ssh/config`: a persistent master connection makes calls fast and, with multi-factor login,
-lets you authenticate once (`ssh hpc true`) first. Keys must load without a passphrase prompt, for
-example via `ssh-agent`.
+**SSH.** Servatus runs `ssh -T -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=8 -o
+ConnectionAttempts=3 HOST`, so it never prompts, ignores login banners and shell-startup output,
+and retries a connection that never opens. A login that stalls after connecting is not retried, and
+commands themselves never are; each has 30 s to finish, connecting included. With `ProxyJump`, set
+those two options on the jump host too. From your environment it passes only `HOME`, `LOGNAME`,
+`USER`, `SSH_AUTH_SOCK`, `KRB5CCNAME`, and `KRB5_CONFIG`, so agent and Kerberos logins work. Give
+the host `ControlMaster auto`, `ControlPath ~/.ssh/control-%C`, `ControlPersist 30m`,
+`ServerAliveInterval 10`, and `ServerAliveCountMax 2` in `~/.ssh/config`: a persistent master
+connection makes calls fast and, with multi-factor login, lets you authenticate once
+(`ssh hpc true`) first, and the keepalive ends a master whose network went away. Keys must load
+without a passphrase prompt, for example via `ssh-agent`.
+
+## Clusters
+
+A new cluster is a new profile, not new code. Each configuration below passed `servatus doctor` for
+every profile, with `NAME.SURNAME` and the paths filled in. Both clusters run Slurm with `MinJobAge`
+of 300 s and `proctrack/cgroup`, and neither needs `sacct`. Apptainer exists only on their compute
+nodes, at `/usr/bin/apptainer`, so `doctor` cannot check it from the login node.
+
+### Student cluster (`giano`)
+
+Slurm 24.11. Partition `rtx2080` has 8 nodes of 4 CPUs, 42 GiB, and one RTX 2080 Ti. Partition `l40`
+has 4 nodes of 8 CPUs, 64 GiB, and one L40. Home has a 400 MB quota, so everything lives in
+`/scratch.hpc/NAME.SURNAME`, where files unread for 40 days are deleted. Publish what you want to
+keep somewhere else before then.
+
+```toml
+default_profile = "rtx2080"
+
+[target]
+host = "university"
+slurm_bin = "/usr/bin"
+work_root = "/scratch.hpc/NAME.SURNAME/sweep"
+log_root = "/scratch.hpc/NAME.SURNAME/sweep/logs"
+apptainer = "/usr/bin/apptainer"
+image = "/scratch.hpc/NAME.SURNAME/images/train.sif"
+max_tasks_per_allocation = 1
+max_time_limit = "3-00:00:00"
+
+[profiles.rtx2080.target]
+partitions = ["rtx2080"]
+gpu_gres = "gpu"
+max_gpus_per_allocation = 1
+max_cpus_per_allocation = 4
+max_memory_mib_per_allocation = 40960
+
+[profiles.rtx2080.resources]
+cpus = 4
+memory_mib = 40960
+gpus = 1
+time_limit = "12:00:00"
+
+[profiles.l40.target]
+partitions = ["l40"]
+gpu_gres = "gpu"
+max_gpus_per_allocation = 1
+max_cpus_per_allocation = 8
+max_memory_mib_per_allocation = 61440
+
+[profiles.l40.resources]
+cpus = 8
+memory_mib = 61440
+gpus = 1
+time_limit = "12:00:00"
+
+# CPU-only work on the same nodes. Two Tasks share a node.
+[profiles.cpu.target]
+partitions = ["rtx2080"]
+max_tasks_per_allocation = 2
+max_cpus_per_allocation = 4
+max_memory_mib_per_allocation = 32768
+
+[profiles.cpu.resources]
+cpus = 2
+memory_mib = 16384
+time_limit = "04:00:00"
+```
+
+Onboarding a student, in order:
+
+1. **Add the SSH alias.** A login takes about 0.6 s and Servatus opens one connection per Slurm
+   command, so share one. Add this to `~/.ssh/config`, then make a key if you have none
+   (`ssh-keygen -t ed25519`) and run `ssh-copy-id university`:
+
+   ```ssh-config
+   Host university
+       HostName giano.cs.unibo.it
+       User NAME.SURNAME
+       ControlMaster auto
+       ControlPath ~/.ssh/control-%C
+       ControlPersist 30m
+       ServerAliveInterval 10
+       ServerAliveCountMax 2
+   ```
+
+2. **Create the directories on scratch**, never in home:
+
+   ```sh
+   ssh university 'umask 077 && mkdir -p /scratch.hpc/$USER/sweep/logs /scratch.hpc/$USER/sweep/results /scratch.hpc/$USER/images'
+   ```
+
+3. **Build the image on a compute node.** The login node has no Apptainer, and the nodes have
+   network access. Copy a definition like this to `/scratch.hpc/NAME.SURNAME/images/train.def`:
+
+   ```text
+   Bootstrap: docker
+   From: python:3.12-slim
+
+   %post
+       pip install --no-cache-dir servatus
+   ```
+
+   Then build it, keeping Apptainer's cache out of home:
+
+   ```sh
+   ssh university srun --partition=rtx2080 --cpus-per-task=2 --mem=4G --time=00:20:00 \
+     --chdir=/scratch.hpc/NAME.SURNAME/images \
+     /usr/bin/env APPTAINER_CACHEDIR=/scratch.hpc/NAME.SURNAME/images/cache \
+     /usr/bin/apptainer build train.sif train.def
+   ```
+
+   To run a virtual environment instead, make it under `work_root` with `pip3 install
+   --no-cache-dir`, drop `apptainer` and `image` from `[target]`, and start each Task's `args` with
+   the absolute path of its Python.
+
+4. **Save the configuration above as `SERVATUS.toml`** next to your launcher, with your
+   `NAME.SURNAME`, then check it:
+
+   ```sh
+   servatus doctor --profile rtx2080
+   ```
+
+5. **Continue with the [quickstart](#quickstart-a-sweep-in-10-minutes)** from step 2. `doctor`
+   cannot see Apptainer or the image from the login node, so a first small Task proves those.
+
+### Research cluster (`slogin`)
+
+Slurm 23.11, for DISI staff and PhD students. The onboarding steps are the same with the alias
+`research` (`HostName slogin.disi.unibo.it`), the partition `sbuild` for the image, and a profile
+from this file for `doctor`. These profiles leave CPUs and memory for other users on shared nodes.
+
+```toml
+default_profile = "a100"
+
+[target]
+host = "research"
+slurm_bin = "/usr/bin"
+apptainer = "/usr/bin/apptainer"
+image = "/scratch.hpc/NAME.SURNAME/images/train.sif"
+work_root = "/scratch.hpc/NAME.SURNAME/sweep"
+log_root = "/scratch.hpc/NAME.SURNAME/sweep/logs"
+account = "default"
+qos = "limitjob3node2"
+max_tasks_per_allocation = 1
+max_cpus_per_allocation = 128
+max_memory_mib_per_allocation = 262144
+max_gpus_per_allocation = 1
+max_time_limit = "72:00:00"
+
+[resources]
+cpus = 64
+memory_mib = 131072
+gpus = 1
+time_limit = "72:00:00"
+
+[profiles.a100.target]
+partitions = ["a100"]
+gpu_gres = "gpu:a100_80GB"
+
+# Two one-GPU runs per node, each on 104 CPUs: the 16 left over keep other users' small jobs from
+# holding the node out of reach.
+[profiles.l40s.target]
+partitions = ["l40s"]
+gpu_gres = "gpu:l40s"
+max_tasks_per_allocation = 2
+max_cpus_per_allocation = 208
+max_memory_mib_per_allocation = 393216
+max_gpus_per_allocation = 2
+
+[profiles.l40s.resources]
+cpus = 104
+memory_mib = 196608
+
+[profiles.l40.target]
+partitions = ["l40"]
+gpu_gres = "gpu:l40"
+max_tasks_per_allocation = 2
+max_gpus_per_allocation = 2
+max_memory_mib_per_allocation = 196608
+
+[profiles.l40.resources]
+memory_mib = 98304
+
+[profiles.h100.target]
+partitions = ["h100pcie"]
+gpu_gres = "gpu:h100pcie"
+
+[profiles.cpu.target]
+partitions = ["amdepyc9754"]
+max_gpus_per_allocation = 0
+
+[profiles.cpu.resources]
+gpus = 0
+cpus = 128
+memory_mib = 262144
+
+# CPU-only evaluations on the EPYC nodes, or the a100 node's idle CPUs when those are full.
+[profiles.eval.target]
+partitions = ["amdepyc9754", "a100"]
+max_gpus_per_allocation = 0
+max_time_limit = "06:00:00"
+max_tasks_per_allocation = 8
+max_cpus_per_allocation = 144
+
+[profiles.eval.resources]
+gpus = 0
+cpus = 18
+memory_mib = 32768
+time_limit = "06:00:00"
+
+[profiles.smoke.target]
+partitions = ["l40"]
+gpu_gres = "gpu:l40"
+max_time_limit = "00:30:00"
+
+[profiles.smoke.resources]
+cpus = 16
+memory_mib = 32768
+time_limit = "00:30:00"
+
+# One training task with most of the l40 node's CPUs, leaving two GPUs for other users.
+[profiles.l40-solo.target]
+partitions = ["l40"]
+gpu_gres = "gpu:l40"
+max_cpus_per_allocation = 112
+
+[profiles.l40-solo.resources]
+cpus = 112
+memory_mib = 98304
+```
 
 ## CLI reference
 
 `STATE` is the campaign directory. `plan` and `doctor` read `./SERVATUS.toml` unless
 `--config PATH` is given. Output is human-readable, with every non-printable character escaped
 (except `--show-scripts`); every command except `logs` accepts `--json` for exact machine output.
-`status --json` prints a `servatus.status/1` document (`tasks`, `attempts`, `counts`, `quiescent`,
-`results_ready`); saved plans are `servatus.plan/1` documents. Receipts, submit results, shape
-checks, and planned allocations are encoded with `servatus.campaign.to_document`; a receipt is
-`{"allocation_id", "job": {"job_id", "cluster"}, "task_keys"}`.
+`status --json` prints a `servatus.status/2` document (`tasks`, `attempts`, `counts`, `quiescent`,
+`results_ready`, `warnings`); saved plans are `servatus.plan/2` documents. Receipts, submit and
+reconcile results, shape checks, and planned allocations are encoded with
+`servatus.campaign.to_document`; a receipt is `{"allocation_id", "job", "task_keys"}` with an
+integer job number.
 
 | Command | Purpose |
 | --- | --- |
@@ -373,18 +631,29 @@ checks, and planned allocations are encoded with `servatus.campaign.to_document`
 | `append STATE TASKS.jsonl` | Append new Tasks to an appendable campaign. |
 | `seal STATE` | End authoring irreversibly. |
 | `plan STATE [--profile NAME] [--output FILE]` | Show selected, held, and deferred Tasks; `--output` saves the plan (0600, never overwrites). |
-| `  --retry KEY`, `--retry-failed` | Retry named Tasks, or every Task whose latest work failed or was cancelled. |
-| `  --allow-duplicate-risk KEY` | Retry a named Task whose earlier work has `UNKNOWN` evidence. |
+| `  --retry KEY`, `--retry-failed` | Retry named Tasks (`LOST` ones included), or every Task whose latest work failed or stopped. |
 | `  --only KEY`, `--tasks-per-allocation N`, `--show-scripts` | Restrict the plan; lower packing; print batch scripts (sensitive). |
 | `validate STATE PLAN` | `sbatch --test-only` once per distinct allocation shape; exit 1 if any is rejected. |
 | `submit STATE PLAN` | Submit the reviewed plan. Exit 3 if interrupted. |
 | `status STATE [--offline]` | Task and allocation status; `--offline` skips Slurm. |
 | `logs STATE [--task KEY] [--allocation ID] [--bytes N] [--output FILE]` | Bounded log tail; writes 0600; refuses a terminal. |
-| `reconcile STATE ALLOCATION` | Resolve an unresolved allocation from Slurm evidence. |
-| `mark-accepted STATE ALLOCATION JOB_ID [--cluster NAME]` | Record a job you found yourself. |
-| `mark-not-submitted STATE ALLOCATION` | Record an allocation that its original target proves never reached Slurm. |
-| `cancel STATE [--task KEY]... [--allocation ID]...` | `scancel` matching accepted allocations not known to be finished. |
-| `doctor [--profile NAME]` | Check the profile and run `sbatch --version`; a failure shows Slurm's first stderr line. |
+| `reconcile STATE` | Resolve every unresolved allocation from Slurm evidence; exit 75 while some still wait. |
+| `cancel STATE [--task KEY]... [--allocation ID]...` | `scancel` matching allocations that Slurm lists as queued or running. |
+| `doctor [--profile NAME]` | Check what the profile needs from its cluster, read-only; see below. Exit 1 if a check fails, 75 if one went unanswered. |
+
+`doctor` submits nothing and writes nothing. It refuses a profile that does not fit its ceilings,
+then runs every check. Each one is `pass`, `fail` (the command ran and said no, or its output is
+unusable), or `unavailable` (no answer came back). A cluster that does not answer `sbatch --version`
+stops there, since every other command would wait for its deadline too:
+
+| Check | Passes when | Why Servatus needs it |
+| --- | --- | --- |
+| `slurm version` | `sbatch --version` reports 23.02 or later. | Every submission uses `--export=NIL`. |
+| `squeue` | `squeue` exits 0 under the scrubbed environment. | Liveness comes from `squeue`, with only `PATH`, `LANG`, `LC_ALL`, and `TZ` set. |
+| `MinJobAge` | `scontrol show config` reports at least 120 s. | Outcomes are read after the purge, which must outlast a cached directory listing. |
+| `ProctrackType` | `scontrol show config` reports `proctrack/cgroup`. | A job Slurm no longer lists must have no steps left. |
+| `work_root`, `log_root` | Each is a writable directory on the login host. | Steps start in one and write logs and run markers to the other. |
+| `sbatch --test-only` | Slurm accepts the profile's one-Task request. | It proves the partition, account, QOS, GRES, and limits go together. It says nothing about whether a job would start soon. |
 
 `logs --task KEY` reads that Task's step log in its latest accepted allocation, `--allocation ID`
 the allocation log, and both that Task's step log in that allocation; `--bytes` is 1 to 1048576
@@ -393,11 +662,12 @@ the allocation log, and both that Task's step log in that allocation; `--bytes` 
 ## Guarantees
 
 - Intent is durable before each `sbatch`. An uncertain submission blocks its Tasks until it is
-  resolved, and is recorded as never submitted only on Slurm's proof; nothing is retried without
-  an explicit decision.
+  resolved, and is recorded as never submitted only after Slurm and the run markers show nothing
+  for 15 minutes; nothing is retried without an explicit decision.
 - Submission executes exactly the reviewed plan, or refuses it as stale or tampered.
 - Campaign state is owner-only, validated on every read, atomically replaced, and synced.
 - Scheduler evidence is bounded, identity-checked, and read from each Attempt's original target.
+  No Slurm accounting is needed, and a missing marker counts only after Slurm forgets the job.
 - A published destination is absent or complete and is never overwritten. Content is synced before
   commit and the parent after it.
 - Private work survives failure and is removed only after a durable publication.
@@ -415,6 +685,6 @@ your launchers, pass `servatus.testing.FakeScheduler()`, an in-memory Slurm, as 
 - **No job arrays or multi-node jobs.** One Task may use several GPUs on its node (`torchrun`).
 - **No automatic retry, background polling, or scheduler plugins.** One native Slurm lane.
 - **Not an experiment tracker, workflow engine, or secrets manager.** Task meaning belongs to you.
-- **No raw Slurm options, fractional GPUs, or cross-filesystem copies.**
+- **No raw Slurm options, fractional GPU requests, or cross-filesystem copies.**
 
 See the [changelog](https://github.com/edoski/servatus/blob/main/CHANGELOG.md) for release notes.

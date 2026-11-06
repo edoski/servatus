@@ -1,553 +1,446 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta, timezone
+from pathlib import PurePosixPath
 
 import pytest
-from scheduler_fixtures import IDENTITY, SUBMIT, WINDOW, sacct_row, squeue_row
+from scheduler_fixtures import ALLOCATION, IDENTITY, LOG_ROOT, allocation, listing
 
 from servatus.campaign._evidence import (
-    AllocationState,
-    Expectation,
-    JobRef,
-    SchedulerEvidence,
-    StepEvidence,
-    combine,
-    is_missing_reply,
-    normalize_state,
-    parse_accounting,
-    parse_active,
-    parse_identity,
+    MAX_REPLY_LINES,
+    End,
+    Execution,
+    Marker,
+    Observation,
+    QueueRow,
+    Start,
+    Stop,
+    evidenced_job,
+    observe,
+    parse_markers,
+    parse_queue,
     parse_receipt,
-    parse_steps,
-    submission_window,
+    queue_row,
 )
-from servatus.errors import ConfigurationError, EvidenceConflict, ReconciliationError
+from servatus.errors import EvidenceConflict
 
-EXPECTED = {42: Expectation(IDENTITY.removeprefix("servatus-"), *WINDOW, 2)}
+ROOT = PurePosixPath(LOG_ROOT)
+OTHER = allocation(5)
 
-
-def evidence(squeue: str = "", sacct: str = "", *, cluster: str | None = None) -> SchedulerEvidence:
-    active = parse_active(squeue.encode("utf-8", "surrogateescape"), EXPECTED, cluster)
-    history = parse_accounting(sacct.encode("utf-8", "surrogateescape"), EXPECTED, cluster)
-    return combine(EXPECTED[42], active[42], history[42])
-
-
-# --- State table -----------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        *[
-            (state, AllocationState.QUEUED)
-            for state in (
-                "PENDING",
-                "CONFIGURING",
-                "REQUEUED",
-                "RESIZING",
-                "SPECIAL_EXIT",
-                "REQUEUE_HOLD",
-                "REQUEUE_FED",
-                "RESV_DEL_HOLD",
-                "EXPEDITING",
-            )
-        ],
-        *[
-            (state, AllocationState.RUNNING)
-            for state in ("RUNNING", "COMPLETING", "SIGNALING", "STAGE_OUT", "SUSPENDED", "STOPPED")
-        ],
-        ("COMPLETED", AllocationState.SUCCEEDED),
-        ("CANCELLED", AllocationState.CANCELLED),
-        ("PREEMPTED", AllocationState.CANCELLED),
-        ("CANCELLED by 1234", AllocationState.CANCELLED),
-        ("CANCELLED+", AllocationState.CANCELLED),
-        *[
-            (state, AllocationState.FAILED)
-            for state in (
-                "BOOT_FAIL",
-                "DEADLINE",
-                "FAILED",
-                "NODE_FAIL",
-                "OUT_OF_MEMORY",
-                "TIMEOUT",
-            )
-        ],
-        ("REVOKED", AllocationState.UNKNOWN),
-        ("FUTURE_STATE", AllocationState.UNKNOWN),
-        ("bad state!", AllocationState.UNKNOWN),
-    ],
+# The spec's Slurm state families, written out independently of the implementation's sets.
+QUEUED_STATES = (
+    "PENDING",
+    "CONFIGURING",
+    "REQUEUED",
+    "REQUEUE_HOLD",
+    "RESV_DEL_HOLD",
+    "SPECIAL_EXIT",
+    "RESIZING",
+    "FUTURE_KEYWORD",
 )
-def test_one_state_table_normalizes_every_listed_state_exactly(
-    raw: str, expected: AllocationState
-) -> None:
-    assert normalize_state(raw) is expected
+RUNNING_STATES = ("RUNNING", "COMPLETING", "SIGNALING", "STAGE_OUT", "SUSPENDED", "STOPPED")
+SETTLING_STATES = (
+    "COMPLETED",
+    "CANCELLED",
+    "FAILED",
+    "TIMEOUT",
+    "NODE_FAIL",
+    "PREEMPTED",
+    "BOOT_FAIL",
+    "DEADLINE",
+    "OUT_OF_MEMORY",
+)
 
 
-def test_revoked_federation_sibling_is_unknown_and_retained_not_cancelled() -> None:
-    # Regression: REVOKED (the job runs on another cluster) was treated as terminal CANCELLED,
-    # which permitted a duplicate retry.
-    result = evidence(sacct=sacct_row("REVOKED"))
-    assert result.state is AllocationState.UNKNOWN
-    assert result.raw_state == "REVOKED"
-    assert result.retained
-
-
-def test_expediting_is_queued_and_retained_from_either_source() -> None:
-    assert evidence(sacct=sacct_row("EXPEDITING")).state is AllocationState.QUEUED
-    assert evidence(sacct=sacct_row("EXPEDITING")).retained
-    both = evidence(squeue_row("EXPEDITING"), sacct_row("EXPEDITING"))
-    assert (both.state, both.retained, both.problem) == (AllocationState.QUEUED, True, None)
-
-
-# --- Windows and receipts --------------------------------------------------------------------
-
-
-def test_submission_window_is_utc_text_one_hour_either_side() -> None:
-    zone = timezone(timedelta(hours=-10))
-    intent = datetime(2030, 1, 1, 2, 0, 0, tzinfo=zone)
-    assert submission_window(intent) == ("2030-01-01T11:00:00", "2030-01-01T13:00:00")
-    with pytest.raises(ConfigurationError, match="timezone-aware"):
-        submission_window(datetime(2030, 1, 1))
+# --- sbatch receipt --------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     ("output", "expected"),
-    [(b"42\n", JobRef(42)), (b"42", JobRef(42)), (b"42;cluster-a\n", JobRef(42, "cluster-a"))],
+    [(b"42", 42), (b"42\n", 42), (b"9876543210\n", 9876543210), (b"1\n", 1)],
 )
-def test_parse_receipt_accepts_one_exact_identity(output: bytes, expected: JobRef) -> None:
+def test_receipt_is_one_job_number_with_an_optional_newline(output: bytes, expected: int) -> None:
     assert parse_receipt(output) == expected
 
 
 @pytest.mark.parametrize(
     "output",
-    [b"0\n", b"-1\n", b"042\n", b"42;bad;extra\n", b"noise 42\n", b"", b"42\n\n", b"42;\n"],
+    [
+        b"",
+        b"\n",
+        b"42;cluster\n",
+        b"42;cluster",
+        b"042\n",
+        b"0\n",
+        b"-1\n",
+        b" 42\n",
+        b"42 \n",
+        b"42\n\n",
+        b"42\r\n",
+        b"\n42",
+        b"4\n2\n",
+        b"Submitted batch job 42\n",
+        b"\xd9\xa4\xd9\xa2\n",
+    ],
 )
-def test_parse_receipt_rejects_unproved_identity(output: bytes) -> None:
-    with pytest.raises(EvidenceConflict, match="exactly one job identity"):
+def test_receipt_rejects_anything_but_digits(output: bytes) -> None:
+    with pytest.raises(EvidenceConflict, match="exactly one job number"):
         parse_receipt(output)
 
 
-# --- Missing-job reply -----------------------------------------------------------------------
+# --- squeue rows -----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("returncode", "stdout", "stderr", "cluster", "missing"),
-    [
-        (1, b"", b"slurm_load_jobs error: Invalid job id specified\n", None, True),
-        (
-            1,
-            b"CLUSTER: alpha\n",
-            b"slurm_load_jobs error: Invalid job id specified\n",
-            "alpha",
-            True,
-        ),
-        (
-            1,
-            b"CLUSTER: beta\n",
-            b"slurm_load_jobs error: Invalid job id specified\n",
-            "alpha",
-            False,
-        ),
-        (2, b"", b"slurm_load_jobs error: Invalid job id specified\n", None, False),
-        (1, b"partial", b"slurm_load_jobs error: Invalid job id specified\n", None, False),
-        (1, b"", b"squeue: communication failure\n", None, False),
-        (0, b"", b"slurm_load_jobs error: Invalid job id specified\n", None, False),
-    ],
-)
-def test_only_the_exact_native_missing_reply_means_absence(
-    returncode: int, stdout: bytes, stderr: bytes, cluster: str | None, missing: bool
-) -> None:
-    assert is_missing_reply(returncode, stdout, stderr, cluster) is missing
-
-
-# --- Identity guards ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("squeue", "sacct", "message"),
-    [
-        (squeue_row(job=43), "", "unrelated job"),
-        (squeue_row(job="042"), "", "unrelated job"),
-        (squeue_row(job=" 42"), "", "unrelated job"),
-        ("", sacct_row(job=43), "unrelated job"),
-        ("", sacct_row(cluster="bad cluster"), "unrelated cluster"),
-    ],
-)
-def test_rows_for_unqueried_jobs_raise_evidence_conflict(
-    squeue: str, sacct: str, message: str
-) -> None:
-    with pytest.raises(EvidenceConflict, match=message):
-        evidence(squeue, sacct)
-
-
-@pytest.mark.parametrize(
-    ("squeue", "sacct"),
-    [
-        (squeue_row(name="servatus-000000000000000000000000"), ""),
-        (squeue_row(comment=""), ""),
-        (squeue_row(comment=f" {IDENTITY} "), ""),
-        (squeue_row(name="someone-else", comment="someone-else"), sacct_row("COMPLETED")),
-        ("", sacct_row(name=f" {IDENTITY} ")),
-        ("", sacct_row(comment="wrong-identity")),
-        ("", sacct_row(comment=" N/A ")),
-        ("", sacct_row(comment=" ")),
-    ],
-)
-def test_foreign_identity_under_a_queried_job_number_is_confined_to_its_allocation(
-    squeue: str, sacct: str
-) -> None:
-    assert evidence(squeue, sacct) == SchedulerEvidence(
-        AllocationState.UNKNOWN, retained=True, problem="job number is held by a foreign job"
-    )
-
-
-def test_accounting_cluster_must_match_the_queried_route() -> None:
-    assert evidence(sacct=sacct_row(cluster="alpha"), cluster="alpha").state is (
-        AllocationState.RUNNING
-    )
-    with pytest.raises(EvidenceConflict, match="unrelated cluster"):
-        evidence(sacct=sacct_row(cluster="beta"), cluster="alpha")
-    with pytest.raises(EvidenceConflict, match="unrelated cluster"):
-        evidence(sacct=sacct_row(cluster=""), cluster="alpha")
-
-
-@pytest.mark.parametrize("comment", ["", "None", "Unknown", "N/A", IDENTITY])
-def test_accounting_may_omit_the_comment_but_the_queue_may_not(comment: str) -> None:
-    assert evidence(sacct=sacct_row("PENDING", comment=comment)).state is AllocationState.QUEUED
-
-
-@pytest.mark.parametrize(
-    ("squeue", "sacct", "message"),
-    [
-        (squeue_row() + "x", "", "partial"),
-        ("42|RUNNING\n", "", "malformed"),
-        (squeue_row().replace("None", "\udcff"), "", "malformed"),
-        ("", sacct_row(exit_code="x:y"), "exit code"),
-        ("", sacct_row(submit="2030-01-01T1:00:00"), "timestamp"),
-        ("", sacct_row(submit="2030-02-30T01:00:00"), "timestamp"),
-        ("", sacct_row(submit="Unknown"), "submit time"),
-        ("", sacct_row(start="2030-01-01 12:00:00"), "timestamp"),
-        ("", sacct_row(state="!bad"), "state"),
-        ("", sacct_row(identity=IDENTITY, reason="x" * 4097), "malformed"),
-    ],
-)
-def test_malformed_replies_raise_evidence_conflict(squeue: str, sacct: str, message: str) -> None:
-    with pytest.raises(EvidenceConflict, match=message):
-        evidence(squeue, sacct)
-
-
-@pytest.mark.parametrize("control", ["\t", "\r", "\x00", "\x7f"])
-def test_fields_reject_controls_before_space_normalization(control: str) -> None:
-    with pytest.raises(EvidenceConflict, match="malformed"):
-        evidence(squeue_row(f" RUNNING{control}"))
-
-
-def test_reply_line_bound_is_enforced() -> None:
-    with pytest.raises(EvidenceConflict, match="line bound"):
-        evidence(sacct=sacct_row() * 4097)
-
-
-def test_reply_field_bound_is_4096_bytes() -> None:
-    assert evidence(squeue_row(reason="r" * 4096)).reason == "r" * 4096
-    with pytest.raises(EvidenceConflict, match="malformed"):
-        evidence(squeue_row(reason="r" * 4097))
-
-
-def test_padded_state_and_time_fields_are_normalized() -> None:
-    row = squeue_row(" RUNNING ", submit=f" {SUBMIT} ", start=" 2030-01-01T12:01:00 ")
-    result = evidence(row)
-    assert (result.state, result.raw_state, result.started_at) == (
-        AllocationState.RUNNING,
-        "RUNNING",
-        "2030-01-01T12:01:00",
-    )
-
-
-# --- Combination -----------------------------------------------------------------------------
-
-
-def test_nothing_observed_is_unknown_and_not_retained() -> None:
-    assert evidence() == SchedulerEvidence(AllocationState.UNKNOWN)
-
-
-def test_queue_evidence_alone_proves_retained_work() -> None:
-    result = evidence(squeue_row("PENDING", reason="Priority"))
-    assert (result.state, result.retained, result.reason) == (
-        AllocationState.QUEUED,
-        True,
-        "Priority",
-    )
-    unknown = evidence(squeue_row("FUTURE_RETAINED_STATE"))
-    assert (unknown.state, unknown.retained) == (AllocationState.UNKNOWN, True)
-
-
-def test_terminal_queue_row_without_accounting_anchor_is_unknown() -> None:
-    result = evidence(squeue_row("COMPLETED"))
-    assert (result.state, result.retained, result.raw_state) == (
-        AllocationState.UNKNOWN,
-        False,
-        "COMPLETED",
-    )
-
-
-def test_terminal_accounting_carries_exit_code_times_and_reason() -> None:
-    row = sacct_row(
-        "FAILED",
-        exit_code="1:0",
-        reason="NonZeroExitCode",
-        start="2030-01-01T12:01:00",
-        end="2030-01-01T13:30:00",
-    )
-    assert evidence(sacct=row) == SchedulerEvidence(
-        AllocationState.FAILED,
-        raw_state="FAILED",
-        accounting_state="FAILED",
-        exit_code="1:0",
-        reason="NonZeroExitCode",
-        started_at="2030-01-01T12:01:00",
-        ended_at="2030-01-01T13:30:00",
-    )
-
-
-def test_times_missing_from_the_chosen_row_come_from_accounting() -> None:
-    queue = squeue_row("COMPLETING")
-    history = sacct_row("RUNNING", start="2030-01-01T12:01:00", end="2030-01-01T12:09:00")
-    result = evidence(queue, history)
-    assert (result.raw_state, result.started_at, result.ended_at) == (
-        "COMPLETING",
-        "2030-01-01T12:01:00",
-        "2030-01-01T12:09:00",
-    )
-
-
-@pytest.mark.parametrize("cluster", [5, b"alpha", "two words"])
-def test_job_references_need_a_token_cluster(cluster: object) -> None:
-    with pytest.raises(ConfigurationError, match="cluster must be one safe site token"):
-        JobRef(1, cluster)  # pyright: ignore[reportArgumentType]
-
-
-@pytest.mark.parametrize(
-    ("queue", "accounting", "state", "raw", "retained"),
-    [
-        # Regression (lag): squeue already terminal, slurmdbd still reports an older state.
-        ("COMPLETED", "RUNNING", AllocationState.SUCCEEDED, "COMPLETED", True),
-        ("FAILED", "PENDING", AllocationState.FAILED, "FAILED", True),
-        ("RUNNING", "COMPLETED", AllocationState.SUCCEEDED, "COMPLETED", True),
-        ("RUNNING", "PENDING", AllocationState.RUNNING, "RUNNING", True),
-        ("PENDING", "RUNNING", AllocationState.RUNNING, "RUNNING", True),
-        ("COMPLETING", "RUNNING", AllocationState.RUNNING, "COMPLETING", True),
-        ("CANCELLED by 1234", "CANCELLED+", AllocationState.CANCELLED, "CANCELLED by 1234", False),
-        ("FAILED", "TIMEOUT", AllocationState.FAILED, "TIMEOUT", False),
-        ("SPECIAL_EXIT", "COMPLETED", AllocationState.SUCCEEDED, "COMPLETED", True),
-    ],
-)
-def test_same_incarnation_prefers_the_more_advanced_state_and_stays_conservative(
-    queue: str, accounting: str, state: AllocationState, raw: str, retained: bool
-) -> None:
-    result = evidence(squeue_row(queue), sacct_row(accounting))
-    assert (result.state, result.raw_state, result.retained, result.problem) == (
-        state,
-        raw,
-        retained,
-        None,
-    )
-    assert result.accounting_state == accounting
-
-
-@pytest.mark.parametrize(
-    ("queue", "accounting"),
-    [
-        ("COMPLETED", "FAILED"),
-        ("CANCELLED", "COMPLETED"),
-        ("FUTURE_ACTIVE", "FUTURE_ACCOUNTING"),
-        ("REVOKED", "RUNNING"),
-    ],
-)
-def test_irreconcilable_same_incarnation_is_a_contained_problem(
-    queue: str, accounting: str
-) -> None:
-    result = evidence(squeue_row(queue), sacct_row(accounting))
-    assert (result.state, result.retained) == (AllocationState.UNKNOWN, True)
-    assert result.problem == f"squeue reports {queue} but sacct reports {accounting}"
-    assert (result.raw_state, result.accounting_state) == (queue, accounting)
-
-
-def test_requeue_inside_the_submission_window_is_accepted() -> None:
-    # Regression (wedge): a requeue 20 minutes after submission put a second accounting row in
-    # the window, which made inspection fail permanently.
-    history = sacct_row("REQUEUED", submit="2030-01-01T12:00:00") + sacct_row(
-        "RUNNING", submit="2030-01-01T12:20:00"
-    )
-    running = evidence(squeue_row("RUNNING", submit="2030-01-01T12:20:00"), history)
-    assert (running.state, running.retained, running.problem) == (
-        AllocationState.RUNNING,
-        True,
-        None,
-    )
-    finished = sacct_row("REQUEUED", submit="2030-01-01T12:00:00") + sacct_row(
-        "COMPLETED", submit="2030-01-01T12:20:00", end="2030-01-02T00:00:00"
-    )
-    done = evidence(sacct=finished)
-    assert (done.state, done.retained, done.ended_at) == (
-        AllocationState.SUCCEEDED,
-        False,
-        "2030-01-02T00:00:00",
-    )
-
-
-def test_requeue_after_the_window_uses_the_latest_incarnation() -> None:
-    history = sacct_row("RUNNING", submit="2030-01-01T12:00:00") + sacct_row(
-        "PENDING", submit="2030-01-01T14:00:00"
-    )
-    active = evidence(squeue_row("RUNNING", submit="2030-01-01T15:00:00"), history)
-    assert (active.state, active.accounting_state, active.retained) == (
-        AllocationState.RUNNING,
-        "PENDING",
-        True,
-    )
-    terminal = sacct_row("RUNNING", submit="2030-01-01T12:00:00") + sacct_row(
-        "COMPLETED", submit="2030-01-01T14:00:00", end="2030-01-01T16:00:00"
-    )
-    assert evidence(sacct=terminal).state is AllocationState.SUCCEEDED
-
-
-def test_queue_row_sampled_before_a_recorded_requeue_defers_to_accounting() -> None:
-    history = sacct_row("REQUEUED", submit="2030-01-01T12:00:00") + sacct_row(
-        "PENDING", submit="2030-01-01T12:30:00"
-    )
-    result = evidence(squeue_row("RUNNING", submit="2030-01-01T12:00:00"), history)
-    assert (result.state, result.retained, result.problem) == (AllocationState.QUEUED, True, None)
-
-
-@pytest.mark.parametrize(
-    "rows",
-    [
-        (("2030-01-01T14:00:00", "RUNNING"),),
-        (("2030-01-01T10:00:00", "RUNNING"), ("2030-01-01T12:00:00", "RUNNING")),
-        (
-            ("2030-01-01T12:00:00", "RUNNING"),
-            ("2030-01-01T15:00:00", "PENDING"),
-            ("2030-01-01T14:00:00", "RUNNING"),
-        ),
-        (("2030-01-01T12:00:00", "RUNNING"), ("2030-01-01T12:00:00", "PENDING")),
-    ],
-)
-def test_unanchored_or_unordered_history_is_a_contained_problem(
-    rows: tuple[tuple[str, str], ...],
-) -> None:
-    sacct = "".join(sacct_row(state, submit=submit) for submit, state in rows)
-    result = evidence(sacct=sacct)
-    assert (result.state, result.retained) == (AllocationState.UNKNOWN, True)
-    assert result.problem is not None and "accounting" in result.problem
-
-
-def test_history_from_two_clusters_is_a_contained_problem() -> None:
-    sacct = sacct_row(cluster="alpha") + sacct_row(cluster="beta", submit="2030-01-01T12:30:00")
-    assert evidence(sacct=sacct).problem == "accounting requeue history is not ordered"
-
-
-@pytest.mark.parametrize(
-    ("squeue", "sacct"),
-    [
-        (squeue_row(submit="2029-12-31T23:00:00"), ""),
-        (squeue_row(submit="2030-01-01T11:30:00"), sacct_row(submit="2030-01-01T12:00:00")),
-    ],
-)
-def test_queue_row_older_than_the_allocation_is_a_contained_problem(
-    squeue: str, sacct: str
-) -> None:
-    result = evidence(squeue, sacct)
-    assert result.problem == "queue row predates the allocation's submission"
-    assert (result.state, result.retained) == (AllocationState.UNKNOWN, True)
-
-
-def test_two_queue_rows_for_one_job_are_a_contained_problem() -> None:
-    result = evidence(squeue_row() + squeue_row("PENDING"))
-    assert result.problem == "squeue returned several rows for one job"
-
-
-@pytest.mark.parametrize("raw", ["RUNNING", "SPECIAL_EXIT", "REQUEUE_HOLD", "RESV_DEL_HOLD"])
-@pytest.mark.parametrize("accounting", [False, True])
-def test_retained_queue_work_blocks_even_after_terminal_accounting(
-    raw: str, accounting: bool
-) -> None:
-    sacct = sacct_row("COMPLETED") if accounting else ""
-    assert evidence(squeue_row(raw), sacct).retained
-
-
-# --- Steps -----------------------------------------------------------------------------------
-
-
-def test_step_rows_map_to_slots_by_name_and_ignore_everything_else() -> None:
-    output = (
-        f"42|{IDENTITY}|RUNNING|0:0\n"
-        "42.batch|batch|RUNNING|0:0\n"
-        "42.extern|extern|RUNNING|0:0\n"
-        f"42.0|{IDENTITY}-1|FAILED|1:0\n"
-        f"42.1|{IDENTITY}-0|COMPLETED|0:0\n"
-        f"42.2|{IDENTITY}-2|COMPLETED|0:0\n"
-        f"42.3|{IDENTITY}-01|COMPLETED|0:0\n"
-        "42.4|servatus-ffffffffffffffffffffffff-0|COMPLETED|0:0\n"
-    )
-    assert parse_steps(output.encode(), EXPECTED) == {
-        42: (
-            StepEvidence(AllocationState.SUCCEEDED, "COMPLETED", "0:0"),
-            StepEvidence(AllocationState.FAILED, "FAILED", "1:0"),
-        )
+def test_queue_rows_are_grouped_by_queried_name() -> None:
+    other = f"servatus-{OTHER}"
+    output = f"42|{IDENTITY}|RUNNING\n43|{IDENTITY}|PENDING\n7|{other}|COMPLETED\n".encode()
+    rows = parse_queue(output, [IDENTITY, other, "servatus-unseen"])
+    assert rows == {
+        IDENTITY: [QueueRow(42, "RUNNING"), QueueRow(43, "PENDING")],
+        other: [QueueRow(7, "COMPLETED")],
+        "servatus-unseen": [],
     }
 
 
-def test_a_slot_reported_twice_has_no_step_evidence() -> None:
-    output = f"42.0|{IDENTITY}-0|COMPLETED|0:0\n42.1|{IDENTITY}-0|FAILED|1:0\n"
-    assert parse_steps(output.encode(), EXPECTED) == {42: (None, None)}
+def test_empty_queue_reply_lists_every_name_without_rows() -> None:
+    assert parse_queue(b"", [IDENTITY]) == {IDENTITY: []}
 
 
-def test_malformed_step_rows_raise_for_the_caller_to_degrade() -> None:
-    with pytest.raises(EvidenceConflict, match="exit code"):
-        parse_steps(f"42.0|{IDENTITY}-0|FAILED|bad\n".encode(), EXPECTED)
-
-
-# --- Identity proof for reconciliation -------------------------------------------------------
-
-
-def test_identity_accepts_absent_accounting_comment_and_adopts_cluster() -> None:
-    squeue = f"42|{IDENTITY}|{IDENTITY}\n".encode()
-    sacct = f"42|{IDENTITY}||alpha\n42|{IDENTITY}|{IDENTITY}|alpha\n".encode()
-    assert parse_identity(squeue, sacct, IDENTITY) == (JobRef(42, "alpha"),)
-    assert parse_identity(b"", f"42|{IDENTITY}|N/A|\n".encode(), IDENTITY) == (JobRef(42),)
-
-
-def test_identity_lists_every_job_or_proves_absence() -> None:
-    assert parse_identity(b"", b"", IDENTITY) == ()
-    squeue = f"43|{IDENTITY}|{IDENTITY}\n".encode()
-    sacct = f"42|{IDENTITY}|{IDENTITY}|alpha\n".encode()
-    assert parse_identity(squeue, sacct, IDENTITY) == (JobRef(42, "alpha"), JobRef(43))
+def test_queue_row_for_an_unqueried_name_is_a_conflict() -> None:
+    with pytest.raises(EvidenceConflict, match="row for an unrelated job"):
+        parse_queue(b"42|servatus-other|RUNNING\n", [IDENTITY])
 
 
 @pytest.mark.parametrize(
-    ("squeue", "sacct", "message"),
+    ("row", "message"),
     [
-        ("42|wrong|wrong\n", "", "unrelated"),
-        (f"42|{IDENTITY}|wrong\n", "", "unrelated"),  # queue rows need both name and comment
-        (f"42|wrong|{IDENTITY}\n", "", "unrelated"),
-        (f"42|{IDENTITY}|{IDENTITY}\n", f"42|{IDENTITY}|wrong-identity|alpha\n", "unrelated"),
-        (f"42|{IDENTITY}|{IDENTITY}\nmalformed\n", "", "malformed"),
-        (f"42|{IDENTITY}|{IDENTITY}\n0|{IDENTITY}|{IDENTITY}\n", "", "invalid job"),
-        (f"42|{IDENTITY}|{IDENTITY}\n", f"42|{IDENTITY}||alpha\nmalformed\n", "malformed"),
-        (f"42| {IDENTITY} |{IDENTITY}\n", "", "unrelated"),
-        ("", f"42|{IDENTITY}| N/A |alpha\n", "unrelated"),
-        (f"42|{IDENTITY}|{IDENTITY}\n", f"42|{IDENTITY}||bad cluster\n", "invalid cluster"),
-        ("", f"42|{IDENTITY}||alpha\n42|{IDENTITY}||beta\n", "conflicting cluster"),
-        (f"42|{IDENTITY}|{IDENTITY}", "", "partial"),
+        (f"42|{IDENTITY}", "row is malformed"),
+        (f"42|{IDENTITY}|RUNNING|extra", "row is malformed"),
+        (f"042|{IDENTITY}|RUNNING", "row is malformed"),
+        (f"0|{IDENTITY}|RUNNING", "row is malformed"),
+        (f"42.0|{IDENTITY}|RUNNING", "row is malformed"),
+        (f"|{IDENTITY}|RUNNING", "row is malformed"),
+        (f" 42|{IDENTITY}|RUNNING", "row is malformed"),
+        (f"42|{IDENTITY}\t|RUNNING", "row is malformed"),
+        (f"42|{IDENTITY}|RUN\x7fNING", "row is malformed"),
+        (f"42|{IDENTITY}|", "state is malformed"),
+        (f"42|{IDENTITY}|CANCELLED by 7", "state is malformed"),
+        (f"42|{IDENTITY}|RUNNING+", "state is malformed"),
+        (f"42|{IDENTITY}|-RUNNING", "state is malformed"),
     ],
 )
-def test_untrustworthy_identity_replies_are_reconciliation_errors(
-    squeue: str, sacct: str, message: str
+def test_malformed_queue_rows_are_conflicts(row: str, message: str) -> None:
+    with pytest.raises(EvidenceConflict, match=message):
+        parse_queue(f"{row}\n".encode(), [IDENTITY])
+
+
+def test_queue_row_that_is_not_utf8_is_a_conflict() -> None:
+    with pytest.raises(EvidenceConflict, match="row is malformed"):
+        parse_queue(b"42|servatus-\xff|RUNNING\n", [IDENTITY])
+
+
+def test_partial_queue_reply_is_a_conflict() -> None:
+    with pytest.raises(EvidenceConflict, match="output is partial"):
+        parse_queue(f"42|{IDENTITY}|RUNNING".encode(), [IDENTITY])
+
+
+def test_queue_reply_line_bound_is_enforced() -> None:
+    row = f"42|{IDENTITY}|RUNNING\n".encode()
+    assert len(parse_queue(row * MAX_REPLY_LINES, [IDENTITY])[IDENTITY]) == MAX_REPLY_LINES
+    with pytest.raises(EvidenceConflict, match="exceeds its line bound"):
+        parse_queue(row * (MAX_REPLY_LINES + 1), [IDENTITY])
+
+
+@pytest.mark.parametrize("state", SETTLING_STATES)
+def test_terminal_rows_are_settling(state: str) -> None:
+    assert QueueRow(42, state).settling
+
+
+@pytest.mark.parametrize("state", QUEUED_STATES + RUNNING_STATES)
+def test_other_rows_are_not_settling(state: str) -> None:
+    assert not QueueRow(42, state).settling
+
+
+# --- Run markers -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "marker"),
+    [
+        (f"{ALLOCATION}.42.start", Start(42)),
+        (f"{ALLOCATION}.42.stop", Stop(42)),
+        (f"{ALLOCATION}.42.0.0.end", End(42, 0, 0)),
+        (f"{ALLOCATION}.42.17.3.end", End(42, 17, 3)),
+        (f"{ALLOCATION}.9876543210.3.255.end", End(9876543210, 3, 255)),
+    ],
+)
+def test_each_marker_kind_parses(name: str, marker: Marker) -> None:
+    assert parse_markers(listing(name), ROOT, [ALLOCATION]) == {ALLOCATION: [marker]}
+
+
+@pytest.mark.parametrize("code", range(256))
+def test_every_exit_status_parses(code: int) -> None:
+    markers = parse_markers(listing(f"{ALLOCATION}.42.1.{code}.end"), ROOT, [ALLOCATION])
+    assert markers == {ALLOCATION: [End(42, 1, code)]}
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "42.0.256.end",
+        "42.0.999.end",
+        "42.0.-1.end",
+        "42.0.01.end",
+        "42.0.00.end",
+        "42.01.0.end",
+        "042.start",
+        "042.0.0.end",
+        "0.start",
+        "start",
+        "42.end",
+        "42.0.end",
+        "42.x.0.end",
+        "42.0.0.0.end",
+        "42.start.tmp",
+        "42.Start",
+        "42.stop.end",
+        "４２.start",
+        "42.0.0.end\x00",
+    ],
+)
+def test_malformed_marker_of_a_queried_allocation_is_a_conflict(suffix: str) -> None:
+    with pytest.raises(EvidenceConflict, match=f"allocation {ALLOCATION} has a malformed"):
+        parse_markers(listing(f"{ALLOCATION}.{suffix}"), ROOT, [ALLOCATION])
+
+
+def test_marker_name_that_is_not_ascii_is_a_conflict() -> None:
+    output = f"{LOG_ROOT}/{ALLOCATION}.42.".encode() + b"\xff.start\n"
+    with pytest.raises(EvidenceConflict, match=f"allocation {ALLOCATION} has a malformed"):
+        parse_markers(output, ROOT, [ALLOCATION])
+
+
+def test_markers_of_other_allocations_and_unrelated_files_are_ignored() -> None:
+    output = listing(
+        f"{OTHER}.42.start",
+        f"{OTHER}.junk.end",
+        f"{ALLOCATION}-42.out",
+        f"{ALLOCATION}-42-0.out",
+        f"x{ALLOCATION}.42.start",
+        f"{ALLOCATION.upper()}.42.start",
+        f"{ALLOCATION}0.42.start",
+        "README.start",
+        f"{ALLOCATION}.42.start",
+    )
+    assert parse_markers(output, ROOT, [ALLOCATION]) == {ALLOCATION: [Start(42)]}
+
+
+def test_lines_outside_the_log_root_are_ignored() -> None:
+    output = (
+        listing(f"{ALLOCATION}.43.start", root="/elsewhere")
+        + listing(f"{ALLOCATION}.43.start", root=f"{LOG_ROOT}2")
+        + listing(f"sub/{ALLOCATION}.43.start")
+        + listing(f"{ALLOCATION}.43.start", root=LOG_ROOT.removeprefix("/"))
+        + listing(f"{ALLOCATION}.42.stop")
+    )
+    assert parse_markers(output, ROOT, [ALLOCATION]) == {ALLOCATION: [Stop(42)]}
+
+
+@pytest.mark.parametrize("root", [LOG_ROOT, f"{LOG_ROOT}/", "/"])
+def test_log_root_matches_with_or_without_a_trailing_slash(root: str) -> None:
+    shown = root.rstrip("/")
+    output = f"{shown}/{ALLOCATION}.42.start\n".encode()
+    assert parse_markers(output, PurePosixPath(root), [ALLOCATION]) == {ALLOCATION: [Start(42)]}
+
+
+def test_markers_are_grouped_by_allocation_in_listing_order() -> None:
+    output = listing(
+        f"{ALLOCATION}.42.1.0.end",
+        f"{OTHER}.7.start",
+        f"{ALLOCATION}.42.start",
+        f"{ALLOCATION}.42.0.9.end",
+    )
+    assert parse_markers(output, ROOT, [ALLOCATION, OTHER, allocation(6)]) == {
+        ALLOCATION: [End(42, 1, 0), Start(42), End(42, 0, 9)],
+        OTHER: [Start(7)],
+        allocation(6): [],
+    }
+
+
+def test_partial_marker_listing_is_a_conflict() -> None:
+    with pytest.raises(EvidenceConflict, match="output is partial"):
+        parse_markers(listing(f"{ALLOCATION}.42.start").rstrip(b"\n"), ROOT, [ALLOCATION])
+
+
+# --- Observation -----------------------------------------------------------------------------
+
+
+def observation(
+    state: str | None, *, started: bool, stopped: bool, code: int | None
+) -> Observation:
+    return Observation(state, started, stopped, (code,))
+
+
+MARKERS = [
+    pytest.param(started, stopped, code, id=f"start={started}-stop={stopped}-end={code}")
+    for started in (False, True)
+    for stopped in (False, True)
+    for code in (None, 0, 1, 255)
+]
+
+
+@pytest.mark.parametrize("state", QUEUED_STATES)
+@pytest.mark.parametrize(("started", "stopped", "code"), MARKERS)
+def test_a_queued_row_is_queued_whatever_the_markers(
+    state: str, started: bool, stopped: bool, code: int | None
 ) -> None:
-    with pytest.raises(ReconciliationError, match=message):
-        parse_identity(squeue.encode(), sacct.encode(), IDENTITY)
+    seen = observation(state, started=started, stopped=stopped, code=code)
+    assert seen.execution(0) == (Execution.QUEUED, None)
+    assert seen.live
 
 
-def test_window_and_submit_constants_agree() -> None:
-    assert submission_window(datetime(2030, 1, 1, 12, tzinfo=UTC)) == WINDOW
-    assert WINDOW[0] <= SUBMIT <= WINDOW[1]
+@pytest.mark.parametrize("state", RUNNING_STATES + SETTLING_STATES)
+@pytest.mark.parametrize(("started", "stopped"), [(False, False), (True, False), (True, True)])
+def test_a_running_or_settling_row_follows_the_slot_end_marker(
+    state: str, started: bool, stopped: bool
+) -> None:
+    def execution(code: int | None) -> tuple[Execution, int | None]:
+        return observation(state, started=started, stopped=stopped, code=code).execution(0)
+
+    assert execution(None) == (Execution.RUNNING, None)
+    assert execution(0) == (Execution.SUCCEEDED, 0)
+    assert execution(1) == (Execution.FAILED, 1)
+    assert execution(255) == (Execution.FAILED, 255)
+    assert observation(state, started=started, stopped=stopped, code=None).live
+
+
+@pytest.mark.parametrize(("started", "stopped"), [(False, False), (True, False), (True, True)])
+def test_a_purged_job_with_a_slot_end_marker_has_that_outcome(started: bool, stopped: bool) -> None:
+    def execution(code: int) -> tuple[Execution, int | None]:
+        return observation(None, started=started, stopped=stopped, code=code).execution(0)
+
+    assert execution(0) == (Execution.SUCCEEDED, 0)
+    assert execution(7) == (Execution.FAILED, 7)
+
+
+@pytest.mark.parametrize(
+    ("started", "stopped", "expected"),
+    [
+        (True, True, Execution.STOPPED),
+        (False, False, Execution.STOPPED),
+        (False, True, Execution.STOPPED),
+        (True, False, Execution.LOST),
+    ],
+    ids=["interrupted", "never-started", "stopped-before-start", "lost"],
+)
+def test_a_purged_job_without_a_slot_end_marker(
+    started: bool, stopped: bool, expected: Execution
+) -> None:
+    seen = observation(None, started=started, stopped=stopped, code=None)
+    assert seen.execution(0) == (expected, None)
+    assert not seen.live
+
+
+def test_each_slot_is_decided_by_its_own_end_marker() -> None:
+    seen = Observation(None, True, False, (0, None, 3))
+    assert [seen.execution(slot) for slot in range(3)] == [
+        (Execution.SUCCEEDED, 0),
+        (Execution.LOST, None),
+        (Execution.FAILED, 3),
+    ]
+
+
+def test_only_known_outcomes_are_terminal() -> None:
+    assert {state for state in Execution if state.terminal} == {
+        Execution.SUCCEEDED,
+        Execution.FAILED,
+        Execution.STOPPED,
+    }
+
+
+# --- Decisions -------------------------------------------------------------------------------
+
+
+def test_queue_row_is_the_single_row_of_the_recorded_job() -> None:
+    row = QueueRow(42, "RUNNING")
+    assert queue_row(ALLOCATION, [], 42) is None
+    assert queue_row(ALLOCATION, [], None) is None
+    assert queue_row(ALLOCATION, [row], 42) == row
+    assert queue_row(ALLOCATION, [row], None) == row
+
+
+@pytest.mark.parametrize(
+    ("rows", "job", "message"),
+    [
+        ([QueueRow(43, "RUNNING")], 42, "lists job 43 under its identity, not the accepted job 42"),
+        ([QueueRow(42, "RUNNING"), QueueRow(42, "PENDING")], 42, "lists job 42 twice"),
+        ([QueueRow(42, "RUNNING"), QueueRow(43, "PENDING")], 42, "lists jobs 42, 43"),
+        ([QueueRow(44, "RUNNING"), QueueRow(43, "PENDING")], None, "lists jobs 43, 44"),
+    ],
+)
+def test_queue_row_conflicts_name_the_allocation(
+    rows: list[QueueRow], job: int | None, message: str
+) -> None:
+    with pytest.raises(EvidenceConflict, match=f"allocation {ALLOCATION}: Slurm {message}"):
+        queue_row(ALLOCATION, rows, job)
+
+
+def test_observe_combines_the_row_and_the_markers() -> None:
+    markers = [Start(42), End(42, 2, 0), End(42, 0, 5)]
+    seen = observe(ALLOCATION, 42, 3, [QueueRow(42, "COMPLETING")], markers)
+    assert seen == Observation("COMPLETING", True, False, (5, None, 0))
+    assert observe(ALLOCATION, 42, 2, [], [Start(42), Stop(42)]) == Observation(
+        None, True, True, (None, None)
+    )
+    assert observe(ALLOCATION, 42, 1, [], []) == Observation(None, False, False, (None,))
+
+
+@pytest.mark.parametrize(
+    ("rows", "markers", "message"),
+    [
+        ([QueueRow(43, "RUNNING")], [], "Slurm lists job 43 under its identity"),
+        ([QueueRow(42, "RUNNING"), QueueRow(42, "RUNNING")], [], "lists job 42 twice"),
+        ([], [Start(43)], "a run marker names job 43, not the accepted job 42"),
+        ([], [Stop(43)], "a run marker names job 43"),
+        ([], [End(43, 0, 0)], "a run marker names job 43"),
+        ([], [End(42, 2, 0)], "unexpected end marker for slot 2"),
+        ([], [End(42, 5, 0)], "unexpected end marker for slot 5"),
+        ([], [End(42, 1, 0), End(42, 1, 1)], "unexpected end marker for slot 1"),
+    ],
+)
+def test_observe_conflicts_name_the_allocation(
+    rows: list[QueueRow], markers: list[Marker], message: str
+) -> None:
+    with pytest.raises(EvidenceConflict, match=f"allocation {ALLOCATION}: .*{message}"):
+        observe(ALLOCATION, 42, 2, rows, markers)
+
+
+@pytest.mark.parametrize(
+    ("rows", "markers", "expected"),
+    [
+        ([], [], None),
+        ([QueueRow(42, "PENDING")], [], 42),
+        ([], [Start(42)], 42),
+        ([], [End(42, 0, 1), Stop(42)], 42),
+        ([QueueRow(42, "RUNNING")], [Start(42)], 42),
+    ],
+)
+def test_evidenced_job_is_the_one_job_any_evidence_names(
+    rows: list[QueueRow], markers: list[Marker], expected: int | None
+) -> None:
+    assert evidenced_job(ALLOCATION, rows, markers) == expected
+
+
+@pytest.mark.parametrize(
+    ("rows", "markers", "shown"),
+    [
+        ([QueueRow(42, "RUNNING"), QueueRow(43, "PENDING")], [], "42, 43"),
+        ([QueueRow(43, "RUNNING")], [Start(42)], "42, 43"),
+        ([], [Start(42), Stop(44)], "42, 44"),
+    ],
+)
+def test_two_jobs_for_one_unresolved_identity_are_a_conflict(
+    rows: list[QueueRow], markers: list[Marker], shown: str
+) -> None:
+    with pytest.raises(
+        EvidenceConflict, match=f"allocation {ALLOCATION}: evidence names jobs {shown}"
+    ):
+        evidenced_job(ALLOCATION, rows, markers)

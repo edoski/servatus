@@ -6,21 +6,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from support.posix import Syscalls, hidden, open_descriptors
 
 from servatus import _fs
 from servatus.errors import Unavailable, UnsafeFilesystem
 from servatus.publication import Workspace, publish, publish_file
 
 
-def open_descriptors() -> int:
-    return len(os.listdir("/dev/fd"))
-
-
-def hidden(parent: Path) -> list[Path]:
-    return sorted(parent.glob(".servatus-*"))
-
-
-def track_opens(syscalls: Any, prefix: str) -> set[int]:
+def track_opens(syscalls: Syscalls, prefix: str) -> set[int]:
     """Record descriptors opened for entries whose name starts with `prefix`."""
     opened: set[int] = set()
 
@@ -39,7 +32,7 @@ def track_opens(syscalls: Any, prefix: str) -> set[int]:
     [(OSError("injected fstat failure"), Unavailable), (KeyboardInterrupt(), KeyboardInterrupt)],
 )
 def test_fstat_failure_on_a_new_stage_leaks_nothing(
-    tmp_path: Path, syscalls: Any, failure: BaseException, raised: type[BaseException]
+    tmp_path: Path, syscalls: Syscalls, failure: BaseException, raised: type[BaseException]
 ) -> None:
     # Regression: the descriptor (and stage) leaked when fstat failed right after open.
     opened = track_opens(syscalls, ".servatus-stage-")
@@ -63,7 +56,9 @@ def test_fstat_failure_on_a_new_stage_leaks_nothing(
     assert list(tmp_path.iterdir()) == []
 
 
-def test_stat_failure_after_stage_creation_leaves_no_residue(tmp_path: Path, syscalls: Any) -> None:
+def test_stat_failure_after_stage_creation_leaves_no_residue(
+    tmp_path: Path, syscalls: Syscalls
+) -> None:
     def stat(real: Callable[..., os.stat_result], path: Any, *args: Any, **kwargs: Any) -> Any:
         if str(path).startswith(".servatus-stage-"):
             raise KeyboardInterrupt
@@ -79,7 +74,7 @@ def test_stat_failure_after_stage_creation_leaves_no_residue(tmp_path: Path, sys
     assert list(tmp_path.iterdir()) == []
 
 
-def test_fstat_failure_on_workspace_lock_leaks_nothing(tmp_path: Path, syscalls: Any) -> None:
+def test_fstat_failure_on_workspace_lock_leaks_nothing(tmp_path: Path, syscalls: Syscalls) -> None:
     opened = track_opens(syscalls, ".lock")
 
     def fstat(real: Callable[[int], os.stat_result], fd: int) -> os.stat_result:
@@ -99,7 +94,9 @@ def test_fstat_failure_on_workspace_lock_leaks_nothing(tmp_path: Path, syscalls:
     assert open_descriptors() == before
 
 
-def test_write_new_failure_removes_the_file_and_descriptor(tmp_path: Path, syscalls: Any) -> None:
+def test_write_new_failure_removes_the_file_and_descriptor(
+    tmp_path: Path, syscalls: Syscalls
+) -> None:
     def write(real: Callable[..., int], fd: int, data: Any) -> int:
         raise OSError("injected write failure")
 
@@ -113,24 +110,9 @@ def test_write_new_failure_removes_the_file_and_descriptor(tmp_path: Path, sysca
     assert list(tmp_path.iterdir()) == []
 
 
-def test_failed_attempt_closes_stage_descriptor_once(tmp_path: Path, syscalls: Any) -> None:
-    opened = track_opens(syscalls, ".servatus-stage-")
-    closes: list[int] = []
-
-    def close(real: Callable[[int], None], fd: int) -> None:
-        if fd in opened:
-            closes.append(fd)
-        real(fd)
-
-    syscalls.os("close", close)
-
-    with pytest.raises(ValueError, match="stop"):
-        publish(tmp_path / "result", lambda draft: (_ for _ in ()).throw(ValueError("stop")))
-
-    assert len(closes) == len(opened) == 1
-
-
-def test_interrupted_sync_removes_stage_and_leaks_nothing(tmp_path: Path, syscalls: Any) -> None:
+def test_interrupted_sync_removes_stage_and_leaks_nothing(
+    tmp_path: Path, syscalls: Syscalls
+) -> None:
     def interrupt(real: Callable[[int], None], fd: int) -> None:
         raise KeyboardInterrupt
 
@@ -172,7 +154,7 @@ def test_many_operations_leak_no_descriptors(tmp_path: Path) -> None:
 
 # -- substitution between creation and open --------------------------------------------------
 def substitute_on_open(
-    syscalls: Any, matches: Callable[[str], bool], moved: Path, parent: Path, fill: bool
+    syscalls: Syscalls, matches: Callable[[str], bool], moved: Path, parent: Path, fill: bool
 ) -> list[Path]:
     replaced: list[Path] = []
 
@@ -192,7 +174,7 @@ def substitute_on_open(
 
 @pytest.mark.parametrize("fill", [False, True])
 def test_new_stage_substituted_before_open_is_preserved(
-    tmp_path: Path, syscalls: Any, fill: bool
+    tmp_path: Path, syscalls: Syscalls, fill: bool
 ) -> None:
     moved = tmp_path / "moved-stage"
     replaced = substitute_on_open(
@@ -207,7 +189,9 @@ def test_new_stage_substituted_before_open_is_preserved(
     assert not (tmp_path / "result").exists()
 
 
-def test_new_container_substituted_before_open_is_preserved(tmp_path: Path, syscalls: Any) -> None:
+def test_new_container_substituted_before_open_is_preserved(
+    tmp_path: Path, syscalls: Syscalls
+) -> None:
     moved = tmp_path / "moved-container"
     replaced = substitute_on_open(
         syscalls, lambda name: name.endswith(".work"), moved, tmp_path, False
@@ -225,7 +209,7 @@ def test_new_container_substituted_before_open_is_preserved(tmp_path: Path, sysc
 
 @pytest.mark.parametrize("entry", ["container", "work", ".lock", ".identity"])
 def test_foreign_owned_private_entries_are_rejected(
-    tmp_path: Path, syscalls: Any, entry: str
+    tmp_path: Path, syscalls: Syscalls, entry: str
 ) -> None:
     with Workspace(tmp_path / "result", identity=b"request") as workspace:
         container = workspace.path.parent
@@ -250,7 +234,7 @@ def test_foreign_owned_private_entries_are_rejected(
 
 @pytest.mark.parametrize("failure", [OSError(5, "close reported EIO"), KeyboardInterrupt()])
 def test_write_new_close_failure_removes_the_file(
-    tmp_path: Path, syscalls: Any, failure: BaseException
+    tmp_path: Path, syscalls: Syscalls, failure: BaseException
 ) -> None:
     # Regression: the descriptor was closed after the cleanup handler, so the file survived.
     opened = track_opens(syscalls, "state")

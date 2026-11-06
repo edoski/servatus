@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "servatus"
-version = "0.12.1"
+version = "0.13.0"
 description = "Run resumable work through Slurm and atomically publish validated outputs."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -55,6 +55,9 @@ reportUnnecessaryIsInstance = false
 [tool.coverage.run]
 source = ["src"]
 branch = true
+
+[tool.coverage.report]
+fail_under = 97
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

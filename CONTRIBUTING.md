@@ -29,19 +29,26 @@ The last step installs the built wheel into a throwaway environment and checks t
 (`py.typed`, no tests), the public names, that `servatus` is imported from the installed wheel,
 the console script and `--version`, an offline CLI campaign, a `FakeScheduler` plan, validate,
 submit, and retry round-trip, and publication. It takes the wheel path as its only argument. Clear
-`dist/` first if it holds older wheels. Coverage settings (`source`, branch coverage) live in
-`pyproject.toml`.
+`dist/` first if it holds older wheels. Coverage settings (`source`, branch coverage, the 97% floor)
+live in `pyproject.toml`.
 
 ## Test layout
 
-- `tests/support/`: shared builders for synthetic Tasks, Targets, Resources, and Profiles.
+- `tests/support/`: shared builders for synthetic Tasks, Targets, Resources, and Profiles
+  (`builders.py`), POSIX helpers and fault injection (`posix.py`), and the spawned-process harness
+  (`processes.py`).
 - `tests/core/`: codec, configuration, state invariant and transitions, store, status, policy.
-- `tests/scheduler/`: transport bounds, batch scripts, evidence parsing, and `FakeScheduler`.
+- `tests/scheduler/`: transport bounds, batch scripts, evidence parsing, `doctor`, and
+  `FakeScheduler`.
 - `tests/publication/`: publish, `publish_file`, Draft, Workspace, children, and POSIX fallbacks.
 - `tests/faults/`: injected failures, interruptions, and crash points.
 - `tests/campaign/`: Campaign behaviour and the CLI, driven through `FakeScheduler`.
 
 `tests/` is on the import path, so tests import helpers as `from support.builders import target`.
+
+`scripts/cluster_e2e.py` is the live check against a real cluster: direct and Apptainer launchers,
+CPU and one GPU. CI and pytest never run it. Run it before a release, and after any change to a
+Slurm command, a batch script, or a run marker.
 
 ## Rules
 

@@ -29,12 +29,6 @@ detect or exclude concurrent content writers. A hard-linked result shares its so
 rewriting the source in place after publication changes the published content. The owner-only draft
 namespace must remain quiescent during each link call.
 
-Optional directory retirement (`retire=`) accepts one existing owner-only destination sibling.
-Servatus pins it before the builder, commits and syncs the destination first, then removes only the
-pinned tree and syncs the parent again. Missing, moved, substituted, newly permissive, or
-unremovable trees after commit are preserved as cleanup residue and cannot turn a committed
-publication into apparent failure.
-
 The hidden Workspace container is the lifecycle trust root. Its container, work directory,
 lifecycle lock, and identity file must belong to the effective user with no group or world
 permissions and are reverified through pinned descriptors. Initialization syncs the private
@@ -58,13 +52,11 @@ lock file would split its holders. It must be owned by the effective user with n
 permissions, so a directory coordinated this way cannot be shared between users; another user's
 lock file is refused.
 
-Filesystem failures surface as Servatus errors, never as a raw `OSError`: a missing, denied,
-read-only, or overlong path, or a file its owner cannot read, is `ConfigurationError` (`NotFound`
-for a missing campaign or state file); no space, quota, I/O errors, and descriptor exhaustion are
-`Unavailable`; a cross-device operation is `CrossDeviceError`. `UnsafeFilesystem` is reserved for
-explicit substitution, type (for example a symlink or file where a directory must be), and
-ownership checks, so treat it as a reason to investigate. Exceptions raised by builders, writers,
-and other application callbacks propagate unchanged.
+Filesystem failures surface as Servatus errors, never as a raw `OSError`; the
+[README](README.md#publication) and [ADR 0002](docs/adr/0002-posix-workspace-publication.md) map
+them. `UnsafeFilesystem` is reserved for explicit substitution, type (for example a symlink or file
+where a directory must be), and ownership checks, so treat it as a reason to investigate. Exceptions
+raised by builders, writers, and other application callbacks propagate unchanged.
 
 On Linux, when `renameat2(RENAME_NOREPLACE)` is unavailable (no libc wrapper and no known raw
 syscall number) or the filesystem rejects it (`EINVAL`, `ENOSYS`, `EOPNOTSUPP`/`ENOTSUP`),
@@ -79,9 +71,11 @@ on every client to use Servatus, and a mount with coherent `flock` and stable in
 ## Campaigns
 
 Task arguments, stdin, and environment values are written into the submitted batch script (stdin as
-`printf` literals, environment as `APPTAINERENV_*` assignments or `env -i` arguments). Cluster
-administrators and accounting systems may read them. Do not put credentials or other secrets in
-Tasks. The batch script creates no scratch files.
+`printf` literals; environment as `/usr/bin/env` arguments of a direct step, or as `APPTAINERENV_*`
+assignments on an Apptainer step's `srun`, which keeps it out of process listings). Cluster
+administrators and accounting systems may read them, and other users on the node can read a direct
+step's command line. Do not put credentials or other secrets in Tasks. The batch script creates no
+scratch files.
 
 Values in a repository-owned `SERVATUS.toml` are editable user-side guardrails, not an enforcement
 boundary; Profile labels are nonbinding provenance. Slurm remains authoritative for identity,
@@ -105,34 +99,37 @@ prints scripts verbatim, including any control characters in Task arguments or e
 Campaign state is an owner-only directory. It keeps complete Task arguments, stdin, and environment
 for retry; keep it private.
 
-Plan files (`servatus.plan/1`) retain the resolved Target and Resources, Task keys with their hold
-reasons, retry choices, duplicate-risk acknowledgements, and the nonce from which allocation
-identities derive. They exclude Task arguments, stdin, and environment
-but remain private operational data. `Plan.save` and `servatus plan --output` write them with mode
-`0600` and never overwrite an existing file. `--show-scripts` prints complete scripts, including
-Task payloads; treat that output as sensitive. Submission rebuilds each plan from its decision and
-the current state and refuses a plan that does not match.
+Plan files (`servatus.plan/2`) retain the resolved Target and Resources, Task keys with their hold
+reasons, and the nonce from which allocation identities derive. They exclude Task arguments, stdin,
+and environment but remain private operational data. `Plan.save` and `servatus plan --output` write
+them with mode `0600` and never overwrite an existing file. `--show-scripts` prints complete
+scripts, including Task payloads; treat that output as sensitive. Submission rebuilds each plan from
+its decision and the current state and refuses a plan that does not match.
 
 `Status.to_json()` (`servatus status --json`) is a diagnostic snapshot, not a redacted record. It
 includes Task keys, result states, allocation identities, retry choices, Profile labels, Slurm job
-ids and clusters, raw scheduler and accounting states, exit codes, scheduler reasons, timestamps,
-and any evidence problem text. It excludes Task arguments, stdin, environment values, Target values,
-scripts, log content, and application output. Scheduler text, keys, and labels may themselves
-identify private work; keep snapshots private. Snapshots carry no execution authority.
+ids, raw `squeue` states, run-marker facts, exit codes, timestamps, and warnings. It excludes Task
+arguments, stdin, environment values, Target values, scripts, log content, and application output.
+Scheduler text, keys, and labels may themselves identify private work; keep snapshots private.
+Snapshots carry no execution authority.
 
 Submission checks the scheduler connection and the plan's eligibility before recording anything,
 then syncs unresolved intent before each `sbatch`. A failure after launch does not prove rejection.
 `SubmissionInterrupted.result` distinguishes confirmed receipts, unresolved work, unattempted
 allocations, and a job observed but not durably recorded. Reconcile uncertain acceptance before
-retrying; unknown accepted work is retried only after an explicit duplicate-risk acknowledgement.
+retrying; `LOST` work (a job that vanished without recording how it ended) is retried only when its
+Task key is named explicitly.
 
-`mark_not_submitted` (`servatus mark-not-submitted`) releases Tasks for resubmission, so it
-requires proof: it first asks the allocation's original target for every job carrying the
-allocation's identity, raises `Conflict` if any exists, `Unavailable` if the query fails, and
-`ReconciliationError` for an untrustworthy reply, and records the outcome only on proven absence.
-The proof is bounded by Slurm's own retention (queue plus accounting near the intent time).
-`mark_accepted` may replace a not-submitted record only when the original target proves exactly
-that job and no later allocation already includes the Tasks.
+`reconcile` releases Tasks for resubmission only when the allocation's original target shows no
+job with its identity in `squeue` and no run marker in `log_root`, at least 15 minutes after the
+intent. A failed query raises `Unavailable` and records nothing; an untrustworthy reply (two jobs
+for one identity, a malformed marker) raises `EvidenceConflict`. If a job appears later anyway,
+`status` warns about it and planning holds its Tasks `ACTIVE` until it leaves the queue.
+
+Run markers are empty files named after facts (allocation, job, slot, exit code) in `log_root`.
+Servatus trusts that directory as it trusts the logs in it: anyone who can write there as the
+cluster account can forge an outcome. Keep `log_root` owner-only (the batch script runs under
+`umask 077`).
 
 ## Logs
 

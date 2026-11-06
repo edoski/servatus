@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from support.posix import Syscalls, hidden
 
 from servatus.errors import DestinationExists, Unavailable, UnsafeFilesystem, WorkspaceConflict
 from servatus.publication import Draft, Workspace, publish, publish_file
@@ -16,11 +17,9 @@ from servatus.publication import Draft, Workspace, publish, publish_file
 Sync = Callable[[int], None]
 
 
-def hidden(parent: Path) -> list[Path]:
-    return sorted(parent.glob(".servatus-*"))
-
-
-def fail_rmdir_of(syscalls: Any, predicate: Callable[[str], bool], times: int = 1) -> list[str]:
+def fail_rmdir_of(
+    syscalls: Syscalls, predicate: Callable[[str], bool], times: int = 1
+) -> list[str]:
     failures: list[str] = []
 
     def rmdir(real: Callable[..., None], path: str, *args: Any, **kwargs: Any) -> None:
@@ -34,7 +33,7 @@ def fail_rmdir_of(syscalls: Any, predicate: Callable[[str], bool], times: int = 
 
 
 def test_workspace_cleanup_failure_is_reported_then_reclaimed(
-    tmp_path: Path, syscalls: Any
+    tmp_path: Path, syscalls: Syscalls
 ) -> None:
     destination = tmp_path / "model"
     failures = fail_rmdir_of(syscalls, lambda name: name.endswith(".work"))
@@ -60,7 +59,7 @@ def test_workspace_cleanup_failure_is_reported_then_reclaimed(
     assert hidden(tmp_path) == []
 
 
-def test_workspace_discard_failure_propagates(tmp_path: Path, syscalls: Any) -> None:
+def test_workspace_discard_failure_propagates(tmp_path: Path, syscalls: Syscalls) -> None:
     fail_rmdir_of(syscalls, lambda name: name.endswith(".work"))
 
     with Workspace(tmp_path / "result", identity=b"run") as workspace:
@@ -70,43 +69,63 @@ def test_workspace_discard_failure_propagates(tmp_path: Path, syscalls: Any) -> 
             workspace.publish(lambda draft: None)
 
 
-def test_retirement_cleanup_failure_is_nonfatal(tmp_path: Path, syscalls: Any) -> None:
-    source = tmp_path / "bundle"
-    source.mkdir(mode=0o700)
-    fail_rmdir_of(syscalls, lambda name: name == "bundle")
-
-    with pytest.warns(RuntimeWarning, match="private cleanup remains pending"):
-        publication = publish(tmp_path / "result", lambda draft: None, retire=source)
-
-    assert publication.cleanup_pending is True
-    assert (tmp_path / "result").is_dir()
-    assert source.is_dir()
-
-
-def test_retirement_parent_sync_failure_is_nonfatal(tmp_path: Path, syscalls: Any) -> None:
-    source = tmp_path / "bundle"
-    source.mkdir(mode=0o700)
+def test_cleanup_sync_failure_after_commit_is_nonfatal(tmp_path: Path, syscalls: Syscalls) -> None:
     destination = tmp_path / "result"
     failed: list[bool] = []
 
     def fail_cleanup_sync(real: Sync, fd: int) -> None:
-        if not failed and destination.exists() and not source.exists():
+        if not failed and destination.exists() and not hidden(tmp_path):
             failed.append(True)
-            raise OSError("injected retirement parent sync failure")
+            raise OSError("injected cleanup sync failure")
         real(fd)
 
     syscalls.on_sync(fail_cleanup_sync)
 
-    with pytest.warns(RuntimeWarning, match="private cleanup remains pending"):
-        publication = publish(destination, lambda draft: None, retire=source)
+    with (
+        Workspace(destination, identity=b"run") as workspace,
+        pytest.warns(RuntimeWarning, match="private cleanup remains pending"),
+    ):
+        publication = workspace.publish(lambda draft: None)
 
     assert failed
     assert publication.cleanup_pending is True
     assert destination.is_dir()
-    assert not source.exists()
+    assert hidden(tmp_path) == []
 
 
-def test_stage_cleanup_failure_keeps_writer_exception(tmp_path: Path, syscalls: Any) -> None:
+def test_warning_filter_cannot_mask_committed_publication(
+    tmp_path: Path, syscalls: Syscalls
+) -> None:
+    fail_rmdir_of(syscalls, lambda name: name.endswith(".work"))
+
+    with warnings.catch_warnings(), Workspace(tmp_path / "result", identity=b"run") as workspace:
+        warnings.simplefilter("error", RuntimeWarning)
+        publication = workspace.publish(lambda draft: None)
+
+    assert publication.cleanup_pending is True
+    assert (tmp_path / "result").is_dir()
+
+
+def test_warning_hook_failure_cannot_mask_committed_publication(
+    tmp_path: Path, syscalls: Syscalls, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fail_rmdir_of(syscalls, lambda name: name.endswith(".work"))
+    calls: list[object] = []
+
+    def fail_warning(*args: object, **kwargs: object) -> None:
+        calls.append(args)
+        raise RuntimeError("injected warning hook failure")
+
+    monkeypatch.setattr(warnings, "warn", fail_warning)
+
+    with Workspace(tmp_path / "result", identity=b"run") as workspace:
+        publication = workspace.publish(lambda draft: None)
+
+    assert len(calls) == 1
+    assert publication.cleanup_pending is True
+
+
+def test_stage_cleanup_failure_keeps_writer_exception(tmp_path: Path, syscalls: Syscalls) -> None:
     fail_rmdir_of(syscalls, lambda name: name.startswith(".servatus-stage-"))
     failure = RuntimeError("invalid output")
 
@@ -123,7 +142,9 @@ def test_stage_cleanup_failure_keeps_writer_exception(tmp_path: Path, syscalls: 
 
 
 @pytest.mark.usefixtures("linux_fallback")
-def test_file_fallback_reports_only_private_cleanup_pending(tmp_path: Path, syscalls: Any) -> None:
+def test_file_fallback_reports_only_private_cleanup_pending(
+    tmp_path: Path, syscalls: Syscalls
+) -> None:
     fail_rmdir_of(syscalls, lambda name: name.startswith(".servatus-stage-"))
 
     with pytest.warns(RuntimeWarning, match="private cleanup remains pending"):
@@ -134,7 +155,9 @@ def test_file_fallback_reports_only_private_cleanup_pending(tmp_path: Path, sysc
     assert len(hidden(tmp_path)) == 1
 
 
-def test_cleanup_preserves_root_substituted_during_removal(tmp_path: Path, syscalls: Any) -> None:
+def test_cleanup_preserves_root_substituted_during_removal(
+    tmp_path: Path, syscalls: Syscalls
+) -> None:
     moved = tmp_path / "moved-container"
     substituted: list[Path] = []
 
@@ -164,7 +187,7 @@ def test_cleanup_preserves_root_substituted_during_removal(tmp_path: Path, sysca
 
 
 def test_cleanup_preserves_nested_directory_substituted_before_open(
-    tmp_path: Path, syscalls: Any
+    tmp_path: Path, syscalls: Syscalls
 ) -> None:
     moved = tmp_path / "moved-nested"
     substituted: list[bool] = []
@@ -191,7 +214,7 @@ def test_cleanup_preserves_nested_directory_substituted_before_open(
     assert (nested / "replacement").read_text() == "preserve"
 
 
-def test_link_cleanup_failure_poisons_the_draft(tmp_path: Path, syscalls: Any) -> None:
+def test_link_cleanup_failure_poisons_the_draft(tmp_path: Path, syscalls: Syscalls) -> None:
     source = tmp_path / "source"
     source.write_text("value")
     inspected: list[bool] = []
@@ -222,7 +245,7 @@ def test_link_cleanup_failure_poisons_the_draft(tmp_path: Path, syscalls: Any) -
     assert not (tmp_path / "result").exists()
 
 
-def test_link_selects_source_at_the_hard_link_operation(tmp_path: Path, syscalls: Any) -> None:
+def test_link_selects_source_at_the_hard_link_operation(tmp_path: Path, syscalls: Syscalls) -> None:
     source = tmp_path / "source.bin"
     source.write_bytes(b"original")
     moved = tmp_path / "moved.bin"
@@ -241,7 +264,7 @@ def test_link_selects_source_at_the_hard_link_operation(tmp_path: Path, syscalls
 
 
 def test_link_tree_withdraws_an_entry_substituted_during_linking(
-    tmp_path: Path, syscalls: Any
+    tmp_path: Path, syscalls: Syscalls
 ) -> None:
     tree = tmp_path / "tree"
     tree.mkdir()
@@ -266,7 +289,7 @@ def test_link_tree_withdraws_an_entry_substituted_during_linking(
 
 
 # -- identity-stage cleanup on the Linux fallback --------------------------------------------
-def fail_identity_unlink(syscalls: Any) -> None:
+def fail_identity_unlink(syscalls: Syscalls) -> None:
     def unlink(real: Callable[..., None], path: Any, *args: Any, **kwargs: Any) -> None:
         if str(path).startswith(".identity-"):
             raise OSError("injected identity stage cleanup failure")
@@ -277,7 +300,7 @@ def fail_identity_unlink(syscalls: Any) -> None:
 
 @pytest.mark.usefixtures("linux_fallback")
 def test_identity_fallback_reports_stage_residue_without_failing(
-    tmp_path: Path, syscalls: Any
+    tmp_path: Path, syscalls: Syscalls
 ) -> None:
     fail_identity_unlink(syscalls)
 
@@ -291,7 +314,9 @@ def test_identity_fallback_reports_stage_residue_without_failing(
 
 
 @pytest.mark.usefixtures("linux_fallback")
-def test_identity_fallback_warns_when_cleanup_sync_fails(tmp_path: Path, syscalls: Any) -> None:
+def test_identity_fallback_warns_when_cleanup_sync_fails(
+    tmp_path: Path, syscalls: Syscalls
+) -> None:
     failures: list[bool] = []
 
     def fail_cleanup_sync(real: Sync, fd: int) -> None:
@@ -317,7 +342,7 @@ def test_identity_fallback_warns_when_cleanup_sync_fails(tmp_path: Path, syscall
 
 @pytest.mark.usefixtures("linux_fallback")
 def test_identity_warning_preserves_other_thread_warning_policy(
-    tmp_path: Path, syscalls: Any, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, syscalls: Syscalls, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fail_identity_unlink(syscalls)
     real_warn = warnings.warn
@@ -359,7 +384,7 @@ def test_identity_warning_preserves_other_thread_warning_policy(
 # -- interrupted container removal -----------------------------------------------------------
 @pytest.mark.parametrize("finish", ["discard", "publish"])
 def test_interrupted_removal_keeps_the_identity_until_work_is_gone(
-    tmp_path: Path, syscalls: Any, finish: str
+    tmp_path: Path, syscalls: Syscalls, finish: str
 ) -> None:
     # Regression: `.identity` went first, so a failed removal left bare work for anyone to adopt.
     destination = tmp_path / "result"
@@ -386,7 +411,7 @@ def test_interrupted_removal_keeps_the_identity_until_work_is_gone(
 
 
 def test_removal_interrupted_before_the_identity_is_finished_on_entry(
-    tmp_path: Path, syscalls: Any
+    tmp_path: Path, syscalls: Syscalls
 ) -> None:
     destination = tmp_path / "result"
     interrupted: list[bool] = []

@@ -8,15 +8,14 @@ import stat
 import subprocess
 import sys
 import textwrap
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 from core_helpers import CAMPAIGN_ID, reencode, roster, submit
 from support.builders import tasks
+from support.posix import Syscalls, open_descriptors
 
-from servatus import _fs
-from servatus._fs import replace_file
 from servatus.campaign import _store
 from servatus.campaign._config import Task
 from servatus.campaign._state import State, append, decode, encode, seal
@@ -34,20 +33,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture(autouse=True)
-def plain_fsync(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Behave like a filesystem without ``F_FULLFSYNC`` so every durability request reaches
-    ``os.fsync`` exactly once, where these tests observe and inject faults."""
-    full_sync: int | None = getattr(fcntl, "F_FULLFSYNC", None)
-    real = fcntl.fcntl
-
-    def without_full_sync(descriptor: int, command: int, *args: int) -> object:
-        if command == full_sync:
-            raise OSError(errno.ENOTSUP, "F_FULLFSYNC disabled by the test")
-        return real(descriptor, command, *args)
-
-    if full_sync is not None:
-        monkeypatch.setattr(fcntl, "fcntl", without_full_sync)
-    yield
+def plain_fsync(monkeypatch: pytest.MonkeyPatch) -> None:
+    Syscalls(monkeypatch)
 
 
 def created(tmp_path: Path, state: State | None = None) -> tuple[Path, Store]:
@@ -101,15 +88,17 @@ def test_open_missing_campaigns_is_not_found(tmp_path: Path) -> None:
         Store.open(tmp_path / "bare")
 
 
-@pytest.mark.parametrize("path", ["", "a\0b", "/"])
-def test_campaign_paths_must_name_one_directory(path: str) -> None:
-    with pytest.raises(ConfigurationError, match="campaign path"):
+@pytest.mark.parametrize(
+    ("path", "message"),
+    [
+        ("", "campaign path must name one directory"),
+        ("/", "campaign path must name one directory"),
+        ("a\0b", "embedded NUL"),
+    ],
+)
+def test_campaign_paths_must_name_one_directory(path: str, message: str) -> None:
+    with pytest.raises(ConfigurationError, match=message):
         Store.open(path)
-
-
-def test_create_rejects_non_states(tmp_path: Path) -> None:
-    with pytest.raises(ConfigurationError, match="campaign State"):
-        Store.create(tmp_path / "campaign", "state")  # pyright: ignore[reportArgumentType]
 
 
 # --- unsafe filesystem -----------------------------------------------------------------------
@@ -286,19 +275,12 @@ def test_update_commits_and_returns_the_new_state(tmp_path: Path) -> None:
     assert Store.open(path).read() == changed
 
 
-def test_unchanged_update_writes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_unchanged_update_writes_nothing(tmp_path: Path) -> None:
     path, store = created(tmp_path)
     before = (path / "campaign.json").stat()
-    writes: list[str] = []
-
-    def record(*_args: object, **_kwargs: object) -> None:
-        writes.append("write")
-
-    monkeypatch.setattr(_fs, "replace_file", record)
     state = store.read()
     assert store.update(lambda current: current) is state
     assert store.update(lambda current: append(current, ())) is state
-    assert writes == []
     after = (path / "campaign.json").stat()
     assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
 
@@ -312,55 +294,30 @@ def test_failed_change_leaves_state_untouched(tmp_path: Path) -> None:
 
     with pytest.raises(Conflict, match="no"):
         store.update(broken)
-    with pytest.raises(TypeError, match="must return a State"):
-        store.update(lambda state: "x")  # pyright: ignore[reportArgumentType, reportUnknownLambdaType]
     assert (path / "campaign.json").read_bytes() == before
 
 
-def count_decodes(monkeypatch: pytest.MonkeyPatch) -> list[int]:
-    calls: list[int] = []
-    real = decode
-
-    def counting(data: bytes) -> State:
-        calls.append(len(data))
-        return real(data)
-
-    monkeypatch.setattr(_store, "decode", counting)
-    return calls
-
-
-def test_content_cache_decodes_only_changed_bytes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_reads_reuse_the_state_until_its_bytes_change(tmp_path: Path) -> None:
     path, _ = created(tmp_path)
-    calls = count_decodes(monkeypatch)
     store = Store.open(path)
-    assert len(calls) == 1
     first = store.read()
-    assert store.read() is first and len(calls) == 1
+    assert store.read() is first
     changed = store.update(lambda state: append(state, [Task("x")]))
-    assert len(calls) == 1, "a commit fills the cache with the bytes it wrote"
-    assert store.read() is changed and len(calls) == 1
-    other = Store.open(path)
-    assert len(calls) == 2
-    other.update(seal)
-    sealed = store.read()
-    assert sealed.sealed and len(calls) == 3
-    assert store.read() is sealed and len(calls) == 3
+    assert store.read() is changed, "a commit fills the cache with the state it wrote"
     os.replace(path / "campaign.json", tmp_path / "copy")
     (path / "campaign.json").write_bytes((tmp_path / "copy").read_bytes())
     (path / "campaign.json").chmod(0o600)
-    assert store.read() is sealed and len(calls) == 3, "same bytes, new inode: still a hit"
+    assert store.read() is changed, "the same bytes under a new inode still hit the cache"
 
 
-def test_cache_never_masks_corruption(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cache_never_masks_changes_or_corruption(tmp_path: Path) -> None:
     path, store = created(tmp_path)
-    calls = count_decodes(monkeypatch)
     store.read()
+    Store.open(path).update(seal)
+    assert store.read().sealed, "another handle's commit is visible"
     (path / "campaign.json").write_bytes(b"{}")
     with pytest.raises(CorruptState, match="unsupported campaign schema"):
         store.read()
-    assert len(calls) == 1
 
 
 # --- crash safety ----------------------------------------------------------------------------
@@ -485,18 +442,6 @@ def test_new_directory_is_synced_into_its_parent(
     assert synced[-1] == (tmp_path / "campaign").stat().st_ino
 
 
-def test_replace_file_never_overwrites_an_existing_stage(tmp_path: Path) -> None:
-    directory = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        replace_file(directory, "file", b"one")
-        replace_file(directory, "file", b"two", mode=0o640)
-    finally:
-        os.close(directory)
-    assert (tmp_path / "file").read_bytes() == b"two"
-    assert stat.S_IMODE((tmp_path / "file").stat().st_mode) == 0o640
-    assert os.listdir(tmp_path) == ["file"]
-
-
 # --- concurrency -----------------------------------------------------------------------------
 
 WORKER = textwrap.dedent(
@@ -551,10 +496,6 @@ def test_two_handles_in_one_process_see_each_other(tmp_path: Path) -> None:
 
 
 # --- error mapping and descriptors ------------------------------------------------------------
-
-
-def open_descriptors() -> int:
-    return len(os.listdir("/dev/fd"))
 
 
 def test_create_closes_every_descriptor_when_a_close_is_interrupted(

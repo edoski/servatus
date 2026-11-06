@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import posixpath
 import secrets
 import selectors
 import shlex
@@ -22,8 +23,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import IO, Protocol, cast
 
-from ..errors import ConfigurationError, Unavailable
-from ._config import Target
+from ..errors import Unavailable
+from ._config import CONTROL, Target
 from ._script import check_command
 
 MAX_STREAM_BYTES = 1024 * 1024
@@ -31,10 +32,24 @@ DEADLINE_SECONDS = 30.0
 # Login banners and shell start-up noise precede the output marker; bound them separately.
 NOISE_ALLOWANCE = 64 * 1024
 
-_PATH = "/usr/bin:/bin"
-_SSH_OPTIONS = ("-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "--")
-_REMOTE_ENV = ("PATH=" + _PATH, "LANG=C", "LC_ALL=C", "TZ=UTC")
-_LOCAL_ENV = {"PATH": _PATH, "LANG": "C", "LC_ALL": "C", "TZ": "UTC"}
+# Each connection attempt is a new TCP flow, made before any command runs, so a flow that never
+# opens recovers and nothing can run twice. Three attempts to one address take at most 26 s, inside
+# the 30 s deadline; the operating system alone can wait 75 s on the first flow.
+_SSH_OPTIONS = (
+    "-T",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "LogLevel=ERROR",
+    "-o",
+    "ConnectTimeout=8",
+    "-o",
+    "ConnectionAttempts=3",
+    "--",
+)
+_SSH_FAILED = 255
+_ENVIRONMENT = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C", "TZ": "UTC"}
+_REMOTE_ENV = " ".join(f"{name}={value}" for name, value in _ENVIRONMENT.items())
 # What the ssh client needs to find its configuration, agent, and Kerberos (GSSAPI) credentials.
 _SSH_PASSTHROUGH = ("HOME", "LOGNAME", "USER", "SSH_AUTH_SOCK", "KRB5CCNAME", "KRB5_CONFIG")
 # How often to check whether the child exited while its pipes stay open.
@@ -58,50 +73,46 @@ class Transport(Protocol):
     ) -> Completed: ...
 
 
-def _check_stdout_bound(max_stdout: int) -> None:
-    if type(max_stdout) is not int or max_stdout < 0:
-        raise ConfigurationError("max_stdout must be a non-negative integer")
-
-
-@dataclass(frozen=True, slots=True, init=False)
+@dataclass(frozen=True, slots=True)
 class Ssh:
-    """Run commands on ``host`` through ``ssh -T -o BatchMode=yes -o LogLevel=ERROR``.
+    """Run commands on ``host`` through ``ssh -T`` in batch mode, retrying the connection only.
 
     The remote command prints a fresh random marker on stdout and stderr, then ``exec``s
     ``/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C TZ=UTC <argv>``. Anything before the
     markers (login banners, shell start-up noise) is discarded; a missing marker means the command
     never ran as requested and raises ``Unavailable``. ``command`` replaces the local ``ssh``
-    invocation, for example with a fake executable in tests.
+    invocation, for example with a fake executable in tests. ``Target`` validates ``host``, and
+    ``--`` keeps it from parsing as an option.
     """
 
     host: str
-    command: tuple[str, ...]
-
-    def __init__(self, host: str, *, command: Sequence[str] = ("ssh",)) -> None:
-        # ``Target`` validates the destination; ``--`` keeps it from parsing as an option.
-        object.__setattr__(self, "host", host)
-        object.__setattr__(self, "command", check_command(command))
+    command: tuple[str, ...] = ("ssh",)
 
     def run(
         self, argv: Sequence[str], *, stdin: bytes = b"", max_stdout: int = MAX_STREAM_BYTES
     ) -> Completed:
         fields = check_command(argv)
-        _check_stdout_bound(max_stdout)
         marker = f"servatus-{secrets.token_hex(16)}"
         script = (
             f"printf '%s\\n' {marker}; printf '%s\\n' {marker} >&2; "
-            f"exec /usr/bin/env -i {' '.join(_REMOTE_ENV)} {shlex.join(fields)}"
+            f"exec /usr/bin/env -i {_REMOTE_ENV} {shlex.join(fields)}"
         )
         remote = shlex.join(("/bin/sh", "-c", script))
         command = (*self.command, *_SSH_OPTIONS, self.host, remote)
         allowance = NOISE_ALLOWANCE + len(marker) + 1
         raw = run_bounded(
             command,
+            what=posixpath.basename(fields[0]),
             stdin=stdin,
             max_stdout=max_stdout + allowance,
             max_stderr=MAX_STREAM_BYTES + allowance,
             env=ssh_environment(),
         )
+        if raw.returncode == _SSH_FAILED:
+            noise = raw.stderr.replace(f"{marker}\n".encode(), b"")
+            raise Unavailable(
+                f"ssh failed with {diagnostic(Completed(raw.returncode, b'', noise))}"
+            )
         stdout = after_marker(raw.stdout, marker)
         stderr = after_marker(raw.stderr, marker)
         if len(stdout) > max_stdout or len(stderr) > MAX_STREAM_BYTES:
@@ -117,13 +128,13 @@ class Local:
         self, argv: Sequence[str], *, stdin: bytes = b"", max_stdout: int = MAX_STREAM_BYTES
     ) -> Completed:
         fields = check_command(argv)
-        _check_stdout_bound(max_stdout)
         return run_bounded(
             fields,
+            what=posixpath.basename(fields[0]),
             stdin=stdin,
             max_stdout=max_stdout,
             max_stderr=MAX_STREAM_BYTES,
-            env=dict(_LOCAL_ENV),
+            env=_ENVIRONMENT,
         )
 
 
@@ -134,11 +145,16 @@ def connect(target: Target) -> Transport:
 
 def ssh_environment() -> dict[str, str]:
     """The local environment for the ``ssh`` client: no scheduler overrides leak through."""
-    environment = {"PATH": _PATH, "LANG": "C", "LC_ALL": "C"}
-    for name in _SSH_PASSTHROUGH:
-        if value := os.environ.get(name):
-            environment[name] = value
-    return environment
+    return _ENVIRONMENT | {
+        name: os.environ[name] for name in _SSH_PASSTHROUGH if os.environ.get(name)
+    }
+
+
+def diagnostic(completed: Completed) -> str:
+    """The exit status and first stderr line, bounded and printable, for operator messages."""
+    first = completed.stderr.decode("utf-8", "replace").strip().partition("\n")[0]
+    text = CONTROL.sub("?", first)[:200]
+    return f"exit status {completed.returncode}" + (f": {text}" if text else "")
 
 
 def after_marker(output: bytes, marker: str) -> bytes:
@@ -153,6 +169,7 @@ def after_marker(output: bytes, marker: str) -> bytes:
 def run_bounded(
     command: Sequence[str],
     *,
+    what: str,
     stdin: bytes,
     max_stdout: int,
     max_stderr: int,
@@ -160,11 +177,10 @@ def run_bounded(
 ) -> Completed:
     """Run ``command`` with a deadline, concurrent bounded draining, and guaranteed reaping.
 
-    Stdin comes from an anonymous temporary file, so a child that never reads cannot deadlock the
-    parent. Any failure kills the child's process group, reaps it, and raises ``Unavailable``.
+    ``what`` names the command in a deadline error. Stdin comes from an anonymous temporary file,
+    so a child that never reads cannot deadlock the parent. Any failure kills the child's process
+    group, reaps it, and raises ``Unavailable``.
     """
-    if not isinstance(stdin, bytes):
-        raise ConfigurationError("stdin must be bytes")
     try:
         with tempfile.TemporaryFile() as source:
             source.write(stdin)
@@ -190,10 +206,10 @@ def run_bounded(
     except Unavailable:
         raise
     except subprocess.TimeoutExpired:
-        raise Unavailable(f"command exceeded its {DEADLINE_SECONDS:g} s deadline") from None
+        raise Unavailable(f"{what} exceeded its {DEADLINE_SECONDS:g} s deadline") from None
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         detail = getattr(error, "strerror", None) or type(error).__name__
-        raise Unavailable(f"command could not run: {detail}") from None
+        raise Unavailable(f"{command[0]} could not run: {detail}") from None
 
 
 def _drain(process: subprocess.Popen[bytes], max_stdout: int, max_stderr: int) -> Completed:

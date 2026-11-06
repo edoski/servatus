@@ -3,26 +3,32 @@
 The stubs emulate only what the script relies on: ``srun`` sets step-local GPU visibility and
 executes the step command with the batch environment; ``apptainer exec --cleanenv`` executes the
 command with exactly the ``APPTAINERENV_`` variables. Nothing contacts Slurm or Apptainer.
+
+The interrupt trap signals its whole process group, so every script runs in its own session.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import random
 import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
 import pytest
+from scheduler_fixtures import ALLOCATION
 from support.builders import target
 
 from servatus.campaign._config import Apptainer, Resources, Target, Task
 from servatus.campaign._script import render_batch
 
-ALLOCATION = "00112233445566778899aabb"
+JOB = "4242"
 SHELLS = [
     shell for shell in ("/bin/sh", "/bin/dash", "/bin/bash", "/bin/ksh") if Path(shell).exists()
 ]
@@ -37,8 +43,14 @@ while args and args[0].startswith("--"):
     options.append(args.pop(0))
 config = json.load(open({config!r}))
 name = next(item.split("=", 1)[1] for item in options if item.startswith("--job-name="))
+record = {{
+    "options": options,
+    "argv": sys.argv[1:],
+    "path": os.environ.get("PATH"),
+    "start_marker": os.path.exists(config["start"]),
+}}
 with open(os.path.join(config["dir"], name + ".srun.json"), "w") as handle:
-    json.dump({{"options": options, "path": os.environ.get("PATH")}}, handle)
+    json.dump(record, handle)
 if any(item.startswith("--gres=") for item in options) and not config["no_gpu"]:
     os.environ["CUDA_VISIBLE_DEVICES"] = "GPU-step-" + name.rsplit("-", 1)[1]
 else:
@@ -65,11 +77,13 @@ with open(record, "w") as handle:
 os.execve(args[0], args, env)
 """
 
+# On SIGTERM a worker records whether the batch script's stop marker already existed.
 WORKER = """#!{python}
 import json, os, signal, sys, time
 out, mode = sys.argv[1], sys.argv[2]
 def stop(*_):
-    open(out + ".stopped", "w").close()
+    with open(out + ".stopped", "w") as handle:
+        handle.write("stop marker" if os.path.exists({stop!r}) else "no stop marker")
     os._exit(143)
 signal.signal(signal.SIGTERM, stop)
 open(out + ".started", "w").close()
@@ -87,20 +101,35 @@ sys.exit(7 if mode == "fail" else 0)
 """
 
 
+def wait_until(condition: Callable[[], bool], what: str, seconds: float = 20) -> None:
+    deadline = time.monotonic() + seconds
+    while not condition():
+        assert time.monotonic() < deadline, what
+        time.sleep(0.02)
+
+
 class Runtime:
     def __init__(self, root: Path, *, container: bool, no_gpu: bool = False) -> None:
         self.root = root
         self.bin = root / "bin"
         self.out = root / "out"
         self.records = root / "records"
-        for directory in (self.bin, self.out, self.records, root / "work"):
+        self.logs = root / "run logs"
+        for directory in (self.bin, self.out, self.records, self.logs, root / "work"):
             directory.mkdir()
         config = root / "srun.json"
-        config.write_text(json.dumps({"dir": str(self.records), "no_gpu": no_gpu}))
+        config.write_text(
+            json.dumps(
+                {"dir": str(self.records), "no_gpu": no_gpu, "start": str(self.marker("start"))}
+            )
+        )
         python = sys.executable
         self._stub("srun", SRUN.format(python=python, config=str(config)))
         self._stub("apptainer", APPTAINER.format(python=python, directory=str(self.records)))
-        self.worker = self._stub("worker", WORKER.format(python=python, noise=INTERPRETER_NOISE))
+        self.worker = self._stub(
+            "worker",
+            WORKER.format(python=python, noise=INTERPRETER_NOISE, stop=str(self.marker("stop"))),
+        )
         apptainer = Apptainer(
             executable=str(self.bin / "apptainer"),
             image="/images/work.sif",
@@ -109,7 +138,7 @@ class Runtime:
         self.target: Target = target(
             slurm_bin=str(self.bin),
             work_root=str(root / "work"),
-            log_root=str(root / "logs"),
+            log_root=str(self.logs),
             container=apptainer if container else None,
             max_script_bytes=16 * 1024 * 1024,
         )
@@ -120,6 +149,13 @@ class Runtime:
         path.chmod(0o700)
         return path
 
+    def marker(self, suffix: str) -> Path:
+        return self.logs / f"{ALLOCATION}.{JOB}.{suffix}"
+
+    def markers(self) -> set[str]:
+        prefix = f"{ALLOCATION}.{JOB}."
+        return {path.name.removeprefix(prefix) for path in self.logs.iterdir()}
+
     def task(self, key: str, mode: str = "read", *extra: str, **options: Any) -> Task:
         return Task(key, (str(self.worker), str(self.out / key), mode, *extra), **options)
 
@@ -129,23 +165,51 @@ class Runtime:
         path.write_bytes(render_batch(self.target, resources, tasks, ALLOCATION))
         return path
 
-    def run(self, shell: str, script: Path, **env: str) -> subprocess.CompletedProcess[bytes]:
+    @staticmethod
+    def environment(**env: str) -> dict[str, str]:
         # Slurm's --export=NIL: the batch starts with (almost) nothing but SLURM_* variables.
-        environment = {"SLURM_JOB_ID": "4242", **env}
+        values = {"SLURM_JOB_ID": JOB, **env}
+        return {key: value for key, value in values.items() if value}
+
+    def run(self, shell: str, script: Path, **env: str) -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
             [shell, str(script)],
-            env={key: value for key, value in environment.items() if value},
+            env=self.environment(**env),
             cwd=self.root,
             capture_output=True,
             timeout=60,
             check=False,
+            start_new_session=True,
         )
+
+    @contextmanager
+    def spawn(self, shell: str, script: Path) -> Generator[subprocess.Popen[bytes]]:
+        child = subprocess.Popen(
+            [shell, str(script)],
+            env=self.environment(),
+            cwd=self.root,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            yield child
+        finally:
+            # Reap anything the test left behind, steps included.
+            with suppress(ProcessLookupError, PermissionError):
+                os.killpg(child.pid, signal.SIGKILL)
+            child.wait(timeout=20)
+            if child.stderr is not None:
+                child.stderr.close()
 
     def record(self, key: str) -> dict[str, Any]:
         return json.loads((self.out / f"{key}.json").read_text())
 
     def started(self, key: str) -> bool:
         return (self.out / f"{key}.started").exists()
+
+    def stopped(self, key: str) -> str | None:
+        path = self.out / f"{key}.stopped"
+        return path.read_text() if path.exists() else None
 
 
 TRICKY_ENV = {
@@ -176,9 +240,10 @@ def test_steps_receive_exact_stdin_argv_and_environment(
         runtime.task("empty", stdin=b""),
         runtime.task("large", stdin=large, env={"OMP_NUM_THREADS": "4"}),
     )
-    result = runtime.run(shell, runtime.script(tasks, gpus), SLURM_RESTART_COUNT="2")
+    result = runtime.run(shell, runtime.script(tasks, gpus))
     assert result.returncode == 0, result.stderr
     assert not (tmp_path / "never").exists()
+    assert runtime.markers() == {"start", "0.0.end", "1.0.end", "2.0.end"}
     for slot, task in enumerate(tasks):
         assert (runtime.out / task.key).read_bytes() == task.stdin
         record = runtime.record(task.key)
@@ -191,11 +256,11 @@ def test_steps_receive_exact_stdin_argv_and_environment(
             SERVATUS_TASK_KEY=task.key,
             SERVATUS_ALLOCATION_ID=ALLOCATION,
             SERVATUS_SLOT=str(slot),
-            SERVATUS_JOB_ID="4242",
-            SERVATUS_RESTART_COUNT="2",
+            SERVATUS_JOB_ID=JOB,
         )
         assert record["env"] == expected
         step = json.loads((runtime.records / f"servatus-{ALLOCATION}-{slot}.srun.json").read_text())
+        assert step["start_marker"], "a step started before the start marker existed"
         options: list[str] = step["options"]
         assert options[:5] == [
             "--exclusive",
@@ -215,23 +280,45 @@ def test_steps_receive_exact_stdin_argv_and_environment(
             flags = ["--cleanenv", "--bind", f"{work}:{work}", "--bind", "/data:/data:ro"]
             flags += ["--pwd", work] + (["--nv"] if gpus else [])
             assert launch == {"flags": flags, "image": "/images/work.sif"}
-
-
-def test_restart_count_defaults_to_zero(tmp_path: Path) -> None:
-    runtime = Runtime(tmp_path, container=False)
-    result = runtime.run("/bin/sh", runtime.script((runtime.task("t"),)))
-    assert result.returncode == 0, result.stderr
-    assert runtime.record("t")["env"]["SERVATUS_RESTART_COUNT"] == "0"
+            # Other users on the node can read every process's command line. Only the GPU wrapper
+            # names the step-local device there.
+            for name in {*task.env, "SERVATUS_TASK_KEY"} - {"CUDA_VISIBLE_DEVICES"}:
+                assert not any(f"{name}=" in word for word in step["argv"]), name
 
 
 @pytest.mark.parametrize("container", [False, True], ids=["direct", "apptainer"])
-def test_missing_job_id_fails_before_any_step(tmp_path: Path, container: bool) -> None:
+def test_missing_job_id_fails_before_any_marker_or_step(tmp_path: Path, container: bool) -> None:
     runtime = Runtime(tmp_path, container=container)
     result = runtime.run("/bin/sh", runtime.script((runtime.task("t"),)), SLURM_JOB_ID="")
     assert result.returncode != 0
     assert b"Slurm did not set SLURM_JOB_ID" in result.stderr
     assert not runtime.started("t")
     assert list(runtime.records.iterdir()) == []
+    assert list(runtime.logs.iterdir()) == []
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("problem", ["missing", "unwritable"])
+def test_log_root_that_cannot_take_the_start_marker_starts_no_step(
+    tmp_path: Path, shell: str, problem: str
+) -> None:
+    runtime = Runtime(tmp_path, container=False)
+    script = runtime.script((runtime.task("t"),))
+    if problem == "missing":
+        runtime.logs.rmdir()
+    else:
+        if os.geteuid() == 0:
+            pytest.skip("root can write to a read-only directory")
+        runtime.logs.chmod(0o500)
+    try:
+        result = runtime.run(shell, script)
+    finally:
+        if runtime.logs.exists():
+            runtime.logs.chmod(0o700)
+    assert result.returncode != 0
+    assert not runtime.started("t")
+    assert list(runtime.records.iterdir()) == []
+    assert not runtime.logs.exists() or list(runtime.logs.iterdir()) == []
 
 
 @pytest.mark.parametrize("container", [False, True], ids=["direct", "apptainer"])
@@ -253,6 +340,7 @@ def test_failure_waits_for_every_sibling_and_aggregates(tmp_path: Path, shell: s
     assert result.returncode == 1
     assert (runtime.out / "slow").read_bytes() == b"slow"
     assert (runtime.out / "fail").read_bytes() == b"f"
+    assert runtime.markers() == {"start", "0.7.end", "1.0.end"}
 
 
 def test_worker_may_close_large_stdin_early(tmp_path: Path) -> None:
@@ -260,27 +348,42 @@ def test_worker_may_close_large_stdin_early(tmp_path: Path) -> None:
     tasks = (runtime.task("early", "early", stdin=b"x" * 2_000_000),)
     result = runtime.run("/bin/sh", runtime.script(tasks))
     assert result.returncode == 0, result.stderr
+    assert runtime.markers() == {"start", "0.0.end"}
 
 
 @pytest.mark.parametrize("shell", SHELLS)
-def test_interrupt_kills_and_reaps_every_recorded_step(tmp_path: Path, shell: str) -> None:
+def test_a_slot_that_returns_early_is_recorded_while_its_sibling_runs(
+    tmp_path: Path, shell: str
+) -> None:
+    runtime = Runtime(tmp_path, container=False)
+    tasks = (runtime.task("quick", "fail", stdin=b"q"), runtime.task("block", "block"))
+    with runtime.spawn(shell, runtime.script(tasks)) as child:
+        wait_until(lambda: runtime.marker("0.7.end").exists(), "early slot was never recorded")
+        wait_until(lambda: runtime.started("block"), "sibling never started")
+        assert child.poll() is None
+        assert runtime.stopped("block") is None
+        child.send_signal(signal.SIGTERM)
+        assert child.wait(timeout=20) == 1
+        wait_until(lambda: runtime.stopped("block") is not None, "sibling was never stopped")
+    assert runtime.markers() == {"start", "0.7.end", "stop"}
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_interrupt_records_the_stop_then_terminates_every_step(tmp_path: Path, shell: str) -> None:
     runtime = Runtime(tmp_path, container=False)
     keys = ("b0", "b1", "b2")
     script = runtime.script(tuple(runtime.task(key, "block", stdin=b"x") for key in keys))
-    with subprocess.Popen(
-        [shell, str(script)], env={"SLURM_JOB_ID": "4242"}, cwd=tmp_path, stderr=subprocess.PIPE
-    ) as child:
-        try:
-            deadline = time.monotonic() + 20
-            while not all(runtime.started(key) for key in keys):
-                assert time.monotonic() < deadline, "steps never started"
-                time.sleep(0.02)
-            child.send_signal(signal.SIGTERM)
-            assert child.wait(timeout=20) != 0
-        finally:
-            if child.poll() is None:
-                child.kill()
-    assert all((runtime.out / f"{key}.stopped").exists() for key in keys)
+    with runtime.spawn(shell, script) as child:
+        wait_until(lambda: all(runtime.started(key) for key in keys), "steps never started")
+        assert runtime.markers() == {"start"}
+        child.send_signal(signal.SIGTERM)
+        assert child.wait(timeout=20) == 1
+        assert runtime.marker("stop").exists()
+        for key in keys:
+            wait_until(lambda key=key: runtime.stopped(key) is not None, f"{key} kept running")
+            assert runtime.stopped(key) == "stop marker", f"{key} was signalled before the stop"
+        time.sleep(0.3)
+    assert runtime.markers() == {"start", "stop"}, "an interrupted step recorded an outcome"
 
 
 @pytest.mark.parametrize("shell", SHELLS)
@@ -296,3 +399,4 @@ def test_interrupt_before_any_launch_exits_without_errors(tmp_path: Path, shell:
     assert result.returncode == 1
     assert result.stderr == b""
     assert not runtime.started("t")
+    assert runtime.markers() == {"stop"}

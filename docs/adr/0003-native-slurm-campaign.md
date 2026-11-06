@@ -1,6 +1,7 @@
 # ADR 0003: Own one native Slurm campaign
 
-Status: accepted (revised for 0.12)
+Status: accepted (revised for 0.13); the Evidence section is superseded by
+[ADR 0007](0007-run-markers.md)
 
 Servatus supports one concrete lane: an unprivileged user runs absolute Slurm executables, either
 through OpenSSH from a workstation or directly on a login node, and each Task starts through one of
@@ -18,14 +19,18 @@ submit or observe work.
 the exit status and both output streams. `connect(target)` returns `Ssh(target.host)` when the
 Target has a host and `Local()` otherwise; callers and tests may supply their own `connect`.
 
-- `Ssh` runs `ssh -T -o BatchMode=yes -o LogLevel=ERROR HOST REMOTE`. The remote command prints a
-  per-call random marker to stdout and stderr, then `exec`s `/usr/bin/env -i PATH=... LANG=C
-  LC_ALL=C TZ=UTC` with the argv. Output before the markers (login banners, shell-startup noise) is
-  discarded; a missing marker means the command did not run as intended and is `Unavailable`.
-  Batch mode means Servatus never prompts; connection reuse and multi-factor login belong in the
-  user's ssh_config (`ControlMaster`/`ControlPersist`). The local `ssh` client gets a fixed `PATH`
-  and C locale plus only `HOME`, `LOGNAME`, `USER`, `SSH_AUTH_SOCK`, `KRB5CCNAME`, and
-  `KRB5_CONFIG` from the caller, enough for its configuration, agent, and Kerberos credentials.
+- `Ssh` runs `ssh -T -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=8 -o ConnectionAttempts=3
+  HOST REMOTE`. `ConnectionAttempts` retries only the TCP connect, before any command runs, so a
+  stalled banner exchange fails after 8 s and a command is never retried. Exit status 255 is `ssh`'s
+  own failure and is `Unavailable`. The remote command prints a per-call random marker to stdout and
+  stderr, then `exec`s `/usr/bin/env -i PATH=... LANG=C LC_ALL=C TZ=UTC` with the argv. Output
+  before the markers (login banners, shell-startup noise) is discarded; a missing marker means the
+  command did not run as intended and is `Unavailable`. Batch mode means Servatus never prompts;
+  connection reuse and multi-factor login belong in the user's ssh_config
+  (`ControlMaster`/`ControlPersist`).
+  The local `ssh` client gets the same scrubbed environment plus only `HOME`, `LOGNAME`, `USER`,
+  `SSH_AUTH_SOCK`, `KRB5CCNAME`, and `KRB5_CONFIG` from the caller, enough for its configuration,
+  agent, and Kerberos credentials.
 - `Local` runs the argv with the same scrubbed environment and no shell.
 
 Every operation has a 30-second deadline, at most 32 arguments, 16 KiB of command text, 4 KiB per
@@ -36,8 +41,9 @@ reads what is already buffered and stops waiting for end-of-file, because a desc
 overflow, missing-marker, and connection failures, and scheduler commands that fail where success is
 required, all surface as `Unavailable`: one error boundary. `check_command(argv)` applies the bounds
 purely, so planning rejects an oversized `sbatch` request before any intent exists.
-`servatus.campaign.ping(target)` runs `sbatch --version` through this seam for `servatus doctor`,
-and every submission runs the same check first; a failure reports Slurm's first stderr line.
+Every submission first runs `sbatch --version` through this seam; a failure reports Slurm's first
+stderr line. `servatus doctor` starts with the same check, then the capability checks of
+`servatus.campaign.diagnose`.
 
 ## Batch script and launchers
 
@@ -52,24 +58,25 @@ finds the host NVIDIA binaries and libraries on it. Each allocation starts one
 `servatus-<allocation_id>-<slot>` with `--job-name`. Each step's stdin is a single-quoted `printf`
 literal piped into `srun`: printable ASCII verbatim, every other byte as `\ooo`. The script needs
 no scratch directory, `mktemp`, `base64`, or cleanup. Every step receives the Task environment plus
-`SERVATUS_TASK_KEY`, `SERVATUS_ALLOCATION_ID`, `SERVATUS_SLOT`, `SERVATUS_JOB_ID` (from
-`$SLURM_JOB_ID`), and `SERVATUS_RESTART_COUNT` (`${SLURM_RESTART_COUNT:-0}`).
+`SERVATUS_TASK_KEY`, `SERVATUS_ALLOCATION_ID`, `SERVATUS_SLOT`, and `SERVATUS_JOB_ID` (from
+`$SLURM_JOB_ID`).
 
 - **Apptainer launcher:** `apptainer exec --cleanenv` with `--bind WORK_ROOT:WORK_ROOT`, one
   `--bind` per Target bind, `--pwd WORK_ROOT`, and `--nv` for GPU work, then the image and the
   Task's arguments. `exec`, not `run`: the Task's `args` are the program and its arguments
   whatever the image's runscript does, and a relative `args[0]` resolves on the container's `PATH`.
   An Apptainer Task with empty `args` is a `ConfigurationError` at planning. Environment values are
-  passed as `APPTAINERENV_NAME=<shell-quoted value>` assignments, never `--env`, so values
-  containing commas or equals signs survive intact.
+  passed as `APPTAINERENV_NAME=<shell-quoted value>` assignments on `srun`, never `--env`, so values
+  containing commas or equals signs survive intact and stay off the step's command line.
 - **Direct launcher:** `env -i ... NAME=VALUE` runs the Task's `args[0]`, which must be an absolute
-  path without `=` (`ConfigurationError` at planning otherwise), from `work_root`.
+  path without `=` (`ConfigurationError` at planning otherwise), from `work_root`. The values show
+  in the step's command line to other users on the node.
 
 GPU steps forward Slurm's step-local `CUDA_VISIBLE_DEVICES` (failing the step when it is unset) and
 set `CUDA_DEVICE_ORDER=PCI_BUS_ID`; site configuration owns device isolation. When the Resources set
-`signal_before_end`, each step receives `--signal=USR1@<seconds>`. The batch records each step's
-pid; its interrupt trap signals only those recorded pids. It waits for every started step and
-aggregates failure into the allocation's exit status.
+`signal_before_end`, each step receives `--signal=USR1@<seconds>`. The batch waits for every started
+step and aggregates failure into the job's exit status; ADR 0007 defines its run markers and its
+interrupt trap.
 
 Allocation output goes to `log_root/<allocation_id>-%j.out` and each Task's combined output to
 `log_root/<allocation_id>-%j-<slot>.out`. The immutable allocation identity prevents reused job
@@ -78,6 +85,9 @@ Target is built: `%` in `log_root` (Slurm filename patterns), `,` or `:` in `wor
 syntax), and `:` in the Apptainer image (Apptainer reads it as a URI such as `docker://`).
 
 ## Evidence
+
+> Superseded by [ADR 0007](0007-run-markers.md): Servatus no longer reads Slurm accounting. Liveness
+> comes from `squeue`, outcomes from run markers in `log_root`, and cancel uses the name alone.
 
 Observation batches at most 16 jobs per query, grouped by each Attempt's original Target and
 cluster; reused job numbers are queried separately. Each batch runs `squeue`, anchored
@@ -122,8 +132,10 @@ contained in the Attempt's `log_root`.
 
 ## Recorded production acceptance
 
-This section predates 0.12. It records the live gate of the 0.11 candidate below; the 0.12
-transport, launcher, payload, and step-evidence changes have not yet passed an equivalent gate.
+This section predates 0.12 and records the live gate of the 0.11 candidate below. Since 0.13,
+`scripts/cluster_e2e.py` is the repeatable gate: it runs the direct and Apptainer launchers, CPU and
+one GPU, through the CLI on a real cluster. On 2026-11-06 the 0.13.0 candidate passed it on Slurm
+24.11.5 (RTX 2080 Ti) and Slurm 23.11.4 (L40). A later release needs its own run.
 
 The following evidence concerns the tested candidate and site, not a live acceptance of every later
 release. On 2026-08-10, candidate `0c454bd38da4f3d5b0ba4f0777b708f8a2eb011c` passed the live gate as

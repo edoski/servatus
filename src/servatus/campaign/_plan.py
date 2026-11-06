@@ -16,15 +16,16 @@ from datetime import timedelta
 from types import MappingProxyType
 from typing import cast
 
+from .._fs import StrPath
 from ..errors import ConfigurationError, StalePlan
 from ..publication import publish_file
 from . import _codec
-from ._config import Profile, Resources, StrPath, Target, Task, task_keys
+from ._config import Profile, Resources, Target, Task
 from ._policy import Hold
 from ._script import check_command, render_batch, sbatch_argv
-from ._state import State
+from ._state import State, history
 
-PLAN_FORMAT = "servatus.plan/1"
+PLAN_FORMAT = "servatus.plan/2"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -33,9 +34,8 @@ class Decision:
 
     ``selected`` Tasks are packed into this plan's allocations; ``deferred`` Tasks were eligible
     but exceed the target's ``max_allocations_per_submit``; every other Task is ``held`` with
-    one reason. ``retry`` and ``duplicate_risk`` list the selected or deferred Tasks that
-    resubmit accepted work (with acknowledged duplicate risk). ``nonce`` makes every plan's
-    allocation identities unique, even for copies of the same Campaign state.
+    one reason. ``nonce`` makes every plan's allocation identities unique, even for copies of
+    the same Campaign state.
     """
 
     campaign_id: str
@@ -45,32 +45,11 @@ class Decision:
     selected: tuple[str, ...]
     held: Mapping[str, Hold]
     deferred: tuple[str, ...]
-    retry: tuple[str, ...]
-    duplicate_risk: tuple[str, ...]
     tasks_per_allocation: int
     probe_required: bool
 
     def __post_init__(self) -> None:
-        if not isinstance(self.profile, Profile):
-            raise ConfigurationError("plan profile must be a Profile")
-        if not (_codec.is_hex(self.nonce, 32) and _codec.is_hex(self.campaign_id, 32)):
-            raise ConfigurationError("plan identities must be 32 lowercase hexadecimal digits")
-        if type(self.revision) is not int or self.revision < 0:
-            raise ConfigurationError("plan revision must be a non-negative integer")
-        if type(self.tasks_per_allocation) is not int or self.tasks_per_allocation < 1:
-            raise ConfigurationError("tasks_per_allocation must be a positive integer")
-        if type(self.probe_required) is not bool:
-            raise ConfigurationError("probe_required must be a bool")
-        for name in ("selected", "deferred", "retry", "duplicate_risk"):
-            keys = task_keys(getattr(self, name), f"plan {name}")
-            if len(set(keys)) != len(keys):
-                raise ConfigurationError(f"plan {name} must be distinct Task keys")
-        held = dict(self.held)
-        if any(
-            not isinstance(key, str) or not isinstance(hold, Hold) for key, hold in held.items()
-        ):
-            raise ConfigurationError("plan held Tasks must map Task keys to Hold reasons")
-        object.__setattr__(self, "held", MappingProxyType(held))
+        object.__setattr__(self, "held", MappingProxyType(dict(self.held)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,7 +68,8 @@ class PlannedAllocation:
 
 @dataclass(frozen=True, slots=True)
 class Plan:
-    """A reviewed ``decision`` plus its derived allocations and digest.
+    """A reviewed ``decision`` plus what it derives: allocations, the digest, and ``retry``, the
+    selected or deferred Tasks that resubmit accepted work.
 
     Scripts and argv contain Task arguments, environment, and stdin: treat them as sensitive.
     ``to_json`` and ``save`` write only the Decision and digest.
@@ -98,12 +78,11 @@ class Plan:
     decision: Decision
     allocations: tuple[PlannedAllocation, ...]
     digest: str
+    retry: tuple[str, ...]
 
     @property
     def warnings(self) -> tuple[str, ...]:
         notes: list[str] = []
-        if risk := self.decision.duplicate_risk:
-            notes.append(f"duplicate execution risk acknowledged for: {', '.join(risk)}")
         if deferred := self.decision.deferred:
             notes.append(
                 f"{len(deferred)} eligible Tasks are deferred by max_allocations_per_submit; "
@@ -112,7 +91,7 @@ class Plan:
         return tuple(notes)
 
     def to_json(self) -> bytes:
-        """Canonical JSON: ``{"format": "servatus.plan/1"}``, the Decision, and the digest."""
+        """Canonical JSON: ``{"format": "servatus.plan/2"}``, the Decision, and the digest."""
         document = cast(dict[str, object], _codec.dump(self.decision))
         document["format"] = PLAN_FORMAT
         document["digest"] = self.digest
@@ -178,6 +157,16 @@ def capacity(target: Target, resources: Resources, cap: int | None = None) -> in
     return cap
 
 
+def batch(
+    keys: tuple[str, ...], target: Target, cap: int
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """``keys`` split into the Tasks one submit carries (``max_allocations_per_submit``
+    allocations of ``cap``) and the deferred rest."""
+    limit = target.max_allocations_per_submit
+    bound = len(keys) if limit is None else cap * limit
+    return keys[:bound], keys[bound:]
+
+
 def pack(keys: Sequence[str], cap: int) -> tuple[tuple[str, ...], ...]:
     """Split ``keys`` in order into the fewest groups of at most ``cap``, sizes differing by
     at most one (larger groups first)."""
@@ -206,18 +195,12 @@ def _check(state: State, decision: Decision) -> None:
     parts = (decision.selected, tuple(decision.held), decision.deferred)
     if sorted(key for part in parts for key in part) != sorted(roster):
         raise ConfigurationError("plan Tasks do not partition the campaign roster")
-    eligible = decision.selected + decision.deferred
-    if frozenset(decision.retry) != state.accepted_keys.intersection(eligible):
-        raise ConfigurationError("plan retry keys disagree with accepted Campaign history")
-    if not set(decision.duplicate_risk) <= set(decision.retry):
-        raise ConfigurationError("plan duplicate-risk keys must be retried keys")
     position = {key: index for index, key in enumerate(roster)}
-    for part in (decision.selected, decision.deferred, decision.retry, decision.duplicate_risk):
+    for part in (decision.selected, decision.deferred):
         if list(part) != sorted(part, key=position.__getitem__):
             raise ConfigurationError("plan Task keys are not in roster order")
-    limit = decision.profile.target.max_allocations_per_submit
-    cap = decision.tasks_per_allocation
-    if limit is not None and len(decision.selected) > cap * limit:
+    _, over = batch(decision.selected, decision.profile.target, decision.tasks_per_allocation)
+    if over:
         raise ConfigurationError("plan exceeds the target's max_allocations_per_submit")
 
 
@@ -258,4 +241,6 @@ def build_plan(state: State, decision: Decision) -> Plan:
         )
     scripts = [hashlib.sha256(item.script).hexdigest() for item in allocations]
     digest = _codec.digest({"decision": document, "scripts": scripts})
-    return Plan(decision, tuple(allocations), digest)
+    past = history(state)
+    retry = tuple(key for key in decision.selected + decision.deferred if past[key].accepted)
+    return Plan(decision, tuple(allocations), digest, retry)

@@ -1,131 +1,83 @@
 """Test doubles for code that drives Servatus campaigns without a cluster.
 
-``FakeScheduler`` is an in-memory Slurm. Pass it wherever Servatus accepts ``connect``: it returns
-itself as the ``Transport`` and answers exactly the ``sbatch``, ``squeue``, ``sacct``, ``scancel``,
-and ``tail`` commands Servatus issues, with the same output formats and the same local command
-bounds as the real transport. Controls move jobs through their lifecycle and inject failures::
+``FakeScheduler`` is an in-memory Slurm with a shared log directory. Pass it wherever Servatus
+accepts ``connect``: it returns itself as the ``Transport`` and answers exactly the ``sbatch``,
+``squeue``, ``scancel``, ``scontrol``, ``find``, ``sh``, and ``tail`` commands Servatus issues,
+with the same output formats and the same local command bounds as the real transport. Controls move
+jobs through their lifecycle the way Slurm and the batch script would, writing the same run markers,
+and inject failures::
 
     fake = FakeScheduler()
     campaign = Campaign.create(path, tasks, connect=fake)
-    campaign.submit(campaign.plan(profile))
-    fake.start(1000)
-    fake.finish(1000)
+    job = campaign.submit(campaign.plan(profile)).receipts[0].job
+    fake.start(job)      # RUNNING; the batch script writes its start marker
+    fake.finish(job)     # every step returns 0; the job settles as COMPLETED in squeue
+    fake.purge(job)      # Slurm forgets the job (MinJobAge); its markers stay
 
-Controls and ``count`` name commands by basename (``"sbatch"``, ``"squeue"``, ...), except the
-``sbatch --version`` connectivity check that precedes every submission, which is ``"ping"``: so
-``fail_next("sbatch")`` affects the next real submission, and ``fail_next("ping")`` the check.
-Commands Servatus never issues raise ``AssertionError`` so that drift fails tests loudly.
+Controls and ``count`` name commands by basename (``"sbatch"``, ``"squeue"``, ``"find"``, ...),
+except the ``sbatch --version`` connectivity check that precedes every submission, which is
+``"ping"``: so ``fail_next("sbatch")`` affects the next real submission, and ``fail_next("ping")``
+the check. Commands Servatus never issues raise ``AssertionError`` so that drift fails tests
+loudly.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import posixpath
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 
 from .campaign._config import Resources, Target
-from .campaign._evidence import MISSING_JOBS_STDERR, TIMESTAMP_FORMAT, JobRef, normalize_state
 from .campaign._remote import MAX_STREAM_BYTES, Completed, Transport
-from .campaign._scheduler import (
-    SACCT_ALLOCATION_FORMAT,
-    SACCT_IDENTITY_FORMAT,
-    SACCT_STEP_FORMAT,
-    SQUEUE_FORMAT,
-    TAIL,
-)
+from .campaign._scheduler import SQUEUE_FORMAT, SQUEUE_OPTIONS, TAIL, WRITABLE_DIRECTORY, find_argv
 from .campaign._script import check_command, sbatch_argv
 from .errors import ConfigurationError, Unavailable
 
 __all__ = ["FakeJob", "FakeScheduler"]
 
-_SACCT_OPTIONS = frozenset(
-    ("--noheader", "--parsable2", "--allocations", "--duplicates", "--jobs", "--name")
-    + ("--starttime", "--endtime", "--local", "--clusters", "--format")
-)
-_VALUED = frozenset({"--jobs", "--name", "--starttime", "--endtime"})
-_LATEST = "9999-12-31T23:59:59"
+_RUNNING = "RUNNING"
+_PENDING = "PENDING"
 
 
 @dataclass(frozen=True, slots=True)
 class FakeJob:
-    """A read-only snapshot of one job submitted to a ``FakeScheduler``."""
+    """A read-only snapshot of one job submitted to a ``FakeScheduler``.
 
-    job: JobRef
+    ``state`` is what ``squeue`` shows; ``in_queue`` is false once Slurm purged the job.
+    """
+
+    job: int
     name: str
     argv: tuple[str, ...]
     script: bytes = field(repr=False)
     task_count: int
     state: str
-    incarnations: int
-
-
-@dataclass(slots=True)
-class _Sample:
-    state: str = "PENDING"
-    exit_code: str = "0:0"
-    reason: str = "None"
-    started_at: str | None = None
-    ended_at: str | None = None
-
-
-@dataclass(slots=True)
-class _Incarnation:
-    submitted_at: str
-    live: _Sample = field(default_factory=_Sample)
-    recorded: _Sample = field(default_factory=_Sample)
-    steps: dict[int, _Sample] = field(default_factory=dict[int, _Sample])
+    in_queue: bool
 
 
 @dataclass(slots=True)
 class _Job:
-    job_id: int
+    job: int
     name: str
-    comment: str
     argv: tuple[str, ...]
     script: bytes
     task_count: int
-    history: list[_Incarnation]
+    marker: str
+    state: str = _PENDING
     in_queue: bool = True
-    accounted: bool = True
+    ended: dict[int, int] = field(default_factory=dict[int, int])
 
     @property
-    def latest(self) -> _Incarnation:
-        return self.history[-1]
+    def started(self) -> bool:
+        return self.state != _PENDING
 
 
 def _key(argv: Sequence[str]) -> str:
     """A command's control key: its basename, or ``ping`` for ``sbatch --version``."""
     command = posixpath.basename(argv[0])
     return "ping" if command == "sbatch" and tuple(argv[1:]) == ("--version",) else command
-
-
-def _step_rows(job: _Job) -> list[str]:
-    """``sacct`` step rows for the newest incarnation: allocation, batch, extern, then steps."""
-    recorded = job.latest.recorded
-    rows = [f"{job.job_id}|{job.name}|{recorded.state}|{recorded.exit_code}"]
-    if recorded.started_at is not None:
-        rows.append(f"{job.job_id}.batch|batch|{recorded.state}|0:0")
-        rows.append(f"{job.job_id}.extern|extern|{recorded.state}|0:0")
-    for slot, step in sorted(job.latest.steps.items()):
-        rows.append(f"{job.job_id}.{slot}|{job.name}-{slot}|{step.state}|{step.exit_code}")
-    return rows
-
-
-def _incarnations(
-    jobs: Sequence[_Job], options: Mapping[str, str | None]
-) -> list[tuple[_Job, _Incarnation]]:
-    """Incarnations of the named jobs that overlap the ``--starttime``/``--endtime`` window."""
-    names = set((options.get("--name") or "").split(","))
-    start, end = options.get("--starttime") or "", options.get("--endtime") or _LATEST
-    return [
-        (job, incarnation)
-        for job in jobs
-        if job.name in names
-        for incarnation in job.history
-        if not ((incarnation.recorded.ended_at or start) < start or incarnation.submitted_at > end)
-    ]
 
 
 def _sbatch_options() -> frozenset[str]:
@@ -153,43 +105,34 @@ def _sbatch_options() -> frozenset[str]:
 
 
 _SBATCH_OPTIONS = _sbatch_options()
+_SLURM_CONFIG = b"MinJobAge               = 300 sec\nProctrackType           = proctrack/cgroup\n"
+_SBATCH_REQUIRED = ("--parsable", "--no-requeue", "--export", "--ntasks", "--job-name", "--output")
 
 
 def _lines(rows: Sequence[str]) -> bytes:
     return "".join(f"{row}\n" for row in rows).encode("utf-8")
 
 
-def _shown(value: str | None, absent: str) -> str:
-    return absent if value is None else value
+def _exit_code(value: object) -> int:
+    if type(value) is not int or not 0 <= value <= 255:
+        raise ConfigurationError("exit_code must be an integer from 0 to 255")
+    return value
 
 
 class FakeScheduler:
     """An in-memory Slurm cluster that answers Servatus' scheduler commands.
 
-    ``cluster`` names a federation cluster: when set, ``sbatch --parsable`` prints
-    ``<job id>;<cluster>`` and accounting rows carry it. Job numbers count up from
-    ``first_job_id``. ``clock`` supplies submission, start, and end times (UTC now by default);
-    pass the same clock the code under test uses so submissions fall in its intent window.
+    Job numbers count up from ``first_job_id``. ``version`` is the ``sbatch --version`` text.
+    Every Target reaches the same cluster and the same files, keyed by absolute path.
     """
 
-    def __init__(
-        self,
-        *,
-        cluster: str | None = None,
-        first_job_id: int = 1000,
-        clock: Callable[[], datetime] | None = None,
-        version: str = "slurm 23.11.4",
-    ) -> None:
-        if cluster is not None:
-            JobRef(1, cluster)
+    def __init__(self, *, first_job_id: int = 1000, version: str = "slurm 23.11.4") -> None:
         if type(first_job_id) is not int or first_job_id < 1:
             raise ConfigurationError("first_job_id must be a positive integer")
-        self._cluster = cluster
         self._next_job_id = first_job_id
-        self._clock = clock or (lambda: datetime.now(UTC))
         self._version = version
         self._jobs: list[_Job] = []
-        self._logs: dict[str, bytes] = {}
+        self._files: dict[str, bytes] = {}
         self._calls: list[tuple[str, ...]] = []
         self._failures: dict[str, list[Completed | None]] = {}
         self._lost: dict[str, int] = {}
@@ -218,8 +161,10 @@ class FakeScheduler:
             "ping": self._ping,
             "sbatch": self._sbatch,
             "squeue": self._squeue,
-            "sacct": self._sacct,
             "scancel": self._scancel,
+            "scontrol": self._scontrol,
+            "find": self._find_files,
+            "sh": self._writable_directory,
             "tail": self._tail,
         }
         if command not in handlers:
@@ -248,80 +193,72 @@ class FakeScheduler:
         """Snapshots of every submitted job, in submission order."""
         return tuple(self._snapshot(job) for job in self._jobs)
 
-    def job(self, job: int | JobRef) -> FakeJob:
+    def job(self, job: int) -> FakeJob:
         """A snapshot of the most recent job with this number."""
         return self._snapshot(self._find(job))
 
+    @property
+    def files(self) -> Mapping[str, bytes]:
+        """Every file on the fake cluster (logs and run markers) by absolute path."""
+        return dict(self._files)
+
     # --- Controls ----------------------------------------------------------------------------
 
-    def start(self, job: int | JobRef, *, accounted: bool = True) -> None:
-        """Start the job's current incarnation; every Task step starts running.
-
-        ``accounted=False`` leaves accounting showing the previous state (slurmdbd lag).
-        """
+    def start(self, job: int) -> None:
+        """The job starts running: its batch script writes the start marker."""
         found = self._find(job)
-        now = self._now()
-        latest = found.latest
-        latest.live.state, latest.live.started_at = "RUNNING", now
-        latest.steps = {
-            slot: _Sample("RUNNING", started_at=now) for slot in range(found.task_count)
-        }
-        self._record(found, accounted)
+        if found.state != _PENDING:
+            raise ConfigurationError(f"job {found.job} is not pending")
+        found.state = _RUNNING
+        self._files[f"{found.marker}.start"] = b""
 
-    def finish(
-        self,
-        job: int | JobRef,
-        state: str = "COMPLETED",
-        *,
-        exit_code: str = "0:0",
-        in_queue: bool = False,
-        accounted: bool = True,
-    ) -> None:
-        """End the current incarnation in ``state``; unfinished steps end the same way.
-
-        ``in_queue=True`` keeps the finished job visible to ``squeue`` (before ``MinJobAge``);
-        ``accounted=False`` leaves accounting showing the previous state (slurmdbd lag).
-        """
+    def finish_step(self, job: int, slot: int, exit_code: int = 0) -> None:
+        """One Task step of a running job returns: its slot's end marker appears."""
         found = self._find(job)
-        now = self._now()
-        latest = found.latest
-        latest.live.state, latest.live.exit_code, latest.live.ended_at = state, exit_code, now
-        for step in latest.steps.values():
-            if not normalize_state(step.state).terminal:
-                step.state, step.exit_code, step.ended_at = state, exit_code, now
-        found.in_queue = in_queue
-        self._record(found, accounted)
+        code = _exit_code(exit_code)
+        if found.state != _RUNNING or not 0 <= slot < found.task_count or slot in found.ended:
+            raise ConfigurationError(f"job {found.job} has no running step in slot {slot}")
+        found.ended[slot] = code
+        self._files[f"{found.marker}.{slot}.{code}.end"] = b""
 
-    def finish_step(
-        self, job: int | JobRef, slot: int, state: str = "COMPLETED", *, exit_code: str = "0:0"
-    ) -> None:
-        """End one Task step (by zero-based slot) of a running job."""
+    def finish(self, job: int, exit_code: int = 0) -> None:
+        """Every remaining step returns ``exit_code`` (a pending job starts first). The job
+        settles as ``COMPLETED`` when every step returned 0, else ``FAILED``, and stays in
+        ``squeue`` until ``purge``."""
         found = self._find(job)
-        if slot not in found.latest.steps:
-            raise ConfigurationError(f"job {found.job_id} has no started step for slot {slot}")
-        step = found.latest.steps[slot]
-        step.state, step.exit_code, step.ended_at = state, exit_code, self._now()
+        code = _exit_code(exit_code)
+        if found.state == _PENDING:
+            self.start(job)
+        if found.state != _RUNNING:
+            raise ConfigurationError(f"job {found.job} is not running")
+        for slot in range(found.task_count):
+            if slot not in found.ended:
+                self.finish_step(job, slot, code)
+        found.state = "COMPLETED" if not any(found.ended.values()) else "FAILED"
 
-    def requeue(self, job: int | JobRef, *, state: str = "PENDING") -> None:
-        """Requeue the job: a new incarnation with a strictly later submit time."""
-        found = self._find(job)
-        latest = found.latest
-        if not normalize_state(latest.live.state).terminal:
-            latest.live.state = "REQUEUED"
-            latest.live.ended_at = self._now()
-            self._record(found, True)
-        moment = self._clock()
-        previous = datetime.strptime(latest.submitted_at, TIMESTAMP_FORMAT).replace(tzinfo=UTC)
-        moment = max(moment, previous + timedelta(seconds=1))
-        incarnation = _Incarnation(moment.astimezone(UTC).strftime(TIMESTAMP_FORMAT))
-        incarnation.live.state = incarnation.recorded.state = state
-        found.history.append(incarnation)
-        found.in_queue = True
+    def interrupt(self, job: int, state: str = "CANCELLED") -> None:
+        """Slurm interrupts the job (cancel, time limit, preemption). A started batch script
+        writes its stop marker and its unfinished steps record nothing."""
+        self._interrupt(self._find(job), state)
 
-    def forget(self, job: int | JobRef) -> None:
-        """The job ages out of both ``squeue`` and ``sacct``."""
+    def lose(self, job: int, state: str = "NODE_FAIL") -> None:
+        """The batch shell vanishes without writing anything (SIGKILL, node failure)."""
         found = self._find(job)
-        found.in_queue = found.accounted = False
+        if found.state not in (_PENDING, _RUNNING):
+            raise ConfigurationError(f"job {found.job} already ended")
+        found.state = state
+
+    def purge(self, job: int) -> None:
+        """Slurm forgets the job (after ``MinJobAge``); ``squeue`` no longer lists it."""
+        self._find(job).in_queue = False
+
+    def write_file(self, path: str | PurePosixPath, content: bytes = b"") -> None:
+        """Create or replace a file, such as a log ``tail`` reads or a run marker."""
+        self._files[str(path)] = bytes(content)
+
+    def remove_file(self, path: str | PurePosixPath) -> None:
+        """Remove a file, for example a marker an NFS client does not see yet."""
+        del self._files[str(path)]
 
     def fail_next(self, command: str, reply: Completed | None = None) -> None:
         """Make the next ``command`` (by key) fail without acting.
@@ -335,10 +272,6 @@ class FakeScheduler:
         """The next ``command`` (by key) takes effect, but its reply is lost (``Unavailable``)."""
         self._lost[command] = self._lost.get(command, 0) + 1
 
-    def write_log(self, path: str | PurePosixPath, content: bytes) -> None:
-        """Set the content ``tail`` reads from a remote log path."""
-        self._logs[str(path)] = bytes(content)
-
     def set_next_job_id(self, job_id: int) -> None:
         """Choose the next job number, for example to simulate job-number reuse."""
         if type(job_id) is not int or job_id < 1:
@@ -347,177 +280,118 @@ class FakeScheduler:
 
     # --- Internals ---------------------------------------------------------------------------
 
-    def _now(self) -> str:
-        return self._clock().astimezone(UTC).strftime(TIMESTAMP_FORMAT)
+    def _interrupt(self, found: _Job, state: str) -> None:
+        if found.state not in (_PENDING, _RUNNING):
+            raise ConfigurationError(f"job {found.job} already ended")
+        if found.started:
+            self._files[f"{found.marker}.stop"] = b""
+        found.state = state
 
-    def _find(self, job: int | JobRef) -> _Job:
-        job_id = job.job_id if isinstance(job, JobRef) else job
+    def _find(self, job: int) -> _Job:
         for candidate in reversed(self._jobs):
-            if candidate.job_id == job_id:
+            if candidate.job == job:
                 return candidate
-        raise ConfigurationError(f"FakeScheduler has no job {job_id}")
+        raise ConfigurationError(f"FakeScheduler has no job {job}")
 
-    def _snapshot(self, job: _Job) -> FakeJob:
+    @staticmethod
+    def _snapshot(job: _Job) -> FakeJob:
         return FakeJob(
-            JobRef(job.job_id, self._cluster),
-            job.name,
-            job.argv,
-            job.script,
-            job.task_count,
-            job.latest.live.state,
-            len(job.history),
+            job.job, job.name, job.argv, job.script, job.task_count, job.state, job.in_queue
         )
 
     @staticmethod
-    def _record(job: _Job, accounted: bool) -> None:
-        if accounted:
-            live = job.latest.live
-            job.latest.recorded = _Sample(
-                live.state, live.exit_code, live.reason, live.started_at, live.ended_at
-            )
-
-    def _routed(self, options: Mapping[str, str | None]) -> list[_Job]:
-        if "--clusters" in options and options["--clusters"] != self._cluster:
-            return []
-        return list(self._jobs)
-
-    @staticmethod
-    def _options(argv: tuple[str, ...], allowed: frozenset[str]) -> dict[str, str | None]:
+    def _options(argv: tuple[str, ...]) -> dict[str, str | None]:
         options: dict[str, str | None] = {}
-        words = iter(argv[1:])
-        operands: list[str] = []
-        for word in words:
+        for word in argv[1:]:
             name, equals, value = word.partition("=")
-            if not word.startswith("--"):
-                operands.append(word)
-            elif name in _VALUED and not equals:
-                options[name] = next(words, None)
-            else:
-                options[name] = value if equals else None
-        unknown = options.keys() - allowed
-        if unknown or None in (options.get(name, "") for name in _VALUED):
-            raise AssertionError(f"FakeScheduler does not understand {argv!r}")
-        if operands:
-            options["operands"] = " ".join(operands)
+            if not word.startswith("--") or name in options:
+                raise AssertionError(f"FakeScheduler does not understand {argv!r}")
+            options[name] = value if equals else None
         return options
 
     def _ping(self, _argv: tuple[str, ...], _stdin: bytes) -> Completed:
         return Completed(0, f"{self._version}\n".encode(), b"")
 
     def _sbatch(self, argv: tuple[str, ...], stdin: bytes) -> Completed:
-        options = self._options(argv, _SBATCH_OPTIONS)
-        required = ("--parsable", "--export", "--ntasks", "--job-name", "--comment")
-        if "operands" in options or any(name not in options for name in required):
+        options = self._options(argv)
+        if options.keys() - _SBATCH_OPTIONS or any(
+            name not in options for name in _SBATCH_REQUIRED
+        ):
             raise AssertionError(f"FakeScheduler does not understand {argv!r}")
         if options["--export"] != "NIL" or not stdin.startswith(b"#!/bin/sh\n"):
             raise AssertionError("Servatus batch requests use --export=NIL and a /bin/sh script")
         task_count = int(options["--ntasks"] or "0")
         if "--test-only" in options:
             message = (
-                f"sbatch: Job {self._next_job_id} to start at {self._now()} using "
+                f"sbatch: Job {self._next_job_id} to start at 2030-01-01T00:00:00 using "
                 f"{task_count} processors on nodes fake1 in partition {options.get('--partition')}"
             )
             return Completed(0, b"", f"{message}\n".encode())
+        name = options["--job-name"] or ""
+        log_root = posixpath.dirname(options["--output"] or "")
         job = _Job(
             self._next_job_id,
-            options["--job-name"] or "",
-            options["--comment"] or "",
+            name,
             argv,
             stdin,
             task_count,
-            [_Incarnation(self._now())],
+            f"{log_root}/{name.removeprefix('servatus-')}.{self._next_job_id}",
         )
         self._jobs.append(job)
         self._next_job_id += 1
-        suffix = "" if self._cluster is None else f";{self._cluster}"
-        return Completed(0, f"{job.job_id}{suffix}\n".encode(), b"")
+        return Completed(0, f"{job.job}\n".encode(), b"")
 
     def _squeue(self, argv: tuple[str, ...], _stdin: bytes) -> Completed:
-        options = self._options(
-            argv, frozenset({"--noheader", "--jobs", "--name", "--local", "--clusters", "--format"})
-        )
-        jobs = [job for job in self._routed(options) if job.in_queue]
-        if options.get("--format") == "%i|%j|%k" and "--name" in options:
-            rows = [f"{j.job_id}|{j.name}|{j.comment}" for j in jobs if j.name == options["--name"]]
-            return Completed(0, _lines(rows), b"")
-        if f"--format={options.get('--format')}" != SQUEUE_FORMAT or "--jobs" not in options:
+        if len(argv) != len(SQUEUE_OPTIONS) + 3:
             raise AssertionError(f"FakeScheduler does not understand {argv!r}")
-        wanted = {int(item) for item in (options["--jobs"] or "").split(",")}
-        banner = "" if "--clusters" not in options else f"CLUSTER: {options['--clusters']}\n"
-        rows: list[str] = []
-        for job in jobs:
-            if job.job_id in wanted:
-                live = job.latest.live
-                rows.append(
-                    f"{job.job_id}|{job.name}|{job.comment}|{job.latest.submitted_at}|"
-                    f"{live.state}|{live.reason}|{_shown(live.started_at, 'N/A')}|"
-                    f"{_shown(live.ended_at, 'N/A')}"
-                )
-        if not rows:
-            return Completed(1, banner.encode(), MISSING_JOBS_STDERR)
-        return Completed(0, banner.encode() + _lines(rows), b"")
-
-    def _sacct(self, argv: tuple[str, ...], _stdin: bytes) -> Completed:
-        options = self._options(argv, _SACCT_OPTIONS)
-        format_ = f"--format={options.get('--format')}"
-        wanted = (
-            None
-            if "--jobs" not in options
-            else {int(item) for item in (options["--jobs"] or "").split(",")}
-        )
-        jobs = [
-            job
-            for job in self._routed(options)
-            if job.accounted and (wanted is None or job.job_id in wanted)
+        names = argv[len(SQUEUE_OPTIONS) + 1].removeprefix("--name=")
+        expected = (argv[0], *SQUEUE_OPTIONS, f"--name={names}", SQUEUE_FORMAT)
+        if argv != expected or not names:
+            raise AssertionError(f"FakeScheduler does not understand {argv!r}")
+        wanted = set(names.split(","))
+        rows = [
+            f"{job.job}|{job.name}|{job.state}"
+            for job in self._jobs
+            if job.in_queue and job.name in wanted
         ]
-        history = "--allocations" in options and "--duplicates" in options
-        if format_ == SACCT_STEP_FORMAT and "--allocations" not in options and wanted:
-            rows = [row for job in jobs for row in _step_rows(job)]
-        elif format_ == SACCT_ALLOCATION_FORMAT and history and wanted is not None:
-            rows = [
-                f"{job.job_id}|{self._cluster or ''}|{job.name}|{job.comment}|"
-                f"{incarnation.submitted_at}|{recorded.state}|{recorded.exit_code}|"
-                f"{recorded.reason}|{_shown(recorded.started_at, 'Unknown')}|"
-                f"{_shown(recorded.ended_at, 'Unknown')}"
-                for job, incarnation in _incarnations(jobs, options)
-                for recorded in (incarnation.recorded,)
-            ]
-        elif format_ == SACCT_IDENTITY_FORMAT and history and wanted is None:
-            rows = [
-                f"{job.job_id}|{job.name}|{job.comment}|{self._cluster or ''}"
-                for job, _ in _incarnations(jobs, options)
-            ]
-        else:
-            raise AssertionError(f"FakeScheduler does not understand {argv!r}")
         return Completed(0, _lines(rows), b"")
 
     def _scancel(self, argv: tuple[str, ...], _stdin: bytes) -> Completed:
-        options = self._options(argv, frozenset({"--clusters", "--name"}))
-        operand = options.get("operands") or ""
-        if "--name" not in options or not operand.isdecimal():
+        if len(argv) != 3 or argv[1] != "--me" or not argv[2].startswith("--name="):
             raise AssertionError(f"FakeScheduler does not understand {argv!r}")
-        job_id = int(operand)
-        jobs = [job for job in self._routed(options) if job.job_id == job_id and job.accounted]
-        if not jobs:
-            message = f"scancel: error: Kill job error on job id {job_id}: Invalid job id specified"
-            return Completed(1, b"", f"{message}\n".encode())
-        job = jobs[-1]
-        if job.name != options["--name"]:
-            return Completed(0, b"", b"")
-        if normalize_state(job.latest.live.state).terminal:
-            message = (
-                f"scancel: error: Kill job error on job id {job_id}: "
-                "Job/step already completing or completed"
-            )
-            return Completed(1, b"", f"{message}\n".encode())
-        self.finish(job_id, "CANCELLED by 1000", exit_code="0:15")
+        name = argv[2].removeprefix("--name=")
+        for job in self._jobs:
+            if job.in_queue and job.name == name and job.state in (_PENDING, _RUNNING):
+                self._interrupt(job, "CANCELLED")
         return Completed(0, b"", b"")
+
+    def _scontrol(self, argv: tuple[str, ...], _stdin: bytes) -> Completed:
+        if argv[1:] != ("show", "config"):
+            raise AssertionError(f"FakeScheduler does not understand {argv!r}")
+        return Completed(0, _SLURM_CONFIG, b"")
+
+    def _writable_directory(self, argv: tuple[str, ...], _stdin: bytes) -> Completed:
+        if argv[:-1] != WRITABLE_DIRECTORY:
+            raise AssertionError(f"FakeScheduler does not understand {argv!r}")
+        return Completed(0, b"", b"")
+
+    def _find_files(self, argv: tuple[str, ...], _stdin: bytes) -> Completed:
+        root, patterns = (argv[2], argv[9:-1:3]) if len(argv) > 10 else ("", ())
+        if not patterns or argv != find_argv(PurePosixPath(root), patterns):
+            raise AssertionError(f"FakeScheduler does not understand {argv!r}")
+        found = sorted(
+            path
+            for path in self._files
+            if posixpath.dirname(path) == root
+            and any(fnmatch.fnmatchcase(posixpath.basename(path), item) for item in patterns)
+        )
+        return Completed(0, _lines(found), b"")
 
     def _tail(self, argv: tuple[str, ...], _stdin: bytes) -> Completed:
         if argv[0] != TAIL or len(argv) != 5 or argv[1] != "-c" or argv[3] != "--":
             raise AssertionError(f"FakeScheduler does not understand {argv!r}")
         path = argv[4]
-        if path not in self._logs:
+        if path not in self._files:
             message = f"tail: cannot open '{path}' for reading: No such file or directory"
             return Completed(1, b"", f"{message}\n".encode())
-        return Completed(0, self._logs[path][-int(argv[2]) :], b"")
+        return Completed(0, self._files[path][-int(argv[2]) :], b"")

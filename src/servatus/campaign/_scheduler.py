@@ -1,89 +1,85 @@
-"""Slurm operations over one ``Transport``: submit, test, observe, identify, tail, and cancel.
+"""Slurm operations over one ``Transport``: submit, test, read the queue and run markers, tail,
+and cancel.
 
 Every method issues fixed, absolute argument vectors and parses replies with the pure functions in
 ``_evidence``. Command failures raise ``Unavailable``; untrustworthy replies raise
-``EvidenceConflict`` (observation) or ``ReconciliationError`` (identification).
+``EvidenceConflict``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
-from datetime import datetime
+from collections.abc import Mapping, Sequence
 from pathlib import PurePosixPath
 
-from ..errors import ConfigurationError, EvidenceConflict, ReconciliationError, Unavailable
-from ._config import CONTROL
-from ._evidence import (
-    Expectation,
-    JobRef,
-    Observation,
-    combine,
-    is_missing_reply,
-    parse_accounting,
-    parse_active,
-    parse_identity,
-    parse_receipt,
-    parse_steps,
-    submission_window,
-)
-from ._remote import MAX_STREAM_BYTES, Completed, Transport
+from ..errors import ConfigurationError, EvidenceConflict, Unavailable
+from ._config import Target
+from ._evidence import Marker, QueueRow, parse_markers, parse_queue, parse_receipt
+from ._remote import MAX_STREAM_BYTES, Completed, Transport, diagnostic
 from ._script import job_name
 
-MAX_QUERY_JOBS = 16
+MAX_QUERY_NAMES = 100
 TAIL = "/usr/bin/tail"
-SQUEUE_FORMAT = "--format=%i|%j|%k|%V|%T|%r|%S|%e"
-SACCT_ALLOCATION_FORMAT = (
-    "--format=JobIDRaw%64,Cluster%256,JobName%256,Comment%256,Submit%32,State%256,ExitCode%32,"
-    "Reason%4096,Start%32,End%32"
-)
-SACCT_STEP_FORMAT = "--format=JobIDRaw%64,JobName%256,State%256,ExitCode%32"
-SACCT_IDENTITY_FORMAT = "--format=JobIDRaw,JobName,Comment,Cluster"
-_NOTHING_TO_CANCEL = (b"already completing or completed", b"Invalid job id specified")
+FIND = "/usr/bin/find"
+WRITABLE_DIRECTORY = ("/bin/sh", "-c", 'test -d "$1" && test -w "$1"', "servatus")
+SQUEUE_OPTIONS = ("--me", "--all", "--states=all", "--noheader")
+SQUEUE_FORMAT = "--format=%i|%j|%T"
+MARKER_SUFFIXES = (".start", ".stop", ".end")
+# Each name pattern costs three find arguments; eight keep one listing within the 32-argument bound.
+MAX_NAME_PATTERNS = 8
+# Generous per-marker line length beyond log_root: "/", 24 hex digits, and the longest suffix.
+_MARKER_LINE_BYTES = 64
 
 
-@dataclass(frozen=True, slots=True)
-class AttemptQuery:
-    """One accepted allocation to observe: its identity, job, intent time, and Task count."""
-
-    allocation_id: str
-    job: JobRef
-    intent_at: datetime
-    task_count: int
-
-
-def _diagnostic(completed: Completed) -> str:
-    """The first stderr line, bounded and printable, for operator-facing messages."""
-    first = completed.stderr.decode("utf-8", "replace").strip().partition("\n")[0]
-    text = CONTROL.sub("?", first)[:200]
-    return f"exit status {completed.returncode}" + (f": {text}" if text else "")
+class CommandFailed(Unavailable):
+    """The command ran and reported failure, unlike a transport that never got an answer."""
 
 
 def _require_ok(completed: Completed, what: str, *, quiet: bool = True) -> Completed:
     """``completed`` if it exited 0 (and, when ``quiet``, wrote nothing to stderr)."""
     if completed.returncode != 0 or (quiet and completed.stderr):
-        raise Unavailable(f"{what} failed with {_diagnostic(completed)}")
+        raise CommandFailed(f"{what} failed with {diagnostic(completed)}")
     return completed
 
 
-class Scheduler:
-    """Slurm commands under ``slurm_bin``, run through ``transport``."""
+def find_argv(log_root: PurePosixPath, patterns: Sequence[str]) -> tuple[str, ...]:
+    """List the regular files in ``log_root`` whose names match any of ``patterns``. ``-H``
+    follows ``log_root`` itself when it is a symbolic link, as Slurm and the batch script do."""
+    names: list[str] = []
+    for pattern in patterns:
+        names.extend(("-o", "-name", pattern))
+    return (FIND, "-H", str(log_root), "-maxdepth", "1", "-type", "f", "(", *names[1:], ")")
 
-    def __init__(self, transport: Transport, slurm_bin: PurePosixPath | str) -> None:
-        path = PurePosixPath(slurm_bin)
-        if not path.is_absolute():
-            raise ConfigurationError("slurm_bin must be an absolute POSIX path")
+
+def marker_patterns(
+    log_root: PurePosixPath, task_counts: Mapping[str, int]
+) -> list[tuple[str, ...]]:
+    """The name patterns of each directory read for these allocations' markers.
+
+    A few allocations are named exactly (``<id>.*``; logs are ``<id>-...``), so the read stays
+    small however many other markers share ``log_root``. Many allocations take one read of every
+    marker, split by leading hex digit when their own markers could exceed the stream bound.
+    """
+    allocation_ids = sorted(task_counts)
+    if len(allocation_ids) <= MAX_NAME_PATTERNS:
+        return [tuple(f"{allocation_id}.*" for allocation_id in allocation_ids)]
+    estimate = sum(
+        (3 + count) * (len(str(log_root)) + _MARKER_LINE_BYTES) for count in task_counts.values()
+    )
+    prefixes = [""]
+    if estimate > MAX_STREAM_BYTES // 2:
+        prefixes = sorted({allocation_id[0] for allocation_id in allocation_ids})
+    return [tuple(f"{prefix}*{suffix}" for suffix in MARKER_SUFFIXES) for prefix in prefixes]
+
+
+class Scheduler:
+    """Slurm commands of one ``target``, run through ``transport``."""
+
+    def __init__(self, transport: Transport, target: Target) -> None:
         self._transport = transport
-        self._bin = path
+        self._target = target
 
     def _command(self, name: str) -> str:
-        return str(self._bin / name)
-
-    def _sbatch_request(self, argv: Sequence[str]) -> tuple[str, ...]:
-        fields = tuple(argv)
-        if not fields or fields[0] != self._command("sbatch") or "--test-only" in fields:
-            raise ConfigurationError("submission argv must start with this target's sbatch")
-        return fields
+        return str(self._target.slurm_bin / name)
 
     def ping(self) -> str:
         """Prove the transport and Slurm client work: the ``sbatch --version`` text."""
@@ -91,140 +87,77 @@ class Scheduler:
         _require_ok(completed, "sbatch --version", quiet=False)
         return completed.stdout.decode("utf-8", "replace").strip()
 
-    def submit(self, argv: Sequence[str], script: bytes) -> JobRef:
+    def submit(self, argv: Sequence[str], script: bytes) -> int:
         """Submit ``script`` with the rendered ``sbatch`` argv and return the accepted job.
 
         Any failure raises ``Unavailable``; the caller must treat acceptance as unresolved.
         """
-        completed = self._transport.run(self._sbatch_request(argv), stdin=script)
+        completed = self._transport.run(argv, stdin=script)
         _require_ok(completed, "sbatch", quiet=False)
         try:
             return parse_receipt(completed.stdout)
         except EvidenceConflict:
-            raise Unavailable("sbatch did not print exactly one job identity") from None
+            raise Unavailable("sbatch did not print exactly one job number") from None
 
     def test_only(self, argv: Sequence[str], script: bytes) -> tuple[bool, str, str]:
         """Ask ``sbatch --test-only`` whether Slurm would accept this request now."""
-        completed = self._transport.run((*self._sbatch_request(argv), "--test-only"), stdin=script)
+        completed = self._transport.run((*argv, "--test-only"), stdin=script)
         return (
             completed.returncode == 0,
             completed.stdout.decode("utf-8", "replace").rstrip("\n"),
             completed.stderr.decode("utf-8", "replace").rstrip("\n"),
         )
 
-    def observe(self, queries: Iterable[AttemptQuery]) -> dict[str, Observation]:
-        """Observe accepted allocations, keyed by allocation id in query order.
+    def config(self) -> dict[str, str]:
+        """``scontrol show config``: each setting's name and its value as Slurm prints it."""
+        argv = (self._command("scontrol"), "show", "config")
+        completed = _require_ok(self._transport.run(argv), "scontrol show config", quiet=False)
+        pairs = (
+            line.partition("=") for line in completed.stdout.decode("utf-8", "replace").split("\n")
+        )
+        return {name.strip(): value.strip() for name, equals, value in pairs if equals}
 
-        Queries are grouped by cluster and batched at most 16 jobs at a time; a reused job number
-        always goes to a separate batch. Each batch runs ``squeue``, anchored ``sacct``
-        allocation history, and a best-effort ``sacct`` step query.
-        """
-        frozen = tuple(queries)
-        if any(not isinstance(query, AttemptQuery) for query in frozen):
-            raise ConfigurationError("queries must be AttemptQuery values")
-        if len({query.allocation_id for query in frozen}) != len(frozen):
-            raise ConfigurationError("each allocation can be observed once per query")
-        groups: dict[str | None, list[AttemptQuery]] = {}
-        for query in frozen:
-            groups.setdefault(query.job.cluster, []).append(query)
-        observed: dict[str, Observation] = {}
-        for cluster, group in groups.items():
-            batch: list[AttemptQuery] = []
-            for query in group:
-                if len(batch) == MAX_QUERY_JOBS or any(
-                    item.job.job_id == query.job.job_id for item in batch
-                ):
-                    observed.update(self._observe_batch(cluster, batch))
-                    batch = []
-                batch.append(query)
-            if batch:
-                observed.update(self._observe_batch(cluster, batch))
-        return {query.allocation_id: observed[query.allocation_id] for query in frozen}
+    def writable_directory(self, path: PurePosixPath) -> bool:
+        """Whether ``path`` is a directory this user can write to, without writing anything."""
+        completed = self._transport.run((*WRITABLE_DIRECTORY, str(path)))
+        if completed.returncode not in (0, 1):
+            raise CommandFailed(f"checking {path} failed with {diagnostic(completed)}")
+        return completed.returncode == 0
 
-    def _observe_batch(
-        self, cluster: str | None, batch: Sequence[AttemptQuery]
-    ) -> dict[str, Observation]:
-        expected: dict[int, Expectation] = {}
-        for query in batch:
-            start, end = submission_window(query.intent_at)
-            expected[query.job.job_id] = Expectation(
-                query.allocation_id, start, end, query.task_count
+    def queue(self, allocation_ids: Sequence[str]) -> dict[str, tuple[QueueRow, ...]]:
+        """Every ``squeue`` row (terminal ones included) of this user's jobs named after the
+        allocations, by allocation id, at most ``MAX_QUERY_NAMES`` names per query."""
+        rows: dict[str, tuple[QueueRow, ...]] = {}
+        for start in range(0, len(allocation_ids), MAX_QUERY_NAMES):
+            batch = allocation_ids[start : start + MAX_QUERY_NAMES]
+            names = {job_name(allocation_id): allocation_id for allocation_id in batch}
+            argv = (
+                self._command("squeue"),
+                *SQUEUE_OPTIONS,
+                f"--name={','.join(names)}",
+                SQUEUE_FORMAT,
             )
-        jobs = ",".join(str(job) for job in expected)
-        route = "--local" if cluster is None else f"--clusters={cluster}"
-        earliest = min(item.window_start for item in expected.values())
-        squeue = self._transport.run(
-            (self._command("squeue"), "--noheader", "--jobs", jobs, route, SQUEUE_FORMAT)
-        )
-        if is_missing_reply(squeue.returncode, squeue.stdout, squeue.stderr, cluster):
-            active = parse_active(b"", expected, cluster)
-        else:
-            active = parse_active(_require_ok(squeue, "squeue").stdout, expected, cluster)
-        names = ",".join(item.identity for item in expected.values())
-        window = ("--starttime", earliest, route)
-        history = parse_accounting(
-            self._sacct(
-                "--allocations",
-                "--duplicates",
-                "--jobs",
-                jobs,
-                "--name",
-                names,
-                *window,
-                SACCT_ALLOCATION_FORMAT,
-            ),
-            expected,
-            cluster,
-        )
-        try:  # step evidence is best effort: any failure leaves it unavailable
-            steps = parse_steps(self._sacct("--jobs", jobs, *window, SACCT_STEP_FORMAT), expected)
-        except (Unavailable, EvidenceConflict):
-            steps = None
-        return {
-            item.allocation_id: Observation(
-                combine(item, active[job], history[job]),
-                () if steps is None else steps[job],
+            found = parse_queue(_require_ok(self._transport.run(argv), "squeue").stdout, names)
+            rows.update((names[name], tuple(items)) for name, items in found.items())
+        return rows
+
+    def markers(self, task_counts: Mapping[str, int]) -> dict[str, tuple[Marker, ...]]:
+        """The run markers of each allocation (by id, with its Task count) in the target's
+        ``log_root``, read as ``marker_patterns`` says."""
+        log_root = self._target.log_root
+        allocation_ids = tuple(task_counts)
+        found: dict[str, list[Marker]] = {allocation_id: [] for allocation_id in allocation_ids}
+        if not allocation_ids:
+            return {}
+        for patterns in marker_patterns(log_root, task_counts):
+            completed = _require_ok(
+                self._transport.run(find_argv(log_root, patterns)), f"listing {log_root}"
             )
-            for job, item in expected.items()
-        }
-
-    def _sacct(self, *arguments: str) -> bytes:
-        """The checked stdout of ``sacct --noheader --parsable2 <arguments>``."""
-        argv = (self._command("sacct"), "--noheader", "--parsable2", *arguments)
-        return _require_ok(self._transport.run(argv), "sacct").stdout
-
-    def identify(self, allocation_id: str, intent_at: datetime) -> JobRef:
-        """The one job Slurm holds for an allocation, else ``ReconciliationError``."""
-        jobs = self.find(allocation_id, intent_at)
-        if len(jobs) != 1:
-            raise ReconciliationError(
-                f"scheduler evidence shows {len(jobs)} jobs named {job_name(allocation_id)}, "
-                "not exactly one"
-            )
-        return jobs[0]
-
-    def find(self, allocation_id: str, intent_at: datetime) -> tuple[JobRef, ...]:
-        """Every job carrying an allocation's identity: queued or running, or accounted near
-        ``intent_at``. Empty proves absence; command failures raise ``Unavailable`` and
-        untrustworthy replies ``ReconciliationError``."""
-        identity = job_name(allocation_id)
-        start, end = submission_window(intent_at)
-        squeue = self._transport.run(
-            (self._command("squeue"), "--noheader", "--name", identity, "--format=%i|%j|%k")
-        )
-        _require_ok(squeue, "squeue")
-        history = self._sacct(
-            "--allocations",
-            "--duplicates",
-            "--name",
-            identity,
-            "--starttime",
-            start,
-            "--endtime",
-            end,
-            SACCT_IDENTITY_FORMAT,
-        )
-        return parse_identity(squeue.stdout, history, identity)
+            for allocation_id, items in parse_markers(
+                completed.stdout, log_root, allocation_ids
+            ).items():
+                found[allocation_id].extend(items)
+        return {allocation_id: tuple(items) for allocation_id, items in found.items()}
 
     def tail(self, path: PurePosixPath, max_bytes: int) -> tuple[bytes, bool]:
         """The last ``max_bytes`` of a remote file and whether earlier bytes exist.
@@ -233,12 +166,11 @@ class Scheduler:
         """
         if type(max_bytes) is not int or not 1 <= max_bytes <= MAX_STREAM_BYTES:
             raise ConfigurationError(f"max_bytes must be an integer from 1 to {MAX_STREAM_BYTES}")
-        text = str(path)
-        if not PurePosixPath(text).is_absolute() or CONTROL.search(text):
-            raise ConfigurationError("log path must be an absolute POSIX path")
         limit = max_bytes + 1
         try:
-            completed = self._transport.run((TAIL, "-c", str(limit), "--", text), max_stdout=limit)
+            completed = self._transport.run(
+                (TAIL, "-c", str(limit), "--", str(path)), max_stdout=limit
+            )
         except Unavailable:
             raise Unavailable("log is unavailable") from None
         if completed.returncode != 0 or completed.stderr or len(completed.stdout) > limit:
@@ -247,17 +179,8 @@ class Scheduler:
             return completed.stdout[1:], True
         return completed.stdout, False
 
-    def cancel(self, allocation_id: str, job: JobRef) -> None:
-        """Cancel ``job`` only while it still carries this allocation's name.
-
-        A job that already ended or aged out of Slurm counts as cancelled.
-        """
-        argv = [self._command("scancel")]
-        if job.cluster is not None:
-            argv.append(f"--clusters={job.cluster}")
-        argv.extend((f"--name={job_name(allocation_id)}", str(job.job_id)))
-        completed = self._transport.run(argv)
-        if completed.returncode != 0 and not any(
-            phrase in completed.stderr for phrase in _NOTHING_TO_CANCEL
-        ):
-            raise Unavailable(f"scancel failed with {_diagnostic(completed)}")
+    def cancel(self, allocation_id: str) -> None:
+        """Cancel this user's jobs named after the allocation. A reused job number can never be
+        hit, and a job that already ended is not an error."""
+        argv = (self._command("scancel"), "--me", f"--name={job_name(allocation_id)}")
+        _require_ok(self._transport.run(argv), "scancel", quiet=False)

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import multiprocessing
-from collections.abc import Callable
+from functools import partial
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 
 import pytest
+from support.processes import Gate, gate, race, spawn
 
 from servatus.errors import (
     Busy,
@@ -18,27 +18,22 @@ from servatus.errors import (
 from servatus.publication import Draft, Workspace
 
 
-def _hold_child(destination: str, name: str, ready: Connection, release: Connection) -> None:
+def _hold_child(destination: str, name: str, worker: Gate) -> None:
     try:
         with Workspace(destination, identity=b"study").child(name, identity=name.encode()):
-            ready.send("entered")
-            release.recv()
+            worker.ready.send("entered")
+            worker.release.recv()
     except BaseException as error:
-        ready.send(type(error).__name__)
+        worker.ready.send(type(error).__name__)
         raise
 
 
 def _spawn_holder(destination: Path, name: str) -> tuple[BaseProcess, Connection, Connection]:
-    context = multiprocessing.get_context("spawn")
-    ready_parent, ready_child = context.Pipe(duplex=False)
-    release_child, release_parent = context.Pipe(duplex=False)
-    process = context.Process(
-        target=_hold_child, args=(str(destination), name, ready_child, release_child)
-    )
-    process.start()
-    ready_child.close()
-    release_child.close()
-    return process, ready_parent, release_parent
+    worker, test = gate()
+    process = spawn(_hold_child, str(destination), name, worker)
+    worker.ready.close()
+    worker.release.close()
+    return process, test.ready, test.release
 
 
 def _finish(process: BaseProcess, release: Connection) -> None:
@@ -85,34 +80,6 @@ def _race_child_publication(destination: str, start: Connection, result: Connect
         result.send("busy")
     else:
         result.send("published")
-
-
-Racer = Callable[[str, Connection, Connection], None]
-
-
-def _start(target: Racer, destination: Path) -> tuple[BaseProcess, Connection, Connection]:
-    context = multiprocessing.get_context("spawn")
-    start_child, start_parent = context.Pipe(duplex=False)
-    result_parent, result_child = context.Pipe(duplex=False)
-    process = context.Process(target=target, args=(str(destination), start_child, result_child))
-    process.start()
-    start_child.close()
-    result_child.close()
-    return process, start_parent, result_parent
-
-
-def _race(first: Racer, second: Racer, destination: Path) -> tuple[str, str]:
-    racers = [_start(first, destination), _start(second, destination)]
-    for _, start, _ in racers:
-        start.send("start")
-        start.close()
-    outcomes: list[str] = []
-    for process, _, result in racers:
-        assert result.poll(10)
-        outcomes.append(result.recv())
-        process.join(timeout=10)
-        assert process.exitcode == 0
-    return outcomes[0], outcomes[1]
 
 
 @pytest.mark.parametrize("name", ["", ".", "..", "nested/child", "child\0suffix"])
@@ -376,7 +343,9 @@ def test_spawned_parent_finalization_and_child_open_race_is_fail_closed(tmp_path
         with Workspace(destination, identity=b"study"):
             pass
 
-        parent_outcome, child_outcome = _race(_race_parent, _race_child, destination)
+        parent_outcome, child_outcome = race(
+            partial(_race_parent, str(destination)), partial(_race_child, str(destination))
+        )
 
         assert parent_outcome in {"busy", "published"}
         assert child_outcome in {"busy", "entered", "finalized"}
@@ -391,7 +360,10 @@ def test_spawned_child_cleanup_and_duplicate_open_race_is_fail_closed(tmp_path: 
         with parent.child("method-0", identity=b"method-0"):
             pass
 
-        publisher, opener = _race(_race_child_publication, _race_child, destination)
+        publisher, opener = race(
+            partial(_race_child_publication, str(destination)),
+            partial(_race_child, str(destination)),
+        )
 
         assert publisher in {"busy", "published"}
         assert opener in {"busy", "entered", "finalized"}

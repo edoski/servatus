@@ -185,7 +185,10 @@ def test_overridden_document_defaults_are_not_validated(tmp_path: Path) -> None:
         (CPU.replace('slurm_bin = "/opt/slurm/bin"\n', ""), "missing target keys: slurm_bin"),
         (CPU.replace('apptainer = "/usr/bin/apptainer"\n', ""), "missing target keys: apptainer"),
         (CPU.replace('image = "/images/cpu.sif"\n', ""), "missing target keys: image"),
-        (CPU.replace('partitions = ["cpu"]', 'partitions = "cpu"'), "array of strings"),
+        (
+            CPU.replace('partitions = ["cpu"]', 'partitions = "cpu"'),
+            "partitions must be a sequence of strings",
+        ),
         (CPU.replace('"00:10:00"', "00:10:00"), "duration string or timedelta"),
         (CPU.replace("cpus = 2", "cpus = 2.0"), "cpus must be an integer"),
         (CPU.replace("profiles.cpu", 'profiles.""'), "profile label must be nonempty"),

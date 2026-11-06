@@ -6,17 +6,17 @@ import selectors
 import subprocess
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 import pytest
-from scheduler_fixtures import ALLOCATION, IDENTITY, query, sacct_row
+from scheduler_fixtures import ALLOCATION, IDENTITY
 from support.builders import target
 
 import servatus.campaign._remote as _remote
-from servatus.campaign._evidence import AllocationState, JobRef
+from servatus.campaign._evidence import End, QueueRow, Start
 from servatus.campaign._remote import Completed, Local, Ssh, after_marker, connect
-from servatus.campaign._scheduler import Scheduler
+from servatus.campaign._scheduler import CommandFailed, Scheduler
 from servatus.campaign._script import check_command
 from servatus.errors import ConfigurationError, Unavailable
 
@@ -59,7 +59,7 @@ def fake_ssh(tmp_path: Path, mode: str = "banner") -> tuple[Ssh, Path]:
     executable = tmp_path / "fake-ssh"
     executable.write_text(FAKE_SSH.format(python=sys.executable, config=str(config)))
     executable.chmod(0o700)
-    return Ssh("login.example.edu", command=(str(executable),)), record
+    return Ssh("login.example.edu", (str(executable),)), record
 
 
 def recorded(record: Path) -> dict[str, Any]:
@@ -96,8 +96,6 @@ def test_check_command_accepts_the_largest_permitted_command() -> None:
 
 def test_stdout_bounds_and_markers_at_their_edges() -> None:
     assert Local().run(("/usr/bin/true",), max_stdout=0) == Completed(0, b"", b"")
-    with pytest.raises(ConfigurationError, match="max_stdout must be a non-negative integer"):
-        Local().run(("/usr/bin/true",), max_stdout=True)
     assert after_marker(b"servatus-m\nreply", "servatus-m") == b"reply"
     with pytest.raises(Unavailable, match="marker missing"):
         after_marker(b"servatus-m", "servatus-m")
@@ -112,8 +110,6 @@ def test_bound_violations_never_spawn(monkeypatch: pytest.MonkeyPatch, tmp_path:
     for transport in (Local(), ssh):
         with pytest.raises(ConfigurationError, match="bound of 32 arguments"):
             transport.run(("/bin/echo",) * 33)
-        with pytest.raises(ConfigurationError, match="max_stdout"):
-            transport.run(("/bin/echo",), max_stdout=-1)
 
 
 def test_connect_selects_ssh_or_local() -> None:
@@ -255,16 +251,20 @@ def test_ssh_invocation_shape_and_remote_environment(tmp_path: Path) -> None:
     ssh, record = fake_ssh(tmp_path)
     result = ssh.run(("/usr/bin/env",))
     argv = recorded(record)["argv"]
-    assert argv[:7] == [
+    assert argv[:11] == [
         "-T",
         "-o",
         "BatchMode=yes",
         "-o",
         "LogLevel=ERROR",
+        "-o",
+        "ConnectTimeout=8",
+        "-o",
+        "ConnectionAttempts=3",
         "--",
         "login.example.edu",
     ]
-    assert len(argv) == 8 and argv[7].startswith("/bin/sh -c ")
+    assert len(argv) == 12 and argv[11].startswith("/bin/sh -c ")
     assert sorted(result.stdout.decode().splitlines()) == [
         "LANG=C",
         "LC_ALL=C",
@@ -295,8 +295,24 @@ def test_ssh_preserves_argv_and_binary_stdin_exactly(tmp_path: Path) -> None:
 @pytest.mark.parametrize("mode", ["unmarked", "refused", "quiet-stderr"])
 def test_ssh_without_both_markers_is_unavailable(tmp_path: Path, mode: str) -> None:
     ssh, _ = fake_ssh(tmp_path, mode)
-    with pytest.raises(Unavailable, match="output marker missing"):
+    with pytest.raises(Unavailable, match="output marker missing|ssh failed with exit status 255"):
         ssh.run(("/bin/echo", "42"))
+
+
+def test_ssh_exit_255_reports_ssh_s_own_message_and_never_a_command_status(tmp_path: Path) -> None:
+    executable = tmp_path / "ssh"
+    executable.write_text("#!/bin/sh\necho 'ssh: connect to host h: timed out' >&2\nexit 255\n")
+    executable.chmod(0o755)
+    with pytest.raises(
+        Unavailable, match="ssh failed with exit status 255: ssh: connect to host h: timed out"
+    ) as raised:
+        Ssh("h", (str(executable),)).run(("/bin/true",))
+    assert not isinstance(raised.value, CommandFailed)
+
+
+def test_a_missing_local_ssh_is_named_as_the_program_that_could_not_run() -> None:
+    with pytest.raises(Unavailable, match="/nonexistent/ssh could not run: No such file"):
+        Ssh("h", ("/nonexistent/ssh",)).run(("/opt/slurm/bin/sbatch", "--version"))
 
 
 def test_ssh_deadline_is_unavailable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -330,6 +346,7 @@ def test_ssh_client_environment_drops_scheduler_overrides(
         "PATH",
         "LANG",
         "LC_ALL",
+        "TZ",
         "HOME",
         "LOGNAME",
         "USER",
@@ -400,21 +417,49 @@ def test_every_spawn_failure_is_unavailable(
 
 def test_scheduler_over_noisy_ssh_reads_exact_replies(tmp_path: Path) -> None:
     # End to end: the fake ssh prints a banner and shell noise, then really executes stub Slurm
-    # commands under the scrubbed remote environment.
+    # commands and the real find under the scrubbed remote environment.
     slurm = tmp_path / "slurm"
+    logs = tmp_path / "logs"
     slurm.mkdir()
+    logs.mkdir()
+    for name in (f"{ALLOCATION}.42.start", f"{ALLOCATION}.42.0.0.end", f"{ALLOCATION}-42.out"):
+        (logs / name).touch()
     replies = {
         "sbatch": "printf '42\\n'",
-        "squeue": "printf 'slurm_load_jobs error: Invalid job id specified\\n' >&2; exit 1",
-        "sacct": f"printf '%s' '{sacct_row('COMPLETED', end='2030-01-01T13:00:00')}'",
+        "squeue": f"printf '42|{IDENTITY}|COMPLETED\\n'",
     }
     for name, body in replies.items():
         stub = slurm / name
         stub.write_text(f"#!/bin/sh\n{body}\n")
         stub.chmod(0o700)
     ssh, _ = fake_ssh(tmp_path)
-    scheduler = Scheduler(ssh, str(slurm))
+    scheduler = Scheduler(ssh, target(slurm_bin=str(slurm), log_root=str(logs)))
     argv = (str(slurm / "sbatch"), "--parsable", f"--job-name={IDENTITY}")
-    assert scheduler.submit(argv, b"#!/bin/sh\n") == JobRef(42)
-    observed = scheduler.observe([query()])[ALLOCATION]
-    assert observed.allocation.state is AllocationState.SUCCEEDED
+    assert scheduler.submit(argv, b"#!/bin/sh\n") == 42
+    assert scheduler.queue([ALLOCATION]) == {ALLOCATION: (QueueRow(42, "COMPLETED"),)}
+    markers = scheduler.markers({ALLOCATION: 1})
+    assert sorted(markers[ALLOCATION], key=repr) == [End(42, 0, 0), Start(42)]
+
+
+@pytest.mark.parametrize("many", [False, True], ids=["named", "every"])
+def test_real_find_follows_a_symlinked_log_root(tmp_path: Path, many: bool) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / f"{ALLOCATION}.42.start").touch()
+    (logs / f"{ALLOCATION}.42.0.3.end").touch()
+    link = tmp_path / "link"
+    link.symlink_to(logs)
+    counts = {ALLOCATION: 1}
+    if many:
+        counts |= {f"{index:024x}": 1 for index in range(8)}
+    markers = Scheduler(Local(), target(slurm_bin="/usr/bin", log_root=link)).markers(counts)
+    assert sorted(markers[ALLOCATION], key=repr) == [End(42, 0, 3), Start(42)]
+
+
+def test_writable_directory_tells_a_writable_directory_from_anything_else(tmp_path: Path) -> None:
+    scheduler = Scheduler(Local(), target(slurm_bin="/usr/bin"))
+    regular = tmp_path / "regular"
+    regular.touch()
+    assert scheduler.writable_directory(PurePosixPath(tmp_path)) is True
+    assert scheduler.writable_directory(PurePosixPath(regular)) is False
+    assert scheduler.writable_directory(PurePosixPath(tmp_path / "missing")) is False
