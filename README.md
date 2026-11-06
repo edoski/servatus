@@ -366,8 +366,8 @@ the node can read them: never put secrets in Tasks.
 
 **SSH.** Servatus runs `ssh -T -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=8 -o
 ConnectionAttempts=3 HOST`, so it never prompts, ignores login banners and shell-startup output,
-and retries a connection that never opens. Commands themselves are never retried, and each has 30 s
-to finish, connecting included. With `ProxyJump`, set those two options on the jump host too. From
+and retries a connection that never opens. A login that stalls after connecting is not retried, and
+commands themselves never are; each has 30 s to finish, connecting included. With `ProxyJump`, set those two options on the jump host too. From
 your environment it passes only `HOME`,
 `LOGNAME`, `USER`, `SSH_AUTH_SOCK`, `KRB5CCNAME`, and `KRB5_CONFIG`, so agent and Kerberos logins
 work. Give the host `ControlMaster auto`, `ControlPath ~/.ssh/control-%C`, `ControlPersist 30m`,

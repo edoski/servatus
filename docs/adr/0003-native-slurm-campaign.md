@@ -20,8 +20,8 @@ the exit status and both output streams. `connect(target)` returns `Ssh(target.h
 Target has a host and `Local()` otherwise; callers and tests may supply their own `connect`.
 
 - `Ssh` runs `ssh -T -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=8 -o ConnectionAttempts=3
-  HOST REMOTE`. A connection is retried before any command runs; a command never is. Exit status
-  255 is `ssh`'s own failure and is `Unavailable`. The remote command prints a
+  HOST REMOTE`. `ConnectionAttempts` retries only the TCP connect, before any command runs, so a
+  stalled banner exchange fails after 8 s and a command is never retried. Exit status 255 is `ssh`'s own failure and is `Unavailable`. The remote command prints a
   per-call random marker to stdout and stderr, then `exec`s `/usr/bin/env -i PATH=... LANG=C
   LC_ALL=C TZ=UTC` with the argv. Output before the markers (login banners, shell-startup noise) is
   discarded; a missing marker means the command did not run as intended and is `Unavailable`.

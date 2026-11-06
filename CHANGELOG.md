@@ -64,9 +64,10 @@ Servatus no longer needs Slurm accounting. See
 ### Fixed
 
 - A status poll over SSH could fail at the 30 s deadline when one TCP connection never opened, which
-  happened about once in 50 connections from a laptop on a phone hotspot. `ssh` now gives each
-  connection three attempts of 8 s. Only the connection is retried, never a command. The deadline
-  error names the command, and `ssh`'s own failure (exit 255) reports its message.
+  happened about once in 100 connections from a laptop on a phone hotspot. `ssh` now gives each
+  connection three attempts of 8 s. Only the connection is retried, never a command, and a stalled
+  banner exchange still fails, after 8 s. The deadline error names the command, and `ssh`'s own
+  failure (exit 255) reports its message.
 
 ## [0.12.1] - 2026-10-05
 
