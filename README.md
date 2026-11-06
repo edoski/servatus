@@ -249,7 +249,7 @@ cancelled job, its Tasks are `STOPPED` and `--retry-failed` selects them.
 Publication works with or without a Campaign. Work, sources, stages, and destinations must share
 one filesystem; Servatus never copies.
 
-**`publish(destination, build, *, retire=None, mode=None)`** builds a directory in a private stage
+**`publish(destination, build, *, mode=None)`** builds a directory in a private stage
 and commits it with a no-replace rename. The builder receives a `Draft`, writes into `draft.path`,
 validates, and returns; using the draft afterwards raises `RuntimeError`.
 
@@ -300,6 +300,9 @@ with parent as workspace:
     workspace.publish(lambda draft: draft.link_tree(workspace.path / "method-a", "method-a"))
 ```
 
+Entering a finished child raises `DestinationExists` for that child only: the parent has not
+necessarily published, so do not read it as "the whole result exists".
+
 **Modes.** Stages stay owner-only (0700) until commit. Just before commit, `publish` sets every
 directory in the tree to `mode` (default `0o777 & ~umask`) and leaves file modes as written;
 `publish_file` sets the file to `mode` (default `0o666 & ~umask`), overriding the writer's choice.
@@ -307,15 +310,15 @@ directory in the tree to `mode` (default `0o777 & ~umask`) and leaves file modes
 **Hard links alias.** `Draft.link` and `link_tree` publish the *same inode* as their source, so
 rewrite sources only by replacement (a new file and `os.replace`), never in place.
 
-`retire=` removes one owner-only sibling directory after the destination is durably committed.
 Unprovable cleanup never fails a publication: it sets `cleanup_pending` and warns. Where a
 directory cannot be `flock`ed (NFS), Servatus locks an owner-only `.servatus.lock` file in it
 instead and leaves it there; another user's lock file is refused. Linux without `renameat2` uses a
 documented fallback ([SECURITY.md](https://github.com/edoski/servatus/blob/main/SECURITY.md)).
 
-**Errors.** An existing destination raises `DestinationExists`. Bad input or an unusable location
-raises `ConfigurationError`: an unsafe draft path; a missing, unwritable, or overlong path; a
-missing link or `retire` source; a non-sibling `retire`; a writer that creates nothing; a
+**Errors.** Only an existing destination raises `DestinationExists`. Bad input or an unusable
+location raises `ConfigurationError`: an unsafe draft path; a link onto an occupied draft path; a
+missing, unwritable, or overlong path; a missing link source; paths on different filesystems; a platform or
+filesystem without an atomic no-replace rename or a working lock; a writer that creates nothing; a
 `link_tree` source containing the draft; a file its owner cannot read; a bad `mode`. No space,
 quota, I/O errors, or too many open files raise `Unavailable`; `UnsafeFilesystem` means an entry
 was substituted or has the wrong type or owner. No raw `OSError` escapes, but exceptions from your

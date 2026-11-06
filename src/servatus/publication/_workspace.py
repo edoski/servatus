@@ -19,7 +19,7 @@ import hashlib
 import os
 from collections.abc import Callable
 from contextlib import ExitStack, suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 
 from .. import _fs
@@ -31,15 +31,7 @@ from ..errors import (
     UnsafeFilesystem,
     WorkspaceConflict,
 )
-from ._transaction import (
-    Draft,
-    Publication,
-    checked_mode,
-    draft_builder,
-    result,
-    transact,
-    warn_pending,
-)
+from ._transaction import Draft, Publication, draft_builder, result, transact, warn_pending
 
 _HEADER = b"servatus-workspace-v2\n"
 _MAX_RECORD = len(_HEADER) + 65 + 3 * 21
@@ -95,16 +87,17 @@ class _Level:
         ):
             _fs.require_owner_only(os.fstat(pin.fd), f"workspace entry {name}")
             directory.expect(name, pin.entry)
-        if identity and _pins(self.container, location) != self.record:
+        if identity and _check_identity(self.container, location) != self.record:
             raise UnsafeFilesystem(f"workspace lifecycle entries changed: {location.path}")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _Session:
     stack: ExitStack
     directories: tuple[Pin, ...]
     """The directory holding each level: the destination parent, then (for a child) root work."""
     levels: tuple[_Level, ...]
+    finished: str | None = None
 
     @property
     def directory(self) -> Pin:
@@ -128,30 +121,26 @@ class Workspace:
     leftover private work, then raises `DestinationExists`.
     """
 
-    __slots__ = ("_finished", "_location", "_session")
+    __slots__ = ("_location", "_session")
+
+    _location: _Location
+    _session: _Session | None
 
     def __init__(self, destination: StrPath, *, identity: bytes) -> None:
         digest = _digest(identity)
         parent, name = _fs.split(destination)
-        self._bind(_Location(parent, name, digest))
-
-    @classmethod
-    def _at(cls, location: _Location) -> Workspace:
-        workspace = cls.__new__(cls)
-        workspace._bind(location)
-        return workspace
-
-    def _bind(self, location: _Location) -> None:
-        self._location = location
-        self._session: _Session | None = None
-        self._finished: str | None = None
+        self._location = _Location(parent, name, digest)
+        self._session = None
 
     def child(self, name: str, *, identity: bytes) -> Workspace:
         """A child Workspace publishing `<self.path>/<name>`; siblings may run concurrently."""
         location = self._location
         if location.root is not None:
             raise ConfigurationError("child workspaces cannot contain child workspaces")
-        return Workspace._at(_Location(location.path, _fs.leaf(name), _digest(identity), location))
+        child = Workspace.__new__(Workspace)
+        child._location = _Location(location.path, _fs.leaf(name), _digest(identity), location)
+        child._session = None
+        return child
 
     @property
     def path(self) -> Path:
@@ -181,8 +170,8 @@ class Workspace:
             session.verify(chain)
             for directory, location in zip(session.directories, chain, strict=True):
                 directory.absent(location.name, location.destination)
-            self._session = replace(session, stack=stack.pop_all())
-        self._finished = None
+            session.stack = stack.pop_all()
+            self._session = session
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -197,13 +186,15 @@ class Workspace:
         follow `publish`. Failure to remove the work after commit sets `cleanup_pending`.
         """
         session = self._active()
-        checked = checked_mode(mode)
+        checked = _fs.check_mode(mode)
         location, directory = self._location, session.directory
         with _fs.Boundary(location.destination) as boundary:
             session.verify(location.chain)
             builder = draft_builder(boundary.passthrough(build))
-            clean = transact(location.parent, directory, location.name, builder, mode=checked)
-            self._finished = "published"
+            clean = transact(
+                location.parent, directory, location.name, builder, file=False, mode=checked
+            )
+            session.finished = "published"
             removed = _fs.succeeded(session.verify, location.chain) and _fs.succeeded(
                 _remove_level, session, location
             )
@@ -220,15 +211,15 @@ class Workspace:
         session = self._active()
         with _fs.Boundary(self._location.path):
             session.verify(self._location.chain)
-            self._finished = "discarded"
+            session.finished = "discarded"
             _remove_level(session, self._location)
             _fs.sync(session.directory.fd)
 
     def _active(self) -> _Session:
         if self._session is None:
             raise RuntimeError("workspace must be entered first")
-        if self._finished is not None:
-            raise RuntimeError(f"workspace was already {self._finished}")
+        if self._session.finished is not None:
+            raise RuntimeError(f"workspace was already {self._session.finished}")
         return self._session
 
 
@@ -248,21 +239,18 @@ def _remove_container(directory: Pin, location: _Location, container: Pin) -> No
 
 
 def _open_lock(container: Pin, location: _Location, *, exclusive: bool) -> Pin:
+    operation = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
     try:
-        return _fs.lock_file(container, ".lock", _lease_mode(exclusive), "workspace lock .lock")
+        return _fs.lock_file(container, ".lock", operation, "workspace lock .lock")
     except BlockingIOError as error:
         raise Busy(f"workspace is already in use: {location.destination}") from error
 
 
 def _upgrade(lock: Pin, location: _Location) -> None:
     try:
-        fcntl.flock(lock.fd, _lease_mode(True))
+        fcntl.flock(lock.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as error:
         raise Busy(f"workspace is already in use: {location.destination}") from error
-
-
-def _lease_mode(exclusive: bool) -> int:
-    return (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
 
 
 def _open_level(stack: ExitStack, parent: Pin, location: _Location, *, exclusive: bool) -> _Level:
@@ -285,6 +273,7 @@ def _open_level(stack: ExitStack, parent: Pin, location: _Location, *, exclusive
     level = _Level(container, lock, work)
     level.verify(parent, location, identity=False)
     if container.lstat(".identity") is None:
+        # A sibling child can install the root identity and fill root work between these checks.
         if os.listdir(work.fd) and container.lstat(".identity") is None:
             raise WorkspaceConflict(
                 f"private work at {location.path} has no workspace identity; inspect it and "
@@ -315,7 +304,7 @@ def _claim(
                 return container, lock
             if not exclusive:
                 _upgrade(lock, location)
-            _pins(container, location)
+            _check_identity(container, location)
             _remove_container(parent, location, container)
     raise UnsafeFilesystem(f"workspace container keeps reappearing: {location.path}")
 
@@ -354,7 +343,7 @@ def _remove_leftover(
                     if os.listdir(pinned.fd):
                         raise WorkspaceConflict("the private work has no workspace identity")
         elif work is None:
-            _pins(container, location)
+            _check_identity(container, location)
         else:
             with container.open("work", expected=work) as pinned:
                 _Level(container, lock, pinned).verify(parent, location)
@@ -387,8 +376,8 @@ def _install_identity(level: _Level, location: _Location) -> None:
         )
 
 
-def _pins(container: Pin, location: _Location) -> bytes:
-    """Return the inode pins recorded in `.identity` after proving it names this identity."""
+def _check_identity(container: Pin, location: _Location) -> bytes:
+    """Prove `.identity` names this identity and return the inode pins it records."""
     try:
         record = container.open(".identity", directory=False)
     except (UnsafeFilesystem, ConfigurationError) as error:

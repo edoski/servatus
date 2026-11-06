@@ -106,10 +106,13 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
 ## Publication
 
 - **Destination:** the application-owned canonical path. It is immutable once published.
+  `DestinationExists` means a destination exists and nothing else; a child's destination lies
+  inside its parent's private work.
 - **Stage:** one private owner-only directory beside the destination where a result is assembled
   before its no-replace commit.
 - **Draft (`Draft`):** the builder's handle on a directory stage. `link` and `link_tree` hard-link
-  regular files into it. Using it after the builder returns raises `RuntimeError`.
+  regular files into it; a link onto an occupied draft path is `ConfigurationError`. Using it after
+  the builder returns raises `RuntimeError`.
 - **File member:** the single entry named after the destination inside a `publish_file` stage. The
   writer may create it any way it likes; after the writer returns it must be a single-link regular
   file, and Servatus pins, chmods, syncs, and commits it.
@@ -132,8 +135,6 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
 - **Directory lock:** an exclusive `flock` coordinating entries of one directory (Workspace
   parents, the directory-commit fallback). Where a directory handle cannot be locked (NFS), an
   owner-only `.servatus.lock` file in the directory is locked instead and never removed.
-- **Retained tree:** one existing owner-only destination sibling removed only after the destination
-  commit is durable.
 - **Builder / writer:** the application callbacks that write and validate a draft or file member,
   then stop mutating it before returning.
 

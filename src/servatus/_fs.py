@@ -1,9 +1,10 @@
 """Pinned-descriptor POSIX primitives shared by publication and the campaign store.
 
-Nothing here knows about publication policy. Every descriptor is wrapped in a `Pin` the moment it
-is opened: the pin is verified (device, inode, type) or the descriptor is closed before the error
-propagates, so no failure path leaks a descriptor. Names are always resolved relative to a pinned
-directory and never followed.
+Policy stays with the callers, except that the no-replace helpers report an occupied destination
+as `DestinationExists`. Every descriptor is wrapped in a `Pin` the moment it is opened: the pin is
+verified (device, inode, type) or the descriptor is closed before the error propagates, so no
+failure path leaks a descriptor. Names are always resolved relative to a pinned directory and never
+followed.
 
 Public operations run inside a `Boundary`, the one place where an `OSError` becomes the public
 error a caller can act on (`os_error`); `UnsafeFilesystem` is reserved for the explicit
@@ -28,12 +29,10 @@ from typing import Any, ParamSpec, TypeAlias, TypeVar
 
 from .errors import (
     ConfigurationError,
-    CrossDeviceError,
     DestinationExists,
     ServatusError,
     Unavailable,
     UnsafeFilesystem,
-    UnsupportedPlatform,
 )
 
 P = ParamSpec("P")
@@ -42,7 +41,7 @@ StrPath: TypeAlias = "str | os.PathLike[str]"
 NoReplace: TypeAlias = Callable[[int, bytes, int, bytes], int]
 """A native no-replace rename returning 0 or an errno value."""
 
-LOCK_NAME = ".servatus.lock"
+_LOCK_NAME = ".servatus.lock"
 """The owner-only lock file used where a directory handle cannot be `flock`ed (NFS)."""
 
 _DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
@@ -80,10 +79,9 @@ def os_error(
 ) -> ServatusError:
     """Map one filesystem `OSError` about `subject` to the public error a caller can act on.
 
-    A missing entry is `missing`; denied access, read-only filesystems, overlong names, and paths
-    of the wrong kind are a bad location (`ConfigurationError`); a cross-device operation is
-    `CrossDeviceError`; everything else (no space, quota, I/O errors, descriptor exhaustion) is
-    transient: `Unavailable`, retry later.
+    A missing entry is `missing`; denied access, read-only filesystems, overlong names, paths of
+    the wrong kind, and cross-device operations are `ConfigurationError`; everything else (no space,
+    quota, I/O errors, descriptor exhaustion) is transient: `Unavailable`, retry later.
     """
     code = error.errno
     if code == errno.ENOENT:
@@ -91,7 +89,7 @@ def os_error(
     if code in _BAD_LOCATION:
         return ConfigurationError(f"{subject} is not a usable location: {error}")
     if code == errno.EXDEV:
-        return CrossDeviceError(f"{subject} crosses a filesystem boundary: {error}")
+        return ConfigurationError(f"{subject} crosses a filesystem boundary: {error}")
     return Unavailable(f"filesystem operation on {subject} failed; retry later: {error}")
 
 
@@ -146,7 +144,7 @@ def succeeded(function: Callable[P, object], *args: P.args, **kwargs: P.kwargs) 
 # -- validation ------------------------------------------------------------------------------
 def require_supported_platform() -> None:
     if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
-        raise UnsupportedPlatform(f"publication requires Linux or macOS, not {sys.platform}")
+        raise ConfigurationError(f"publication requires Linux or macOS, not {sys.platform}")
 
 
 def fspath(path: StrPath) -> str:
@@ -166,7 +164,9 @@ def leaf(name: str) -> str:
     return name
 
 
-def check_mode(mode: int) -> int:
+def check_mode(mode: int | None) -> int | None:
+    if mode is None:
+        return None
     if isinstance(mode, bool) or not isinstance(mode, int) or not 0 <= mode <= 0o777:
         raise ConfigurationError(f"mode must be a permission set from 0 to 0o777: {mode!r}")
     return mode
@@ -293,7 +293,7 @@ class Pin:
                 raise ConfigurationError(f"{kind} is not readable by its owner: {name}") from error
             raise
         device = self.entry.st_dev if same_device else None
-        return adopt(fd, name, device=device, expected=expected, regular=not directory)
+        return _adopt(fd, name, device=device, expected=expected, regular=not directory)
 
     def mkdir(self, name: str, *, exist_ok: bool = False) -> Pin:
         """Create (or with `exist_ok`, reuse) an owner-only directory and pin it."""
@@ -323,7 +323,7 @@ class Pin:
         raise UnsafeFilesystem(f"could not allocate a unique private directory: {prefix}*")
 
 
-def adopt(
+def _adopt(
     fd: int,
     name: object,
     *,
@@ -335,7 +335,7 @@ def adopt(
     try:
         entry = os.fstat(fd)
         if device is not None and entry.st_dev != device:
-            raise CrossDeviceError(f"entry crosses a filesystem boundary: {name}")
+            raise ConfigurationError(f"entry crosses a filesystem boundary: {name}")
         if expected is not None and not same(entry, expected):
             raise UnsafeFilesystem(f"entry was substituted before it was opened: {name}")
         if regular and not stat.S_ISREG(entry.st_mode):
@@ -355,7 +355,7 @@ def open_path(path: StrPath) -> Pin:
         if error.errno in {errno.ELOOP, errno.ENOTDIR}:
             raise UnsafeFilesystem(f"not a safe directory: {text}") from error
         raise
-    return adopt(fd, text)
+    return _adopt(fd, text)
 
 
 def read(file: Pin) -> bytes:
@@ -387,7 +387,7 @@ def lock_file(directory: Pin, name: str, operation: int, what: str) -> Pin:
         if error.errno in _NOT_PLAIN:
             raise UnsafeFilesystem(f"{what} is not a plain file") from error
         raise
-    lock = adopt(fd, name, device=directory.entry.st_dev, regular=True)
+    lock = _adopt(fd, name, device=directory.entry.st_dev, regular=True)
     try:
         require_owner_only(lock.entry, what)
         fcntl.flock(lock.fd, operation)
@@ -408,10 +408,10 @@ def locked(directory: Pin) -> Generator[None]:
     Where the filesystem refuses `flock` on such a handle (NFS: EBADF, ENOLCK, EOPNOTSUPP,
     EINVAL), the owner-only hidden file `.servatus.lock` in the directory is created and locked
     instead. It is never removed: unlinking a lock file would split its holders. Actors on one
-    filesystem therefore always take the same path. `UnsupportedPlatform` if neither works.
+    filesystem therefore always take the same path. `ConfigurationError` if neither works.
     """
     fd = os.open(".", _DIRECTORY, dir_fd=directory.fd)
-    with adopt(fd, ".", expected=directory.entry) as handle:
+    with _adopt(fd, ".", expected=directory.entry) as handle:
         try:
             fcntl.flock(handle.fd, fcntl.LOCK_EX)
         except OSError as error:
@@ -421,11 +421,11 @@ def locked(directory: Pin) -> Generator[None]:
             yield
             return
     try:
-        lock = lock_file(directory, LOCK_NAME, fcntl.LOCK_EX, f"directory lock {LOCK_NAME}")
+        lock = lock_file(directory, _LOCK_NAME, fcntl.LOCK_EX, f"directory lock {_LOCK_NAME}")
     except OSError as error:
         if error.errno not in _NO_DIRECTORY_LOCK:
             raise
-        raise UnsupportedPlatform("directory lock is unavailable on this filesystem") from error
+        raise ConfigurationError("directory lock is unavailable on this filesystem") from error
     with lock:
         yield
 
@@ -443,7 +443,7 @@ def walk(directory: Pin, visit: Visit, *, strict: bool = True, order: Order | No
     for name in sorted(os.listdir(directory.fd), key=order):
         entry = directory.present(name)
         if entry.st_dev != directory.entry.st_dev:
-            raise CrossDeviceError(f"entry crosses a filesystem boundary: {name}")
+            raise ConfigurationError(f"entry crosses a filesystem boundary: {name}")
         if strict and not (stat.S_ISDIR(entry.st_mode) or stat.S_ISREG(entry.st_mode)):
             raise UnsafeFilesystem(f"tree contains a symlink or special file: {name}")
         visit(directory, name, entry)
@@ -533,13 +533,12 @@ def write_new(dir_fd: int, name: str, data: bytes, *, mode: int = 0o600) -> os.s
     The directory is not synced; the caller decides how the file is installed. On any failure,
     including a failing close, the new file is removed (unsynced) and the error propagates.
     """
-    checked = check_mode(mode)
-    fd = os.open(leaf(name), _NEW, checked, dir_fd=dir_fd)
+    fd = os.open(name, _NEW, mode, dir_fd=dir_fd)
     created: os.stat_result | None = None
     try:
         try:
             created = os.fstat(fd)
-            os.fchmod(fd, checked)
+            os.fchmod(fd, mode)
             view = memoryview(data)
             while view:
                 written = os.write(fd, view)
@@ -562,7 +561,6 @@ def replace_file(dir_fd: int, name: str, data: bytes, *, mode: int = 0o600) -> N
     see the old or the new file, never a mixture. If the final directory sync fails the new file
     may already be visible; the error still propagates.
     """
-    leaf(name)
     stage = f".servatus-replace-{os.urandom(12).hex()}"
     created = write_new(dir_fd, stage, data, mode=mode)
     try:
@@ -604,14 +602,14 @@ def commit(source: Pin, name: str, target: Pin, destination: str, expected: os.s
         if code == 0:
             return
     if not (sys.platform.startswith("linux") and code in _UNSUPPORTED):
-        raise rename_error(code)
+        raise _rename_error(code)
     if stat.S_ISREG(current.st_mode):
         try:
             os.link(
                 name, destination, src_dir_fd=source.fd, dst_dir_fd=target.fd, follow_symlinks=False
             )
         except OSError as error:
-            raise rename_error(error.errno) from error
+            raise _rename_error(error.errno) from error
         if not same(target.present(destination), expected):
             raise UnsafeFilesystem(f"published file is not the verified source: {destination}")
     elif stat.S_ISDIR(current.st_mode):
@@ -643,6 +641,7 @@ def native_noreplace() -> NoReplace | None:
     function: Any = getattr(library, "renameatx_np" if darwin else "renameat2", None)
     if darwin or function is not None:
         return _bind(function, (), _RENAME_EXCL if darwin else _RENAME_NOREPLACE)
+    # Only a real Linux kernel knows these numbers; tests fake sys.platform on macOS.
     number = _SYS_RENAMEAT2.get(platform.machine()) if os.uname().sysname == "Linux" else None
     syscall: Any = getattr(library, "syscall", None)
     if number is None or syscall is None:
@@ -671,10 +670,10 @@ def _bind(function: Any, prefix: tuple[int, ...], flag: int) -> NoReplace | None
     return call
 
 
-def rename_error(code: int | None) -> Exception:
+def _rename_error(code: int | None) -> Exception:
     if code in {errno.EEXIST, errno.ENOTEMPTY}:
         return DestinationExists("publication destination already exists")
     if code in _UNSUPPORTED:
-        return UnsupportedPlatform("filesystem does not support an atomic no-replace rename")
+        return ConfigurationError("filesystem does not support an atomic no-replace rename")
     code = code or errno.EIO
     return os_error(OSError(code, os.strerror(code)), "publication commit")

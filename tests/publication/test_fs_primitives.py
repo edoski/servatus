@@ -2,17 +2,15 @@ from __future__ import annotations
 
 import os
 import stat
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
+from support.posix import Syscalls, mode_of
 
 from servatus import _fs
-from servatus.errors import ConfigurationError, CrossDeviceError, UnsafeFilesystem
-
-
-def mode_of(path: Path) -> int:
-    return stat.S_IMODE(path.stat(follow_symlinks=False).st_mode)
+from servatus.errors import ConfigurationError, UnsafeFilesystem
 
 
 def test_write_new_creates_exact_mode_and_refuses_existing(tmp_path: Path) -> None:
@@ -70,26 +68,6 @@ def test_replace_file_onto_a_directory_fails_without_residue(tmp_path: Path) -> 
         _fs.replace_file(directory.fd, "state", b"new")
 
     assert sorted(path.name for path in tmp_path.iterdir()) == ["state"]
-
-
-@pytest.mark.parametrize("name", ["", ".", "..", "a/b", "nul\0"])
-def test_writers_reject_unsafe_names(tmp_path: Path, name: str) -> None:
-    with _fs.open_path(tmp_path) as directory:
-        with pytest.raises(ConfigurationError, match="unsafe filesystem leaf"):
-            _fs.write_new(directory.fd, name, b"")
-        with pytest.raises(ConfigurationError, match="unsafe filesystem leaf"):
-            _fs.replace_file(directory.fd, name, b"")
-
-    assert list(tmp_path.iterdir()) == []
-
-
-@pytest.mark.parametrize("mode", [-1, 0o1000, True])
-def test_writers_reject_invalid_modes(tmp_path: Path, mode: int) -> None:
-    with (
-        _fs.open_path(tmp_path) as directory,
-        pytest.raises(ConfigurationError, match="mode must be"),
-    ):
-        _fs.write_new(directory.fd, "state", b"", mode=mode)
 
 
 def test_pin_closes_once_and_rejects_use_after_close(tmp_path: Path) -> None:
@@ -151,60 +129,53 @@ def other_device(entry: os.stat_result) -> os.stat_result:
     return os.stat_result(fields)
 
 
-def test_open_rejects_a_child_on_another_device(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_open_rejects_a_child_on_another_device(tmp_path: Path, syscalls: Syscalls) -> None:
     (tmp_path / "mounted").mkdir()
     mounted = (tmp_path / "mounted").stat().st_ino
-    real = os.fstat
 
-    def fstat(fd: int) -> os.stat_result:
+    def fstat(real: Callable[[int], os.stat_result], fd: int) -> os.stat_result:
         entry = real(fd)
         return other_device(entry) if entry.st_ino == mounted else entry
 
-    monkeypatch.setattr(os, "fstat", fstat)
+    syscalls.os("fstat", fstat)
     with _fs.open_path(tmp_path) as directory:
         before = len(os.listdir("/dev/fd"))
-        with pytest.raises(CrossDeviceError, match="filesystem boundary: mounted"):
+        with pytest.raises(ConfigurationError, match="filesystem boundary: mounted"):
             directory.open("mounted")
         assert len(os.listdir("/dev/fd")) == before
 
 
-def test_walk_rejects_an_entry_on_another_device(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_walk_rejects_an_entry_on_another_device(tmp_path: Path, syscalls: Syscalls) -> None:
     (tmp_path / "mounted").mkdir()
-    real = os.stat
 
-    def stat_(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+    def stat_(real: Callable[..., os.stat_result], path: Any, *args: Any, **kwargs: Any) -> Any:
         entry = real(path, *args, **kwargs)
         return other_device(entry) if path == "mounted" else entry
 
-    monkeypatch.setattr(os, "stat", stat_)
+    syscalls.os("stat", stat_)
     visited: list[str] = []
     with (
         _fs.open_path(tmp_path) as directory,
-        pytest.raises(CrossDeviceError, match="filesystem boundary: mounted"),
+        pytest.raises(ConfigurationError, match="filesystem boundary: mounted"),
     ):
         _fs.walk(directory, lambda parent, name, entry: visited.append(name))
     assert visited == []
 
 
 def test_replace_file_never_installs_or_deletes_a_substituted_stage(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, syscalls: Syscalls
 ) -> None:
     (tmp_path / "state").write_bytes(b"original")
-    real = os.stat
     impostors: list[str] = []
 
-    def stat_(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+    def stat_(real: Callable[..., os.stat_result], path: Any, *args: Any, **kwargs: Any) -> Any:
         if isinstance(path, str) and path.startswith(".servatus-replace-") and not impostors:
             os.rename(tmp_path / path, tmp_path / "moved")
             (tmp_path / path).write_bytes(b"impostor")
             impostors.append(path)
         return real(path, *args, **kwargs)
 
-    monkeypatch.setattr(os, "stat", stat_)
+    syscalls.os("stat", stat_)
     with (
         _fs.open_path(tmp_path) as directory,
         pytest.raises(UnsafeFilesystem, match="replacement stage was substituted"),

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from support.posix import Syscalls, key
 
 from servatus import _fs
 from servatus.errors import Unavailable, UnsafeFilesystem
@@ -18,15 +19,13 @@ from servatus.publication import Draft, Workspace, publish, publish_file
 Sync = Callable[[int], None]
 
 
-def key(entry: os.stat_result) -> tuple[int, int]:
-    return entry.st_dev, entry.st_ino
-
-
 def kind(fd: int) -> str:
     return "directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
 
 
-def test_directory_syncs_files_then_directories_then_parent(tmp_path: Path, syscalls: Any) -> None:
+def test_directory_syncs_files_then_directories_then_parent(
+    tmp_path: Path, syscalls: Syscalls
+) -> None:
     events: list[tuple[str, tuple[int, int]]] = []
 
     def record(real: Sync, fd: int) -> None:
@@ -50,7 +49,7 @@ def test_directory_syncs_files_then_directories_then_parent(tmp_path: Path, sysc
     ]
 
 
-def test_file_syncs_content_then_parent(tmp_path: Path, syscalls: Any) -> None:
+def test_file_syncs_content_then_parent(tmp_path: Path, syscalls: Syscalls) -> None:
     events: list[str] = []
 
     def record(real: Sync, fd: int) -> None:
@@ -86,7 +85,7 @@ def test_macos_durability_uses_full_fsync(tmp_path: Path, monkeypatch: pytest.Mo
 
 @pytest.mark.parametrize("platform", ["native", "fallback"])
 def test_post_commit_parent_sync_failure_propagates_without_stage_residue(
-    tmp_path: Path, syscalls: Any, request: pytest.FixtureRequest, platform: str
+    tmp_path: Path, syscalls: Syscalls, request: pytest.FixtureRequest, platform: str
 ) -> None:
     if platform == "fallback":
         request.getfixturevalue("linux_fallback")
@@ -110,7 +109,9 @@ def test_post_commit_parent_sync_failure_propagates_without_stage_residue(
 
 
 @pytest.mark.usefixtures("linux_fallback")
-def test_directory_fallback_syncs_parent_once_after_rename(tmp_path: Path, syscalls: Any) -> None:
+def test_directory_fallback_syncs_parent_once_after_rename(
+    tmp_path: Path, syscalls: Syscalls
+) -> None:
     destination = tmp_path / "result"
     parent = key(tmp_path.stat())
     after_rename: list[int] = []
@@ -129,7 +130,7 @@ def test_directory_fallback_syncs_parent_once_after_rename(tmp_path: Path, sysca
 
 
 def test_write_new_and_replace_file_sync_content_before_the_directory(
-    tmp_path: Path, syscalls: Any
+    tmp_path: Path, syscalls: Syscalls
 ) -> None:
     events: list[str] = []
 
@@ -146,7 +147,9 @@ def test_write_new_and_replace_file_sync_content_before_the_directory(
     assert events == ["file", "file", "directory"]
 
 
-def test_replace_file_failure_before_rename_keeps_original(tmp_path: Path, syscalls: Any) -> None:
+def test_replace_file_failure_before_rename_keeps_original(
+    tmp_path: Path, syscalls: Syscalls
+) -> None:
     (tmp_path / "state").write_bytes(b"original")
 
     def fail(real: Sync, fd: int) -> None:
@@ -162,7 +165,7 @@ def test_replace_file_failure_before_rename_keeps_original(tmp_path: Path, sysca
 
 # -- workspace initialization ----------------------------------------------------------------
 def test_workspace_syncs_private_hierarchy_before_identity_exists(
-    tmp_path: Path, syscalls: Any
+    tmp_path: Path, syscalls: Syscalls
 ) -> None:
     events: list[tuple[tuple[int, int], bool]] = []
 
@@ -188,7 +191,7 @@ def test_workspace_syncs_private_hierarchy_before_identity_exists(
 
 @pytest.mark.parametrize("child", [False, True])
 def test_workspace_initialization_syncs_parent_without_coordination(
-    tmp_path: Path, syscalls: Any, child: bool
+    tmp_path: Path, syscalls: Syscalls, child: bool
 ) -> None:
     root = Workspace(tmp_path / "result", identity=b"request")
     if child:
@@ -215,7 +218,7 @@ def test_workspace_initialization_syncs_parent_without_coordination(
 
 @pytest.mark.parametrize("child", [False, True])
 def test_parent_sync_failure_prevents_identity_and_allows_resume(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, syscalls: Any, child: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, syscalls: Syscalls, child: bool
 ) -> None:
     root = Workspace(tmp_path / "result", identity=b"request")
     if child:
@@ -241,9 +244,11 @@ def test_parent_sync_failure_prevents_identity_and_allows_resume(
     assert (workspace.path.parent / ".identity").is_file()
 
 
-def test_workspace_reopen_does_not_sync_unchanged_container(tmp_path: Path, syscalls: Any) -> None:
-    with Workspace(tmp_path / "result", identity=b"request") as workspace:
-        container = key(workspace.path.parent.stat())
+def test_workspace_reopen_does_not_sync_unchanged_container(
+    tmp_path: Path, syscalls: Syscalls
+) -> None:
+    with Workspace(tmp_path / "result", identity=b"request"):
+        pass
     synced: list[tuple[int, int]] = []
 
     def record(real: Sync, fd: int) -> None:
@@ -255,11 +260,10 @@ def test_workspace_reopen_does_not_sync_unchanged_container(tmp_path: Path, sysc
         pass
 
     assert synced == []
-    assert container not in synced
 
 
 def test_identity_initialization_failure_allows_same_identity_resume(
-    tmp_path: Path, syscalls: Any
+    tmp_path: Path, syscalls: Syscalls
 ) -> None:
     failed: list[bool] = []
 
@@ -283,7 +287,9 @@ def test_identity_initialization_failure_allows_same_identity_resume(
     assert list(container.glob(".identity-*.tmp")) == []
 
 
-def test_identity_commit_sync_failure_removes_identity_stage(tmp_path: Path, syscalls: Any) -> None:
+def test_identity_commit_sync_failure_removes_identity_stage(
+    tmp_path: Path, syscalls: Syscalls
+) -> None:
     def fail_after_identity(real: Sync, fd: int) -> None:
         if stat.S_ISDIR(os.fstat(fd).st_mode) and ".identity" in os.listdir(fd):
             raise OSError("injected identity commit sync failure")
@@ -302,7 +308,7 @@ def test_identity_commit_sync_failure_removes_identity_stage(tmp_path: Path, sys
 
 # -- substitution after pinning and error mapping ----------------------------------------------
 def test_member_swapped_after_it_was_pinned_is_never_published(
-    tmp_path: Path, syscalls: Any
+    tmp_path: Path, syscalls: Syscalls
 ) -> None:
     written: list[Path] = []
 
@@ -326,7 +332,9 @@ def test_member_swapped_after_it_was_pinned_is_never_published(
 
 
 @pytest.mark.parametrize("code", [errno.ENOSPC, errno.EIO, errno.EDQUOT])
-def test_transient_write_failures_are_unavailable(tmp_path: Path, syscalls: Any, code: int) -> None:
+def test_transient_write_failures_are_unavailable(
+    tmp_path: Path, syscalls: Syscalls, code: int
+) -> None:
     def write(real: Callable[..., int], fd: int, data: Any) -> int:
         raise OSError(code, os.strerror(code))
 
@@ -342,7 +350,7 @@ def test_transient_write_failures_are_unavailable(tmp_path: Path, syscalls: Any,
     assert raised.value.__cause__.errno == code
 
 
-def test_descriptor_exhaustion_is_unavailable(tmp_path: Path, syscalls: Any) -> None:
+def test_descriptor_exhaustion_is_unavailable(tmp_path: Path, syscalls: Syscalls) -> None:
     def open_(real: Callable[..., int], path: Any, *args: Any, **kwargs: Any) -> int:
         if str(path).startswith(".servatus-stage-"):
             raise OSError(errno.EMFILE, os.strerror(errno.EMFILE))

@@ -52,6 +52,9 @@ Servatus no longer needs Slurm accounting. See
 - The `apptainer` path cannot contain `=`.
 - `Scheduler` takes its `Target`, and the module-private checks of values only internal code produces
   are gone. `args` and `env` errors from a Task file now come from `Task`.
+- `publish` no longer takes `retire=`. No known consumer used it; a `Workspace` covers private work
+  beside the destination, with identity binding and residue reclaim.
+- `CrossDeviceError` and `UnsupportedPlatform` are gone. Those failures raise `ConfigurationError`.
 
 ### Added
 
@@ -66,6 +69,11 @@ Servatus no longer needs Slurm accounting. See
 - `scripts/cluster_e2e.py`, a live end-to-end check against a real cluster, never run by CI. It can
   also run a one-GPU Task and an Apptainer Task.
 
+### Changed
+
+- A hard-link failure that is not a substitution uses the general filesystem wording (for example
+  `crosses a filesystem boundary`).
+
 ### Fixed
 
 - A status poll over SSH could fail at the 30 s deadline when one TCP connection never opened, which
@@ -73,6 +81,9 @@ Servatus no longer needs Slurm accounting. See
   connection three attempts of 8 s. Only the connection is retried, never a command, and a stalled
   banner exchange still fails, after 8 s. The deadline error names the command, and `ssh`'s own
   failure (exit 255) reports its message.
+- A draft-path collision in `Draft.link` or `Draft.link_tree` raises `ConfigurationError` instead of
+  `DestinationExists`. A worker that reads `DestinationExists` as "already published" could exit 0
+  with nothing published when its builder linked two files to one path.
 
 ## [0.12.1] - 2026-10-05
 

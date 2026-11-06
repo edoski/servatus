@@ -19,7 +19,7 @@ from pathlib import Path, PurePosixPath
 
 from .. import _fs
 from .._fs import Pin, StrPath
-from ..errors import ConfigurationError, CrossDeviceError, DestinationExists, UnsafeFilesystem
+from ..errors import ConfigurationError, UnsafeFilesystem
 
 STAGE_PREFIX = ".servatus-stage-"
 
@@ -29,8 +29,8 @@ class Publication:
     """A committed destination.
 
     `cleanup_pending` is true when the destination is committed and durable but some private
-    residue (stage, Workspace tree, or retired sibling) could not be removed or its removal could
-    not be synced. It never means the publication failed.
+    residue (stage or Workspace tree) could not be removed or its removal could not be synced. It
+    never means the publication failed.
     """
 
     destination: Path
@@ -184,55 +184,36 @@ def _components(destination: str | os.PathLike[str], *, allow_root: bool) -> tup
 
 
 def _link_error(error: OSError, source: object, destination: object) -> Exception:
-    if error.errno == errno.EEXIST:
-        return DestinationExists(f"draft path already exists: {destination}")
-    if error.errno == errno.ENOENT:
-        return ConfigurationError(f"hard-link source does not exist: {source}")
-    if error.errno == errno.EACCES:
-        return ConfigurationError(f"hard-link source is not accessible: {source}")
     if error.errno in {errno.EPERM, errno.ELOOP, errno.EISDIR}:
         return UnsafeFilesystem(f"unsafe hard-link source: {source}")
-    if error.errno == errno.EXDEV:
-        return CrossDeviceError(f"hard-link source is on another filesystem: {source}")
-    return _fs.os_error(error, f"hard link of {source}")
+    return _fs.os_error(error, f"hard link of {source} to draft path {destination}")
 
 
 # -- transaction -----------------------------------------------------------------------------
-Build = Callable[[Path, Pin], "str | None"]
-"""Fill the stage; return the member name to publish, or None to publish the stage itself."""
-
-
-@dataclass(frozen=True, slots=True)
-class Retired:
-    name: str
-    pin: Pin
-
-
 def transact(
     parent: Path,
     directory: Pin,
     name: str,
-    build: Build,
+    build: Callable[[Path, Pin], object],
     *,
+    file: bool,
     mode: int | None,
-    retire: Retired | None = None,
 ) -> bool:
-    """Run one publication; return True when every private cleanup step was proven."""
-    directory.verify_path(parent)
+    """Commit the filled stage, or with `file` its member `name`; True when cleanup was proven."""
     directory.absent(name, parent / name)
     stage_name, stage = directory.unique(STAGE_PREFIX)
     with stage, ExitStack() as pins:
         try:
             umask = _fs.probe_umask(stage) if mode is None else 0
-            member = build(parent / stage_name, stage)
-            if member is None:
-                _fs.sync_tree(stage, 0o777 & ~umask if mode is None else mode)
-                source, source_name, entry = directory, stage_name, stage.entry
-            else:
-                payload = pins.enter_context(_payload(stage, member, name))
+            build(parent / stage_name, stage)
+            if file:
+                payload = pins.enter_context(_payload(stage, name))
                 os.fchmod(payload.fd, 0o666 & ~umask if mode is None else mode)
                 _fs.sync(payload.fd)
-                source, source_name, entry = stage, member, payload.entry
+                source, source_name, entry = stage, name, payload.entry
+            else:
+                _fs.sync_tree(stage, 0o777 & ~umask if mode is None else mode)
+                source, source_name, entry = directory, stage_name, stage.entry
             directory.expect(stage_name, stage.entry)
             directory.verify_path(parent)
             _fs.commit(source, source_name, directory, name, entry)
@@ -240,45 +221,20 @@ def transact(
             if not _fs.discard(directory, stage_name, stage):
                 error.add_note(f"Servatus could not remove the failed stage {parent / stage_name}")
             raise
-        clean = member is None or _fs.discard(directory, stage_name, stage)
+        clean = not file or _fs.discard(directory, stage_name, stage)
     _fs.sync(directory.fd)  # the durability point; failure here leaves an unproven commit
-    if retire is not None:
-        retired = _fs.succeeded(
-            lambda: _fs.require_owner_only(os.fstat(retire.pin.fd), "retirement source")
-        ) and _fs.discard(directory, retire.name, retire.pin)
-        clean = retired and _fs.succeeded(_fs.sync, directory.fd) and clean
     return clean
 
 
-def _payload(stage: Pin, member: str, name: str) -> Pin:
+def _payload(stage: Pin, name: str) -> Pin:
     """Pin the writer's single-link regular file."""
-    if stage.lstat(member) is None:
+    if stage.lstat(name) is None:
         raise ConfigurationError(f"the writer did not create the file to publish: {name}")
-    payload = stage.open(member, directory=False)
+    payload = stage.open(name, directory=False)
     if payload.entry.st_nlink != 1:
         payload.close()
         raise UnsafeFilesystem(f"published file must have one link: {name}")
     return payload
-
-
-@contextmanager
-def _retirement(
-    parent: Path, directory: Pin, name: str, retire: StrPath | None
-) -> Generator[Retired | None]:
-    if retire is None:
-        yield None
-        return
-    retire_parent, retire_name = _fs.split(retire)
-    if retire_parent != parent:
-        raise ConfigurationError(f"retirement source must be a destination sibling: {retire}")
-    if retire_name == name:
-        raise ConfigurationError(f"retirement source must differ from the destination: {retire}")
-    if directory.lstat(retire_name) is None:
-        raise ConfigurationError(f"retirement source does not exist: {retire}")
-    with directory.open(retire_name) as pin:
-        _fs.require_owner_only(pin.entry, f"retirement source {retire}")
-        directory.expect(retire_name, pin.entry)
-        yield Retired(retire_name, pin)
 
 
 def warn_pending(message: str, *, stacklevel: int) -> None:
@@ -293,7 +249,7 @@ def result(destination: Path, clean: bool) -> Publication:
     return Publication(destination, cleanup_pending=not clean)
 
 
-def draft_builder(build: Callable[[Draft], object]) -> Build:
+def draft_builder(build: Callable[[Draft], object]) -> Callable[[Path, Pin], None]:
     def run(path: Path, stage: Pin) -> None:
         state = DraftState(stage, path)
         try:
@@ -306,37 +262,22 @@ def draft_builder(build: Callable[[Draft], object]) -> Build:
     return run
 
 
-def checked_mode(mode: int | None) -> int | None:
-    return None if mode is None else _fs.check_mode(mode)
-
-
 # -- public entry points ---------------------------------------------------------------------
 def publish(
-    destination: StrPath,
-    build: Callable[[Draft], object],
-    *,
-    retire: StrPath | None = None,
-    mode: int | None = None,
+    destination: StrPath, build: Callable[[Draft], object], *, mode: int | None = None
 ) -> Publication:
     """Build a directory in a private stage and commit it as `destination`, never replacing.
 
     `build` receives a `Draft` and must finish all content mutations before returning. Every
     directory in the published tree is set to `mode` just before commit (default: `0o777` minus
-    the umask); file modes are left as written. With `retire`, one existing owner-only sibling
-    directory is pinned before the builder and removed only after the commit is durable.
+    the umask); file modes are left as written.
     """
     _fs.require_supported_platform()
-    checked = checked_mode(mode)
+    checked = _fs.check_mode(mode)
     parent, name = _fs.split(destination)
-    with (
-        _fs.Boundary(parent / name) as boundary,
-        _fs.open_path(parent) as directory,
-        _retirement(parent, directory, name, retire) as retired,
-    ):
-        build = boundary.passthrough(build)
-        clean = transact(
-            parent, directory, name, draft_builder(build), mode=checked, retire=retired
-        )
+    with _fs.Boundary(parent / name) as boundary, _fs.open_path(parent) as directory:
+        builder = draft_builder(boundary.passthrough(build))
+        clean = transact(parent, directory, name, builder, file=False, mode=checked)
     return result(parent / name, clean)
 
 
@@ -351,16 +292,11 @@ def publish_file(
     just before commit (default: `0o666` minus the umask), overriding any mode the writer chose.
     """
     _fs.require_supported_platform()
-    checked = checked_mode(mode)
+    checked = _fs.check_mode(mode)
     parent, name = _fs.split(destination)
-
     with _fs.Boundary(parent / name) as boundary, _fs.open_path(parent) as directory:
-        written = boundary.passthrough(write)
-
-        def build(path: Path, stage: Pin) -> str:
-            del stage
-            written(path / name)
-            return name
-
-        clean = transact(parent, directory, name, build, mode=checked)
+        writer = boundary.passthrough(write)
+        clean = transact(
+            parent, directory, name, lambda path, _: writer(path / name), file=True, mode=checked
+        )
     return result(parent / name, clean)

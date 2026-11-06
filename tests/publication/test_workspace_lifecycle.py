@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import stat
 from pathlib import Path
 
 import pytest
+from support.posix import hidden, mode_of
 
 from servatus.errors import (
     Busy,
@@ -15,10 +15,6 @@ from servatus.errors import (
     WorkspaceConflict,
 )
 from servatus.publication import Draft, Workspace
-
-
-def hidden(parent: Path) -> list[Path]:
-    return sorted(parent.glob(".servatus-*"))
 
 
 def container_of(tmp_path: Path, destination: str = "result") -> Path:
@@ -107,19 +103,11 @@ def test_identity_must_be_bytes(tmp_path: Path) -> None:
         Workspace(tmp_path / "result", identity=b"root").child("a", identity=1)  # type: ignore[arg-type]
 
 
-def test_identity_record_stores_canonical_inode_pins(tmp_path: Path) -> None:
+def test_private_entries_are_owner_only(tmp_path: Path) -> None:
     container = container_of(tmp_path)
-    entries = (container, container / ".lock", container / "work")
-    expected = (
-        b"servatus-workspace-v2\n"
-        + hashlib.sha256(b"request").hexdigest().encode("ascii")
-        + b"\n"
-        + b"".join(f"{entry.stat(follow_symlinks=False).st_ino}\n".encode() for entry in entries)
-    )
 
-    assert (container / ".identity").read_bytes() == expected
-    for entry in (*entries, container / ".identity"):
-        assert stat.S_IMODE(entry.stat().st_mode) & 0o077 == 0
+    for entry in (container, container / ".lock", container / "work", container / ".identity"):
+        assert mode_of(entry) & 0o077 == 0
 
 
 @pytest.mark.parametrize(
@@ -253,19 +241,6 @@ def test_lifecycle_entry_substitution_blocks_publication(tmp_path: Path, entry: 
     assert not (tmp_path / "result").exists()
 
 
-def test_cleanup_removes_unreadable_files_and_read_only_directories(tmp_path: Path) -> None:
-    with Workspace(tmp_path / "result", identity=b"request") as workspace:
-        (workspace.path / "private").write_text("resumable")
-        (workspace.path / "private").chmod(0o000)
-        (workspace.path / "frozen").mkdir()
-        (workspace.path / "frozen/value").write_text("x")
-        (workspace.path / "frozen").chmod(0o500)
-        publication = workspace.publish(lambda draft: None)
-
-    assert publication.cleanup_pending is False
-    assert hidden(tmp_path) == []
-
-
 def test_nested_independent_workspace_can_feed_parent_publication(tmp_path: Path) -> None:
     destination = tmp_path / "study"
     with Workspace(destination, identity=b"study") as parent:
@@ -354,18 +329,25 @@ def test_existing_destination_without_private_work_creates_nothing(tmp_path: Pat
     assert sorted(path.name for path in tmp_path.iterdir()) == ["result"]
 
 
-def test_cleanup_removes_directories_without_owner_access(tmp_path: Path) -> None:
+@pytest.mark.parametrize("finish", ["discard", "publish"])
+def test_cleanup_removes_entries_without_owner_access(tmp_path: Path, finish: str) -> None:
     # Regression: removal opened such directories before making them accessible, and failed.
-    for finish in ("discard", "publish"):
-        with Workspace(tmp_path / finish, identity=b"request") as workspace:
-            for name, mode in (("write-only", 0o300), ("closed", 0o000), ("no-search", 0o600)):
-                (workspace.path / name).mkdir()
-                (workspace.path / name / "value").write_text("x")
-                (workspace.path / name).chmod(mode)
-            if finish == "discard":
-                workspace.discard()
-            else:
-                assert workspace.publish(lambda draft: None).cleanup_pending is False
+    with Workspace(tmp_path / "result", identity=b"request") as workspace:
+        (workspace.path / "unreadable").write_text("resumable")
+        (workspace.path / "unreadable").chmod(0o000)
+        for name, mode in (
+            ("read-only", 0o500),
+            ("write-only", 0o300),
+            ("closed", 0o000),
+            ("no-search", 0o600),
+        ):
+            (workspace.path / name).mkdir()
+            (workspace.path / name / "value").write_text("x")
+            (workspace.path / name).chmod(mode)
+        if finish == "discard":
+            workspace.discard()
+        else:
+            assert workspace.publish(lambda draft: None).cleanup_pending is False
 
     assert hidden(tmp_path) == []
 

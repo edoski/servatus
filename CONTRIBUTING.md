@@ -34,7 +34,9 @@ live in `pyproject.toml`.
 
 ## Test layout
 
-- `tests/support/`: shared builders for synthetic Tasks, Targets, Resources, and Profiles.
+- `tests/support/`: shared builders for synthetic Tasks, Targets, Resources, and Profiles
+  (`builders.py`), POSIX helpers and fault injection (`posix.py`), and the spawned-process harness
+  (`processes.py`).
 - `tests/core/`: codec, configuration, state invariant and transitions, store, status, policy.
 - `tests/scheduler/`: transport bounds, batch scripts, evidence parsing, and `FakeScheduler`.
 - `tests/publication/`: publish, `publish_file`, Draft, Workspace, children, and POSIX fallbacks.
