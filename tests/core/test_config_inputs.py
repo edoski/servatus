@@ -211,10 +211,15 @@ def test_target_accepts_ssh_destinations(host: str | None) -> None:
         ({"partitions": ("bad name",)}, "partition must be one safe site token"),
         ({"account": "-x"}, "account must be one safe site token"),
         ({"qos": "a b"}, "qos must be one safe site token"),
-        ({"constraint": "a|b"}, "constraint must be one safe site token"),
-        ({"gpu_gres": "scratch"}, "count-free GPU resource"),
-        ({"gpu_gres": "gpu:2"}, "count-free GPU resource"),
-        ({"gpu_gres": "gpu:a100:2"}, "count-free GPU resource"),
+        ({"constraint": "a b"}, "constraint must be one Slurm feature expression"),
+        ({"constraint": "a;b"}, "constraint must be one Slurm feature expression"),
+        ({"constraint": "$(x)"}, "constraint must be one Slurm feature expression"),
+        ({"constraint": ""}, "constraint must be one Slurm feature expression"),
+        ({"constraint": 7}, "constraint must be one Slurm feature expression"),
+        ({"gpu_gres": "gpu:2"}, "count-free GRES"),
+        ({"gpu_gres": "gpu:a100:2"}, "count-free GRES"),
+        ({"gpu_gres": "2"}, "count-free GRES"),
+        ({"gpu_gres": "gpu a"}, "count-free GRES"),
         ({"gpu_gres": None}, "gpu_gres and max_gpus_per_allocation conflict"),
         ({"max_gpus_per_allocation": 0}, "gpu_gres and max_gpus_per_allocation conflict"),
         ({"max_tasks_per_allocation": 0}, "max_tasks_per_allocation must be an integer >= 1"),
@@ -305,3 +310,20 @@ def test_profiles_round_trip_through_the_codec(value: Profile) -> None:
     document = _codec.decode_json(_codec.canonical(_codec.dump(value)))
     assert _codec.load(Profile, document) == value
     assert pickle.loads(pickle.dumps(value)) == value
+
+
+@pytest.mark.parametrize(
+    "constraint", ["a100", "a100|h100", "intel&ib", "[rack1|rack2]*2", "(a&b)|c", "fast,ssd"]
+)
+def test_constraint_accepts_slurm_feature_expressions(constraint: str) -> None:
+    assert target(constraint=constraint).constraint == constraint
+
+
+@pytest.mark.parametrize("gres", ["gpu", "gpu:a100", "gpu:a100_80GB", "gpu:l40s", "shard", "mps"])
+def test_gpu_gres_accepts_any_count_free_gres(gres: str) -> None:
+    assert target(gpu_gres=gres).gpu_gres == gres
+
+
+def test_apptainer_executable_cannot_read_as_an_env_assignment() -> None:
+    with pytest.raises(ConfigurationError, match="apptainer cannot contain '='"):
+        Apptainer(executable="/opt/a=b/apptainer", image="/i.sif")

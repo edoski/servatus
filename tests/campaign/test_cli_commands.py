@@ -210,12 +210,12 @@ def test_ensure_append_and_task_files(cli: Cli) -> None:
 @pytest.mark.parametrize(
     ("line", "message"),
     [
-        ({"key": "x", "args": [], "env": ["A=1"]}, "env must be an object"),
+        ({"key": "x", "args": [], "env": ["A=1"]}, "Task.env must map environment names"),
         ({"key": "x", "args": [], "env": {"1A": "x"}}, "Task.env names must be identifiers"),
         ({"key": "x", "args": [], "env": {"A": 1}}, r"Task.env\[A\] must be a string"),
         ({"key": "x", "args": [], "stdin_file": ""}, "stdin_file must be a nonempty path"),
         ({"key": "x", "args": [], "stdin_file": "missing.bin"}, "cannot read stdin_file"),
-        ({"key": "x", "args": "run"}, "args must be an array"),
+        ({"key": "x", "args": "run"}, "Task.args must be a sequence"),
         ({"key": 1, "args": []}, "Task.key must be a string"),
         ({"key": "x"}, "missing fields: args"),
         ({"key": "x", "args": [], "extra": 1}, "unknown fields: extra"),

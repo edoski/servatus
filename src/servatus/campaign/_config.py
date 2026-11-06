@@ -9,6 +9,7 @@ import tomllib
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
+from functools import partial
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Self, cast
@@ -23,7 +24,10 @@ TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _HOST = re.compile(r"(?:[A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-_GRES = re.compile(r"gpu(?::(?![0-9]+\Z)[A-Za-z0-9][A-Za-z0-9._-]*)?\Z")
+# Slurm parses both inside one argv element, never through a shell, so a bad value only makes Slurm
+# refuse the job. A digits-only type would read as the count Servatus appends.
+_GRES = re.compile(r"[A-Za-z_][A-Za-z0-9._-]*(?::(?![0-9]+\Z)[A-Za-z0-9][A-Za-z0-9._-]*)?\Z")
+_CONSTRAINT = re.compile(r"[A-Za-z0-9._:+&|,*!()\[\]-]+\Z")
 RESERVED_ENV_PREFIX = "SERVATUS_"
 DEFAULT_MAX_SCRIPT_BYTES = 1024 * 1024
 _MINUTE = timedelta(minutes=1)
@@ -157,7 +161,9 @@ class Task:
         values: object = {} if env is None else env
         _require(isinstance(values, Mapping), "Task.env must map environment names to strings")
         frozen_env: dict[str, str] = {}
-        for name, item in sorted(cast(Mapping[object, object], values).items(), key=_by_name):
+        for name, item in sorted(
+            cast(Mapping[object, object], values).items(), key=lambda item: str(item[0])
+        ):
             _require(
                 isinstance(name, str) and _ENV_NAME.fullmatch(name) is not None,
                 "Task.env names must be identifiers",
@@ -178,10 +184,6 @@ class Task:
 
     def __reduce__(self) -> tuple[object, tuple[object, ...]]:
         return (_restore_task, (self.key, self.args, self.stdin, dict(self.env)))
-
-
-def _by_name(item: tuple[object, object]) -> str:
-    return str(item[0])
 
 
 # --- Resources -------------------------------------------------------------------------------
@@ -249,8 +251,11 @@ class Apptainer:
         self, *, executable: PosixInput, image: PosixInput, binds: Iterable[str] = ()
     ) -> None:
         container = _absolute(image, "image")
+        program = _plain(
+            _absolute(executable, "apptainer"), "apptainer", "=", "env reads it as a variable"
+        )
         use = "Apptainer reads it as a URI such as docker://"
-        object.__setattr__(self, "executable", _absolute(executable, "apptainer"))
+        object.__setattr__(self, "executable", program)
         object.__setattr__(self, "image", _plain(container, "image", ":", use))
         object.__setattr__(self, "binds", tuple(_bind(item) for item in _strings(binds, "binds")))
 
@@ -316,46 +321,63 @@ class Target:
         if gpu_gres is not None:
             _require(
                 isinstance(gpu_gres, str) and _GRES.fullmatch(gpu_gres) is not None,
-                "gpu_gres must be one count-free GPU resource such as gpu or gpu:a100",
+                "gpu_gres must be one count-free GRES such as gpu, gpu:a100, or shard",
             )
         gpus = _integer(max_gpus_per_allocation, "max_gpus_per_allocation", minimum=0)
         _require((gpu_gres is None) == (gpus == 0), "gpu_gres and max_gpus_per_allocation conflict")
-        values: dict[str, object] = {
-            "slurm_bin": _absolute(slurm_bin, "slurm_bin"),
-            "work_root": _plain(
+        put = partial(object.__setattr__, self)
+        put("slurm_bin", _absolute(slurm_bin, "slurm_bin"))
+        put(
+            "work_root",
+            _plain(
                 _absolute(work_root, "work_root"),
                 "work_root",
                 ",:",
                 "it is bound into containers as SOURCE:DESTINATION",
             ),
-            "log_root": _plain(
+        )
+        put(
+            "log_root",
+            _plain(
                 _absolute(log_root, "log_root"),
                 "log_root",
                 "%",
                 "Slurm expands '%' patterns in output paths",
             ),
-            "partitions": frozen_partitions,
-            "max_time_limit": whole_minutes(duration(max_time_limit, "max_time_limit")),
-            "host": host,
-            "container": container,
-            "account": _optional_token(account, "account"),
-            "qos": _optional_token(qos, "qos"),
-            "constraint": _optional_token(constraint, "constraint"),
-            "gpu_gres": gpu_gres,
-            "max_gpus_per_allocation": gpus,
-        }
-        positive = {
-            "max_tasks_per_allocation": max_tasks_per_allocation,
-            "max_cpus_per_allocation": max_cpus_per_allocation,
-            "max_memory_mib_per_allocation": max_memory_mib_per_allocation,
-            "max_allocations_per_submit": max_allocations_per_submit,
-            "max_script_bytes": max_script_bytes,
-        }
-        for name, item in positive.items():
-            optional = name == "max_allocations_per_submit" and item is None
-            values[name] = None if optional else _integer(item, name, minimum=1)
-        for name, item in values.items():
-            object.__setattr__(self, name, item)
+        )
+        put("partitions", frozen_partitions)
+        put(
+            "max_tasks_per_allocation",
+            _integer(max_tasks_per_allocation, "max_tasks_per_allocation", minimum=1),
+        )
+        put(
+            "max_cpus_per_allocation",
+            _integer(max_cpus_per_allocation, "max_cpus_per_allocation", minimum=1),
+        )
+        put(
+            "max_memory_mib_per_allocation",
+            _integer(max_memory_mib_per_allocation, "max_memory_mib_per_allocation", minimum=1),
+        )
+        put("max_time_limit", whole_minutes(duration(max_time_limit, "max_time_limit")))
+        put("host", host)
+        put("container", container)
+        put("account", _optional_token(account, "account"))
+        put("qos", _optional_token(qos, "qos"))
+        if constraint is not None:
+            _require(
+                isinstance(constraint, str) and _CONSTRAINT.fullmatch(constraint) is not None,
+                "constraint must be one Slurm feature expression such as a100|h100",
+            )
+        put("constraint", constraint)
+        put("gpu_gres", gpu_gres)
+        put("max_gpus_per_allocation", gpus)
+        put(
+            "max_allocations_per_submit",
+            None
+            if max_allocations_per_submit is None
+            else _integer(max_allocations_per_submit, "max_allocations_per_submit", minimum=1),
+        )
+        put("max_script_bytes", _integer(max_script_bytes, "max_script_bytes", minimum=1))
 
 
 # --- Profile ---------------------------------------------------------------------------------
@@ -464,8 +486,7 @@ def _target(values: dict[str, object]) -> Target:
             image=cast(PosixInput, container_values["image"]),
             binds=cast(Iterable[str], container_values.get("binds", ())),
         )
-    _missing(values, _required(Target) - {"container"}, "target")
-    _require(isinstance(values["partitions"], list), "partitions must be an array of strings")
+    _missing(values, _required(Target), "target")
     return Target(container=container, **values)  # pyright: ignore[reportArgumentType]
 
 

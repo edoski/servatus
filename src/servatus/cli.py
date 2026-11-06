@@ -77,20 +77,17 @@ def _task(raw: object, base: Path) -> Task:
         raise ConfigurationError(f"unknown fields: {', '.join(unknown)}")
     if missing := sorted({"key", "args"} - fields.keys()):
         raise ConfigurationError(f"missing fields: {', '.join(missing)}")
-    args = fields["args"]
-    if not isinstance(args, list):
-        raise ConfigurationError("args must be an array of strings")
     stdin = b""
     if "stdin_file" in fields:
         name = fields["stdin_file"]
         if not isinstance(name, str) or not name:
             raise ConfigurationError("stdin_file must be a nonempty path")
         stdin = _read_bytes(base / name, "stdin_file")
-    env = fields.get("env", {})
-    if not isinstance(env, dict):
-        raise ConfigurationError("env must be an object mapping names to strings")
     return Task(
-        cast(str, fields["key"]), cast(list[str], args), stdin=stdin, env=cast(dict[str, str], env)
+        cast(str, fields["key"]),
+        cast(list[str], fields["args"]),
+        stdin=stdin,
+        env=cast(dict[str, str], fields.get("env", {})),
     )
 
 
