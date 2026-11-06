@@ -14,10 +14,12 @@ It drives small sweeps through the ``servatus`` CLI over SSH, one Task per alloc
   list exactly one GPU.
 - ``--image-partition``: a compute node pulls a tiny image, then one Task runs in it through the
   Apptainer launcher. Nodes without network access skip this and the summary says why.
+- Both: one one-GPU Task runs ``nvidia-smi -L`` inside the image through ``--nv``. It must list
+  exactly one GPU and see Slurm's step-local ``CUDA_VISIBLE_DEVICES``.
 
 Everything it writes on the cluster lives in a new ``WORK_DIR/run-<timestamp>`` directory. It
-submits at most six small jobs, at most three at a time, and cancels whatever it leaves behind. It
-prints one JSON summary line last.
+submits at most seven small jobs, at most three at a time, and cancels whatever it leaves behind.
+It prints one JSON summary line last.
 """
 
 from __future__ import annotations
@@ -40,10 +42,15 @@ TASKS = {
     "long": "sleep 900",
 }
 POLL_SECONDS = 20
-IMAGE_SOURCE = "docker://alpine:3.20"
+# glibc, not Alpine's musl: --nv binds the host's nvidia-smi, which needs a glibc loader.
+IMAGE_SOURCE = "docker://debian:12-slim"
 PULL_JOB = "servatus-e2e-pull"
 PULL_SECONDS = 600
-IMAGE_TASK = 'cat /etc/alpine-release; printf "%s %s\\n" "$SERVATUS_TASK_KEY" "$PWD"'
+IMAGE_TASK = 'cat /etc/debian_version; printf "%s %s\\n" "$SERVATUS_TASK_KEY" "$PWD"'
+IMAGE_GPU_TASK = (
+    'cat /etc/debian_version && nvidia-smi -L && printf "%s %s\\n" "$SERVATUS_TASK_KEY" '
+    '"$CUDA_VISIBLE_DEVICES"'
+)
 
 
 def log(message: str) -> None:
@@ -145,6 +152,18 @@ def configuration(arguments: argparse.Namespace, run: PurePosixPath, image: bool
             f"apptainer = {json.dumps(arguments.apptainer)}\n"
             f'image = "{run}/image.sif"\n'
         )
+    if image and arguments.gpu_partition is not None:
+        document += (
+            "\n[profiles.image-gpu.target]\n"
+            f"partitions = [{json.dumps(arguments.gpu_partition)}]\n"
+            f"gpu_gres = {json.dumps(arguments.gpu_gres)}\n"
+            "max_gpus_per_allocation = 1\n"
+            f"apptainer = {json.dumps(arguments.apptainer)}\n"
+            f'image = "{run}/image.sif"\n'
+            "\n[profiles.image-gpu.resources]\n"
+            "gpus = 1\n"
+            "memory_mib = 1024\n"
+        )
     return document
 
 
@@ -190,11 +209,15 @@ def one_task(root: Path, profile: str, argv: list[str], deadline: float) -> tupl
     return job, text
 
 
-def gpu_check(root: Path, deadline: float) -> dict[str, Any]:
-    job, text = one_task(root, "gpu", ["/usr/bin/nvidia-smi", "-L"], deadline)
+def one_gpu(text: str) -> list[str]:
     gpus = [line for line in text.splitlines() if line.startswith("GPU ")]
     assert len(gpus) == 1, text
-    return {"job": job, "gpus": gpus}
+    return gpus
+
+
+def gpu_check(root: Path, deadline: float) -> dict[str, Any]:
+    job, text = one_task(root, "gpu", ["/usr/bin/nvidia-smi", "-L"], deadline)
+    return {"job": job, "gpus": one_gpu(text)}
 
 
 def pull_image(arguments: argparse.Namespace, run: PurePosixPath) -> str | None:
@@ -208,6 +231,8 @@ def pull_image(arguments: argparse.Namespace, run: PurePosixPath) -> str | None:
         "--time=00:15:00",
         f"--chdir={run}",
         f"--job-name={PULL_JOB}",
+        "/usr/bin/env",
+        f"APPTAINER_TMPDIR={run}/tmp",
         arguments.apptainer,
         "pull",
         "--disable-cache",
@@ -236,9 +261,17 @@ def pull_image(arguments: argparse.Namespace, run: PurePosixPath) -> str | None:
 def image_check(root: Path, run: PurePosixPath, deadline: float) -> dict[str, Any]:
     job, text = one_task(root, "image", ["/bin/sh", "-c", IMAGE_TASK], deadline)
     release, identity = text.splitlines()[-2:]
-    assert release.startswith("3.20"), text
+    assert release.startswith("12."), text
     assert identity == f"image {run}/work", text
-    return {"job": job, "alpine": release}
+    return {"job": job, "debian": release}
+
+
+def image_gpu_check(root: Path, deadline: float) -> dict[str, Any]:
+    job, text = one_task(root, "image-gpu", ["/bin/sh", "-c", IMAGE_GPU_TASK], deadline)
+    lines = text.splitlines()
+    key, visible = lines[-1].split(" ", 1)
+    assert lines[-3].startswith("12.") and key == "image-gpu" and visible, text
+    return {"job": job, "debian": lines[-3], "gpus": one_gpu(text), "visible": visible}
 
 
 def sweep(arguments: argparse.Namespace, root: Path, run: PurePosixPath) -> dict[str, Any]:
@@ -255,8 +288,14 @@ def sweep(arguments: argparse.Namespace, root: Path, run: PurePosixPath) -> dict
             for key, command in TASKS.items()
         )
     )
-    for profile in (*(("gpu",) if arguments.gpu_partition else ()), *(("image",) if image else ())):
-        diagnose(root, profile)
+    image_gpu = image and arguments.gpu_partition is not None
+    for profile, wanted in (
+        ("gpu", arguments.gpu_partition is not None),
+        ("image", image),
+        ("image-gpu", image_gpu),
+    ):
+        if wanted:
+            diagnose(root, profile)
     servatus(root, "create", "state", "tasks.jsonl")
     servatus(root, "plan", "state", "--output", "plan.json")
     servatus(root, "validate", "state", "plan.json")
@@ -294,6 +333,8 @@ def sweep(arguments: argparse.Namespace, root: Path, run: PurePosixPath) -> dict
         summary["gpu"] = gpu_check(root, deadline)
     if image:
         summary["apptainer"] = image_check(root, run, deadline)
+        if image_gpu:
+            summary["apptainer_gpu"] = image_gpu_check(root, deadline)
     elif skipped is not None:
         log(f"apptainer skipped: {skipped}")
         summary["apptainer"] = {"skipped": skipped}
@@ -319,7 +360,8 @@ def main() -> None:
     if not work_dir.is_absolute():
         raise SystemExit("WORK_DIR must be absolute")
     run = work_dir / f"run-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
-    remote = f"mkdir -p -m 700 {shlex.quote(str(run / 'work'))} {shlex.quote(str(run / 'logs'))}"
+    directories = " ".join(shlex.quote(str(run / name)) for name in ("work", "logs", "tmp"))
+    remote = f"mkdir -p -m 700 {directories}"
     subprocess.run(["ssh", "-o", "BatchMode=yes", arguments.host, remote], check=True)
     log(f"run directory {arguments.host}:{run}")
     with tempfile.TemporaryDirectory(prefix="servatus-e2e-") as directory:
@@ -327,7 +369,12 @@ def main() -> None:
         try:
             summary = sweep(arguments, root, run)
         finally:
-            for state, keys in (("state", tuple(TASKS)), ("gpu", ("gpu",)), ("image", ("image",))):
+            for state, keys in (
+                ("state", tuple(TASKS)),
+                ("gpu", ("gpu",)),
+                ("image", ("image",)),
+                ("image-gpu", ("image-gpu",)),
+            ):
                 if (root / state).exists():
                     options = [option for key in keys for option in ("--task", key)]
                     servatus(root, "cancel", state, *options, check=False)
