@@ -251,16 +251,20 @@ def test_ssh_invocation_shape_and_remote_environment(tmp_path: Path) -> None:
     ssh, record = fake_ssh(tmp_path)
     result = ssh.run(("/usr/bin/env",))
     argv = recorded(record)["argv"]
-    assert argv[:7] == [
+    assert argv[:11] == [
         "-T",
         "-o",
         "BatchMode=yes",
         "-o",
         "LogLevel=ERROR",
+        "-o",
+        "ConnectTimeout=8",
+        "-o",
+        "ConnectionAttempts=3",
         "--",
         "login.example.edu",
     ]
-    assert len(argv) == 8 and argv[7].startswith("/bin/sh -c ")
+    assert len(argv) == 12 and argv[11].startswith("/bin/sh -c ")
     assert sorted(result.stdout.decode().splitlines()) == [
         "LANG=C",
         "LC_ALL=C",
@@ -293,6 +297,14 @@ def test_ssh_without_both_markers_is_unavailable(tmp_path: Path, mode: str) -> N
     ssh, _ = fake_ssh(tmp_path, mode)
     with pytest.raises(Unavailable, match="output marker missing"):
         ssh.run(("/bin/echo", "42"))
+
+
+def test_a_connection_that_failed_reports_ssh_s_own_message(tmp_path: Path) -> None:
+    executable = tmp_path / "ssh"
+    executable.write_text("#!/bin/sh\necho 'ssh: connect to host h: timed out' >&2\nexit 255\n")
+    executable.chmod(0o755)
+    with pytest.raises(Unavailable, match="exit status 255: ssh: connect to host h: timed out"):
+        Ssh("h", (str(executable),)).run(("/bin/true",))
 
 
 def test_ssh_deadline_is_unavailable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

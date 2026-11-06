@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import posixpath
 import secrets
 import selectors
 import shlex
@@ -23,7 +24,7 @@ from dataclasses import dataclass
 from typing import IO, Protocol, cast
 
 from ..errors import Unavailable
-from ._config import Target
+from ._config import CONTROL, Target
 from ._script import check_command
 
 MAX_STREAM_BYTES = 1024 * 1024
@@ -31,7 +32,21 @@ DEADLINE_SECONDS = 30.0
 # Login banners and shell start-up noise precede the output marker; bound them separately.
 NOISE_ALLOWANCE = 64 * 1024
 
-_SSH_OPTIONS = ("-T", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", "--")
+# Each connection attempt is a new TCP flow, made before any command runs, so a flow a NAT has lost
+# recovers and nothing can run twice. Three attempts take at most 26 s, inside the 30 s deadline;
+# the operating system alone would wait 75 s on the first flow.
+_SSH_OPTIONS = (
+    "-T",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "LogLevel=ERROR",
+    "-o",
+    "ConnectTimeout=8",
+    "-o",
+    "ConnectionAttempts=3",
+    "--",
+)
 _ENVIRONMENT = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C", "TZ": "UTC"}
 _REMOTE_ENV = " ".join(f"{name}={value}" for name, value in _ENVIRONMENT.items())
 # What the ssh client needs to find its configuration, agent, and Kerberos (GSSAPI) credentials.
@@ -59,7 +74,7 @@ class Transport(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class Ssh:
-    """Run commands on ``host`` through ``ssh -T -o BatchMode=yes -o LogLevel=ERROR``.
+    """Run commands on ``host`` through ``ssh -T`` in batch mode, retrying the connection only.
 
     The remote command prints a fresh random marker on stdout and stderr, then ``exec``s
     ``/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C TZ=UTC <argv>``. Anything before the
@@ -86,13 +101,17 @@ class Ssh:
         allowance = NOISE_ALLOWANCE + len(marker) + 1
         raw = run_bounded(
             command,
+            what=posixpath.basename(fields[0]),
             stdin=stdin,
             max_stdout=max_stdout + allowance,
             max_stderr=MAX_STREAM_BYTES + allowance,
             env=ssh_environment(),
         )
-        stdout = after_marker(raw.stdout, marker)
-        stderr = after_marker(raw.stderr, marker)
+        try:
+            stdout = after_marker(raw.stdout, marker)
+            stderr = after_marker(raw.stderr, marker)
+        except Unavailable as error:
+            raise Unavailable(f"{error}: {diagnostic(raw)}") from None
         if len(stdout) > max_stdout or len(stderr) > MAX_STREAM_BYTES:
             raise Unavailable("remote command output exceeds its byte bound")
         return Completed(raw.returncode, stdout, stderr)
@@ -108,6 +127,7 @@ class Local:
         fields = check_command(argv)
         return run_bounded(
             fields,
+            what=posixpath.basename(fields[0]),
             stdin=stdin,
             max_stdout=max_stdout,
             max_stderr=MAX_STREAM_BYTES,
@@ -127,6 +147,13 @@ def ssh_environment() -> dict[str, str]:
     }
 
 
+def diagnostic(completed: Completed) -> str:
+    """The exit status and first stderr line, bounded and printable, for operator messages."""
+    first = completed.stderr.decode("utf-8", "replace").strip().partition("\n")[0]
+    text = CONTROL.sub("?", first)[:200]
+    return f"exit status {completed.returncode}" + (f": {text}" if text else "")
+
+
 def after_marker(output: bytes, marker: str) -> bytes:
     """The bytes after the first ``marker`` line; ``Unavailable`` when the marker is absent."""
     token = marker.encode("ascii") + b"\n"
@@ -139,6 +166,7 @@ def after_marker(output: bytes, marker: str) -> bytes:
 def run_bounded(
     command: Sequence[str],
     *,
+    what: str,
     stdin: bytes,
     max_stdout: int,
     max_stderr: int,
@@ -146,8 +174,9 @@ def run_bounded(
 ) -> Completed:
     """Run ``command`` with a deadline, concurrent bounded draining, and guaranteed reaping.
 
-    Stdin comes from an anonymous temporary file, so a child that never reads cannot deadlock the
-    parent. Any failure kills the child's process group, reaps it, and raises ``Unavailable``.
+    ``what`` names the command in errors. Stdin comes from an anonymous temporary file, so a child
+    that never reads cannot deadlock the parent. Any failure kills the child's process group, reaps
+    it, and raises ``Unavailable``.
     """
     try:
         with tempfile.TemporaryFile() as source:
@@ -174,10 +203,10 @@ def run_bounded(
     except Unavailable:
         raise
     except subprocess.TimeoutExpired:
-        raise Unavailable(f"command exceeded its {DEADLINE_SECONDS:g} s deadline") from None
+        raise Unavailable(f"{what} exceeded its {DEADLINE_SECONDS:g} s deadline") from None
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         detail = getattr(error, "strerror", None) or type(error).__name__
-        raise Unavailable(f"command could not run: {detail}") from None
+        raise Unavailable(f"{what} could not run: {detail}") from None
 
 
 def _drain(process: subprocess.Popen[bytes], max_stdout: int, max_stderr: int) -> Completed:

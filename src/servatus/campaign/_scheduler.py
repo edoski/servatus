@@ -12,9 +12,9 @@ from collections.abc import Mapping, Sequence
 from pathlib import PurePosixPath
 
 from ..errors import ConfigurationError, EvidenceConflict, Unavailable
-from ._config import CONTROL, Target
+from ._config import Target
 from ._evidence import Marker, QueueRow, parse_markers, parse_queue, parse_receipt
-from ._remote import MAX_STREAM_BYTES, Completed, Transport
+from ._remote import MAX_STREAM_BYTES, Completed, Transport, diagnostic
 from ._script import job_name
 
 MAX_QUERY_NAMES = 100
@@ -30,17 +30,10 @@ MAX_NAME_PATTERNS = 8
 _MARKER_LINE_BYTES = 64
 
 
-def _diagnostic(completed: Completed) -> str:
-    """The first stderr line, bounded and printable, for operator-facing messages."""
-    first = completed.stderr.decode("utf-8", "replace").strip().partition("\n")[0]
-    text = CONTROL.sub("?", first)[:200]
-    return f"exit status {completed.returncode}" + (f": {text}" if text else "")
-
-
 def _require_ok(completed: Completed, what: str, *, quiet: bool = True) -> Completed:
     """``completed`` if it exited 0 (and, when ``quiet``, wrote nothing to stderr)."""
     if completed.returncode != 0 or (quiet and completed.stderr):
-        raise Unavailable(f"{what} failed with {_diagnostic(completed)}")
+        raise Unavailable(f"{what} failed with {diagnostic(completed)}")
     return completed
 
 
@@ -124,7 +117,7 @@ class Scheduler:
         """Whether ``path`` is a directory this user can write to, without writing anything."""
         completed = self._transport.run((*WRITABLE_DIRECTORY, str(path)))
         if completed.returncode > 1:
-            raise Unavailable(f"checking {path} failed with {_diagnostic(completed)}")
+            raise Unavailable(f"checking {path} failed with {diagnostic(completed)}")
         return completed.returncode == 0
 
     def queue(self, allocation_ids: Sequence[str]) -> dict[str, tuple[QueueRow, ...]]:
