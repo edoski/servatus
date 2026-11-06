@@ -5,12 +5,11 @@ Projection rules:
 - The latest accepted Attempt containing a Task owns that Task's current execution. An
   unresolved Attempt (intent recorded, acceptance unknown) dominates instead: the Task is
   ``unresolved`` and its execution is unknown (``None``).
-- A Task's execution and exit code follow ``task_execution``: its own ``srun`` step when known,
-  else the allocation, except that UNKNOWN or contradictory allocation evidence, and a failed or
-  cancelled packed allocation without the Task's step, leave the Task UNKNOWN.
+- A Task's execution and exit code follow ``Observation.execution`` for its slot: its queue row
+  while Slurm lists the job, then its run markers.
 - ``results_ready`` means the roster is sealed and every Task has a VALID result.
-- ``quiescent`` means the scheduler was observed, no acceptance is unresolved, and every
-  accepted Attempt has terminal, non-retained allocation evidence. Scheduler completion says
+- ``quiescent`` means the scheduler was observed, no acceptance is unresolved, and Slurm lists no
+  job of any accepted allocation, nor of one recorded as not submitted. Scheduler completion says
   nothing about result validity, and valid results say nothing about stopped work.
 """
 
@@ -25,10 +24,11 @@ from typing import cast
 from ..errors import ConfigurationError
 from . import _codec
 from ._config import task_keys
-from ._evidence import AllocationState, JobRef, Observation, SchedulerEvidence, StepEvidence
+from ._evidence import Execution, Observation, Observed
 from ._state import AcceptanceState, State
 
 STATUS_FORMAT = "servatus.status/1"
+NEVER_STARTED = "never started"
 
 
 class ResultState(StrEnum):
@@ -44,8 +44,9 @@ class TaskStatus:
     key: str
     result: ResultState
     current_allocation_id: str | None
-    execution: AllocationState | None
-    exit_code: str | None
+    execution: Execution | None
+    exit_code: int | None
+    detail: str | None
     unresolved: bool
 
 
@@ -54,24 +55,25 @@ class AttemptStatus:
     allocation_id: str
     task_keys: tuple[str, ...]
     retry: tuple[str, ...]
-    duplicate_risk: tuple[str, ...]
     profile_label: str
     acceptance: AcceptanceState
-    job: JobRef | None
+    job: int | None
     intent_at: datetime
-    scheduler: SchedulerEvidence | None
-    steps: tuple[StepEvidence | None, ...]
+    observation: Observation | None
 
 
-_UNATTRIBUTED = (AllocationState.FAILED, AllocationState.CANCELLED)
 _EXECUTION_COUNTS = ("unsubmitted", "unresolved", "accepted") + tuple(
-    state.value.lower() for state in AllocationState
+    state.value.lower() for state in Execution
 )
 
 
 @dataclass(frozen=True, slots=True)
 class Status:
-    """One diagnostic snapshot. It carries no execution authority and no Task payloads."""
+    """One diagnostic snapshot. It carries no execution authority and no Task payloads.
+
+    ``warnings`` name allocations recorded as not submitted for which Slurm still lists a job;
+    their Tasks are held ``ACTIVE`` until it leaves the queue.
+    """
 
     campaign_id: str
     revision: int
@@ -82,6 +84,7 @@ class Status:
     attempts: tuple[AttemptStatus, ...]
     results_ready: bool
     quiescent: bool
+    warnings: tuple[str, ...]
 
     def counts(self) -> Mapping[str, int]:
         """Task counts with a fixed set of keys.
@@ -89,7 +92,7 @@ class Status:
         ``tasks`` is the total. ``valid``/``missing``/``unobserved`` partition Tasks by result.
         The execution keys partition them again: ``unsubmitted`` (never accepted),
         ``unresolved``, ``accepted`` (current execution not observed), then one key per
-        lowercased ``AllocationState``.
+        lowercased ``Execution``.
         """
         counts = {"tasks": len(self.tasks)}
         counts.update((state.value.lower(), 0) for state in ResultState)
@@ -128,79 +131,53 @@ def classify_results(keys: Iterable[str], valid: Collection[str]) -> dict[str, R
     return {key: ResultState.VALID if key in answered else ResultState.MISSING for key in asked}
 
 
-def task_execution(
-    observation: Observation, slot: int, task_count: int
-) -> tuple[AllocationState, str | None]:
-    """The Task in ``slot`` of an observed allocation of ``task_count`` Tasks.
-
-    Contradictory (``problem``) or UNKNOWN allocation evidence makes every Task UNKNOWN, whatever
-    its step says. Otherwise the Task's own step decides when known. Without one, a single-Task
-    allocation is the Task, and so is a successful allocation (its script fails when any step
-    does); but a failed or cancelled packed allocation says nothing about one Task, which may
-    have finished first, so the Task is UNKNOWN. Exit codes accompany terminal states only.
-    """
-    allocation = observation.allocation
-    if allocation.problem is not None or allocation.state is AllocationState.UNKNOWN:
-        return AllocationState.UNKNOWN, None
-    step = own_step(observation, slot)
-    if step is not None:
-        state, exit_code = step.state, step.exit_code
-    elif task_count > 1 and allocation.state in _UNATTRIBUTED:
-        return AllocationState.UNKNOWN, None
-    else:
-        state, exit_code = allocation.state, allocation.exit_code
-    return state, exit_code if state.terminal else None
-
-
-def own_step(observation: Observation, slot: int) -> StepEvidence | None:
-    """The step evidence of the Task in ``slot``, when the step query found exactly one."""
-    return observation.steps[slot] if slot < len(observation.steps) else None
+def stray_warning(allocation_id: str, job: int) -> str:
+    return (
+        f"allocation {allocation_id} is recorded as not submitted, but Slurm lists job {job} "
+        "for it; its Tasks stay held ACTIVE until it leaves the queue"
+    )
 
 
 def project(
     state: State,
-    observations: Mapping[str, Observation],
+    observed: Observed,
     results: Mapping[str, ResultState],
     *,
     scheduler_observed: bool,
     observed_at: datetime,
 ) -> Status:
-    """Project ``state`` with scheduler ``observations`` (by allocation id) and probe
-    ``results`` (by Task key; absent keys are UNOBSERVED) into one ``Status``."""
+    """Project ``state`` with scheduler evidence and probe ``results`` (by Task key; absent keys
+    are UNOBSERVED) into one ``Status``."""
     if not isinstance(observed_at, datetime) or observed_at.utcoffset() != timedelta(0):
         raise ConfigurationError("observed_at must be an aware UTC datetime")
     attempts: list[AttemptStatus] = []
     current: dict[str, tuple[AttemptStatus, int]] = {}
     for attempt in state.attempts:
-        accepted = attempt.acceptance is AcceptanceState.ACCEPTED
-        observation = observations.get(attempt.allocation_id) if accepted else None
         projected = AttemptStatus(
             allocation_id=attempt.allocation_id,
             task_keys=attempt.task_keys,
             retry=attempt.retry,
-            duplicate_risk=attempt.duplicate_risk,
             profile_label=attempt.profile.label,
             acceptance=attempt.acceptance,
             job=attempt.job,
             intent_at=attempt.intent_at,
-            scheduler=None if observation is None else observation.allocation,
-            steps=() if observation is None else observation.steps,
+            observation=(
+                None if attempt.job is None else observed.attempts.get(attempt.allocation_id)
+            ),
         )
         attempts.append(projected)
         if attempt.acceptance is not AcceptanceState.NOT_SUBMITTED:
             # The State invariant makes an unresolved Attempt the last one naming its Tasks.
             current.update((key, (projected, slot)) for slot, key in enumerate(attempt.task_keys))
-    tasks = tuple(
-        _task_status(task.key, current.get(task.key), observations, results) for task in state.tasks
-    )
-    quiescent = scheduler_observed and all(
-        attempt.acceptance is AcceptanceState.NOT_SUBMITTED
-        or (
-            attempt.scheduler is not None
-            and attempt.scheduler.state.terminal
-            and not attempt.scheduler.retained
+    tasks = tuple(_task_status(task.key, current.get(task.key), results) for task in state.tasks)
+    quiescent = (
+        scheduler_observed
+        and not observed.strays
+        and all(
+            attempt.acceptance is AcceptanceState.NOT_SUBMITTED
+            or (attempt.observation is not None and not attempt.observation.live)
+            for attempt in attempts
         )
-        for attempt in attempts
     )
     return Status(
         campaign_id=state.campaign_id,
@@ -212,28 +189,29 @@ def project(
         attempts=tuple(attempts),
         results_ready=state.sealed and all(task.result is ResultState.VALID for task in tasks),
         quiescent=quiescent,
+        warnings=tuple(stray_warning(name, job) for name, job in observed.strays.items()),
     )
 
 
 def _task_status(
-    key: str,
-    owner: tuple[AttemptStatus, int] | None,
-    observations: Mapping[str, Observation],
-    results: Mapping[str, ResultState],
+    key: str, owner: tuple[AttemptStatus, int] | None, results: Mapping[str, ResultState]
 ) -> TaskStatus:
     """One Task, owned by the Attempt (and slot) that holds its current execution, if any."""
-    execution: AllocationState | None = None
-    exit_code: str | None = None
     attempt, slot = owner if owner is not None else (None, 0)
-    accepted = attempt is not None and attempt.acceptance is AcceptanceState.ACCEPTED
-    observation = observations.get(attempt.allocation_id) if attempt and accepted else None
-    if attempt is not None and observation is not None:
-        execution, exit_code = task_execution(observation, slot, len(attempt.task_keys))
+    observation = None if attempt is None else attempt.observation
+    execution: Execution | None = None
+    exit_code: int | None = None
+    detail: str | None = None
+    if observation is not None:
+        execution, exit_code = observation.execution(slot)
+        if execution is Execution.STOPPED and not observation.started:
+            detail = NEVER_STARTED
     return TaskStatus(
         key=key,
         result=results.get(key, ResultState.UNOBSERVED),
         current_allocation_id=None if attempt is None else attempt.allocation_id,
         execution=execution,
         exit_code=exit_code,
+        detail=detail,
         unresolved=attempt is not None and attempt.acceptance is AcceptanceState.UNRESOLVED,
     )

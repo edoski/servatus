@@ -6,15 +6,15 @@ import selectors
 import subprocess
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 import pytest
-from scheduler_fixtures import ALLOCATION, IDENTITY, query, sacct_row
+from scheduler_fixtures import ALLOCATION, IDENTITY
 from support.builders import target
 
 import servatus.campaign._remote as _remote
-from servatus.campaign._evidence import AllocationState, JobRef
+from servatus.campaign._evidence import End, QueueRow, Start
 from servatus.campaign._remote import Completed, Local, Ssh, after_marker, connect
 from servatus.campaign._scheduler import Scheduler
 from servatus.campaign._script import check_command
@@ -400,13 +400,16 @@ def test_every_spawn_failure_is_unavailable(
 
 def test_scheduler_over_noisy_ssh_reads_exact_replies(tmp_path: Path) -> None:
     # End to end: the fake ssh prints a banner and shell noise, then really executes stub Slurm
-    # commands under the scrubbed remote environment.
+    # commands and the real find under the scrubbed remote environment.
     slurm = tmp_path / "slurm"
+    logs = tmp_path / "logs"
     slurm.mkdir()
+    logs.mkdir()
+    for name in (f"{ALLOCATION}.42.start", f"{ALLOCATION}.42.0.0.end", f"{ALLOCATION}-42.out"):
+        (logs / name).touch()
     replies = {
         "sbatch": "printf '42\\n'",
-        "squeue": "printf 'slurm_load_jobs error: Invalid job id specified\\n' >&2; exit 1",
-        "sacct": f"printf '%s' '{sacct_row('COMPLETED', end='2030-01-01T13:00:00')}'",
+        "squeue": f"printf '42|{IDENTITY}|COMPLETED\\n'",
     }
     for name, body in replies.items():
         stub = slurm / name
@@ -415,6 +418,7 @@ def test_scheduler_over_noisy_ssh_reads_exact_replies(tmp_path: Path) -> None:
     ssh, _ = fake_ssh(tmp_path)
     scheduler = Scheduler(ssh, str(slurm))
     argv = (str(slurm / "sbatch"), "--parsable", f"--job-name={IDENTITY}")
-    assert scheduler.submit(argv, b"#!/bin/sh\n") == JobRef(42)
-    observed = scheduler.observe([query()])[ALLOCATION]
-    assert observed.allocation.state is AllocationState.SUCCEEDED
+    assert scheduler.submit(argv, b"#!/bin/sh\n") == 42
+    assert scheduler.queue([ALLOCATION]) == {ALLOCATION: (QueueRow(42, "COMPLETED"),)}
+    markers = scheduler.markers(PurePosixPath(logs), {ALLOCATION: 1})
+    assert sorted(markers[ALLOCATION], key=repr) == [End(42, 0, 0), Start(42)]

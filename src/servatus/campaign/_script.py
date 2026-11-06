@@ -4,7 +4,9 @@ plus ``check_command``, the deterministic bounds every scheduler command must me
 The batch script needs only a POSIX shell and its builtins on the compute node: no scratch files,
 no ``mktemp``, ``base64``, or ``rm``. Each Task becomes one exact ``srun`` step whose stdin is a
 single-quoted ``printf`` literal, whose environment is rebuilt from nothing, and whose name binds
-it to the allocation identity and slot.
+it to the allocation identity and slot. The script records its run in empty marker files in
+``log_root`` (see ``_evidence``): a start marker before any step, one end marker per returned step,
+and a stop marker when it is interrupted.
 """
 
 from __future__ import annotations
@@ -68,7 +70,7 @@ def _check_allocation(allocation_id: str) -> str:
 
 
 def job_name(allocation_id: str) -> str:
-    """The immutable Slurm job name (and comment) of one allocation."""
+    """The immutable Slurm job name of one allocation."""
     return f"servatus-{_check_allocation(allocation_id)}"
 
 
@@ -119,6 +121,7 @@ def sbatch_argv(
     argv = [
         str(target.slurm_bin / "sbatch"),
         "--parsable",
+        "--no-requeue",
         "--export=NIL",
         "--nodes=1",
         f"--ntasks={task_count}",
@@ -128,7 +131,6 @@ def sbatch_argv(
         f"--partition={','.join(target.partitions)}",
         f"--chdir={target.work_root}",
         f"--job-name={identity}",
-        f"--comment={identity}",
         f"--output={output}",
         f"--error={output}",
     ]
@@ -153,16 +155,22 @@ _PRELUDE = (
     # --export=NIL leaves no PATH, and Apptainer's --nv finds the host NVIDIA binaries and
     # libraries (nvidia-smi, MPS, libcuda) on it; without one it binds nothing.
     "export PATH=/usr/bin:/bin",
+    'job_id="${SLURM_JOB_ID:?Slurm did not set SLURM_JOB_ID}"',
+)
+# The trap signals the whole process group: each slot's subshell dies before it can write an end
+# marker, so an interrupted step is recorded as stopped, never as a failure of its own. `command :`
+# keeps a failed marker write (quota, ESTALE) from exiting the shell and orphaning the steps.
+_TRAP = (
     "pids=",
     "interrupt() {",
     "  trap '' HUP INT TERM",
-    '  for pid in $pids; do kill "$pid" 2>/dev/null || :; done',
+    '  command : > "$marker.stop"',
+    "  kill -s TERM 0 2>/dev/null || :",
     '  for pid in $pids; do wait "$pid" 2>/dev/null || :; done',
     "  exit 1",
     "}",
     "trap interrupt HUP INT TERM",
-    'job_id="${SLURM_JOB_ID:?Slurm did not set SLURM_JOB_ID}"',
-    'restart_count="${SLURM_RESTART_COUNT:-0}"',
+    ': > "$marker.start" || exit 1',
 )
 _EPILOGUE = (
     "status=0",
@@ -172,7 +180,6 @@ _EPILOGUE = (
 )
 # Step-local GPU visibility exists only inside the step; read it there and fail when absent.
 _GPU_VISIBILITY = '"${CUDA_VISIBLE_DEVICES:?Slurm did not set step GPU visibility}"'
-_DYNAMIC = {"SERVATUS_JOB_ID": '"$job_id"', "SERVATUS_RESTART_COUNT": '"$restart_count"'}
 
 
 def _environment(
@@ -187,7 +194,7 @@ def _environment(
     values["SERVATUS_ALLOCATION_ID"] = allocation_id
     values["SERVATUS_SLOT"] = str(slot)
     words = [(name, shlex.quote(value)) for name, value in values.items()]
-    words.extend(_DYNAMIC.items())
+    words.append(("SERVATUS_JOB_ID", '"$job_id"'))
     return tuple(words)
 
 
@@ -247,15 +254,17 @@ def render_batch(
 ) -> bytes:
     """The complete ``#!/bin/sh`` batch script that launches one exact step per Task.
 
-    Steps start concurrently in slot order; the script then waits for every step and exits
-    nonzero if any failed. An interrupt kills and reaps only the recorded step processes.
+    Steps start concurrently in slot order, each in a subshell that writes the slot's end marker
+    as soon as its step returns; the script then waits for every step and exits nonzero if any
+    failed. An interrupt writes the stop marker, then terminates every step.
     """
     frozen = tuple(tasks)
     if not frozen or any(not isinstance(task, Task) for task in frozen):
         raise ConfigurationError("an allocation needs at least one Task")
     _check_allocation(allocation_id)
     srun = str(target.slurm_bin / "srun")
-    lines: list[str] = list(_PRELUDE)
+    marker = shlex.quote(str(target.log_root / allocation_id))
+    lines: list[str] = [*_PRELUDE, f'marker={marker}."$job_id"', *_TRAP]
     for slot, task in enumerate(frozen):
         path = log_path(target.log_root, allocation_id, "%j", slot)
         step = [
@@ -276,8 +285,8 @@ def render_batch(
             step.append(_gres(target, resources.gpus))
         container = target.container
         if container is None:
-            # Environment words follow `env -i`; the batch shell expands only "$job_id" and
-            # "$restart_count" there, everything else is single-quoted.
+            # Environment words follow `env -i`; the batch shell expands only "$job_id" there,
+            # everything else is single-quoted.
             launcher, assignments, args = _direct_step(resources, task, allocation_id, slot)
             words = f"{shlex.join((*step, *launcher))} {assignments} {shlex.join(args)}"
         else:
@@ -285,7 +294,8 @@ def render_batch(
                 container, target, resources, task, allocation_id, slot
             )
             words = f"{assignments} {shlex.join((*step, *command))}"
-        lines.append(f"printf {printf_literal(task.stdin)} | {words} &")
+        end = f'code=$?; command : > "$marker.{slot}.$code.end"; exit "$code"'
+        lines.append(f"{{ printf {printf_literal(task.stdin)} | {words}; {end}; }} &")
         lines.append('pids="$pids $!"')
     lines.extend(_EPILOGUE)
     script = "\n".join(lines).encode("utf-8")

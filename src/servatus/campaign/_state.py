@@ -17,9 +17,8 @@ from ..errors import ConfigurationError, Conflict, CorruptState, NotFound
 from . import _codec
 from ._codec import FLATTEN
 from ._config import Profile, Task
-from ._evidence import JobRef
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class _Invalid(ValueError):
@@ -59,11 +58,10 @@ class Attempt:
     task_keys: tuple[str, ...]
     profile: Profile
     retry: tuple[str, ...]
-    duplicate_risk: tuple[str, ...]
     intent_revision: int
     intent_at: datetime
     acceptance: AcceptanceState = AcceptanceState.UNRESOLVED
-    job: JobRef | None = None
+    job: int | None = None
     outcome_revision: int | None = None
 
     def __post_init__(self) -> None:
@@ -73,7 +71,6 @@ class Attempt:
         keys = self.task_keys
         _require(bool(keys) and len(set(keys)) == len(keys), "invalid attempt task references")
         _require(_subsequence(self.retry, keys), "invalid retry references")
-        _require(_subsequence(self.duplicate_risk, self.retry), "invalid duplicate-risk references")
         if self.acceptance is AcceptanceState.UNRESOLVED:
             _require(
                 self.outcome_revision is None and self.job is None, "unresolved intent has outcome"
@@ -86,6 +83,9 @@ class Attempt:
             _require(
                 (self.job is not None) == (self.acceptance is AcceptanceState.ACCEPTED),
                 "job identity disagrees with acceptance",
+            )
+            _require(
+                self.job is None or (type(self.job) is int and self.job >= 1), "invalid job number"
             )
         target, resources, count = self.profile.target, self.profile.resources, len(keys)
         _require(
@@ -254,7 +254,6 @@ def record_intent(
     task_keys: tuple[str, ...],
     profile: Profile,
     retry: tuple[str, ...],
-    duplicate_risk: tuple[str, ...],
     at: datetime,
 ) -> tuple[State, Attempt]:
     with _rejected():
@@ -263,7 +262,6 @@ def record_intent(
             task_keys=task_keys,
             profile=profile,
             retry=retry,
-            duplicate_risk=duplicate_risk,
             intent_revision=state.revision + 1,
             intent_at=at,
         )
@@ -273,43 +271,15 @@ def record_intent(
     return changed, attempt
 
 
-def record_outcome(state: State, allocation_id: str, job: JobRef | None) -> State:
-    """Record acceptance (``job``) or explicit non-submission (``None``). Identical repeats are
-    idempotent; a conflicting outcome raises ``Conflict``."""
+def record_outcome(state: State, allocation_id: str, job: int | None) -> State:
+    """Record acceptance of ``job`` or non-submission (``None``) at the next revision. Identical
+    repeats are idempotent; a conflicting outcome raises ``Conflict``."""
     attempt = state.attempt(allocation_id)
     acceptance = AcceptanceState.NOT_SUBMITTED if job is None else AcceptanceState.ACCEPTED
     if attempt.acceptance is not AcceptanceState.UNRESOLVED:
         if attempt.acceptance is acceptance and attempt.job == job:
             return state
         raise Conflict(f"allocation {allocation_id} already has a conflicting outcome")
-    return _resolved(state, attempt, job)
-
-
-def correct_outcome(state: State, allocation_id: str, job: JobRef) -> State:
-    """Replace a NOT_SUBMITTED outcome with acceptance of ``job`` at a new revision.
-
-    Only for scheduler proof that the allocation was accepted after all. Identical repeats are
-    idempotent. ``Conflict`` when the Attempt is not recorded as not submitted, or when a later
-    Attempt already names one of its Tasks (that history cannot be rewritten).
-    """
-    attempt = state.attempt(allocation_id)
-    if attempt.job == job:
-        return state
-    if attempt.acceptance is not AcceptanceState.NOT_SUBMITTED:
-        raise Conflict(f"allocation {allocation_id} is not recorded as not submitted")
-    keys = set(attempt.task_keys)
-    later = state.attempts[state.attempts.index(attempt) + 1 :]
-    if clashes := [item.allocation_id for item in later if keys.intersection(item.task_keys)]:
-        raise Conflict(
-            f"allocation {allocation_id} cannot be marked accepted: later allocations "
-            f"{', '.join(clashes)} already include its Tasks"
-        )
-    return _resolved(state, attempt, job)
-
-
-def _resolved(state: State, attempt: Attempt, job: JobRef | None) -> State:
-    """``state`` with ``attempt``'s outcome recorded at the next revision."""
-    acceptance = AcceptanceState.NOT_SUBMITTED if job is None else AcceptanceState.ACCEPTED
     revision = state.revision + 1
     with _rejected():
         resolved = replace(attempt, acceptance=acceptance, job=job, outcome_revision=revision)
@@ -317,7 +287,7 @@ def _resolved(state: State, attempt: Attempt, job: JobRef | None) -> State:
     return _changed(state, revision=revision, attempts=attempts)
 
 
-# --- Document (schema 7) ---------------------------------------------------------------------
+# --- Document (schema 8) ---------------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -326,11 +296,10 @@ class _AttemptDocument:
     task_keys: tuple[str, ...]
     profile: str
     retry: tuple[str, ...]
-    duplicate_risk: tuple[str, ...]
     intent_revision: int
     intent_at: datetime
     acceptance: AcceptanceState
-    job: JobRef | None
+    job: int | None
     outcome_revision: int | None
 
 

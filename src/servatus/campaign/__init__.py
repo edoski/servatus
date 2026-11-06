@@ -9,17 +9,19 @@ scheduler, and ``to_document`` turns results into JSON-compatible data.
 
 from ._campaign import Campaign, Connect, ResultProbe, ping
 from ._config import Apptainer, Profile, Resources, Target, Task
-from ._evidence import AllocationState, JobRef, SchedulerEvidence, StepEvidence
+from ._evidence import Execution, Observation
 from ._plan import Decision, Plan, PlannedAllocation, capacity
 from ._policy import Hold, Retry
 from ._remote import Completed, Transport, connect
 from ._results import (
     LogSnapshot,
     Receipt,
+    ReconcileResult,
     ShapeCheck,
     SubmitResult,
     UnattemptedAllocation,
     UnresolvedSubmission,
+    WaitingAllocation,
     to_document,
 )
 from ._state import AcceptanceState
@@ -27,28 +29,27 @@ from ._status import AttemptStatus, ResultState, Status, TaskStatus
 
 __all__ = [
     "AcceptanceState",
-    "AllocationState",
     "Apptainer",
     "AttemptStatus",
     "Campaign",
     "Completed",
     "Connect",
     "Decision",
+    "Execution",
     "Hold",
-    "JobRef",
     "LogSnapshot",
+    "Observation",
     "Plan",
     "PlannedAllocation",
     "Profile",
     "Receipt",
+    "ReconcileResult",
     "Resources",
     "ResultProbe",
     "ResultState",
     "Retry",
-    "SchedulerEvidence",
     "ShapeCheck",
     "Status",
-    "StepEvidence",
     "SubmitResult",
     "Target",
     "Task",
@@ -56,6 +57,7 @@ __all__ = [
     "Transport",
     "UnattemptedAllocation",
     "UnresolvedSubmission",
+    "WaitingAllocation",
     "capacity",
     "connect",
     "ping",

@@ -3,7 +3,7 @@
 
 Valid histories come from the real transitions. Each document is mutated (numbers nudged, list
 items swapped/dropped/duplicated, keys removed or added, values transplanted between fields of the
-same name) and re-serialized canonically. ``reference`` restates the schema-7 rules directly and
+same name) and re-serialized canonically. ``reference`` restates the schema-8 rules directly and
 quadratically, in the style of the 0.11 decoder; only Profile decoding reuses the codec.
 """
 
@@ -24,7 +24,6 @@ from support.builders import profile, resources, target, tasks
 
 from servatus.campaign import _codec
 from servatus.campaign._config import Profile, Task
-from servatus.campaign._evidence import JobRef
 from servatus.campaign._state import State, append, create, decode, encode, record_outcome, seal
 from servatus.errors import ConfigurationError, CorruptState
 
@@ -43,7 +42,6 @@ ATTEMPT = {
     "task_keys",
     "profile",
     "retry",
-    "duplicate_risk",
     "intent_revision",
     "intent_at",
     "acceptance",
@@ -51,7 +49,6 @@ ATTEMPT = {
     "outcome_revision",
 }
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 PROFILES = (
     profile(),
     profile(
@@ -140,7 +137,7 @@ def reference(doc: Any) -> bool:
 
 def check(doc: Any) -> None:
     need(is_dict(doc) and set(doc) == TOP)
-    need(is_int(doc["schema_version"]) and doc["schema_version"] == 7)
+    need(is_int(doc["schema_version"]) and doc["schema_version"] == 8)
     need(is_hex(doc["campaign_id"], 32))
     revision, sealed = doc["revision"], doc["sealed_revision"]
     need(is_int(revision) and revision >= 0)
@@ -189,13 +186,12 @@ def check(doc: Any) -> None:
         need(is_int(intent) and 1 <= intent <= revision and intent not in events)
         need(not prior or intent > prior[-1]["intent_revision"])
         events.add(intent)
-        keys, retry, ack = raw["task_keys"], raw["retry"], raw["duplicate_risk"]
-        need(is_strings(keys) and is_strings(retry) and is_strings(ack))
+        keys, retry = raw["task_keys"], raw["retry"]
+        need(is_strings(keys) and is_strings(retry))
         need(bool(keys) and len(set(keys)) == len(keys))
         need(all(key in introduced and introduced[key] < intent for key in keys))
         need([key for key in order if key in keys] == keys)
         need([key for key in keys if key in retry] == retry)
-        need([key for key in retry if key in ack] == ack)
         earlier = {
             key
             for other in prior
@@ -219,12 +215,7 @@ def check(doc: Any) -> None:
             need(is_int(outcome) and intent < outcome <= revision and outcome not in events)
             events.add(outcome)
             if acceptance == "ACCEPTED":
-                need(is_dict(job) and set(job) == {"job_id", "cluster"})
-                need(is_int(job["job_id"]) and job["job_id"] >= 1)
-                cluster = job["cluster"]
-                need(
-                    cluster is None or (isinstance(cluster, str) and bool(TOKEN.fullmatch(cluster)))
-                )
+                need(is_int(job) and job >= 1)
             else:
                 need(job is None)
         need(isinstance(raw["profile"], str) and raw["profile"] in loaded)
@@ -267,15 +258,10 @@ def histories(draw: st.DrawFn) -> State:
             limit = chosen_profile.target.max_tasks_per_allocation
             chosen = draw(st.lists(st.sampled_from(free), min_size=1, max_size=limit, unique=True))
             keys = [key for key in free if key in chosen]
-            state, _ = intend(
-                state,
-                keys,
-                ack=draw(st.sets(st.sampled_from(keys))),
-                profile_value=chosen_profile,
-            )
+            state, _ = intend(state, keys, profile_value=chosen_profile)
         elif operation == "outcome" and unresolved:
             attempt = draw(st.sampled_from(unresolved))
-            job = draw(st.sampled_from([None, JobRef(7), JobRef(8, "alpha")]))
+            job = draw(st.sampled_from([None, 7, 8]))
             state = record_outcome(state, attempt.allocation_id, job)
     return state
 
@@ -415,10 +401,10 @@ def test_mutation_corpus_exercises_both_verdicts() -> None:
     rng = random.Random(7)
     state = create(CAMPAIGN_ID, tasks(4), appendable=True)
     state, first = intend(state, ["task-0", "task-1"], profile_value=PROFILES[1])
-    state = record_outcome(state, first, JobRef(41, "alpha"))
+    state = record_outcome(state, first, 41)
     state = append(state, [Task("task-4", env={"A": "1"})])
-    state, second = intend(state, ["task-0", "task-2", "task-4"], ack=["task-0"])
-    state = record_outcome(state, second, JobRef(42))
+    state, second = intend(state, ["task-0", "task-2", "task-4"])
+    state = record_outcome(state, second, 42)
     state, third = intend(state, ["task-3"])
     state = record_outcome(seal(state), third, None)
     state, _ = intend(state, ["task-1", "task-3"], profile_value=PROFILES[1])

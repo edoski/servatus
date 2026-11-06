@@ -15,7 +15,16 @@ from typing import Any
 
 from support.builders import resources, target
 
-from servatus.campaign import Campaign, Completed, Profile, ResultProbe, Target, Task, Transport
+from servatus.campaign import (
+    Campaign,
+    Completed,
+    PlannedAllocation,
+    Profile,
+    ResultProbe,
+    Target,
+    Task,
+    Transport,
+)
 from servatus.errors import Unavailable
 from servatus.testing import FakeScheduler
 
@@ -23,7 +32,7 @@ START = datetime(2030, 1, 1, 12, 0, 0, tzinfo=UTC)
 
 
 class Clock:
-    """A settable UTC clock shared by the Campaign and the fake cluster."""
+    """A settable UTC clock for the Campaign: intent times and reconcile deadlines."""
 
     def __init__(self, now: datetime = START) -> None:
         self.now = now
@@ -152,8 +161,15 @@ class World:
     def scheduler_calls(self) -> int:
         return len(self.fake.calls)
 
+    def revision(self) -> int:
+        return self.open().status(scheduler=False).revision
+
+    def resubmit(self, allocation: PlannedAllocation) -> int:
+        """A late ``sbatch`` of ``allocation`` reaches Slurm behind Servatus' back; its job."""
+        reply = self.fake.run(allocation.argv, stdin=allocation.script)
+        return int(reply.stdout)
+
 
 def make_world(root: Path) -> World:
-    clock = Clock()
-    fake = FakeScheduler(clock=clock)
-    return World(root, clock, fake, Wire(fake))
+    fake = FakeScheduler()
+    return World(root, Clock(), fake, Wire(fake))

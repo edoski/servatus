@@ -16,8 +16,9 @@ from servatus.campaign import (
     AcceptanceState,
     Completed,
     Hold,
-    JobRef,
     PlannedAllocation,
+    Receipt,
+    ReconcileResult,
     Task,
     UnattemptedAllocation,
 )
@@ -25,8 +26,6 @@ from servatus.campaign._state import State
 from servatus.campaign._store import Store
 from servatus.errors import (
     ConfigurationError,
-    Conflict,
-    ReconciliationError,
     StalePlan,
     SubmissionInterrupted,
     Unavailable,
@@ -57,7 +56,7 @@ def test_submission_records_intent_before_contact_and_receipts_after(world: Worl
         item.allocation_id for item in plan.allocations
     ]
     attempts = campaign.status(scheduler=False).attempts
-    assert [attempt.job for attempt in attempts] == [JobRef(1000), JobRef(1001)]
+    assert [attempt.job for attempt in attempts] == [1000, 1001]
     assert [job.argv for job in world.fake.jobs] == [item.argv for item in plan.allocations]
     assert [job.script for job in world.fake.jobs] == [item.script for item in plan.allocations]
 
@@ -111,13 +110,14 @@ def test_failed_ping_records_no_intent(world: World) -> None:
     assert campaign.submit(plan).complete
 
 
-@pytest.mark.parametrize("fault", ["transport", "nonzero", "receipt"])
+@pytest.mark.parametrize("fault", ["transport", "nonzero", "receipt", "cluster"])
 def test_partial_submission_reports_every_allocation(world: World, fault: str) -> None:
     campaign = world.create(jobs(3))
     plan = campaign.plan(cpu_profile(), tasks_per_allocation=1)
     replies = {
         "nonzero": Completed(1, b"", b"sbatch: error: site rejection\n"),
         "receipt": Completed(0, b"not a receipt\n", b""),
+        "cluster": Completed(0, b"1001;alpha\n", b""),
     }
     world.wire.on("sbatch", lambda _argv: None)
     world.wire.on("sbatch", reset if fault == "transport" else lambda _argv: replies[fault])
@@ -125,13 +125,18 @@ def test_partial_submission_reports_every_allocation(world: World, fault: str) -
         campaign.submit(plan)
     result = caught.value.result
     assert isinstance(caught.value.__cause__, Unavailable) and not result.complete
-    assert [receipt.job for receipt in result.receipts] == [JobRef(1000)]
+    assert [receipt.job for receipt in result.receipts] == [1000]
     assert [item.allocation_id for item in result.unresolved] == [plan.allocations[1].allocation_id]
     assert result.unresolved[0].observed_job is None
     assert result.unattempted == unattempted(plan.allocations[2])
     if fault == "nonzero":
         assert "site rejection" in str(caught.value)
     assert len(world.fake.jobs) == 1  # nothing reached the queue after the failure
+    attempts = campaign.status(scheduler=False).attempts
+    assert [attempt.acceptance for attempt in attempts] == [
+        AcceptanceState.ACCEPTED,
+        AcceptanceState.UNRESOLVED,
+    ]
     following = campaign.plan(cpu_profile())
     assert (
         following.decision.selected == ("task-2",)
@@ -139,100 +144,25 @@ def test_partial_submission_reports_every_allocation(world: World, fault: str) -
     )
 
 
-def test_unresolved_allocations_are_recovered_by_reconcile_or_marking(world: World) -> None:
+def test_a_lost_reply_is_unresolved_until_reconcile_records_the_job(world: World) -> None:
     campaign = world.create(jobs(2))
     plan = campaign.plan(cpu_profile(), tasks_per_allocation=1)
     world.fake.lose_next_reply("sbatch")
-    with pytest.raises(SubmissionInterrupted, match="unresolved") as caught:
+    with pytest.raises(SubmissionInterrupted, match="acceptance is unresolved") as caught:
         campaign.submit(plan)
-    lost = caught.value.result.unresolved[0].allocation_id
-    assert world.fake.jobs[0].name == f"servatus-{lost}"  # Slurm did accept it
-    receipt = campaign.reconcile(lost)
-    assert receipt.job == JobRef(1000) and receipt.task_keys == ("task-0",)
-    assert campaign.reconcile(lost) == receipt  # already accepted: nothing to ask
-
-    retry = campaign.plan(cpu_profile())
-    world.wire.on("sbatch", reset)
-    with pytest.raises(SubmissionInterrupted, match="unresolved") as caught:
-        campaign.submit(retry)
-    never = caught.value.result.unresolved[0].allocation_id
-    with pytest.raises(ReconciliationError, match="0 jobs"):
-        campaign.reconcile(never)
-    campaign.mark_not_submitted(never)
-    campaign.mark_not_submitted(never)  # identical repeat
-    with pytest.raises(Conflict, match="recorded as not submitted"):
-        campaign.reconcile(never)
-    with pytest.raises(Conflict, match=r"does not prove job 77 for it \(.*0 jobs"):
-        campaign.mark_accepted(never, 77)
-    assert campaign.plan(cpu_profile()).decision.selected == ("task-1",)
-
-
-def test_marking_not_submitted_needs_proof_of_absence(world: World) -> None:
-    campaign = world.create(jobs(1))
-    plan = campaign.plan(cpu_profile("old", host="old.example.edu"))
-    allocation = plan.allocations[0].allocation_id
-    world.fake.lose_next_reply("sbatch")
-    with pytest.raises(SubmissionInterrupted, match="unresolved"):
-        campaign.submit(plan)
-    world.wire.hosts.clear()
-    with pytest.raises(Conflict, match="Slurm holds job 1000 for allocation .* mark-accepted"):
-        campaign.mark_not_submitted(allocation)
-    assert world.wire.hosts == ["old.example.edu"]  # asked the original target
-    world.fake.forget(1000)
-    world.wire.on("squeue", reset)
-    with pytest.raises(Unavailable, match="connection reset by peer"):
-        campaign.mark_not_submitted(allocation)
-    world.wire.on("sacct", lambda _argv: Completed(0, b"malformed\n", b""))
-    with pytest.raises(ReconciliationError, match="malformed"):
-        campaign.mark_not_submitted(allocation)
-    assert campaign.status(scheduler=False).attempts[0].acceptance is AcceptanceState.UNRESOLVED
-    campaign.mark_not_submitted(allocation)  # the job aged out: absence is proven
-    calls = world.scheduler_calls()
-    campaign.mark_not_submitted(allocation)  # identical repeat, no contact
-    assert world.scheduler_calls() == calls
-    assert campaign.status(scheduler=False).attempts[0].acceptance is (
-        AcceptanceState.NOT_SUBMITTED
-    )
-
-
-def test_a_proven_job_overrides_a_not_submitted_outcome(world: World) -> None:
-    """The receipt commit lost to a concurrent mark-not-submitted; mark-accepted repairs it."""
-    campaign = world.create(jobs(2))
-    plan = campaign.plan(cpu_profile(), tasks_per_allocation=1)
-    first = plan.allocations[0].allocation_id
-    world.fake.lose_next_reply("sbatch")
-    with pytest.raises(SubmissionInterrupted, match="unresolved"):
-        campaign.submit(plan)
-    world.wire.on("squeue", lambda _argv: Completed(0, b"", b""))  # Slurm lags behind
-    world.wire.on("sacct", lambda _argv: Completed(0, b"", b""))
-    campaign.mark_not_submitted(first)
-    revision = campaign.status(scheduler=False).revision
-    with pytest.raises(Conflict, match=r"does not prove job 1001 for it \(Slurm holds job 1000\)"):
-        campaign.mark_accepted(first, 1001)
-    with pytest.raises(Conflict, match=r"job 1000;alpha .*Slurm holds job 1000\)"):
-        campaign.mark_accepted(first, 1000, cluster="alpha")
-    receipt = campaign.mark_accepted(first, 1000)
-    assert receipt.job == JobRef(1000) and receipt.task_keys == ("task-0",)
-    attempt = campaign.status(scheduler=False).attempts[0]
-    assert attempt.acceptance is AcceptanceState.ACCEPTED and attempt.job == JobRef(1000)
-    assert campaign.status(scheduler=False).revision == revision + 1
-    assert campaign.mark_accepted(first, 1000) == receipt  # identical repeat
+    result = caught.value.result
+    lost = plan.allocations[0].allocation_id
+    assert [item.allocation_id for item in result.unresolved] == [lost]
+    assert result.unattempted == unattempted(plan.allocations[1])
+    assert world.fake.job(1000).name == f"servatus-{lost}"
+    held = campaign.plan(cpu_profile())
+    assert held.decision.selected == ("task-1",)
+    assert held.decision.held["task-0"] is Hold.UNRESOLVED
+    receipt = Receipt(lost, 1000, ("task-0",))
+    assert campaign.reconcile() == ReconcileResult(receipts=(receipt,))
     following = campaign.plan(cpu_profile())
-    assert following.decision.selected == ("task-1",)
-
-
-def test_a_not_submitted_outcome_with_later_attempts_cannot_be_overridden(world: World) -> None:
-    campaign = world.create(jobs(1))
-    world.fake.lose_next_reply("sbatch")
-    with pytest.raises(SubmissionInterrupted, match="unresolved") as caught:
-        campaign.submit(campaign.plan(cpu_profile()))
-    lost = caught.value.result.unresolved[0].allocation_id
-    world.wire.on("squeue", lambda _argv: Completed(0, b"", b""))
-    world.wire.on("sacct", lambda _argv: Completed(0, b"", b""))
-    campaign.mark_not_submitted(lost)
-    later = campaign.submit(campaign.plan(cpu_profile())).receipts[0]
-    with pytest.raises(Conflict, match=f"later allocations {later.allocation_id} already"):
-        campaign.mark_accepted(lost, 1000)
+    assert following.decision.held["task-0"] is Hold.SUBMITTED
+    assert campaign.submit(following).receipts[0].job == 1001
 
 
 def test_a_receipt_that_became_durable_despite_a_failed_commit_is_reported(
@@ -254,7 +184,7 @@ def test_a_receipt_that_became_durable_despite_a_failed_commit_is_reported(
     with pytest.raises(SubmissionInterrupted, match="receipt failed after it became durable") as e:
         campaign.submit(plan)
     result = e.value.result
-    assert [receipt.job for receipt in result.receipts] == [JobRef(1000)]
+    assert [receipt.job for receipt in result.receipts] == [1000]
     assert result.unresolved == () and result.unattempted == unattempted(plan.allocations[1])
 
 
@@ -280,27 +210,6 @@ def test_an_unreadable_campaign_after_a_failed_intent_counts_as_unresolved(
     assert world.fake.jobs == ()
 
 
-def test_operator_marks_are_idempotent_and_conflicts_are_refused(world: World) -> None:
-    campaign = world.create(jobs(1))
-    plan = campaign.plan(cpu_profile())
-    allocation = plan.allocations[0].allocation_id
-
-    def operator(_argv: tuple[str, ...]) -> None:
-        world.open().mark_accepted(allocation, 1000, cluster=None)
-
-    world.wire.on("sbatch", operator)
-    assert campaign.submit(plan).complete
-    revision = campaign.status(scheduler=False).revision
-    assert campaign.mark_accepted(allocation, 1000).job == JobRef(1000)
-    assert campaign.status(scheduler=False).revision == revision
-    with pytest.raises(Conflict, match="conflicting outcome"):
-        campaign.mark_accepted(allocation, 1001)
-    with pytest.raises(Conflict, match="conflicting outcome"):
-        campaign.mark_not_submitted(allocation)
-    with pytest.raises(ConfigurationError, match="job_id must be a positive integer"):
-        campaign.mark_accepted(allocation, 0)
-
-
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
 def test_a_receipt_that_cannot_be_recorded_is_reported_with_the_observed_job(
     world: World,
@@ -321,10 +230,12 @@ def test_a_receipt_that_cannot_be_recorded_is_reported_with_the_observed_job(
     assert isinstance(caught.value.__cause__, ConfigurationError)
     assert isinstance(caught.value.__cause__.__cause__, PermissionError)
     assert result.receipts == ()
-    assert result.unresolved[0].observed_job == JobRef(1000)
+    assert result.unresolved[0].observed_job == 1000
     assert result.unattempted == unattempted(plan.allocations[1])
     assert campaign.status(scheduler=False).attempts[0].acceptance is AcceptanceState.UNRESOLVED
-    assert campaign.mark_accepted(plan.allocations[0].allocation_id, 1000).job == JobRef(1000)
+    assert campaign.reconcile().receipts == (
+        Receipt(plan.allocations[0].allocation_id, 1000, ("task-0",)),
+    )
 
 
 @pytest.mark.parametrize("mutation", ["append", "seal"])
@@ -346,26 +257,25 @@ def test_a_concurrent_roster_change_stops_the_batch_after_the_receipt(
         campaign.submit(plan)
     assert isinstance(caught.value.__cause__, StalePlan)
     result = caught.value.result
-    assert [receipt.job for receipt in result.receipts] == [JobRef(1000)]
+    assert [receipt.job for receipt in result.receipts] == [1000]
     assert result.unresolved == () and result.unattempted == unattempted(plan.allocations[1])
     status = campaign.status(scheduler=False)
-    assert status.revision == 3 and status.attempts[0].job == JobRef(1000)
+    assert status.revision == 3 and status.attempts[0].job == 1000
 
 
 def test_an_identical_concurrent_receipt_does_not_stop_the_batch(world: World) -> None:
     campaign = world.create(jobs(2))
     plan = campaign.plan(cpu_profile(), tasks_per_allocation=1)
-    first = plan.allocations[0].allocation_id
+    first = plan.allocations[0]
 
-    def operator(_argv: tuple[str, ...]) -> None:
-        world.open().mark_accepted(first, 1000)
+    def reconciled_meanwhile(argv: tuple[str, ...]) -> Completed:
+        reply = world.fake.run(argv, stdin=first.script)
+        assert world.open().reconcile().receipts[0].job == 1000
+        return reply
 
-    world.wire.on("sbatch", operator)
+    world.wire.on("sbatch", reconciled_meanwhile)
     result = campaign.submit(plan)
-    assert result.complete and [receipt.job for receipt in result.receipts] == [
-        JobRef(1000),
-        JobRef(1001),
-    ]
+    assert result.complete and [receipt.job for receipt in result.receipts] == [1000, 1001]
 
 
 def test_a_change_after_the_last_receipt_does_not_interrupt(world: World) -> None:
@@ -417,24 +327,6 @@ def test_a_probe_added_later_is_honoured(world: World) -> None:
     with pytest.raises(StalePlan, match="no longer eligible"):
         probed.submit(plan)
     assert probed.status(scheduler=False).attempts == ()
-
-
-def test_retries_rechecked_at_submission_stay_safe(world: World) -> None:
-    campaign = world.create(jobs(1))
-    campaign.submit(campaign.plan(cpu_profile()))
-    world.fake.finish(1000, "FAILED", exit_code="1:0")
-    plan = campaign.plan(cpu_profile(), retry=["task-0"])
-    world.fake.requeue(1000, state="RUNNING")
-    with pytest.raises(StalePlan, match=r"'task-0' \(ACTIVE\)"):
-        campaign.submit(plan)
-    world.fake.forget(1000)
-    with pytest.raises(StalePlan, match="duplicate-risk acknowledgement"):
-        campaign.submit(plan)
-    risky = campaign.plan(cpu_profile(), retry=["task-0"], allow_duplicate_risk=["task-0"])
-    receipt = campaign.submit(risky).receipts[0]
-    attempt = campaign.status(scheduler=False).attempts[-1]
-    assert attempt.allocation_id == receipt.allocation_id
-    assert (attempt.retry, attempt.duplicate_risk) == (("task-0",), ("task-0",))
 
 
 def test_an_empty_plan_submits_nothing(world: World) -> None:

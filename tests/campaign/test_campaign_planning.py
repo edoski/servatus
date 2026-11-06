@@ -12,7 +12,7 @@ import pytest
 from campaign_world import Probe, World, cpu_profile, jobs
 from support.builders import profile, resources, target
 
-from servatus.campaign import AllocationState, Completed, Hold, Profile, Retry, Task
+from servatus.campaign import Completed, Hold, Profile, Retry, Task
 from servatus.errors import (
     ConfigurationError,
     DestinationExists,
@@ -96,8 +96,8 @@ def test_batch_cap_defers_eligible_tasks_and_keeps_retry_intent(world: World) ->
     assert campaign.plan(capped, tasks_per_allocation=3).decision.selected == keys(*range(6, 11))
 
     for job in (1000, 1001):
-        world.fake.start(job)
-        world.fake.finish(job, "FAILED", exit_code="1:0")
+        world.fake.finish(job, exit_code=1)
+        world.fake.purge(job)
     single = cpu_profile(max_allocations_per_submit=1)
     retry = campaign.plan(single, retry=Retry.FAILED, tasks_per_allocation=2)
     assert retry.decision.selected == keys(0, 1)
@@ -107,10 +107,10 @@ def test_batch_cap_defers_eligible_tasks_and_keeps_retry_intent(world: World) ->
     following = campaign.plan(single, retry=Retry.FAILED, tasks_per_allocation=2)
     assert following.decision.selected == keys(2, 3)
     assert following.decision.held["task-0"] is Hold.ACTIVE
-    explicit = campaign.plan(single, retry=keys(*range(6)), tasks_per_allocation=2)
-    assert (
-        explicit.decision.selected == keys(2, 3) and explicit.decision.held["task-1"] is Hold.ACTIVE
-    )
+    explicit = campaign.plan(single, retry=keys(*range(2, 6)), tasks_per_allocation=2)
+    assert explicit.decision.selected == keys(2, 3)
+    with pytest.raises(PlanRefused, match=r"Slurm still lists earlier work.*'task-0', 'task-1'"):
+        campaign.plan(single, retry=keys(*range(6)), tasks_per_allocation=2)
 
 
 def test_unbounded_targets_plan_everything(world: World) -> None:
@@ -137,18 +137,35 @@ def test_fresh_only_plans_never_contact_historical_routes(world: World) -> None:
         campaign.plan(cpu_profile(host="new.example.edu"), retry=["task-0"])
 
 
+def test_plans_of_fresh_work_make_no_scheduler_calls(world: World) -> None:
+    campaign = world.create(jobs(3), probe=Probe())
+    plan = campaign.plan(cpu_profile(), only=["task-0"])
+    assert world.scheduler_calls() == 0
+    campaign.submit(plan)
+    calls = world.scheduler_calls()
+    for retry in ((), Retry.FAILED):
+        following = campaign.plan(cpu_profile(), retry=retry, only=["task-1", "task-2"])
+        assert following.decision.selected == ("task-1", "task-2")
+    assert world.scheduler_calls() == calls
+    campaign.plan(cpu_profile(), retry=Retry.FAILED)
+    assert world.scheduler_calls() > calls  # bulk retry observes the accepted task-0
+
+
 def test_every_hold_reason_is_reported(world: World) -> None:
     probe = Probe()
     campaign = world.create(jobs(6), probe=probe)
     campaign.submit(campaign.plan(cpu_profile(), tasks_per_allocation=1))
-    world.fake.start(1000)  # task-0 active
+    world.fake.start(1000)  # task-0 running
     world.fake.finish(1001)  # task-1 succeeded, result valid
-    world.fake.finish(1002, "FAILED", exit_code="1:0")  # task-2 failed
-    world.fake.forget(1003)  # task-3 unknown
+    world.fake.finish(1002, exit_code=1)  # task-2 failed
+    world.fake.start(1003)
+    world.fake.lose(1003)  # task-3 lost
     world.fake.finish(1004)  # task-4 succeeded, result missing
-    world.fake.finish(1005, "FAILED", exit_code="1:0")  # task-5 failed, then unresolved
+    world.fake.finish(1005, exit_code=1)  # task-5 failed, then unresolved
+    for job in range(1001, 1006):
+        world.fake.purge(job)
     probe.valid.add("task-1")
-    world.wire.on("sbatch", lambda _argv: (_ for _ in ()).throw(Unavailable("reset")))
+    world.fake.fail_next("sbatch")
     with pytest.raises(SubmissionInterrupted, match="unresolved"):
         campaign.submit(campaign.plan(cpu_profile(), retry=["task-5"]))
 
@@ -157,36 +174,91 @@ def test_every_hold_reason_is_reported(world: World) -> None:
     assert dict(bulk.decision.held) == {
         "task-0": Hold.ACTIVE,
         "task-1": Hold.VALID,
-        "task-3": Hold.UNOBSERVABLE,
+        "task-3": Hold.SUBMITTED,
         "task-4": Hold.SUBMITTED,
         "task-5": Hold.UNRESOLVED,
     }
-    only = campaign.plan(cpu_profile(), retry=["task-0", "task-2"], only=["task-0", "task-2"])
-    assert only.decision.selected == ("task-2",) and only.decision.held["task-0"] is Hold.ACTIVE
+    only = campaign.plan(cpu_profile(), retry=["task-2", "task-3"], only=["task-2", "task-3"])
+    assert only.decision.selected == only.decision.retry == ("task-2", "task-3")
     assert only.decision.held["task-4"] is Hold.NOT_REQUESTED
     incomplete = campaign.plan(cpu_profile(), retry=Retry.INCOMPLETE)
     assert incomplete.decision.selected == ("task-2", "task-4")
+    assert incomplete.decision.held["task-3"] is Hold.SUBMITTED
+
+
+def test_retry_failed_waits_for_slurm_to_forget_the_job(world: World) -> None:
+    campaign = world.create(jobs(2))
+    campaign.submit(campaign.plan(cpu_profile(), tasks_per_allocation=1))
+    world.fake.finish(1000, exit_code=1)
+    world.fake.interrupt(1001)
+    plan = campaign.plan(cpu_profile(), retry=Retry.FAILED)
+    assert plan.decision.selected == ()
+    assert dict(plan.decision.held) == {"task-0": Hold.ACTIVE, "task-1": Hold.ACTIVE}
+    with pytest.raises(PlanRefused, match="Slurm still lists earlier work.*: 'task-0'$"):
+        campaign.plan(cpu_profile(), retry=["task-0"])
+    world.fake.purge(1000)
+    world.fake.purge(1001)
+    plan = campaign.plan(cpu_profile(), retry=Retry.FAILED)
+    assert plan.decision.selected == plan.decision.retry == ("task-0", "task-1")
+
+
+def test_lost_work_is_retried_only_by_its_explicit_key(world: World) -> None:
+    campaign = world.create(jobs(1))
+    campaign.submit(campaign.plan(cpu_profile()))
+    world.fake.start(1000)
+    world.fake.lose(1000)
+    world.fake.purge(1000)
+    bulk = campaign.plan(cpu_profile(), retry=Retry.FAILED)
+    assert bulk.decision.selected == () and bulk.decision.held["task-0"] is Hold.SUBMITTED
+    explicit = campaign.plan(cpu_profile(), retry=["task-0"])
+    assert explicit.decision.selected == explicit.decision.retry == ("task-0",)
+    assert campaign.submit(explicit).receipts[0].job == 1001
 
 
 @pytest.mark.parametrize(
-    ("retry", "acknowledged", "message"),
+    ("retry", "message"),
     [
-        (["nope"], [], "unknown Task keys: 'nope'"),
-        (["task-1"], [], "retry needs an earlier accepted attempt: 'task-1'"),
-        (["task-0"], [], "needs a duplicate-risk acknowledgement: 'task-0'"),
-        ([], ["task-0"], "requires an explicitly retried Task key: 'task-0'"),
+        (["nope"], "unknown Task keys: 'nope'"),
+        (["task-1"], "retry needs an earlier accepted attempt: 'task-1'"),
+        (["task-0"], "Slurm still lists earlier work; wait for it or cancel it: 'task-0'"),
     ],
 )
-def test_explicit_retries_are_refused_with_every_reason(
-    world: World, retry: list[str], acknowledged: list[str], message: str
+def test_explicit_retries_are_refused_with_their_reason(
+    world: World, retry: list[str], message: str
 ) -> None:
-    campaign = world.create(jobs(2), appendable=True)
+    campaign = world.create(jobs(2))
     campaign.submit(campaign.plan(cpu_profile(), only=["task-0"]))
-    world.fake.forget(1000)
-    with pytest.raises(PlanRefused, match=message):
-        campaign.plan(cpu_profile(), retry=retry, allow_duplicate_risk=acknowledged)
-    plan = campaign.plan(cpu_profile(), retry=["task-0"], allow_duplicate_risk=["task-0"])
-    assert plan.decision.duplicate_risk == ("task-0",) and plan.warnings
+    world.fake.finish(1000, exit_code=1)
+    with pytest.raises(PlanRefused, match=message) as caught:
+        campaign.plan(cpu_profile(), retry=retry)
+    assert caught.value.keys == tuple(retry)
+
+
+def test_one_refusal_lists_every_offending_key(world: World) -> None:
+    campaign = world.create(jobs(3), probe=Probe({"task-2"}))
+    campaign.submit(campaign.plan(cpu_profile(), only=["task-0"]))
+    with pytest.raises(PlanRefused, match="'ghost'.*'task-2'.*'task-1'.*'task-0'") as caught:
+        campaign.plan(cpu_profile(), retry=["task-0", "task-1", "task-2", "ghost"])
+    assert caught.value.keys == ("ghost", "task-2", "task-1", "task-0")
+
+
+def test_submit_refuses_a_retry_whose_task_became_live(world: World) -> None:
+    campaign = world.create(jobs(1))
+    campaign.submit(campaign.plan(cpu_profile()))
+    world.fake.finish(1000, exit_code=1)
+    world.fake.purge(1000)
+    failed = campaign.plan(cpu_profile(), retry=["task-0"])
+    world.fake.fail_next("sbatch")
+    with pytest.raises(SubmissionInterrupted, match="unresolved"):
+        campaign.submit(failed)
+    world.clock.advance(minutes=15)
+    assert len(campaign.reconcile().not_submitted) == 1
+    plan = campaign.plan(cpu_profile(), retry=["task-0"])
+    world.resubmit(failed.allocations[0])  # the "failed" sbatch reached Slurm after all
+    with pytest.raises(StalePlan, match="Slurm still lists earlier work"):
+        campaign.submit(plan)
+    assert len(campaign.status(scheduler=False).attempts) == 2
+    assert world.fake.count("sbatch") == 3
 
 
 def test_valid_results_are_never_retried(world: World) -> None:
@@ -194,6 +266,7 @@ def test_valid_results_are_never_retried(world: World) -> None:
     campaign = world.open(probe=Probe({"task-0"}))
     world.open().submit(world.open().plan(cpu_profile()))  # planned and submitted without a probe
     world.fake.finish(1000)
+    world.fake.purge(1000)
     with pytest.raises(PlanRefused, match="valid results cannot be retried: 'task-0'"):
         campaign.plan(cpu_profile(), retry=["task-0"])
 
@@ -239,7 +312,7 @@ def test_saved_plans_are_compact_private_and_round_trip_without_observation(worl
     plan = campaign.plan(cpu_profile())
     data = plan.to_json()
     document = json.loads(data)
-    assert document["format"] == "servatus.plan/1" and document["digest"] == plan.digest
+    assert document["format"] == "servatus.plan/2" and document["digest"] == plan.digest
     assert document["selected"] == list(keys(0, 1, 2)) and document["probe_required"] is True
     assert all(secret not in data for secret in (b"secret-", b"train.py", b"SEED"))
     destination = world.root / "plan.json"
@@ -273,7 +346,7 @@ def test_plans_of_the_same_state_have_distinct_identities(world: World) -> None:
         ("probe_required", True, ConfigurationError, "digest does not match"),
         ("nonce", "c" * 32, ConfigurationError, "digest does not match"),
         ("retry", ["task-0"], ConfigurationError, "retry keys disagree"),
-        ("format", "servatus.plan/0", ConfigurationError, "expected format"),
+        ("format", "servatus.plan/1", ConfigurationError, "expected format"),
         ("surprise", 1, ConfigurationError, "unknown keys"),
     ],
 )
@@ -287,7 +360,7 @@ def test_changed_plan_documents_are_refused(
         campaign.load_plan(json.dumps(document).encode())
 
 
-@pytest.mark.parametrize("data", [b"", b"[]", b"{", b'{"format": "servatus.plan/1"}'])
+@pytest.mark.parametrize("data", [b"", b"[]", b"{", b'{"format": "servatus.plan/2"}'])
 def test_malformed_plan_documents_are_refused(world: World, data: bytes) -> None:
     campaign = world.create(jobs(1))
     with pytest.raises(ConfigurationError, match="invalid plan document"):
@@ -319,34 +392,3 @@ def test_validate_checks_each_distinct_shape_without_recording(world: World) -> 
     (rejected, _) = campaign.validate(plan)
     assert not rejected.accepted and rejected.scheduler_stderr == rejection
     assert campaign.status(scheduler=False).attempts == () and world.fake.jobs == ()
-
-
-@pytest.mark.parametrize(
-    "steps", [Completed(1, b"", b"sacct: error: timeout\n"), Completed(0, b"", b"")]
-)
-def test_failed_retry_never_resubmits_a_packed_task_whose_own_outcome_is_unknown(
-    world: World, steps: Completed
-) -> None:
-    """A packed allocation fails after one Task's step succeeded. Without that step's evidence
-    (the step query fails or finds nothing) the Task may have succeeded: never bulk-retry it."""
-    campaign = world.create(jobs(2))
-    campaign.submit(campaign.plan(cpu_profile()))
-    world.fake.start(1000)
-    world.fake.finish_step(1000, 0, "COMPLETED")
-    world.fake.finish(1000, "FAILED", exit_code="1:0")
-
-    def without_steps() -> None:
-        world.wire.on("sacct", lambda _argv: None)  # allocation history answers normally
-        world.wire.on("sacct", lambda _argv: steps)
-
-    without_steps()
-    status = campaign.status()
-    assert [task.execution for task in status.tasks] == [AllocationState.UNKNOWN] * 2
-    without_steps()
-    bulk = campaign.plan(cpu_profile(), retry=Retry.FAILED)
-    assert bulk.decision.selected == ()
-    assert dict(bulk.decision.held) == {"task-0": Hold.UNOBSERVABLE, "task-1": Hold.UNOBSERVABLE}
-    without_steps()
-    with pytest.raises(PlanRefused, match="needs a duplicate-risk acknowledgement: 'task-0'"):
-        campaign.plan(cpu_profile(), retry=["task-0"])
-    assert campaign.plan(cpu_profile(), retry=Retry.FAILED).decision.selected == ("task-1",)

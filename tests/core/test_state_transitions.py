@@ -12,7 +12,6 @@ from support.builders import profile, resources, target, tasks
 
 from servatus.campaign import _codec
 from servatus.campaign._config import Profile, Task
-from servatus.campaign._evidence import JobRef
 from servatus.campaign._state import (
     SCHEMA_VERSION,
     AcceptanceState,
@@ -20,7 +19,6 @@ from servatus.campaign._state import (
     RegisteredTask,
     State,
     append,
-    correct_outcome,
     create,
     decode,
     encode,
@@ -89,63 +87,51 @@ def test_append_accepts_only_a_new_suffix_and_seal_is_irreversible() -> None:
 def test_intent_then_outcome_records_chronology_and_retry_choices() -> None:
     state, first = submit(roster(2), ["task-0", "task-1"])
     attempt = state.attempt(first)
-    assert attempt.acceptance is AcceptanceState.ACCEPTED
+    assert attempt.acceptance is AcceptanceState.ACCEPTED and attempt.job == 101
     assert (attempt.intent_revision, attempt.outcome_revision, state.revision) == (1, 2, 2)
-    state, second = intend(state, ["task-1"], ack=["task-1"])
+    state, second = intend(state, ["task-1"])
     retried = state.attempt(second)
-    assert retried.retry == ("task-1",) and retried.duplicate_risk == ("task-1",)
+    assert retried.retry == ("task-1",)
     assert retried.acceptance is AcceptanceState.UNRESOLVED and retried.job is None
 
 
 def test_outcome_is_idempotent_and_conflicts_are_rejected() -> None:
     state, identity = intend(roster(1), ["task-0"])
-    accepted = record_outcome(state, identity, JobRef(42, "alpha"))
-    assert record_outcome(accepted, identity, JobRef(42, "alpha")) is accepted
+    accepted = record_outcome(state, identity, 42)
+    assert accepted.attempt(identity).job == 42 and accepted.revision == state.revision + 1
+    assert record_outcome(accepted, identity, 42) is accepted
     with pytest.raises(Conflict, match="conflicting outcome"):
-        record_outcome(accepted, identity, JobRef(43))
+        record_outcome(accepted, identity, 43)
     with pytest.raises(Conflict, match="conflicting outcome"):
         record_outcome(accepted, identity, None)
     rejected = record_outcome(state, identity, None)
     assert rejected.attempt(identity).acceptance is AcceptanceState.NOT_SUBMITTED
     assert record_outcome(rejected, identity, None) is rejected
     with pytest.raises(Conflict, match="conflicting outcome"):
-        record_outcome(rejected, identity, JobRef(42))
+        record_outcome(rejected, identity, 42)
     with pytest.raises(NotFound, match="unknown allocation"):
         record_outcome(state, allocation_id(99), None)
     with pytest.raises(NotFound, match="unknown allocation"):
         state.attempt(allocation_id(99))
 
 
-def test_a_not_submitted_outcome_is_corrected_at_a_new_revision() -> None:
-    state, identity = submit(roster(2, appendable=True), ["task-0"], job=None)
-    state = append(state, [Task("late")])  # unrelated history in between is fine
-    corrected = correct_outcome(state, identity, JobRef(42))
-    attempt = corrected.attempt(identity)
-    assert attempt.acceptance is AcceptanceState.ACCEPTED and attempt.job == JobRef(42)
-    assert attempt.outcome_revision == corrected.revision == state.revision + 1
-    assert decode(encode(corrected)) == corrected
-    assert correct_outcome(corrected, identity, JobRef(42)) is corrected
-    with pytest.raises(Conflict, match="is not recorded as not submitted"):
-        correct_outcome(corrected, identity, JobRef(43))
-    pending, unresolved = intend(roster(1), ["task-0"])
-    with pytest.raises(Conflict, match="is not recorded as not submitted"):
-        correct_outcome(pending, unresolved, JobRef(42))
-    with pytest.raises(NotFound, match="unknown allocation"):
-        correct_outcome(state, allocation_id(99), JobRef(42))
+@pytest.mark.parametrize("job", [0, -1])
+def test_outcome_rejects_a_job_number_below_one(job: int) -> None:
+    state, identity = intend(roster(1), ["task-0"])
+    with pytest.raises(Conflict, match="invalid job number"):
+        record_outcome(state, identity, job)
 
 
-def test_a_not_submitted_outcome_followed_by_its_tasks_cannot_be_corrected() -> None:
-    state, identity = submit(roster(2), ["task-0", "task-1"], job=None)
-    state, _ = submit(state, ["task-0"])
-    state, later = intend(state, ["task-1"])
-    with pytest.raises(Conflict, match=f"later allocations .*, {later} already include"):
-        correct_outcome(state, identity, JobRef(42))
+def test_outcome_rejects_a_bool_job() -> None:
+    state, identity = intend(roster(1), ["task-0"])
+    with pytest.raises(Conflict, match="invalid job number"):
+        record_outcome(state, identity, True)
 
 
 def test_outcome_survives_unrelated_authoring() -> None:
     state, identity = intend(roster(1, appendable=True), ["task-0"])
     state = seal(append(state, [Task("late")]))
-    resolved = record_outcome(state, identity, JobRef(7))
+    resolved = record_outcome(state, identity, 7)
     assert resolved.attempt(identity).outcome_revision == 4 == resolved.revision
 
 
@@ -155,7 +141,6 @@ def _intent(state: State, **changes: Any) -> State:
         "task_keys": ("task-0",),
         "profile": profile(),
         "retry": (),
-        "duplicate_risk": (),
         "at": NOW,
     }
     values.update(changes)
@@ -172,7 +157,6 @@ def _intent(state: State, **changes: Any) -> State:
         ({"task_keys": ("task-1", "task-0")}, "not in roster order"),
         ({"retry": ("task-0",)}, "retry choices disagree"),
         ({"retry": ("task-1",)}, "invalid retry references"),
-        ({"duplicate_risk": ("task-0",)}, "invalid duplicate-risk references"),
         (
             {"task_keys": tuple(f"task-{i}" for i in range(5))},
             "attempt exceeds its target capacity",
@@ -225,9 +209,9 @@ def history() -> State:
     """Accepted, retried, appended, sealed, and trailing unresolved work."""
     state, _ = submit(roster(3, appendable=True), ["task-0", "task-1"])
     state = append(state, [Task("task-3", ("x",), env={"A": "1"})])
-    state, _ = submit(state, ["task-0", "task-2"], ack=["task-0"])
+    state, _ = submit(state, ["task-0", "task-2"])
     state = seal(state)
-    state, _ = submit(state, ["task-1"], job=None)
+    state, _ = submit(state, ["task-1"], accepted=False)
     state, _ = intend(state, ["task-3"])
     return state
 
@@ -238,7 +222,9 @@ def test_documents_round_trip_canonically() -> None:
     assert data.endswith(b"\n") and data == reencode(json.loads(data))
     assert decode(data) == state
     raw = json.loads(data)
-    assert raw["schema_version"] == SCHEMA_VERSION == 7
+    assert raw["schema_version"] == SCHEMA_VERSION == 8
+    assert [attempt["job"] for attempt in raw["attempts"]] == [101, 102, None, None]
+    assert all("duplicate_risk" not in attempt for attempt in raw["attempts"])
     assert [attempt["acceptance"] for attempt in raw["attempts"]] == [
         "ACCEPTED",
         "ACCEPTED",
@@ -308,19 +294,15 @@ EDITS: list[tuple[str, Callable[[dict[str, Any]], None]]] = [
     ("attempt overlaps unresolved intent", _unresolve_first),
     (
         "retry choices disagree with prior accepted work",
-        lambda r: r["attempts"][1].update(retry=[], duplicate_risk=[]),
+        lambda r: r["attempts"][1].update(retry=[]),
     ),
     ("revision does not match recorded mutations", lambda r: r.update(revision=99)),
     ("invalid allocation identity", lambda r: r["attempts"][0].update(allocation_id="x" * 24)),
     ("invalid retry references", lambda r: r["attempts"][1].update(retry=["task-3"])),
-    (
-        "invalid duplicate-risk references",
-        lambda r: r["attempts"][1].update(duplicate_risk=["task-2"]),
-    ),
     ("unresolved intent has outcome", lambda r: r["attempts"][3].update(outcome_revision=9)),
     (
         "unresolved intent has outcome",
-        lambda r: r["attempts"][3].update(job={"job_id": 1, "cluster": None}),
+        lambda r: r["attempts"][3].update(job=1),
     ),
     ("invalid outcome revision", lambda r: r["attempts"][0].update(outcome_revision=1)),
     ("invalid outcome revision", lambda r: r["attempts"][0].update(outcome_revision=None)),
@@ -333,9 +315,9 @@ EDITS: list[tuple[str, Callable[[dict[str, Any]], None]]] = [
         lambda r: r["attempts"][2].update(acceptance="ACCEPTED"),
     ),
     ("attempt exceeds its target capacity", lambda r: _set_profile(r, max_tasks_per_allocation=1)),
-    ("unsupported campaign schema; expected 7", lambda r: r.update(schema_version=6)),
+    ("unsupported campaign schema; expected 8", lambda r: r.update(schema_version=7)),
     ("unsupported campaign schema", lambda r: r.pop("schema_version")),
-    ("expected int", lambda r: r.update(schema_version=7.0)),
+    ("expected int", lambda r: r.update(schema_version=8.0)),
     ("profile key does not match its content", lambda r: _rename_profile(r)),
     ("profiles do not match attempt references", lambda r: _add_unused_profile(r)),
     ("expected int", lambda r: r.update(revision=True)),
@@ -347,8 +329,12 @@ EDITS: list[tuple[str, Callable[[dict[str, Any]], None]]] = [
     ("Task.env names must be identifiers", lambda r: r["tasks"][0].update(env={"1A": "x"})),
     ("cannot start with SERVATUS_", lambda r: r["tasks"][0].update(env={"SERVATUS_X": "1"})),
     ("Task.key cannot contain NUL", lambda r: r["tasks"][0].update(key="a\0")),
-    ("job_id must be a positive integer", lambda r: r["attempts"][0]["job"].update(job_id=0)),
-    ("cluster must be one safe site token", lambda r: r["attempts"][0]["job"].update(cluster="")),
+    ("invalid job number", lambda r: r["attempts"][0].update(job=0)),
+    ("invalid job number", lambda r: r["attempts"][0].update(job=-1)),
+    ("expected int", lambda r: r["attempts"][0].update(job=True)),
+    ("expected int", lambda r: r["attempts"][0].update(job=101.0)),
+    ("expected int", lambda r: r["attempts"][0].update(job={"job_id": 101, "cluster": None})),
+    ("unknown keys", lambda r: r["attempts"][0].update(duplicate_risk=[])),
     ("canonical UTC datetime", lambda r: r["attempts"][0].update(intent_at="2030-01-01T00:00:00")),
     ("expected one of", lambda r: r["attempts"][0].update(acceptance="MAYBE")),
 ]
@@ -374,6 +360,17 @@ def test_every_defect_is_corrupt_state_with_its_reason(
 ) -> None:
     with pytest.raises(CorruptState, match=f"invalid campaign state: .*{message}"):
         decode(_edit(edit))
+
+
+def test_a_schema_7_document_is_corrupt_state() -> None:
+    raw = json.loads(encode(history()))
+    raw["schema_version"] = 7
+    for attempt in raw["attempts"]:
+        attempt["duplicate_risk"] = []
+        if attempt["job"] is not None:
+            attempt["job"] = {"job_id": attempt["job"], "cluster": None}
+    with pytest.raises(CorruptState, match="unsupported campaign schema; expected 8"):
+        decode(reencode(raw))
 
 
 @pytest.mark.parametrize(
@@ -432,12 +429,23 @@ def test_direct_construction_checks_attempt_time_and_task_revision() -> None:
             task_keys=("task-0",),
             profile=profile(),
             retry=(),
-            duplicate_risk=(),
             intent_revision=1,
             intent_at=datetime(2030, 1, 1),  # noqa: DTZ001
         )
     with pytest.raises(ValueError, match="invalid task revision"):
         RegisteredTask(Task("a"), -1)
+    with pytest.raises(ValueError, match="invalid job number"):
+        Attempt(
+            allocation_id=allocation_id(1),
+            task_keys=("task-0",),
+            profile=profile(),
+            retry=(),
+            intent_revision=1,
+            intent_at=NOW,
+            acceptance=AcceptanceState.ACCEPTED,
+            job=0,
+            outcome_revision=2,
+        )
 
 
 # --- performance -----------------------------------------------------------------------------
@@ -451,11 +459,10 @@ def large_state(task_count: int = 1000, attempt_count: int = 3000) -> State:
             task_keys=(keys[index % task_count],),
             profile=profile(),
             retry=(keys[index % task_count],) if index >= task_count else (),
-            duplicate_risk=(),
             intent_revision=2 * index + 1,
             intent_at=NOW + timedelta(seconds=index),
             acceptance=AcceptanceState.ACCEPTED,
-            job=JobRef(index + 1),
+            job=index + 1,
             outcome_revision=2 * index + 2,
         )
         for index in range(attempt_count)

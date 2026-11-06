@@ -76,10 +76,6 @@ class EvidenceConflict(IntegrityError):
     """Scheduler output is malformed, unrelated, or contradictory."""
 
 
-class ReconciliationError(ServatusError):
-    """Scheduler evidence could not prove one allocation identity. Resolve it explicitly."""
-
-
 class SubmissionInterrupted(ServatusError):
     """Submission stopped early. ``result`` records receipts and uncertain allocations."""
 

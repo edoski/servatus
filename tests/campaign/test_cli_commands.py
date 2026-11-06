@@ -6,14 +6,16 @@ import json
 import re
 import stat
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from servatus import __version__
-from servatus.campaign import Campaign, Completed
+from servatus.campaign import Campaign, Completed, PlannedAllocation, Profile
 from servatus.cli import main
+from servatus.errors import SubmissionInterrupted
 from servatus.testing import FakeScheduler
 
 PROFILE = """\
@@ -66,6 +68,20 @@ class Cli:
         captured = self.capsys.readouterr()
         return code, captured.out, captured.err
 
+    def submit_failing_twenty_minutes_ago(self, **plan: Any) -> PlannedAllocation:
+        """An API caller plans and submits; its first ``sbatch`` fails and its intent is old
+        enough for ``reconcile`` to decide now."""
+        earlier = Campaign.open(
+            self.root / "state",
+            connect=self.fake,
+            clock=lambda: datetime.now(UTC) - timedelta(minutes=20),
+        )
+        planned = earlier.plan(Profile.load(self.root / "SERVATUS.toml"), **plan)
+        self.fake.fail_next("sbatch")
+        with pytest.raises(SubmissionInterrupted, match="unresolved"):
+            earlier.submit(planned)
+        return planned.allocations[0]
+
     def json(self, *argv: str) -> Any:
         code, out, err = self(*argv, "--json")
         assert code == 0, err
@@ -81,11 +97,26 @@ def cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureF
 def test_version_help_and_usage_errors(cli: Cli) -> None:
     assert cli("--version") == (0, f"servatus {__version__}\n", "")
     code, out, _ = cli("--help")
-    assert code == 0 and "mark-not-submitted" in out
+    assert code == 0 and "reconcile" in out and "mark-" not in out
     code, _, err = cli("plan")
     assert code == 2 and "usage:" in err
     code, _, err = cli("plan", "state", "--retry", "one", "--retry-failed")
     assert code == 2 and "not allowed with argument" in err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("mark-accepted", "state", "a" * 24, "1000"),
+        ("mark-not-submitted", "state", "a" * 24),
+        ("plan", "state", "--retry", "one", "--allow-duplicate-risk", "one"),
+        ("reconcile", "state", "a" * 24),
+    ],
+)
+def test_removed_commands_and_options_are_usage_errors(cli: Cli, argv: tuple[str, ...]) -> None:
+    cli("create", "state", "tasks.jsonl")
+    code, out, err = cli(*argv)
+    assert (code, out) == (2, "") and "usage:" in err
 
 
 def test_human_workflow_from_creation_to_status(cli: Cli) -> None:
@@ -110,10 +141,12 @@ def test_human_workflow_from_creation_to_status(cli: Cli) -> None:
     assert cli.fake.jobs[0].script.count(b"opaque\\000payload") == 1
 
     cli.fake.start(1000)
-    cli.fake.finish_step(1000, 1, "FAILED", exit_code="3:0")
+    cli.fake.finish_step(1000, 1, exit_code=3)
     code, out, _ = cli("status", "state")
     assert code == 0
-    assert "one  UNOBSERVED  RUNNING    -  " in out and "two  UNOBSERVED  FAILED     3:0" in out
+    assert re.search(r"^KEY  RESULT      EXECUTION  EXIT  ALLOCATION$", out, re.M)
+    assert re.search(r"^one  UNOBSERVED  RUNNING    -     [0-9a-f]{24}$", out, re.M)
+    assert re.search(r"^two  UNOBSERVED  FAILED     3     [0-9a-f]{24}$", out, re.M)
     assert "counts: tasks 2, unobserved 2, running 1, failed 1" in out
     assert "next: servatus plan state --retry-failed --output PLAN.json" in out
     cli.fake.finish(1000)
@@ -125,7 +158,7 @@ def test_machine_output_for_every_data_command(cli: Cli) -> None:
     created = cli.json("create", "state", "tasks.jsonl")
     assert created["tasks"] == 2 and created["sealed"] is True
     plan = cli.json("plan", "state", "--output", "plan.json")
-    assert plan["format"] == "servatus.plan/1" and plan["selected"] == ["one", "two"]
+    assert plan["format"] == "servatus.plan/2" and plan["selected"] == ["one", "two"]
     assert plan["saved"] == "plan.json" and plan["warnings"] == []
     allocation = plan["allocations"][0]
     assert "script" not in allocation and allocation["cpus"] == 4
@@ -134,12 +167,24 @@ def test_machine_output_for_every_data_command(cli: Cli) -> None:
     submitted = cli.json("submit", "state", "plan.json")
     assert submitted["complete"] is True and submitted["unresolved"] == []
     receipt = submitted["receipts"][0]
-    assert receipt["job"] == {"job_id": 1000, "cluster": None}
+    assert receipt["job"] == 1000
     assert receipt["task_keys"] == ["one", "two"]
     status = cli.json("status", "state")
     assert status["format"] == "servatus.status/1" and status["counts"]["queued"] == 2
+    assert status["warnings"] == [] and status["tasks"][0]["exit_code"] is None
     cancelled = cli.json("cancel", "state", "--task", "one")
-    assert [item["job"]["job_id"] for item in cancelled["cancelled"]] == [1000]
+    assert cancelled == {
+        "cancelled": [
+            {"allocation_id": receipt["allocation_id"], "job": 1000, "task_keys": ["one", "two"]}
+        ]
+    }
+    assert cli.json("cancel", "state", "--task", "two") == {"cancelled": []}
+    assert cli.json("reconcile", "state") == {
+        "receipts": [],
+        "not_submitted": [],
+        "waiting": [],
+        "complete": True,
+    }
     doctor = cli.json("doctor")
     assert doctor == {
         "profile": "cpu",
@@ -296,8 +341,8 @@ def test_plan_reports_holds_deferrals_and_scripts(cli: Cli) -> None:
     cli("create", "state", "tasks.jsonl")
     cli("plan", "state", "--output", "first.json")
     cli("submit", "state", "first.json")
-    cli.fake.start(1000)
-    cli.fake.finish(1000, "FAILED", exit_code="1:0")
+    cli.fake.finish(1000, exit_code=1)
+    cli.fake.purge(1000)
     code, out, err = cli(
         "plan", "state", "--retry", "one", "--show-scripts", "--tasks-per-allocation", "1"
     )
@@ -312,37 +357,87 @@ def test_plan_reports_holds_deferrals_and_scripts(cli: Cli) -> None:
     assert code == 1 and "unknown Task keys: 'ghost'" in err
 
 
-def test_interrupted_submission_exits_3_and_recovery_commands_resolve_it(cli: Cli) -> None:
+def test_reconcile_reports_each_outcome_and_exits_75_while_waiting(cli: Cli) -> None:
     cli("create", "state", "tasks.jsonl")
-    cli("plan", "state", "--output", "plan.json", "--tasks-per-allocation", "1")
-    cli.fake.fail_next("sbatch", Completed(1, b"", b"sbatch: error: Socket timed out\n"))
-    code, out, err = cli("submit", "state", "plan.json", "--json")
+    old = cli.submit_failing_twenty_minutes_ago(tasks_per_allocation=1).allocation_id
+
+    cli("plan", "state", "--output", "two.json")
+    cli.fake.lose_next_reply("sbatch")
+    code, out, err = cli("submit", "state", "two.json", "--json")
     assert code == 3 and err.startswith("servatus: error: submission interrupted")
-    result = json.loads(out)
-    assert result["complete"] is False and result["receipts"] == []
-    lost = result["unresolved"][0]["allocation_id"]
-    assert len(result["unattempted"]) == 1
-    code, _, err = cli("reconcile", "state", lost)
-    assert code == 1 and "0 jobs" in err
-    assert (
-        cli("mark-not-submitted", "state", lost)[1]
-        == f"allocation {lost}: recorded as not submitted\n"
+    submitted = json.loads(out)
+    assert submitted["complete"] is False and submitted["receipts"] == []
+    found = submitted["unresolved"][0]["allocation_id"]
+
+    code, out, err = cli("reconcile", "state")
+    assert (code, err) == (0, "")
+    assert out == (
+        f"accepted allocation {found}: job 1000 (two)\nnot submitted: allocation {old} (one)\n"
     )
+    assert cli("reconcile", "state")[:2] == (0, "nothing to reconcile\n")
 
     cli("plan", "state", "--output", "again.json")
-    cli.fake.lose_next_reply("ping")
-    code, _, err = cli("submit", "state", "again.json")
-    assert code == 75 and "reply from ping was lost" in err
-    assert Campaign.open(cli.root / "state").status(scheduler=False).revision == 2
-
-    cli.fake.fail_next("sbatch", None)
+    cli.fake.fail_next("sbatch")
     code, out, _ = cli("submit", "state", "again.json")
     assert code == 3 and "next: servatus reconcile state" in out
-    pending = out.split("UNRESOLVED allocation ")[1].split()[0]
-    accepted = cli.json("mark-accepted", "state", pending, "4242", "--cluster", "alpha")
-    assert accepted["accepted"][0]["job"] == {"job_id": 4242, "cluster": "alpha"}
-    code, out, _ = cli("status", "state", "--offline")
-    assert "next: servatus status state" in out
+    young = out.split("UNRESOLVED allocation ")[1].split()[0]
+    code, out, _ = cli("reconcile", "state")
+    assert code == 75
+    lines = out.splitlines()
+    assert lines[0] == f"waiting: allocation {young} (one)"
+    assert re.fullmatch(r"  no evidence yet; reconcile again after \S+\+00:00", lines[1])
+    code, out, err = cli("reconcile", "state", "--json")
+    assert (code, err) == (75, "")
+    document = json.loads(out)
+    assert document["complete"] is False and document["receipts"] == []
+    (waiting,) = document["waiting"]
+    assert (waiting["allocation_id"], waiting["task_keys"]) == (young, ["one"])
+    decidable = datetime.fromisoformat(waiting["decidable_at"].replace("Z", "+00:00"))
+    assert timedelta(minutes=14) < decidable - datetime.now(UTC) <= timedelta(minutes=15)
+    code, out, _ = cli("status", "state")
+    assert "next: servatus reconcile state" in out
+
+
+def test_status_explains_outcomes_warnings_and_next_steps(cli: Cli) -> None:
+    cli.tasks(*({"key": key, "args": ["/bin/true"]} for key in "abc"), name="abc.jsonl")
+    cli("create", "state", "abc.jsonl", "--appendable")
+    cli("plan", "state", "--output", "plan.json", "--tasks-per-allocation", "1")
+    cli("submit", "state", "plan.json")
+    cli.fake.finish(1000, exit_code=3)
+    assert cli.json("cancel", "state", "--task", "b")["cancelled"][0]["job"] == 1001
+    cli.fake.start(1002)
+    cli.fake.lose(1002)
+    for job in (1000, 1001, 1002):
+        cli.fake.purge(job)
+    code, out, _ = cli("status", "state")
+    assert code == 0
+    assert re.search(r"^a\s+UNOBSERVED  FAILED\s+3\s+[0-9a-f]{24}$", out, re.M)
+    assert re.search(r"^b\s+UNOBSERVED  STOPPED \(never started\)  -\s+[0-9a-f]{24}$", out, re.M)
+    assert re.search(r"^c\s+UNOBSERVED  LOST\s+-\s+[0-9a-f]{24}$", out, re.M)
+    assert "counts: tasks 3, unobserved 3, failed 1, stopped 1, lost 1" in out
+    assert "quiescent: yes; results ready: no" in out
+    assert "next: servatus plan state --retry-failed --output PLAN.json" in out
+    assert "next: servatus plan state --retry KEY --output PLAN.json  (LOST Tasks)" in out
+    assert "warning:" not in out and "next: servatus reconcile" not in out
+
+    cli.tasks({"key": "d", "args": ["/bin/true"]}, name="d.jsonl")
+    cli("append", "state", "d.jsonl")
+    stray = cli.submit_failing_twenty_minutes_ago(only=["d"])
+    assert cli("reconcile", "state")[0] == 0
+    cli.fake.run(stray.argv, stdin=stray.script)
+    code, out, _ = cli("status", "state")
+    assert code == 0 and "quiescent: no" in out
+    warnings = [line for line in out.splitlines() if line.startswith("warning: ")]
+    assert warnings == [
+        f"warning: allocation {stray.allocation_id} is recorded as not submitted, but Slurm "
+        "lists job 1003 for it; its Tasks stay held ACTIVE until it leaves the queue"
+    ]
+    assert "next: servatus plan state --output PLAN.json" in out
+    code, out, _ = cli("plan", "state", "--only", "d")
+    assert code == 0 and "ACTIVE: d" in out
+    assert cli.json("cancel", "state", "--allocation", stray.allocation_id)["cancelled"] == [
+        {"allocation_id": stray.allocation_id, "job": 1003, "task_keys": ["d"]}
+    ]
 
 
 def test_logs_write_raw_bytes_and_refuse_terminals(
@@ -356,7 +451,7 @@ def test_logs_write_raw_bytes_and_refuse_terminals(
     assert main(["plan", "state", "--output", "plan.json"], connect=fake) == 0
     assert main(["submit", "state", "plan.json"], connect=fake) == 0
     allocation = fake.jobs[0].name.removeprefix("servatus-")
-    fake.write_log(f"/logs/{allocation}-1000-0.out", b"\xff\x00raw\x1b[2J")
+    fake.write_file(f"/logs/{allocation}-1000-0.out", b"\xff\x00raw\x1b[2J")
     capsysbinary.readouterr()
     assert main(["logs", "state", "--task", "one", "--bytes", "5"], connect=fake) == 0
     captured = capsysbinary.readouterr()

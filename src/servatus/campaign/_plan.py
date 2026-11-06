@@ -24,7 +24,7 @@ from ._policy import Hold
 from ._script import check_command, render_batch, sbatch_argv
 from ._state import State
 
-PLAN_FORMAT = "servatus.plan/1"
+PLAN_FORMAT = "servatus.plan/2"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -33,8 +33,8 @@ class Decision:
 
     ``selected`` Tasks are packed into this plan's allocations; ``deferred`` Tasks were eligible
     but exceed the target's ``max_allocations_per_submit``; every other Task is ``held`` with
-    one reason. ``retry`` and ``duplicate_risk`` list the selected or deferred Tasks that
-    resubmit accepted work (with acknowledged duplicate risk). ``nonce`` makes every plan's
+    one reason. ``retry`` lists the selected or deferred Tasks that resubmit accepted work.
+    ``nonce`` makes every plan's
     allocation identities unique, even for copies of the same Campaign state.
     """
 
@@ -46,7 +46,6 @@ class Decision:
     held: Mapping[str, Hold]
     deferred: tuple[str, ...]
     retry: tuple[str, ...]
-    duplicate_risk: tuple[str, ...]
     tasks_per_allocation: int
     probe_required: bool
 
@@ -61,7 +60,7 @@ class Decision:
             raise ConfigurationError("tasks_per_allocation must be a positive integer")
         if type(self.probe_required) is not bool:
             raise ConfigurationError("probe_required must be a bool")
-        for name in ("selected", "deferred", "retry", "duplicate_risk"):
+        for name in ("selected", "deferred", "retry"):
             keys = task_keys(getattr(self, name), f"plan {name}")
             if len(set(keys)) != len(keys):
                 raise ConfigurationError(f"plan {name} must be distinct Task keys")
@@ -102,8 +101,6 @@ class Plan:
     @property
     def warnings(self) -> tuple[str, ...]:
         notes: list[str] = []
-        if risk := self.decision.duplicate_risk:
-            notes.append(f"duplicate execution risk acknowledged for: {', '.join(risk)}")
         if deferred := self.decision.deferred:
             notes.append(
                 f"{len(deferred)} eligible Tasks are deferred by max_allocations_per_submit; "
@@ -112,7 +109,7 @@ class Plan:
         return tuple(notes)
 
     def to_json(self) -> bytes:
-        """Canonical JSON: ``{"format": "servatus.plan/1"}``, the Decision, and the digest."""
+        """Canonical JSON: ``{"format": "servatus.plan/2"}``, the Decision, and the digest."""
         document = cast(dict[str, object], _codec.dump(self.decision))
         document["format"] = PLAN_FORMAT
         document["digest"] = self.digest
@@ -209,10 +206,8 @@ def _check(state: State, decision: Decision) -> None:
     eligible = decision.selected + decision.deferred
     if frozenset(decision.retry) != state.accepted_keys.intersection(eligible):
         raise ConfigurationError("plan retry keys disagree with accepted Campaign history")
-    if not set(decision.duplicate_risk) <= set(decision.retry):
-        raise ConfigurationError("plan duplicate-risk keys must be retried keys")
     position = {key: index for index, key in enumerate(roster)}
-    for part in (decision.selected, decision.deferred, decision.retry, decision.duplicate_risk):
+    for part in (decision.selected, decision.deferred, decision.retry):
         if list(part) != sorted(part, key=position.__getitem__):
             raise ConfigurationError("plan Task keys are not in roster order")
     limit = decision.profile.target.max_allocations_per_submit

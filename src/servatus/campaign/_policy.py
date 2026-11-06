@@ -6,30 +6,25 @@ this order:
 1. ``only`` given and the Task is not in it: ``NOT_REQUESTED``.
 2. The result probe said VALID: ``VALID``. Valid work is never resubmitted.
 3. An Attempt naming the Task has unresolved acceptance: ``UNRESOLVED``. Reconcile it first.
-4. No accepted Attempt has ever named the Task: selected as fresh work.
+4. No accepted Attempt has ever named the Task: selected as fresh work, unless Slurm still lists
+   a job of an allocation recorded as not submitted for it (``ACTIVE``).
 5. The Task has accepted work and resubmission was not requested for it: ``SUBMITTED``. Its
    scheduler state is not consulted (the work may still be queued, running, or long finished),
    so plans without retries do not depend on (or observe) scheduler evidence.
-6. Any accepted Attempt is queued, running, or retained by the scheduler: ``ACTIVE``.
-7. Any accepted Attempt lacks scheduler evidence: ``UNOBSERVABLE``.
-8. Otherwise every accepted Attempt is terminal or UNKNOWN, and the retry selector decides.
+6. Slurm still lists a job of any accepted (or not-submitted) allocation of the Task, settling
+   ones included: ``ACTIVE``.
+7. Otherwise the retry selector decides from the Task's current (latest accepted) execution.
 
 Resubmission is always explicit, in one of two forms:
 
-- Explicit keys (``retry=["a", "b"]``) select each named Task. An UNKNOWN Attempt (from the
-  allocation, or from the Task's own step) additionally needs the key in ``duplicate_risk``.
-  Explicit keys are checked strictly: unknown keys, VALID results, Tasks with no accepted
-  history, UNKNOWN evidence without acknowledgement, and acknowledgements of keys that were not
-  explicitly retried are all collected into one ``PlanRefused`` listing every offending key.
-  Explicit retries of active, unresolved, or unobservable Tasks are held, not refused.
+- Explicit keys (``retry=["a", "b"]``) select each named Task, whatever its current execution,
+  ``LOST`` included: naming the key is the operator's acknowledgement. They are checked strictly:
+  unknown keys, VALID results, Tasks with no accepted history, and Tasks whose earlier work Slurm
+  still lists are collected into one ``PlanRefused`` listing every offending key.
 - A bulk selector never raises for an individual Task. ``Retry.FAILED`` selects Tasks whose
-  current (latest accepted) Attempt failed or was cancelled, judged by ``task_execution``: the
-  Task's step when known, else the allocation (a failed packed allocation without the Task's
-  step is UNKNOWN, because that Task may have succeeded). ``Retry.INCOMPLETE`` selects terminal
-  Tasks whose result was observed MISSING; it needs a probe, and unprobed Tasks are held
-  ``UNOBSERVABLE``.
-  UNKNOWN evidence holds a Task as ``UNOBSERVABLE``: acknowledging duplicate risk always
-  requires explicit keys.
+  current execution is ``FAILED`` or ``STOPPED``, never ``LOST``. ``Retry.INCOMPLETE`` selects
+  Tasks whose current execution is terminal and whose result was observed MISSING; it needs a
+  probe. Every other Task stays ``SUBMITTED``.
 """
 
 from __future__ import annotations
@@ -41,26 +36,23 @@ from types import MappingProxyType
 
 from ..errors import PlanRefused
 from ._config import Task, task_keys
-from ._evidence import AllocationState, Observation
+from ._evidence import Execution, Observed
 from ._state import AcceptanceState, Attempt, State
-from ._status import ResultState, own_step, task_execution
+from ._status import ResultState
 
 
 class Hold(StrEnum):
     """Why a plan does not submit a Task.
 
     ``VALID``: the probe reports a valid result. ``UNRESOLVED``: an intent has no recorded
-    outcome. ``ACTIVE``: the scheduler still holds earlier work. ``SUBMITTED``: the Task has
-    accepted work and was not selected for retry (its scheduler state was not consulted).
-    ``UNOBSERVABLE``: evidence for earlier work is missing or unknown. ``NOT_REQUESTED``:
-    excluded by ``only``.
+    outcome. ``ACTIVE``: Slurm still lists earlier work. ``SUBMITTED``: the Task has accepted
+    work and was not selected for retry. ``NOT_REQUESTED``: excluded by ``only``.
     """
 
     VALID = "VALID"
     UNRESOLVED = "UNRESOLVED"
     ACTIVE = "ACTIVE"
     SUBMITTED = "SUBMITTED"
-    UNOBSERVABLE = "UNOBSERVABLE"
     NOT_REQUESTED = "NOT_REQUESTED"
 
 
@@ -73,21 +65,19 @@ class Retry(Enum):
 
 @dataclass(frozen=True, slots=True)
 class Selection:
-    """Selected Task keys in roster order, the reason for every other Task, and the subsets of
-    ``selected`` that resubmit accepted work (``retry``) under acknowledged ``duplicate_risk``."""
+    """Selected Task keys in roster order, the reason for every other Task, and the subset of
+    ``selected`` that resubmits accepted work (``retry``)."""
 
     selected: tuple[str, ...]
     held: Mapping[str, Hold]
     retry: tuple[str, ...]
-    duplicate_risk: tuple[str, ...]
 
 
 _REFUSALS = (
     ("unknown", "unknown Task keys"),
     ("valid", "valid results cannot be retried"),
     ("unaccepted", "retry needs an earlier accepted attempt"),
-    ("unknown_evidence", "UNKNOWN scheduler evidence needs a duplicate-risk acknowledgement"),
-    ("unretried", "a duplicate-risk acknowledgement requires an explicitly retried Task key"),
+    ("live", "Slurm still lists earlier work; wait for it or cancel it"),
 )
 
 
@@ -99,16 +89,29 @@ def _scope(only: Collection[str] | None) -> frozenset[str] | None:
     return None if only is None else frozenset(task_keys(only, "only"))
 
 
-def _history(state: State) -> tuple[set[str], dict[str, list[tuple[Attempt, int]]]]:
+@dataclass(frozen=True, slots=True)
+class _History:
+    """Each Task's unresolved, accepted (with its slot), and not-submitted Attempts."""
+
+    unresolved: frozenset[str]
+    accepted: Mapping[str, list[tuple[Attempt, int]]]
+    not_submitted: Mapping[str, list[Attempt]]
+
+
+def _history(state: State) -> _History:
     unresolved: set[str] = set()
     accepted: dict[str, list[tuple[Attempt, int]]] = {}
+    not_submitted: dict[str, list[Attempt]] = {}
     for attempt in state.attempts:
         if attempt.acceptance is AcceptanceState.UNRESOLVED:
             unresolved.update(attempt.task_keys)
         elif attempt.acceptance is AcceptanceState.ACCEPTED:
             for slot, key in enumerate(attempt.task_keys):
                 accepted.setdefault(key, []).append((attempt, slot))
-    return unresolved, accepted
+        else:
+            for key in attempt.task_keys:
+                not_submitted.setdefault(key, []).append(attempt)
+    return _History(frozenset(unresolved), accepted, not_submitted)
 
 
 def result_scope(
@@ -129,19 +132,23 @@ def observation_scope(
 ) -> tuple[str, ...]:
     """Allocation ids whose evidence ``decide`` may consult for these requests, in state order.
 
-    Only accepted Attempts of Tasks that could be retried are included, so a plan that selects
-    only fresh work observes nothing. Unknown keys are ignored here; ``decide`` refuses them.
+    Only the Attempts of Tasks that could be selected are included: accepted and not-submitted
+    Attempts of retry candidates, and not-submitted Attempts of Tasks never accepted. A plan of
+    fresh work without such history observes nothing. Unknown keys are ignored here; ``decide``
+    refuses them.
     """
     explicit, scope = _explicit(retry), _scope(only)
-    unresolved, accepted = _history(state)
+    history = _history(state)
     wanted: set[str] = set()
-    for key, history in accepted.items():
-        if (
-            (scope is None or key in scope)
-            and (explicit is None or key in explicit)
-            and key not in unresolved
-        ):
-            wanted.update(attempt.allocation_id for attempt, _ in history)
+    for task in state.tasks:
+        key = task.key
+        if (scope is not None and key not in scope) or key in history.unresolved:
+            continue
+        accepted = history.accepted.get(key, [])
+        if accepted and explicit is not None and key not in explicit:
+            continue
+        wanted.update(attempt.allocation_id for attempt, _ in accepted)
+        wanted.update(attempt.allocation_id for attempt in history.not_submitted.get(key, []))
     return tuple(
         attempt.allocation_id for attempt in state.attempts if attempt.allocation_id in wanted
     )
@@ -149,28 +156,23 @@ def observation_scope(
 
 def decide(
     state: State,
-    observations: Mapping[str, Observation],
+    observed: Observed,
     results: Mapping[str, ResultState],
     *,
     retry: Collection[str] | Retry = (),
-    duplicate_risk: Collection[str] = (),
     only: Collection[str] | None = None,
 ) -> Selection:
     """Apply the eligibility policy in the module docstring to every Task in the roster.
 
-    ``observations`` maps allocation ids to scheduler evidence (see ``observation_scope``);
-    ``results`` maps Task keys to probe results, with absent keys UNOBSERVED.
+    ``observed`` must cover ``observation_scope``; ``results`` maps Task keys to probe results,
+    with absent keys UNOBSERVED.
     """
     explicit, scope = _explicit(retry), _scope(only)
-    acknowledged = frozenset(task_keys(duplicate_risk, "duplicate_risk"))
     roster = tuple(task.key for task in state.tasks)
     refused: dict[str, list[str]] = {name: [] for name, _ in _REFUSALS}
-    mentioned = (explicit or frozenset()) | acknowledged | (scope or frozenset())
+    mentioned = (explicit or frozenset()) | (scope or frozenset())
     refused["unknown"] = sorted(mentioned - set(roster))
-    refused["unretried"] = [
-        key for key in roster if key in acknowledged and key not in (explicit or ())
-    ]
-    unresolved, accepted = _history(state)
+    history = _history(state)
     selected: list[str] = []
     held: dict[str, Hold] = {}
     for key in roster:
@@ -178,13 +180,12 @@ def decide(
             outcome: Hold | str | None = Hold.NOT_REQUESTED
         else:
             outcome = _judge(
-                accepted.get(key, []),
-                observations,
+                key,
+                history,
+                observed,
                 results.get(key, ResultState.UNOBSERVED),
                 named=explicit is not None and key in explicit,
                 bulk=retry if isinstance(retry, Retry) else None,
-                unresolved=key in unresolved,
-                acknowledged=key in acknowledged,
             )
         if outcome is None:
             selected.append(key)
@@ -194,74 +195,48 @@ def decide(
             refused[outcome].append(key)
     if any(refused.values()):
         _refuse(refused)
-    retried = tuple(key for key in selected if key in accepted)
     return Selection(
         selected=tuple(selected),
         held=MappingProxyType(held),
-        retry=retried,
-        duplicate_risk=tuple(key for key in retried if key in acknowledged),
+        retry=tuple(key for key in selected if key in history.accepted),
     )
 
 
 def _judge(
-    history: list[tuple[Attempt, int]],
-    observations: Mapping[str, Observation],
+    key: str,
+    history: _History,
+    observed: Observed,
     result: ResultState,
     *,
     named: bool,
     bulk: Retry | None,
-    unresolved: bool,
-    acknowledged: bool,
 ) -> Hold | str | None:
     """One requested Task: its hold reason, a refusal name (explicit keys only), or None to
-    select it. ``history`` lists its accepted Attempts with its slot in each."""
+    select it."""
     if result is ResultState.VALID:
         return "valid" if named else Hold.VALID
-    if unresolved:
+    if key in history.unresolved:
         return Hold.UNRESOLVED
-    if not history:
-        return "unaccepted" if named else None
+    accepted = history.accepted.get(key, [])
+    strays = history.not_submitted.get(key, [])
+    stray = any(item.allocation_id in observed.strays for item in strays)
+    if not accepted:
+        if named:
+            return "unaccepted"
+        return Hold.ACTIVE if stray else None
     if not named and bulk is None:
         return Hold.SUBMITTED
-    hold, unknown, current = _assess(history, observations)
-    if hold is not None:
-        return hold
+    if stray or any(observed.attempts[attempt.allocation_id].live for attempt, _ in accepted):
+        return "live" if named else Hold.ACTIVE
     if named:
-        return "unknown_evidence" if unknown and not acknowledged else None
-    if unknown:
-        return Hold.UNOBSERVABLE
+        return None
+    attempt, slot = accepted[-1]
+    current, _ = observed.attempts[attempt.allocation_id].execution(slot)
     if bulk is Retry.FAILED:
-        failed = current in (AllocationState.FAILED, AllocationState.CANCELLED)
-        return None if failed else Hold.SUBMITTED
-    return None if result is ResultState.MISSING else Hold.UNOBSERVABLE
-
-
-def _assess(
-    history: list[tuple[Attempt, int]], observations: Mapping[str, Observation]
-) -> tuple[Hold | None, bool, AllocationState | None]:
-    """Hold reason (if any), whether any Attempt is UNKNOWN, and the current execution state."""
-    unobserved = active = unknown = False
-    current: AllocationState | None = None
-    for attempt, slot in history:
-        observation = observations.get(attempt.allocation_id)
-        if observation is None:
-            unobserved = True
-            continue
-        allocation, step = observation.allocation, own_step(observation, slot)
-        current, _ = task_execution(observation, slot, len(attempt.task_keys))
-        # The Task is current only in the allocation or its own step, so these cover it.
-        active = (
-            active
-            or allocation.retained
-            or allocation.state.active
-            or (step is not None and step.state.active)
-        )
-        unknown = unknown or AllocationState.UNKNOWN in (allocation.state, current)
-    if active:
-        return Hold.ACTIVE, unknown, current
-    if unobserved:
-        return Hold.UNOBSERVABLE, unknown, current
-    return None, unknown, current
+        chosen = current in (Execution.FAILED, Execution.STOPPED)
+    else:
+        chosen = current.terminal and result is ResultState.MISSING
+    return None if chosen else Hold.SUBMITTED
 
 
 def _refuse(refused: Mapping[str, list[str]]) -> None:

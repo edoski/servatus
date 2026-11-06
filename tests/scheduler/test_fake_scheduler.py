@@ -2,36 +2,20 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 
 import pytest
 from support.builders import resources, target, tasks
 
 from servatus.campaign._config import Target
-from servatus.campaign._evidence import AllocationState, JobRef, StepEvidence
+from servatus.campaign._evidence import Execution, Observation, evidenced_job, observe
 from servatus.campaign._remote import Completed
-from servatus.campaign._scheduler import AttemptQuery, Scheduler
+from servatus.campaign._scheduler import Scheduler, find_argv
 from servatus.campaign._script import log_path, render_batch, sbatch_argv
-from servatus.errors import (
-    ConfigurationError,
-    ReconciliationError,
-    Unavailable,
-)
+from servatus.errors import ConfigurationError, EvidenceConflict, Unavailable
 from servatus.testing import FakeJob, FakeScheduler
 
-INTENT = datetime(2030, 1, 1, 12, 0, 0, tzinfo=UTC)
-
-
-class Clock:
-    def __init__(self) -> None:
-        self.now = INTENT
-
-    def __call__(self) -> datetime:
-        return self.now
-
-    def advance(self, minutes: int) -> None:
-        self.now += timedelta(minutes=minutes)
+SBATCH = "/opt/slurm/bin/sbatch"
 
 
 def allocation(index: int) -> str:
@@ -39,10 +23,10 @@ def allocation(index: int) -> str:
 
 
 class Harness:
-    def __init__(self, *, cluster: str | None = None) -> None:
-        self.clock = Clock()
-        self.fake = FakeScheduler(cluster=cluster, clock=self.clock)
+    def __init__(self) -> None:
+        self.fake = FakeScheduler()
         self.target: Target = target()
+        self.root = self.target.log_root
         self.scheduler = Scheduler(self.fake(self.target), self.target.slurm_bin)
 
     def request(self, allocation_id: str, count: int = 2) -> tuple[tuple[str, ...], bytes]:
@@ -50,80 +34,240 @@ class Harness:
         script = render_batch(self.target, resources(), tasks(count), allocation_id)
         return argv, script
 
-    def submit(self, allocation_id: str, count: int = 2) -> JobRef:
+    def submit(self, allocation_id: str, count: int = 2) -> int:
         return self.scheduler.submit(*self.request(allocation_id, count))
 
-    def observe(self, allocation_id: str, job: JobRef, count: int = 2) -> tuple[object, ...]:
-        query = AttemptQuery(allocation_id, job, INTENT, count)
-        observed = self.scheduler.observe([query])[allocation_id]
-        evidence = observed.allocation
-        return (evidence.state, evidence.retained, evidence.problem, observed.steps)
+    def observe(self, allocation_id: str, job: int, count: int = 2) -> Observation:
+        rows = self.scheduler.queue([allocation_id])[allocation_id]
+        markers = self.scheduler.markers(self.root, {allocation_id: count})[allocation_id]
+        return observe(allocation_id, job, count, rows, markers)
+
+    def executions(self, allocation_id: str, job: int, count: int = 2) -> list[object]:
+        seen = self.observe(allocation_id, job, count)
+        return [seen.execution(slot) for slot in range(count)]
+
+    def marker(self, allocation_id: str, job: int, suffix: str) -> str:
+        return f"{self.root}/{allocation_id}.{job}.{suffix}"
+
+    def markers(self) -> set[str]:
+        return {path for path in self.fake.files if path.endswith((".start", ".stop", ".end"))}
 
 
 def test_fake_is_a_connect_function_returning_a_transport() -> None:
-    fake = FakeScheduler()
+    fake = FakeScheduler(version="slurm 24.11.5")
     transport = fake(target())
-    assert transport.run(("/opt/slurm/bin/sbatch", "--version")) == Completed(
-        0, b"slurm 23.11.4\n", b""
-    )
+    assert transport.run((SBATCH, "--version")) == Completed(0, b"slurm 24.11.5\n", b"")
     with pytest.raises(ConfigurationError, match="connect needs a Target"):
         fake("login.example.edu")  # pyright: ignore[reportArgumentType]
+    with pytest.raises(ConfigurationError, match="first_job_id"):
+        FakeScheduler(first_job_id=0)
 
 
 def test_full_lifecycle_through_the_real_scheduler() -> None:
     harness = Harness()
-    fake, scheduler = harness.fake, harness.scheduler
+    fake, scheduler, a = harness.fake, harness.scheduler, allocation(1)
     assert scheduler.ping() == "slurm 23.11.4"
-    argv, script = harness.request(allocation(1))
+    argv, script = harness.request(a)
     accepted, _, stderr = scheduler.test_only(argv, script)
     assert accepted and stderr.startswith("sbatch: Job 1000 to start at")
     assert fake.jobs == ()
 
     job = scheduler.submit(argv, script)
-    assert job == JobRef(1000)
-    assert fake.job(job) == FakeJob(job, f"servatus-{allocation(1)}", argv, script, 2, "PENDING", 1)
-    assert harness.observe(allocation(1), job) == (AllocationState.QUEUED, True, None, (None, None))
+    assert job == 1000
+    assert fake.job(job) == FakeJob(job, f"servatus-{a}", argv, script, 2, "PENDING", True)
+    assert fake.jobs == (fake.job(job),)
+    assert harness.observe(a, job) == Observation("PENDING", False, False, (None, None))
+    assert harness.executions(a, job) == [(Execution.QUEUED, None)] * 2
 
-    harness.clock.advance(1)
     fake.start(job)
-    running = StepEvidence(AllocationState.RUNNING, "RUNNING", "0:0")
-    assert harness.observe(allocation(1), job) == (
-        AllocationState.RUNNING,
-        True,
-        None,
-        (running, running),
-    )
+    assert harness.markers() == {harness.marker(a, job, "start")}
+    assert harness.executions(a, job) == [(Execution.RUNNING, None)] * 2
 
-    # Regression (wedge): a requeue inside the submission window stays observable.
-    harness.clock.advance(10)
-    fake.requeue(job)
-    assert fake.job(job).incarnations == 2
-    assert harness.observe(allocation(1), job)[:3] == (AllocationState.QUEUED, True, None)
+    fake.finish_step(job, 0, exit_code=3)
+    assert harness.marker(a, job, "0.3.end") in fake.files
+    assert harness.executions(a, job) == [(Execution.FAILED, 3), (Execution.RUNNING, None)]
 
-    harness.clock.advance(5)
-    fake.start(job)
-    fake.finish_step(job, 0, "FAILED", exit_code="1:0")
-    harness.clock.advance(5)
     fake.finish(job)
-    assert harness.observe(allocation(1), job) == (
-        AllocationState.SUCCEEDED,
-        False,
-        None,
-        (
-            StepEvidence(AllocationState.FAILED, "FAILED", "1:0"),
-            StepEvidence(AllocationState.SUCCEEDED, "COMPLETED", "0:0"),
-        ),
-    )
+    assert fake.job(job).state == "FAILED"
+    assert harness.observe(a, job) == Observation("FAILED", True, False, (3, 0))
+    assert harness.observe(a, job).live
 
-    assert scheduler.identify(allocation(1), INTENT) == job
-    path = log_path(harness.target.log_root, allocation(1), job.job_id, 1)
-    fake.write_log(path, b"\x00log tail\xff")
+    fake.purge(job)
+    assert not fake.job(job).in_queue
+    assert scheduler.queue([a]) == {a: ()}
+    assert harness.observe(a, job) == Observation(None, True, False, (3, 0))
+    assert harness.executions(a, job) == [(Execution.FAILED, 3), (Execution.SUCCEEDED, 0)]
+
+    path = log_path(harness.root, a, job, 1)
+    fake.write_file(path, b"\x00log tail\xff")
     assert scheduler.tail(path, 4) == (b"ail\xff", True)
     assert scheduler.tail(path, 64) == (b"\x00log tail\xff", False)
-    scheduler.cancel(allocation(1), job)  # already finished: nothing to cancel
-    assert fake.job(job).state == "COMPLETED"
     assert (fake.count("ping"), fake.count("sbatch")) == (1, 2)
-    assert fake.calls[0] == ("/opt/slurm/bin/sbatch", "--version")
+    assert fake.calls[0] == (SBATCH, "--version")
+
+
+def test_finish_settles_completed_and_starts_a_pending_job_first() -> None:
+    harness = Harness()
+    job = harness.submit(allocation(1))
+    harness.fake.finish(job)
+    assert harness.fake.job(job).state == "COMPLETED"
+    assert harness.markers() == {
+        harness.marker(allocation(1), job, suffix) for suffix in ("start", "0.0.end", "1.0.end")
+    }
+    assert harness.executions(allocation(1), job) == [(Execution.SUCCEEDED, 0)] * 2
+
+
+def test_interrupting_a_pending_job_writes_no_marker_and_it_never_started() -> None:
+    harness = Harness()
+    job = harness.submit(allocation(1))
+    harness.fake.interrupt(job)
+    assert harness.fake.job(job).state == "CANCELLED"
+    assert harness.markers() == set()
+    assert harness.observe(allocation(1), job).slurm_state == "CANCELLED"
+    harness.fake.purge(job)
+    assert harness.observe(allocation(1), job) == Observation(None, False, False, (None, None))
+    assert harness.executions(allocation(1), job) == [(Execution.STOPPED, None)] * 2
+
+
+def test_interrupting_a_running_job_writes_its_stop_marker() -> None:
+    harness = Harness()
+    job = harness.submit(allocation(1))
+    harness.fake.start(job)
+    harness.fake.finish_step(job, 1)
+    harness.fake.interrupt(job, state="TIMEOUT")
+    assert harness.fake.job(job).state == "TIMEOUT"
+    assert harness.marker(allocation(1), job, "stop") in harness.fake.files
+    harness.fake.purge(job)
+    assert harness.executions(allocation(1), job) == [
+        (Execution.STOPPED, None),
+        (Execution.SUCCEEDED, 0),
+    ]
+
+
+def test_a_lost_job_writes_nothing_and_is_lost_once_purged() -> None:
+    harness = Harness()
+    job = harness.submit(allocation(1))
+    harness.fake.start(job)
+    harness.fake.lose(job)
+    assert harness.fake.job(job).state == "NODE_FAIL"
+    assert harness.markers() == {harness.marker(allocation(1), job, "start")}
+    assert harness.executions(allocation(1), job) == [(Execution.RUNNING, None)] * 2
+    harness.fake.purge(job)
+    assert harness.executions(allocation(1), job) == [(Execution.LOST, None)] * 2
+
+
+def test_cancel_interrupts_only_live_jobs_with_the_allocation_name() -> None:
+    harness = Harness()
+    pending = harness.submit(allocation(1))
+    running = harness.submit(allocation(2))
+    finished = harness.submit(allocation(3))
+    harness.fake.start(running)
+    harness.fake.finish(finished)
+
+    harness.scheduler.cancel(allocation(9))
+    assert [job.state for job in harness.fake.jobs] == ["PENDING", "RUNNING", "COMPLETED"]
+
+    for index in (1, 2, 3):
+        harness.scheduler.cancel(allocation(index))
+    assert [job.state for job in harness.fake.jobs] == ["CANCELLED", "CANCELLED", "COMPLETED"]
+    assert harness.marker(allocation(1), pending, "stop") not in harness.fake.files
+    assert harness.marker(allocation(2), running, "stop") in harness.fake.files
+    assert harness.fake.calls[-1] == (
+        "/opt/slurm/bin/scancel",
+        "--me",
+        f"--name=servatus-{allocation(3)}",
+    )
+
+
+def test_cancel_by_name_never_touches_a_reused_job_number() -> None:
+    harness = Harness()
+    first = harness.submit(allocation(1))
+    harness.fake.start(first)
+    harness.fake.set_next_job_id(first)
+    second = harness.submit(allocation(2))
+    assert first == second
+    harness.scheduler.cancel(allocation(1))
+    assert [job.state for job in harness.fake.jobs] == ["CANCELLED", "PENDING"]
+
+
+def test_a_second_job_with_an_existing_identity_is_a_conflict() -> None:
+    harness = Harness()
+    first = harness.submit(allocation(1))
+    original = harness.fake.job(first)
+    reply = harness.fake.run(original.argv, stdin=original.script)
+    assert reply == Completed(0, b"1001\n", b"")
+    rows = harness.scheduler.queue([allocation(1)])[allocation(1)]
+    assert [row.job for row in rows] == [1000, 1001]
+    with pytest.raises(EvidenceConflict, match="Slurm lists jobs 1000, 1001"):
+        harness.observe(allocation(1), first)
+    with pytest.raises(EvidenceConflict, match="evidence names jobs 1000, 1001"):
+        evidenced_job(allocation(1), rows, ())
+
+
+def test_find_lists_only_marker_files_directly_in_the_root() -> None:
+    harness = Harness()
+    root = str(harness.root)
+    wanted = [f"{root}/{allocation(1)}.5.start", f"{root}/b.5.stop", f"{root}/a.5.0.0.end"]
+    for path in [
+        *wanted,
+        f"{root}/sub/{allocation(1)}.5.stop",
+        f"{root}2/{allocation(1)}.5.stop",
+        f"{root}/{allocation(1)}-5.out",
+        f"{root}/{allocation(1)}.5.start.tmp",
+        f"/elsewhere/{allocation(1)}.5.start",
+    ]:
+        harness.fake.write_file(path)
+    listing = harness.fake.run(find_argv(harness.root)).stdout
+    assert listing == "".join(f"{path}\n" for path in sorted(wanted)).encode()
+    prefixed = harness.fake.run(find_argv(harness.root, "a")).stdout
+    assert prefixed == f"{root}/a.5.0.0.end\n".encode()
+
+    harness.fake.remove_file(wanted[0])
+    assert wanted[0] not in harness.fake.files
+    assert harness.scheduler.markers(harness.root, {allocation(1): 1}) == {allocation(1): ()}
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("/opt/slurm/bin/squeue", "--all"),
+        (
+            "/opt/slurm/bin/squeue",
+            "--me",
+            "--all",
+            "--states=all",
+            "--noheader",
+            "--name=servatus-x",
+            "--format=%i|%j|%T|%r",
+        ),
+        ("/opt/slurm/bin/squeue", "--me", "--states=all", "--all", "--noheader", "--name=a", "x"),
+        ("/opt/slurm/bin/scancel", "--me", "--name=servatus-x", "42"),
+        ("/opt/slurm/bin/scancel", "--name=servatus-x"),
+        ("/opt/slurm/bin/scancel", "42"),
+        ("/usr/bin/find", "/logs", "-maxdepth", "2", "-type", "f", "(", "-name", "*.start", ")"),
+        (*find_argv(PurePosixPath("/logs"))[:-1], "-print0", ")"),
+        ("/usr/bin/tail", "-n", "5", "--", "/log"),
+    ],
+)
+def test_argv_drift_is_an_assertion_error(argv: tuple[str, ...]) -> None:
+    with pytest.raises(AssertionError, match="does not understand"):
+        FakeScheduler().run(argv)
+
+
+def test_sbatch_drift_is_an_assertion_error() -> None:
+    harness = Harness()
+    argv, script = harness.request(allocation(1))
+    for drifted in (
+        (*argv, f"--comment=servatus-{allocation(1)}"),
+        tuple(word for word in argv if word != "--no-requeue"),
+        tuple(word for word in argv if word != "--parsable"),
+        (*argv, "--requeue"),
+    ):
+        with pytest.raises(AssertionError, match="does not understand"):
+            harness.fake.run(drifted, stdin=script)
+    with pytest.raises(AssertionError, match="--export=NIL and a /bin/sh script"):
+        harness.fake.run(argv, stdin=b"#!/bin/bash\n")
+    assert harness.fake.jobs == ()
 
 
 def test_failed_submission_creates_no_job() -> None:
@@ -136,15 +280,39 @@ def test_failed_submission_creates_no_job() -> None:
     with pytest.raises(Unavailable, match="status 1: sbatch: error: Batch job submission"):
         harness.submit(allocation(1))
     assert harness.fake.jobs == ()
-    with pytest.raises(ReconciliationError, match="0 jobs"):
-        harness.scheduler.identify(allocation(1), INTENT)
+    assert harness.scheduler.queue([allocation(1)]) == {allocation(1): ()}
+    assert harness.submit(allocation(1)) == 1000
+
+
+def test_lost_submission_reply_leaves_the_job_and_its_evidence() -> None:
+    harness = Harness()
+    harness.fake.lose_next_reply("sbatch")
+    with pytest.raises(Unavailable, match="reply from sbatch was lost"):
+        harness.submit(allocation(1))
+    (accepted,) = harness.fake.jobs
+    rows = harness.scheduler.queue([allocation(1)])[allocation(1)]
+    assert evidenced_job(allocation(1), rows, ()) == accepted.job == 1000
+
+
+def test_injected_failures_reach_observation_commands() -> None:
+    harness = Harness()
+    harness.fake.fail_next("squeue")
+    with pytest.raises(Unavailable, match="injected failure of squeue"):
+        harness.scheduler.queue([allocation(1)])
+    harness.fake.fail_next("find", Completed(1, b"", b"find: /x: No such file or directory\n"))
+    with pytest.raises(Unavailable, match="exit status 1: find: /x"):
+        harness.scheduler.markers(harness.root, {allocation(1): 1})
+    harness.fake.lose_next_reply("scancel")
+    with pytest.raises(Unavailable, match="reply from scancel was lost"):
+        harness.scheduler.cancel(allocation(1))
+    assert harness.scheduler.queue([allocation(1)]) == {allocation(1): ()}
 
 
 def test_the_ping_has_its_own_control_key() -> None:
     harness = Harness()
     harness.fake.fail_next("sbatch")
     harness.fake.lose_next_reply("sbatch")
-    assert harness.scheduler.ping() == "slurm 23.11.4"  # neither control is consumed
+    assert harness.scheduler.ping() == "slurm 23.11.4"
     harness.fake.fail_next("ping", Completed(127, b"", b"sbatch: not found\n"))
     with pytest.raises(Unavailable, match="exit status 127"):
         harness.scheduler.ping()
@@ -156,131 +324,6 @@ def test_the_ping_has_its_own_control_key() -> None:
     assert (harness.fake.count("ping"), harness.fake.count("sbatch")) == (3, 1)
 
 
-def test_lost_submission_reply_is_recoverable_by_identity() -> None:
-    harness = Harness(cluster="alpha")
-    harness.fake.lose_next_reply("sbatch")
-    with pytest.raises(Unavailable, match="reply from sbatch was lost"):
-        harness.submit(allocation(1))
-    (accepted,) = harness.fake.jobs
-    assert (
-        harness.scheduler.identify(allocation(1), INTENT) == accepted.job == JobRef(1000, "alpha")
-    )
-
-
-def test_federated_cluster_routes_every_query() -> None:
-    harness = Harness(cluster="alpha")
-    job = harness.submit(allocation(1))
-    assert job == JobRef(1000, "alpha")
-    harness.fake.start(job)
-    assert harness.observe(allocation(1), job)[0] is AllocationState.RUNNING
-    assert all(
-        "--clusters=alpha" in call
-        for call in harness.fake.calls
-        if call[0].endswith(("squeue", "sacct"))
-    )
-    harness.fake.finish(job, "TIMEOUT", exit_code="0:1")
-    assert harness.observe(allocation(1), job)[:2] == (AllocationState.FAILED, False)
-    foreign = AttemptQuery(allocation(1), JobRef(1000, "beta"), INTENT, 2)
-    assert harness.scheduler.observe([foreign])[allocation(1)].allocation.state is (
-        AllocationState.UNKNOWN
-    )
-
-
-def test_cancel_is_bound_to_the_allocation_name() -> None:
-    harness = Harness()
-    job = harness.submit(allocation(1))
-    harness.fake.start(job)
-    harness.scheduler.cancel(allocation(2), job)  # a different allocation's name: no effect
-    assert harness.fake.job(job).state == "RUNNING"
-    harness.scheduler.cancel(allocation(1), job)
-    assert harness.fake.job(job).state == "CANCELLED by 1000"
-    state, retained, problem, steps = harness.observe(allocation(1), job)
-    assert (state, retained, problem) == (AllocationState.CANCELLED, False, None)
-    cancelled = StepEvidence(AllocationState.CANCELLED, "CANCELLED by 1000", "0:15")
-    assert steps == (cancelled, cancelled)
-
-
-def test_forgotten_job_is_unknown_and_not_retained() -> None:
-    harness = Harness()
-    job = harness.submit(allocation(1))
-    harness.fake.forget(job)
-    assert harness.observe(allocation(1), job) == (
-        AllocationState.UNKNOWN,
-        False,
-        None,
-        (None, None),
-    )
-    harness.scheduler.cancel(allocation(1), job)  # unknown to Slurm: nothing to cancel
-
-
-def test_accounting_lag_prefers_the_finished_queue_state_and_stays_retained() -> None:
-    # Regression (lag): squeue reported COMPLETED while slurmdbd still said RUNNING, which used to
-    # abort observation as a conflict.
-    harness = Harness()
-    job = harness.submit(allocation(1))
-    harness.fake.start(job)
-    harness.fake.finish(job, in_queue=True, accounted=False)
-    assert harness.observe(allocation(1), job)[:3] == (AllocationState.SUCCEEDED, True, None)
-    harness.fake.finish(job)
-    assert harness.observe(allocation(1), job)[:3] == (AllocationState.SUCCEEDED, False, None)
-
-
-def test_started_job_without_accounting_is_still_retained() -> None:
-    harness = Harness()
-    job = harness.submit(allocation(1))
-    harness.fake.start(job, accounted=False)
-    assert harness.observe(allocation(1), job)[:3] == (AllocationState.RUNNING, True, None)
-
-
-def test_reused_job_numbers_stay_bound_to_their_allocations() -> None:
-    harness = Harness()
-    first = harness.submit(allocation(1))
-    harness.fake.finish(first, "FAILED", exit_code="1:0")
-    harness.fake.set_next_job_id(first.job_id)
-    second = harness.submit(allocation(2))
-    harness.fake.finish(second)
-    assert first == second
-    queries = [AttemptQuery(allocation(index), first, INTENT, 2) for index in (1, 2)]
-    observed = harness.scheduler.observe(queries)
-    assert observed[allocation(1)].allocation.state is AllocationState.FAILED
-    assert observed[allocation(2)].allocation.state is AllocationState.SUCCEEDED
-    assert harness.fake.count("squeue") == 2  # one batch per reuse of the number
-
-
-def test_live_foreign_job_under_a_queried_number_withholds_only_that_allocation() -> None:
-    harness = Harness()
-    first = harness.submit(allocation(1))
-    other = harness.submit(allocation(3))
-    harness.fake.finish(first)
-    harness.fake.finish(other)
-    harness.fake.set_next_job_id(first.job_id)
-    harness.submit(allocation(2))
-    observed = harness.scheduler.observe(
-        [
-            AttemptQuery(allocation(1), first, INTENT, 2),
-            AttemptQuery(allocation(3), other, INTENT, 2),
-        ]
-    )
-    foreign = observed[allocation(1)].allocation
-    assert (foreign.state, foreign.retained, foreign.problem) == (
-        AllocationState.UNKNOWN,
-        True,
-        "job number is held by a foreign job",
-    )
-    assert observed[allocation(3)].allocation.state is AllocationState.SUCCEEDED
-
-
-def test_batches_are_counted_per_command() -> None:
-    harness = Harness()
-    queries = [
-        AttemptQuery(allocation(index), harness.submit(allocation(index), 1), INTENT, 1)
-        for index in range(20)
-    ]
-    observed = harness.scheduler.observe(queries)
-    assert len(observed) == 20
-    assert (harness.fake.count("squeue"), harness.fake.count("sacct")) == (2, 4)
-
-
 def test_fake_enforces_real_bounds_and_rejects_unknown_commands() -> None:
     fake = FakeScheduler()
     transport = fake(target())
@@ -288,11 +331,9 @@ def test_fake_enforces_real_bounds_and_rejects_unknown_commands() -> None:
         transport.run(("/opt/slurm/bin/squeue",) * 33)
     assert fake.calls == ()
     with pytest.raises(AssertionError, match="does not emulate"):
-        transport.run(("/opt/slurm/bin/srun", "--version"))
-    with pytest.raises(AssertionError, match="does not understand"):
-        transport.run(("/opt/slurm/bin/squeue", "--all"))
+        transport.run(("/opt/slurm/bin/sacct", "--version"))
     with pytest.raises(Unavailable, match="byte bound"):
-        transport.run(("/opt/slurm/bin/sbatch", "--version"), max_stdout=3)
+        transport.run((SBATCH, "--version"), max_stdout=3)
 
 
 def test_missing_log_is_unavailable() -> None:
@@ -301,12 +342,32 @@ def test_missing_log_is_unavailable() -> None:
         harness.scheduler.tail(PurePosixPath("/cluster/logs/none.out"), 16)
 
 
-def test_controls_reject_unknown_jobs_and_unstarted_steps() -> None:
+def test_controls_reject_impossible_transitions() -> None:
     harness = Harness()
+    fake = harness.fake
     with pytest.raises(ConfigurationError, match="no job 7"):
-        harness.fake.start(7)
+        fake.start(7)
     job = harness.submit(allocation(1))
-    with pytest.raises(ConfigurationError, match="no started step for slot 0"):
-        harness.fake.finish_step(job, 0)
+    with pytest.raises(ConfigurationError, match="no running step in slot 0"):
+        fake.finish_step(job, 0)
+    fake.start(job)
+    with pytest.raises(ConfigurationError, match="is not pending"):
+        fake.start(job)
+    for slot in (-1, 2):
+        with pytest.raises(ConfigurationError, match=f"no running step in slot {slot}"):
+            fake.finish_step(job, slot)
+    for code in (-1, 256, True):
+        with pytest.raises(ConfigurationError, match="exit_code must be an integer from 0 to 255"):
+            fake.finish_step(job, 0, code)
+    fake.finish_step(job, 0)
+    with pytest.raises(ConfigurationError, match="no running step in slot 0"):
+        fake.finish_step(job, 0)
+    fake.finish(job)
+    with pytest.raises(ConfigurationError, match="is not running"):
+        fake.finish(job)
+    with pytest.raises(ConfigurationError, match="already ended"):
+        fake.interrupt(job)
+    with pytest.raises(ConfigurationError, match="already ended"):
+        fake.lose(job)
     with pytest.raises(ConfigurationError, match="job_id"):
-        harness.fake.set_next_job_id(0)
+        fake.set_next_job_id(0)

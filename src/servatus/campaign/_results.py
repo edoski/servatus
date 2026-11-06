@@ -6,13 +6,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from . import _codec
-from ._evidence import JobRef
 
 
 def to_document(value: object) -> object:
     """JSON-compatible data for a campaign value (a result, receipt, check, or planned
     allocation), as the strict codec writes it: durations as ``[D-]HH:MM:SS`` text, bytes as
-    base64, enums by value, and nested values such as ``JobRef`` as objects."""
+    base64, enums by value, and nested dataclasses as objects."""
     return _codec.dump(value)
 
 
@@ -21,7 +20,7 @@ class Receipt:
     """Slurm accepted this allocation. Acceptance is not completion."""
 
     allocation_id: str
-    job: JobRef
+    job: int
     task_keys: tuple[str, ...]
 
 
@@ -29,14 +28,13 @@ class Receipt:
 class UnresolvedSubmission:
     """Durable intent exists, but acceptance was not durably recorded.
 
-    ``observed_job`` is set when Slurm answered but recording the receipt failed. Record it with
-    ``mark_accepted`` (which also corrects a concurrent ``mark_not_submitted`` once Slurm proves
-    the job) or ``reconcile`` before retrying.
+    ``observed_job`` is set when Slurm answered but recording the receipt failed. ``reconcile``
+    records it from Slurm's evidence.
     """
 
     allocation_id: str
     task_keys: tuple[str, ...]
-    observed_job: JobRef | None = None
+    observed_job: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +53,30 @@ class SubmitResult:
     @property
     def complete(self) -> bool:
         return self.stop_reason is None
+
+
+@dataclass(frozen=True, slots=True)
+class WaitingAllocation:
+    """An unresolved allocation without evidence yet. ``reconcile`` records it as not submitted
+    from ``decidable_at`` on, if Slurm still shows nothing for it."""
+
+    allocation_id: str
+    task_keys: tuple[str, ...]
+    decidable_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ReconcileResult:
+    """What one ``reconcile`` recorded: receipts proven by Slurm's evidence, allocations recorded
+    as not submitted, and allocations still ``waiting`` for evidence or time."""
+
+    receipts: tuple[Receipt, ...] = ()
+    not_submitted: tuple[UnattemptedAllocation, ...] = ()
+    waiting: tuple[WaitingAllocation, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        return not self.waiting
 
 
 @dataclass(frozen=True, slots=True)

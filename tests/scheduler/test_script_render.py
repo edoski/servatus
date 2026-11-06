@@ -73,6 +73,7 @@ def test_sbatch_argv_is_complete_and_exact() -> None:
     assert sbatch_argv(full, request, 3, ALLOCATION) == (
         "/opt/slurm/bin/sbatch",
         "--parsable",
+        "--no-requeue",
         "--export=NIL",
         "--nodes=1",
         "--ntasks=3",
@@ -82,7 +83,6 @@ def test_sbatch_argv_is_complete_and_exact() -> None:
         "--partition=gpu",
         "--chdir=/cluster/work/project",
         f"--job-name=servatus-{ALLOCATION}",
-        f"--comment=servatus-{ALLOCATION}",
         f"--output={LOG}/{ALLOCATION}-%j.out",
         f"--error={LOG}/{ALLOCATION}-%j.out",
         "--account=research",
@@ -250,19 +250,51 @@ def test_servatus_variables_are_injected_with_runtime_job_identity() -> None:
         f"APPTAINERENV_SERVATUS_ALLOCATION_ID={ALLOCATION}",
         "APPTAINERENV_SERVATUS_SLOT=0",
         'APPTAINERENV_SERVATUS_JOB_ID="$job_id"',
-        'APPTAINERENV_SERVATUS_RESTART_COUNT="$restart_count"',
     ):
         assert assignment in script
     assert 'job_id="${SLURM_JOB_ID:?' in script
-    assert 'restart_count="${SLURM_RESTART_COUNT:-0}"' in script
+    assert "RESTART_COUNT" not in script
 
 
-def test_interrupt_trap_kills_only_recorded_pids() -> None:
+def test_markers_are_named_by_allocation_and_runtime_job() -> None:
+    script = render((task(),), log_root="/cluster/logs/my project")
+    assert f"marker='/cluster/logs/my project/{ALLOCATION}'.\"$job_id\"\n" in script
+
+
+def test_start_marker_is_written_after_the_trap_and_before_any_step() -> None:
+    lines = render((task("a"), task("b"))).splitlines()
+    job_id = next(i for i, line in enumerate(lines) if line.startswith("job_id="))
+    marker = next(i for i, line in enumerate(lines) if line.startswith("marker="))
+    trap = lines.index("trap interrupt HUP INT TERM")
+    start = lines.index(': > "$marker.start" || exit 1')
+    launches = [i for i, line in enumerate(lines) if line.endswith(" &")]
+    assert job_id < marker < trap < start < min(launches)
+
+
+def test_each_slot_writes_its_own_end_marker_in_its_background_subshell() -> None:
+    lines = render(tuple(task(f"t{slot}") for slot in range(3))).splitlines()
+    launches = [line for line in lines if line.endswith(" &")]
+    for slot, line in enumerate(launches):
+        assert line.startswith("{ printf ")
+        assert line.endswith(
+            f'; code=$?; command : > "$marker.{slot}.$code.end"; exit "$code"; }} &'
+        )
+    assert sum(".end" in line for line in lines) == 3
+
+
+def test_interrupt_trap_records_the_stop_then_signals_the_process_group() -> None:
     script = render((task(),))
     assert "trap interrupt HUP INT TERM" in script
     # The handler first ignores further signals, so repeated signals cannot re-enter it.
-    assert "interrupt() {\n  trap '' HUP INT TERM\n" in script
-    assert 'for pid in $pids; do kill "$pid"' in script
+    assert (
+        "interrupt() {\n"
+        "  trap '' HUP INT TERM\n"
+        '  command : > "$marker.stop"\n'
+        "  kill -s TERM 0 2>/dev/null || :\n"
+        '  for pid in $pids; do wait "$pid" 2>/dev/null || :; done\n'
+        "  exit 1\n"
+        "}\n"
+    ) in script
     assert 'pids="$pids $!"' in script
 
 
@@ -282,7 +314,7 @@ def test_direct_launcher_requires_an_absolute_program(args: tuple[str, ...], mes
 
 def test_apptainer_launcher_accepts_relative_commands_inside_the_image() -> None:
     script = render((Task("t", ("python", "train.py")),))
-    assert " python train.py &" in script
+    assert " python train.py; code=$?;" in script
     assert "/usr/bin/apptainer exec --cleanenv " in script and " run " not in script
 
 

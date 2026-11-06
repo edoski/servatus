@@ -106,8 +106,10 @@ def check_campaign(root: Path) -> None:
     assert all(check.accepted for check in campaign.validate(plan))
     result = campaign.submit(plan)
     assert result.complete and len(result.receipts) == 2, result
-    fake.start(result.receipts[0].job)
-    fake.finish(result.receipts[0].job, "FAILED", exit_code="1:0")
+    job = result.receipts[0].job
+    fake.finish(job, exit_code=1)
+    assert campaign.plan(profile, retry=Retry.FAILED).decision.held["t0"] == "ACTIVE"
+    fake.purge(job)
     assert campaign.status().counts()["failed"] == 2
     assert campaign.plan(profile, retry=Retry.FAILED).decision.selected == ("t0", "t1")
 

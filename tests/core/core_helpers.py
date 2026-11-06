@@ -2,21 +2,14 @@
 
 from __future__ import annotations
 
-import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 
 from support.builders import profile, tasks
 
 from servatus.campaign import _codec
 from servatus.campaign._config import Profile
-from servatus.campaign._evidence import (
-    AllocationState,
-    JobRef,
-    Observation,
-    SchedulerEvidence,
-    StepEvidence,
-)
+from servatus.campaign._evidence import Observation, Observed
 from servatus.campaign._state import State, create, record_intent, record_outcome
 
 NOW = datetime(2030, 1, 1, tzinfo=UTC)
@@ -31,26 +24,12 @@ def roster(count: int = 3, *, appendable: bool = False) -> State:
     return create(CAMPAIGN_ID, tasks(count), appendable=appendable)
 
 
-def accepted_keys(state: State) -> set[str]:
-    return {
-        key
-        for attempt in state.attempts
-        if attempt.acceptance.value == "ACCEPTED"
-        for key in attempt.task_keys
-    }
-
-
 def intend(
-    state: State,
-    keys: Iterable[str],
-    *,
-    ack: Iterable[str] = (),
-    profile_value: Profile | None = None,
+    state: State, keys: Iterable[str], *, profile_value: Profile | None = None
 ) -> tuple[State, str]:
     """Record intent for ``keys`` with the retry choices the invariant demands."""
-    chosen, acknowledged = tuple(keys), set(ack)
-    prior = accepted_keys(state)
-    retry = tuple(key for key in chosen if key in prior)
+    chosen = tuple(keys)
+    retry = tuple(key for key in chosen if key in state.accepted_keys)
     identity = allocation_id(len(state.attempts) + 1)
     changed, _ = record_intent(
         state,
@@ -58,7 +37,6 @@ def intend(
         task_keys=chosen,
         profile=profile_value or profile(),
         retry=retry,
-        duplicate_risk=tuple(key for key in retry if key in acknowledged),
         at=NOW + timedelta(minutes=len(state.attempts)),
     )
     return changed, identity
@@ -68,36 +46,30 @@ def submit(
     state: State,
     keys: Iterable[str],
     *,
-    job: int | None = 0,
-    ack: Iterable[str] = (),
+    accepted: bool = True,
     profile_value: Profile | None = None,
 ) -> tuple[State, str]:
-    """Intent plus outcome: ``job=0`` picks a fresh job number, ``None`` records non-submission."""
-    changed, identity = intend(state, keys, ack=ack, profile_value=profile_value)
-    number = len(changed.attempts) + 100 if job == 0 else job
-    reference = None if number is None else JobRef(number)
-    return record_outcome(changed, identity, reference), identity
+    """Intent plus outcome: job ``100 + attempt count`` when accepted, else non-submission."""
+    changed, identity = intend(state, keys, profile_value=profile_value)
+    job = len(changed.attempts) + 100 if accepted else None
+    return record_outcome(changed, identity, job), identity
 
 
-def observed(
-    state: AllocationState = AllocationState.SUCCEEDED,
-    *,
-    retained: bool = False,
-    exit_code: str | None = None,
-    steps: Iterable[StepEvidence | None] = (),
+def seen(
+    slurm_state: str | None = None,
+    *exit_codes: int | None,
+    started: bool = True,
+    stopped: bool = False,
 ) -> Observation:
-    return Observation(
-        SchedulerEvidence(state, raw_state=state.value, exit_code=exit_code, retained=retained),
-        tuple(steps),
-    )
+    """One allocation's evidence: its squeue state (``None`` once purged), markers, and one exit
+    code per slot (a single unfinished slot by default)."""
+    return Observation(slurm_state, started, stopped, exit_codes or (None,))
 
 
-def step(state: AllocationState, exit_code: str | None = None) -> StepEvidence:
-    return StepEvidence(state, state.value, exit_code)
-
-
-def document(data: bytes) -> dict[str, object]:
-    return json.loads(data)
+def evidence(
+    attempts: Mapping[str, Observation] | None = None, strays: Mapping[str, int] | None = None
+) -> Observed:
+    return Observed(dict(attempts or {}), dict(strays or {}))
 
 
 def reencode(value: object) -> bytes:
