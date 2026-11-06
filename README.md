@@ -177,7 +177,9 @@ the empty run markers each batch script writes to `log_root`: a start marker bef
 end marker per step as soon as it returns, and a stop marker when the job is interrupted. A
 finished job stays in `squeue` for the cluster's `MinJobAge` (typically 5 minutes); Servatus
 decides how it ended only after that, when every marker is visible on the login node, so
-`--retry-failed` picks failed work up a few minutes after it ends.
+`--retry-failed` picks failed work up a few minutes after it ends. This needs a nonzero
+`MinJobAge` well above how long the login node caches directory listings (NFS: about a minute);
+`scontrol show config | grep MinJobAge` shows it.
 
 ## Concepts
 

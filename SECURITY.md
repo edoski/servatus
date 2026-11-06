@@ -106,16 +106,16 @@ Campaign state is an owner-only directory. It keeps complete Task arguments, std
 for retry; keep it private.
 
 Plan files (`servatus.plan/2`) retain the resolved Target and Resources, Task keys with their hold
-reasons, retry choices, and the nonce from which allocation identities derive. They exclude Task arguments, stdin, and environment
-but remain private operational data. `Plan.save` and `servatus plan --output` write them with mode
+reasons, retry choices, and the nonce from which allocation identities derive. They exclude Task
+arguments, stdin, and environment but remain private operational data. `Plan.save` and `servatus plan --output` write them with mode
 `0600` and never overwrite an existing file. `--show-scripts` prints complete scripts, including
 Task payloads; treat that output as sensitive. Submission rebuilds each plan from its decision and
 the current state and refuses a plan that does not match.
 
 `Status.to_json()` (`servatus status --json`) is a diagnostic snapshot, not a redacted record. It
 includes Task keys, result states, allocation identities, retry choices, Profile labels, Slurm job
-ids, raw `squeue` states, run-marker facts, exit codes, timestamps, and warnings. It excludes Task arguments, stdin, environment values, Target values,
-scripts, log content, and application output. Scheduler text, keys, and labels may themselves
+ids, raw `squeue` states, run-marker facts, exit codes, timestamps, and warnings. It excludes Task
+arguments, stdin, environment values, Target values, scripts, log content, and application output. Scheduler text, keys, and labels may themselves
 identify private work; keep snapshots private. Snapshots carry no execution authority.
 
 Submission checks the scheduler connection and the plan's eligibility before recording anything,
@@ -129,7 +129,7 @@ Task key is named explicitly.
 job with its identity in `squeue` and no run marker in `log_root`, at least 15 minutes after the
 intent. A failed query raises `Unavailable` and records nothing; an untrustworthy reply (two jobs
 for one identity, a malformed marker) raises `EvidenceConflict`. If a job appears later anyway,
-every observation reports it and holds its Tasks until it leaves the queue.
+`status` warns about it and planning holds its Tasks `ACTIVE` until it leaves the queue.
 
 Run markers are empty files named after facts (allocation, job, slot, exit code) in `log_root`.
 Servatus trusts that directory as it trusts the logs in it: anyone who can write there as the

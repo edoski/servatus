@@ -40,8 +40,10 @@ which the login node already reads for logs, named so they are found without a j
 Empty files are created atomically, so a reader never sees half a marker. Marker writes use
 `command :` so a failed write (quota, ESTALE) cannot exit the batch shell and orphan its steps.
 The trap signals the script's whole process group, so a step's subshell dies with it and an
-interrupted step records no end marker: interruption reads as `STOPPED`, never as the Task's own
-failure.
+interrupted step records no end marker: interruption normally reads as `STOPPED`. Slurm signals the
+steps and the batch shell separately, so a Task that exits on its own step's signal before the
+batch shell is signalled can still record an end marker and read as `FAILED`; `--retry-failed`
+selects both.
 
 **Outcomes are decided only after Slurm forgets the job.** `MinJobAge` keeps a finished job in
 `squeue` for minutes, far longer than an NFS client caches a directory listing (about a minute), so
@@ -104,7 +106,12 @@ leaves the queue. `cancel --allocation` can stop it.
 
 ## Consequences
 
-Servatus works on any Slurm cluster where the user can run `squeue`, `scancel`, and `find` and the
-login node sees `log_root`. A Task's outcome is known only after `MinJobAge`, so `--retry-failed`
-waits minutes longer than before. Markers stay in `log_root` beside the logs and are as private as
+Servatus works on any Slurm cluster where the user can run `squeue`, `scancel`, and `find`, the
+login node sees `log_root`, and `MinJobAge` is nonzero and well above how long the login node may
+cache a directory listing (NFS `acdirmax`, about a minute by default). With `MinJobAge=0` Slurm
+never purges jobs, so their Tasks would stay `ACTIVE`; with a `MinJobAge` shorter than the cache, a
+stale listing could misread finished work as `STOPPED` or `LOST`. Nothing checks this yet. A Task's
+outcome is known only after `MinJobAge`, so `--retry-failed` waits minutes longer than before.
+Markers accumulate in `log_root` like logs; a listing that names many allocations reads every
+marker there, so keep campaigns of tens of thousands of allocations in their own `log_root`. Markers stay in `log_root` beside the logs and are as private as
 they are. Campaigns from 0.12 (schema 7) and their saved plans cannot be opened.
