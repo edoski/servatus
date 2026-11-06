@@ -148,7 +148,7 @@ def test_a_lost_job_writes_nothing_and_is_lost_once_purged() -> None:
     harness.fake.lose(job)
     assert harness.fake.job(job).state == "NODE_FAIL"
     assert harness.markers() == {harness.marker(allocation(1), job, "start")}
-    assert harness.executions(allocation(1), job) == [(Execution.RUNNING, None)] * 2
+    assert harness.executions(allocation(1), job) == [(Execution.ENDING, None)] * 2
     harness.fake.purge(job)
     assert harness.executions(allocation(1), job) == [(Execution.LOST, None)] * 2
 

@@ -169,8 +169,9 @@ servatus plan state --retry-failed --output retry.json    # later: rerun failed 
 
 Without `--output`, `plan` only prints. `submit` rebuilds the reviewed plan, refuses it with
 `StalePlan` if the campaign changed, and pings Slurm and rechecks eligibility before recording
-anything. `status` shows each Task's execution: `QUEUED`, `RUNNING`, `SUCCEEDED` or `FAILED` with
-its step's exit code, `STOPPED` (cancelled, out of time, or never started), or `LOST` (the job
+anything. `status` shows each Task's execution: `QUEUED`, `RUNNING`, `ENDING` (Slurm
+says the job ended; the outcome is final a few minutes later, once Slurm forgets it), `SUCCEEDED`
+or `FAILED` with its step's exit code, `STOPPED` (cancelled, out of time, or never started), or `LOST` (the job
 vanished without recording how it ended, for example on a node failure). A Task without an
 observed execution shows `NOT_SUBMITTED`, `UNRESOLVED` (reconcile it), or `ACCEPTED` (with
 `--offline`).

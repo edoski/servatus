@@ -82,8 +82,8 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   state while Slurm lists the job (`None` once purged; a terminal state is still settling and
   live), whether its start and stop markers exist, and one exit code per slot from its end markers.
 - **Execution (`Execution`):** a Task's state in its current allocation, from its slot:
-  `QUEUED`, `RUNNING` (also while a finished job settles without the slot's end marker),
-  `SUCCEEDED` or `FAILED` (from the end marker's exit code), `STOPPED` (interrupted, or never
+  `QUEUED`, `RUNNING`, `ENDING` (Slurm reports the job ended but still lists it, and the slot
+  has no end marker; its outcome is final once Slurm forgets the job), `SUCCEEDED` or `FAILED` (from the end marker's exit code), `STOPPED` (interrupted, or never
   started), or `LOST` (started, then vanished without a stop marker). `LOST` is not terminal.
   Exit codes accompany `SUCCEEDED` and `FAILED` only.
 - **Observation scope:** the Attempts a plan needs to observe: the accepted and not-submitted

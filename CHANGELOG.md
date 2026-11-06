@@ -33,10 +33,11 @@ Task rerun in a new campaign still resumes its private work. Replace `mark-accep
   writes to `log_root` (`<allocation>.<job>.start`, `<allocation>.<job>.<slot>.<exit code>.end`,
   `<allocation>.<job>.stop`), never `sacct`. A step that returned shows `SUCCEEDED` or `FAILED` as
   soon as its marker is visible. `STOPPED`, `LOST`, and every retry wait until Slurm purges the job
-  (`MinJobAge`), so a cancelled Task reads `RUNNING` until then and `--retry-failed` picks failed
+  (`MinJobAge`), so a cancelled Task reads `ENDING` until then and `--retry-failed` picks failed
   work up a few minutes after it ends.
-- Executions are `QUEUED`, `RUNNING`, `SUCCEEDED`, `FAILED`, `STOPPED` (interrupted or never
-  started), and `LOST` (vanished without recording an outcome). `AllocationState`, `UNKNOWN`,
+- Executions are `QUEUED`, `RUNNING`, `ENDING` (Slurm reports the job ended; the outcome is
+  final once Slurm forgets it), `SUCCEEDED`, `FAILED`, `STOPPED` (interrupted or never started),
+  and `LOST` (vanished without recording an outcome). `AllocationState`, `UNKNOWN`,
   `CANCELLED`, `SchedulerEvidence`, `StepEvidence`, and `JobRef` are replaced by `Execution` and
   `Observation`; job numbers are plain integers and `TaskStatus.exit_code` is the step's exit code.
 - `TaskStatus.execution` is the one field for a Task's state: its observed `Execution`, or
@@ -46,7 +47,7 @@ Task rerun in a new campaign still resumes its private work. Replace `mark-accep
   `duplicate_risk` become `attempts[].observation` (`slurm_state`, `started`, `stopped`,
   `exit_codes`); `attempts[].job` and `tasks[].exit_code` are integers; `tasks[].execution` is never
   null; and `counts` replaces `unsubmitted`, `cancelled`, and `unknown` with `not_submitted`,
-  `stopped`, and `lost`.
+  `ending`, `stopped`, and `lost`.
 - The `UNOBSERVABLE` hold, duplicate-risk acknowledgement (`allow_duplicate_risk`,
   `--allow-duplicate-risk`, `Decision.duplicate_risk`), federation clusters (`--cluster`), and
   `SERVATUS_RESTART_COUNT` are removed. `ACTIVE` means Slurm still lists earlier work, finished but

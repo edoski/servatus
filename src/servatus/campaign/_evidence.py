@@ -22,6 +22,8 @@ from ._config import CONTROL, TOKEN
 class Execution(StrEnum):
     """What one Task's step did in one allocation.
 
+    ``ENDING``: Slurm reports the job ended, but its outcome is final only once Slurm forgets the
+    job (``MinJobAge`` later), when every run marker is certain to be visible.
     ``STOPPED``: the allocation was interrupted (cancel, time limit) or never started the Task.
     ``LOST``: the batch shell vanished without recording anything (SIGKILL, node failure); the
     step may even still run on a node cut off from the controller.
@@ -29,6 +31,7 @@ class Execution(StrEnum):
 
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
+    ENDING = "ENDING"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     STOPPED = "STOPPED"
@@ -125,7 +128,7 @@ class Observation:
         if code is not None:
             return (Execution.SUCCEEDED if code == 0 else Execution.FAILED), code
         if state is not None:
-            return Execution.RUNNING, None
+            return (Execution.ENDING if state in _ENDED else Execution.RUNNING), None
         if self.stopped or not self.started:
             return Execution.STOPPED, None
         return Execution.LOST, None

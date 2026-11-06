@@ -305,7 +305,8 @@ def test_a_running_or_settling_row_follows_the_slot_end_marker(
     def execution(code: int | None) -> tuple[Execution, int | None]:
         return observation(state, started=started, stopped=stopped, code=code).execution(0)
 
-    assert execution(None) == (Execution.RUNNING, None)
+    ending = state in SETTLING_STATES
+    assert execution(None) == (Execution.ENDING if ending else Execution.RUNNING, None)
     assert execution(0) == (Execution.SUCCEEDED, 0)
     assert execution(1) == (Execution.FAILED, 1)
     assert execution(255) == (Execution.FAILED, 255)

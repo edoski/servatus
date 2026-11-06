@@ -79,7 +79,8 @@ def test_attempts_project_their_durable_facts_and_observation() -> None:
         (seen("RUNNING"), E.RUNNING, None, None),
         (seen("COMPLETING"), E.RUNNING, None, None),
         (seen("SUSPENDED"), E.RUNNING, None, None),
-        (seen("FAILED"), E.RUNNING, None, None),
+        (seen("FAILED"), E.ENDING, None, None),
+        (seen("CANCELLED", stopped=True), E.ENDING, None, None),
         (seen("RUNNING", 0), E.SUCCEEDED, 0, None),
         (seen("COMPLETED", 0), E.SUCCEEDED, 0, None),
         (seen("CANCELLED", 3, stopped=True), E.FAILED, 3, None),
@@ -241,6 +242,7 @@ def test_counts_partition_tasks_by_result_and_execution() -> None:
         "accepted": 1,
         "queued": 1,
         "running": 0,
+        "ending": 0,
         "succeeded": 1,
         "failed": 1,
         "stopped": 0,
@@ -248,6 +250,8 @@ def test_counts_partition_tasks_by_result_and_execution() -> None:
     }
     running = view(state, {first: seen("RUNNING", None, None, 0, None, stopped=True)}).counts()
     assert (running["running"], running["succeeded"]) == (3, 1)
+    ending = view(state, {first: seen("CANCELLED", None, None, 0, 0, stopped=True)}).counts()
+    assert (ending["ending"], ending["succeeded"]) == (2, 2)
     stopped = view(state, {first: seen(None, None, None, 0, 0, stopped=True)}).counts()
     assert (stopped["stopped"], stopped["succeeded"]) == (2, 2)
 

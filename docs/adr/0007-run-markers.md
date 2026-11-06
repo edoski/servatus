@@ -114,7 +114,7 @@ cache a directory listing (NFS `acdirmax`, about a minute by default). With `Min
 never purges jobs, so their Tasks would stay `ACTIVE`; with a `MinJobAge` shorter than the cache, a
 stale listing could misread finished work as `STOPPED` or `LOST`. `servatus doctor` refuses a
 `MinJobAge` under 120 s and any process tracking but `proctrack/cgroup`. `STOPPED`, `LOST`, and
-every retry wait for `MinJobAge`, so a cancelled Task reads `RUNNING` until the purge and
+every retry wait for `MinJobAge`, so a cancelled Task reads `ENDING` until the purge and
 `--retry-failed` waits minutes longer than before.
 Markers accumulate in `log_root` like logs; a listing that names many allocations reads every
 marker there, so keep campaigns of tens of thousands of allocations in their own `log_root`. Markers
