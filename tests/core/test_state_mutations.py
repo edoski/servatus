@@ -309,6 +309,10 @@ def paths(node: Any, prefix: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
     return found
 
 
+def clone(value: Any) -> Any:
+    return json.loads(json.dumps(value))
+
+
 def walk(doc: Any, path: tuple[Any, ...]) -> Any:
     for step in path:
         doc = doc[step]
@@ -331,7 +335,7 @@ def open_gap(doc: Any, rng: random.Random) -> None:
 
 
 def mutate(base: Any, rng: random.Random) -> Any:
-    doc = json.loads(json.dumps(base))
+    doc = clone(base)
     for _ in range(rng.choice((1, 1, 2, 3))):
         every = [path for path in paths(doc) if path]
         path = rng.choice(every)
@@ -350,18 +354,16 @@ def mutate(base: Any, rng: random.Random) -> Any:
         elif operation == 2 and isinstance(parent, list):
             del parent[leaf]
         elif operation == 3 and isinstance(parent, list):
-            parent.insert(leaf, json.loads(json.dumps(value)))
+            parent.insert(leaf, clone(value))
         elif operation == 4 and isinstance(parent, dict):
             del parent[leaf]
         elif operation == 5 and isinstance(parent, dict):
             parent["extra"] = 1
         else:
-            same = [
-                json.loads(json.dumps(walk(doc, other)))
-                for other in every
-                if other[-1] == leaf and other != path
-            ]
-            parent[leaf] = rng.choice(same) if same and rng.random() < 0.6 else rng.choice(SCALARS)
+            same = [walk(doc, other) for other in every if other[-1] == leaf and other != path]
+            # A shared SCALARS list or dict edited in place would change later examples.
+            pool = same if same and rng.random() < 0.6 else SCALARS
+            parent[leaf] = clone(rng.choice(pool))
     return doc
 
 
