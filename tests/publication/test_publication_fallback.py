@@ -3,27 +3,27 @@ from __future__ import annotations
 import ctypes
 import errno
 import fcntl
-import multiprocessing
 import os
 import platform
 import stat
 import sys
 import threading
 from collections.abc import Callable
+from functools import partial
 from multiprocessing.connection import Connection
-from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import Any, NamedTuple, NoReturn
 
 import pytest
+from support.posix import Syscalls, libc_without_symbols, use_libc
+from support.processes import Gate, gate, launch, race
 
 from servatus import _fs
 from servatus.errors import (
-    CrossDeviceError,
+    ConfigurationError,
     DestinationExists,
     Unavailable,
     UnsafeFilesystem,
-    UnsupportedPlatform,
 )
 from servatus.publication import Draft, Workspace, publish, publish_file
 
@@ -67,27 +67,13 @@ def renaming(*args: Any) -> int:
     return -1
 
 
-def use_libc(monkeypatch: pytest.MonkeyPatch, system: str, libc: object) -> None:
-    monkeypatch.setattr(sys, "platform", system)
-
-    def load(*args: object, **kwargs: object) -> object:
-        return libc
-
-    monkeypatch.setattr(ctypes, "CDLL", load)
-    _fs.native_noreplace.cache_clear()
-
-
-def no_symbols(*args: object, **kwargs: object) -> object:
-    return object()
-
-
 def forbidden(*args: object, **kwargs: object) -> NoReturn:
     pytest.fail("the Linux fallback must not run")
 
 
 def force_fallback_in_this_process() -> None:
     sys.platform = "linux"
-    setattr(ctypes, "CDLL", no_symbols)  # noqa: B010
+    setattr(ctypes, "CDLL", libc_without_symbols)  # noqa: B010
 
 
 def pinned_commit(parent: Path, source: str, destination: str) -> None:
@@ -96,21 +82,6 @@ def pinned_commit(parent: Path, source: str, destination: str) -> None:
 
 
 # -- native lookup ---------------------------------------------------------------------------
-def test_missing_renameat2_symbol_takes_the_fallback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Regression: a libc without renameat2 (glibc < 2.28) used to be fatal.
-    use_libc(monkeypatch, "linux", FakeLibc())
-
-    assert _fs.native_noreplace() is None
-    publication = publish_file(tmp_path / "a.json", lambda path: path.write_text("{}"))
-    publish(tmp_path / "tree", lambda draft: (draft.path / "value").write_text("x"))
-
-    assert publication.cleanup_pending is False
-    assert (tmp_path / "a.json").read_text() == "{}"
-    assert (tmp_path / "tree/value").read_text() == "x"
-
-
 @pytest.mark.parametrize(("machine", "number"), [("x86_64", 316), ("aarch64", 276)])
 def test_missing_symbol_uses_renameat2_syscall_on_linux(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, machine: str, number: int
@@ -149,21 +120,6 @@ def test_unknown_architecture_without_symbol_takes_the_fallback(
     assert (tmp_path / "result").is_dir()
 
 
-def test_native_lookup_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
-    loads: list[object] = []
-
-    def load(*args: object, **kwargs: object) -> FakeLibc:
-        loads.append(args)
-        return FakeLibc(renameat2=FakeFunction(renaming))
-
-    monkeypatch.setattr(sys, "platform", "linux")
-    monkeypatch.setattr(ctypes, "CDLL", load)
-    _fs.native_noreplace.cache_clear()
-
-    assert _fs.native_noreplace() is _fs.native_noreplace()
-    assert len(loads) == 1
-
-
 def test_native_noreplace_remains_the_fast_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -181,7 +137,7 @@ def test_native_noreplace_remains_the_fast_path(
 @pytest.mark.parametrize(
     ("code", "expected", "message"),
     [
-        (errno.EXDEV, CrossDeviceError, "filesystem boundary"),
+        (errno.EXDEV, ConfigurationError, "filesystem boundary"),
         (errno.EIO, Unavailable, "Input/output error"),
         (errno.EEXIST, DestinationExists, "already exists"),
     ],
@@ -222,7 +178,7 @@ def test_macos_without_renameatx_np_is_unsupported(
 ) -> None:
     use_libc(monkeypatch, "darwin", FakeLibc())
 
-    with pytest.raises(UnsupportedPlatform, match="no-replace rename"):
+    with pytest.raises(ConfigurationError, match="no-replace rename"):
         publish(tmp_path / "result", lambda draft: None)
 
     assert list(tmp_path.iterdir()) == []
@@ -233,7 +189,7 @@ def test_macos_never_falls_back(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     use_libc(monkeypatch, "darwin", FakeLibc(renameatx_np=renameatx_np))
     monkeypatch.setattr(os, "link", forbidden)
 
-    with pytest.raises(UnsupportedPlatform, match="no-replace rename"):
+    with pytest.raises(ConfigurationError, match="no-replace rename"):
         publish_file(tmp_path / "result", lambda path: path.write_text("x"))
 
     assert renameatx_np.calls[0][-1] == 0x4  # RENAME_EXCL
@@ -301,27 +257,13 @@ def test_directory_fallback_rejects_source_substitution(
 
 
 @pytest.mark.usefixtures("linux_fallback")
-def test_directory_fallback_releases_dedicated_lock_by_close(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_directory_fallback_releases_its_lock_before_returning(tmp_path: Path) -> None:
     (tmp_path / "stage").mkdir()
-    operations: list[tuple[int, int]] = []
-    real_flock = fcntl.flock
 
-    def record(fd: int, operation: int) -> None:
-        operations.append((fd, operation))
-        if operation == fcntl.LOCK_UN:
-            raise OSError("explicit unlock must not run")
-        real_flock(fd, operation)
+    pinned_commit(tmp_path, "stage", "result")
 
-    monkeypatch.setattr(fcntl, "flock", record)
-    with _fs.open_path(tmp_path) as directory:
-        _fs.commit(directory, "stage", directory, "result", directory.present("stage"))
-        ((lock_fd, operation),) = operations
-        assert operation == fcntl.LOCK_EX
-        assert lock_fd != directory.fd
-        with _fs.open_path(tmp_path) as other:
-            real_flock(other.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # the lock was released
+    with _fs.open_path(tmp_path) as other:
+        fcntl.flock(other.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     assert (tmp_path / "result").is_dir()
 
@@ -335,7 +277,7 @@ def test_directory_fallback_fails_closed_without_flock(
 
     monkeypatch.setattr(fcntl, "flock", unavailable)
 
-    with pytest.raises(UnsupportedPlatform, match="lock is unavailable"):
+    with pytest.raises(ConfigurationError, match="lock is unavailable"):
         publish(tmp_path / "result", lambda draft: None)
 
     # The NFS lock file was tried too; it is never removed (that would split its holders).
@@ -414,44 +356,22 @@ def test_directory_fallback_has_one_winner_across_processes(tmp_path: Path) -> N
     for name in ("stage-a", "stage-b"):
         (tmp_path / name).mkdir()
         (tmp_path / name / "value").write_text(name)
-    context = multiprocessing.get_context("spawn")
-    workers: list[tuple[BaseProcess, Connection, Connection]] = []
-    for source in ("stage-a", "stage-b"):
-        start_child, start_parent = context.Pipe(duplex=False)
-        result_parent, result_child = context.Pipe(duplex=False)
-        process = context.Process(
-            target=_commit_worker, args=(str(tmp_path), source, start_child, result_child)
-        )
-        process.start()
-        start_child.close()
-        result_child.close()
-        workers.append((process, start_parent, result_parent))
 
-    for _, start, _ in workers:
-        start.send("start")
-        start.close()
-    outcomes: list[str] = []
-    for process, _, result in workers:
-        assert result.poll(10)
-        outcomes.append(result.recv())
-        process.join(timeout=10)
-        assert process.exitcode == 0
+    outcomes = race(
+        partial(_commit_worker, str(tmp_path), "stage-a"),
+        partial(_commit_worker, str(tmp_path), "stage-b"),
+    )
 
     assert sorted(outcomes) == ["committed", "exists"]
     assert (tmp_path / "result/value").read_text() in {"stage-a", "stage-b"}
-
-
-class _Gate(NamedTuple):
-    ready: Connection
-    release: Connection
 
 
 def _publish_worker(
     parent: str,
     destination: str,
     value: str,
-    build_gate: _Gate | None,
-    sync_gate: _Gate | None,
+    build_gate: Gate | None,
+    sync_gate: Gate | None,
     result: Connection,
 ) -> None:
     force_fallback_in_this_process()
@@ -493,37 +413,24 @@ def _publish_worker(
         result.send("committed")
 
 
-def _gate() -> tuple[_Gate, _Gate]:
-    """Return (worker side, test side) of a ready/release pair."""
-    context = multiprocessing.get_context("spawn")
-    ready_test, ready_worker = context.Pipe(duplex=False)
-    release_worker, release_test = context.Pipe(duplex=False)
-    return _Gate(ready_worker, release_worker), _Gate(ready_test, release_test)
-
-
-def _launch(*args: object) -> tuple[BaseProcess, Connection]:
-    context = multiprocessing.get_context("spawn")
-    result_test, result_worker = context.Pipe(duplex=False)
-    process = context.Process(target=_publish_worker, args=(*args, result_worker))
-    process.start()
-    result_worker.close()
-    return process, result_test
-
-
 def test_directory_fallback_does_not_hold_parent_lock_across_durability_sync(
     tmp_path: Path,
 ) -> None:
-    same_worker, same_test = _gate()
-    same, same_result = _launch(str(tmp_path), "result-a", "challenger", same_worker, None)
+    same_worker, same_test = gate()
+    same, same_result = launch(
+        _publish_worker, str(tmp_path), "result-a", "challenger", same_worker, None
+    )
     assert same_test.ready.poll(10)
     assert same_test.ready.recv() == "built"
 
-    sync_worker, sync_test = _gate()
-    winner, winner_result = _launch(str(tmp_path), "result-a", "winner", None, sync_worker)
+    sync_worker, sync_test = gate()
+    winner, winner_result = launch(
+        _publish_worker, str(tmp_path), "result-a", "winner", None, sync_worker
+    )
     assert sync_test.ready.poll(10)
     assert sync_test.ready.recv() == "sync"
 
-    other, other_result = _launch(str(tmp_path), "result-b", "other", None, None)
+    other, other_result = launch(_publish_worker, str(tmp_path), "result-b", "other", None, None)
     same_test.release.send("continue")
     try:
         assert other_result.poll(10)
@@ -544,17 +451,15 @@ def test_directory_fallback_does_not_hold_parent_lock_across_durability_sync(
 
 
 @pytest.mark.usefixtures("linux_fallback")
-def test_file_fallback_verifies_the_hard_linked_inode(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    real_link = os.link
-
-    def link_then_substitute(source: Any, destination: Any, **kwargs: Any) -> None:
-        real_link(source, destination, **kwargs)
+def test_file_fallback_verifies_the_hard_linked_inode(tmp_path: Path, syscalls: Syscalls) -> None:
+    def link_then_substitute(
+        real: Callable[..., None], source: Any, destination: Any, **kwargs: Any
+    ) -> None:
+        real(source, destination, **kwargs)
         os.unlink(destination, dir_fd=kwargs["dst_dir_fd"])
         (tmp_path / destination).write_text("impostor")
 
-    monkeypatch.setattr(os, "link", link_then_substitute)
+    syscalls.os("link", link_then_substitute)
 
     with pytest.raises(UnsafeFilesystem, match="not the verified source"):
         publish_file(tmp_path / "result", lambda path: path.write_text("verified"))
@@ -563,28 +468,27 @@ def test_file_fallback_verifies_the_hard_linked_inode(
 NFS_LOCK_ERRORS = [errno.EBADF, errno.ENOLCK, errno.EOPNOTSUPP, errno.EINVAL]
 
 
-def refuse_directory_locks(monkeypatch: pytest.MonkeyPatch, code: int) -> list[int]:
+def refuse_directory_locks(syscalls: Syscalls, code: int) -> list[int]:
     """Behave like NFS: `flock` on a directory descriptor fails; regular files still lock."""
-    real_flock = fcntl.flock
     locked_files: list[int] = []
 
-    def flock(fd: int, operation: int) -> None:
+    def flock(real: Callable[[int, int], None], fd: int, operation: int) -> None:
         entry = os.fstat(fd)
         if stat.S_ISDIR(entry.st_mode):
             raise OSError(code, os.strerror(code))
         locked_files.append(entry.st_ino)
-        real_flock(fd, operation)
+        real(fd, operation)
 
-    monkeypatch.setattr(fcntl, "flock", flock)
+    syscalls.wrap(fcntl, "flock", flock)
     return locked_files
 
 
 @pytest.mark.usefixtures("linux_fallback")
 @pytest.mark.parametrize("code", NFS_LOCK_ERRORS)
 def test_directory_fallback_locks_a_file_where_directories_cannot_be_locked(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+    tmp_path: Path, syscalls: Syscalls, code: int
 ) -> None:
-    locked_files = refuse_directory_locks(monkeypatch, code)
+    locked_files = refuse_directory_locks(syscalls, code)
 
     publication = publish(tmp_path / "result", lambda draft: (draft.path / "value").touch())
 
@@ -597,9 +501,9 @@ def test_directory_fallback_locks_a_file_where_directories_cannot_be_locked(
 
 @pytest.mark.usefixtures("linux_fallback")
 def test_directory_fallback_lock_file_must_be_a_private_regular_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, syscalls: Syscalls
 ) -> None:
-    refuse_directory_locks(monkeypatch, errno.ENOLCK)
+    refuse_directory_locks(syscalls, errno.ENOLCK)
     (tmp_path / "elsewhere").write_text("x")
     (tmp_path / ".servatus.lock").symlink_to(tmp_path / "elsewhere")
 

@@ -2,31 +2,16 @@ from __future__ import annotations
 
 import errno
 import os
-import stat
 import sys
 import tempfile
-import warnings
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from support.posix import hidden, mode_of
 
-from servatus.errors import (
-    ConfigurationError,
-    CrossDeviceError,
-    DestinationExists,
-    UnsafeFilesystem,
-    UnsupportedPlatform,
-)
+from servatus.errors import ConfigurationError, DestinationExists, UnsafeFilesystem
 from servatus.publication import Draft, Publication, Workspace, publish, publish_file
-
-
-def hidden(parent: Path) -> list[Path]:
-    return sorted(parent.glob(".servatus-*"))
-
-
-def mode_of(path: Path) -> int:
-    return stat.S_IMODE(path.stat(follow_symlinks=False).st_mode)
 
 
 @pytest.fixture
@@ -213,7 +198,7 @@ def test_unsupported_platform_fails_before_builder(
     called: list[object] = []
     monkeypatch.setattr(sys, "platform", "win32")
 
-    with pytest.raises(UnsupportedPlatform, match="Linux or macOS"):
+    with pytest.raises(ConfigurationError, match="Linux or macOS"):
         publish(tmp_path / "result", called.append)
 
     assert called == []
@@ -402,142 +387,6 @@ def test_file_destination_race_never_overwrites(tmp_path: Path) -> None:
     assert hidden(tmp_path) == []
 
 
-# -- retirement ------------------------------------------------------------------------------
-def make_bundle(tmp_path: Path) -> Path:
-    bundle = tmp_path / "bundle"
-    bundle.mkdir(mode=0o700)
-    (bundle / "private").write_text("authored")
-    return bundle
-
-
-def test_publish_retires_owner_only_sibling_after_commit(tmp_path: Path) -> None:
-    bundle = make_bundle(tmp_path)
-    (bundle / "nested").mkdir(mode=0o500)
-
-    publication = publish(
-        tmp_path / "result",
-        lambda draft: (draft.path / "complete").write_text("canonical"),
-        retire=bundle,
-    )
-
-    assert publication.cleanup_pending is False
-    assert (tmp_path / "result/complete").read_text() == "canonical"
-    assert not bundle.exists()
-    assert hidden(tmp_path) == []
-
-
-@pytest.mark.parametrize("failure", ["builder", "collision"])
-def test_precommit_failure_preserves_retirement_source(tmp_path: Path, failure: str) -> None:
-    bundle = make_bundle(tmp_path)
-    destination = tmp_path / "result"
-
-    def build(draft: Draft) -> None:
-        if failure == "builder":
-            raise ValueError("invalid result")
-        destination.mkdir()
-
-    expected = ValueError if failure == "builder" else DestinationExists
-    with pytest.raises(expected, match="invalid result|already exists"):
-        publish(destination, build, retire=bundle)
-
-    assert (bundle / "private").read_text() == "authored"
-
-
-@pytest.mark.parametrize("kind", ["missing", "file", "symlink", "fifo"])
-def test_unsafe_retirement_source_is_rejected_before_builder(tmp_path: Path, kind: str) -> None:
-    expected = (ConfigurationError, "does not exist") if kind == "missing" else None
-    source = tmp_path / "bundle"
-    if kind == "file":
-        source.write_text("not a directory")
-    elif kind == "symlink":
-        (tmp_path / "target").mkdir(mode=0o700)
-        source.symlink_to(tmp_path / "target", target_is_directory=True)
-    elif kind == "fifo":
-        os.mkfifo(source)
-    called: list[object] = []
-
-    error, message = expected or (UnsafeFilesystem, "not a safe directory")
-    with pytest.raises(error, match=message):
-        publish(tmp_path / "result", called.append, retire=source)
-
-    assert called == []
-    assert not (tmp_path / "result").exists()
-
-
-def test_retirement_must_be_private_distinct_sibling(tmp_path: Path) -> None:
-    bundle = make_bundle(tmp_path)
-    bundle.chmod(0o755)
-    called: list[object] = []
-
-    with pytest.raises(UnsafeFilesystem, match="owner-only"):
-        publish(tmp_path / "result", called.append, retire=bundle)
-    bundle.chmod(0o700)
-    (tmp_path / "other").mkdir()
-    with pytest.raises(ConfigurationError, match="sibling"):
-        publish(tmp_path / "other" / "result", called.append, retire=bundle)
-    with pytest.raises(ConfigurationError, match="differ"):
-        publish(bundle, called.append, retire=bundle)
-
-    assert called == []
-
-
-def test_substituted_retirement_source_is_preserved_as_pending_cleanup(tmp_path: Path) -> None:
-    bundle = make_bundle(tmp_path)
-    moved = tmp_path / "moved"
-
-    def build(draft: Draft) -> None:
-        bundle.rename(moved)
-        bundle.mkdir(mode=0o700)
-        (bundle / "replacement").write_text("preserve")
-
-    with pytest.warns(RuntimeWarning, match="private cleanup remains pending"):
-        publication = publish(tmp_path / "result", build, retire=bundle)
-
-    assert publication.cleanup_pending is True
-    assert (tmp_path / "result").is_dir()
-    assert (moved / "private").read_text() == "authored"
-    assert (bundle / "replacement").read_text() == "preserve"
-
-
-def test_newly_permissive_retirement_source_is_preserved(tmp_path: Path) -> None:
-    bundle = make_bundle(tmp_path)
-
-    with pytest.warns(RuntimeWarning, match="private cleanup remains pending"):
-        publication = publish(tmp_path / "result", lambda draft: bundle.chmod(0o755), retire=bundle)
-
-    assert publication.cleanup_pending is True
-    assert (bundle / "private").read_text() == "authored"
-
-
-def test_warning_filter_cannot_mask_committed_publication(tmp_path: Path) -> None:
-    bundle = make_bundle(tmp_path)
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", RuntimeWarning)
-        publication = publish(tmp_path / "result", lambda draft: bundle.chmod(0o755), retire=bundle)
-
-    assert publication.cleanup_pending is True
-    assert (tmp_path / "result").is_dir()
-
-
-def test_warning_hook_failure_cannot_mask_committed_publication(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    bundle = make_bundle(tmp_path)
-    calls: list[object] = []
-
-    def fail_warning(*args: object, **kwargs: object) -> None:
-        calls.append(args)
-        raise RuntimeError("injected warning hook failure")
-
-    monkeypatch.setattr(warnings, "warn", fail_warning)
-
-    publication = publish(tmp_path / "result", lambda draft: bundle.chmod(0o755), retire=bundle)
-
-    assert len(calls) == 1
-    assert publication.cleanup_pending is True
-
-
 # -- cross-device ----------------------------------------------------------------------------
 def test_link_rejects_cross_device_source(tmp_path: Path) -> None:
     shared_memory = Path("/dev/shm")
@@ -546,7 +395,7 @@ def test_link_rejects_cross_device_source(tmp_path: Path) -> None:
     with tempfile.TemporaryDirectory(dir=shared_memory) as directory:
         source = Path(directory) / "source"
         source.write_text("value")
-        with pytest.raises(CrossDeviceError, match="another filesystem"):
+        with pytest.raises(ConfigurationError, match="filesystem boundary"):
             publish(tmp_path / "result", lambda draft: draft.link(source, "source"))
 
 

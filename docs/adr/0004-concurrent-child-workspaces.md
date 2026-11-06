@@ -1,17 +1,16 @@
 # ADR 0004: Coordinate concurrent child workspaces
 
-Status: accepted (revised for 0.12)
+Status: accepted (revised for 0.13)
 
 Some applications run independent resumable workers concurrently, then assemble their validated
 results into one immutable destination. An ordinary parent `Workspace` cannot wrap those workers:
 its exclusive lifecycle lock would reject or serialize them.
 
 `Workspace.child(name, identity=...)` returns one ordinary resumable child beneath the parent's
-private work. Children are built through a private constructor from an immutable, fully initialized
-location; nothing is mutated after construction. A child holds a shared parent lifecycle lease and
-an exclusive child lease. Different children may overlap; a duplicate child or parent finalization
-fails immediately with `Busy`. Children cannot have children. The application decides which
-children are required and when they are ready.
+private work. A child is built from an immutable, fully initialized location. It holds a shared
+parent lifecycle lease and an exclusive child lease. Different children may overlap; a duplicate
+child or parent finalization fails immediately with `Busy`. Children cannot have children. The
+application decides which children are required and when they are ready.
 
 Opening each level takes a short exclusive directory lock (ADR 0002: `flock` on its pinned parent
 directory, or on an owner-only `.servatus.lock` file inside it where the filesystem refuses

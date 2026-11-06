@@ -1,6 +1,6 @@
 # ADR 0002: Publish through a durable POSIX transaction
 
-Status: accepted (revised for 0.12)
+Status: accepted (revised for 0.13)
 
 ## One stage design
 
@@ -10,7 +10,7 @@ descriptors (`_fs.Pin`): a descriptor plus the `stat` entry it was opened agains
 construction and closed on any verification failure, so no descriptor outlives a failed check.
 Ownership checks compare against `os.geteuid()`.
 
-- `publish(destination, build, *, retire=None, mode=None)` hands the builder a `Draft` whose path is
+- `publish(destination, build, *, mode=None)` hands the builder a `Draft` whose path is
   the stage itself. The stage directory becomes the destination.
 - `publish_file(destination, write, *, mode=None)` hands the writer `<stage>/<destination name>`.
   The writer may create that member any way it likes, including writing a temporary sibling and
@@ -23,22 +23,24 @@ Both operations reject an existing destination before entering the callback; the
 remains authoritative against a later race. Creating a stage does not sync its parent; only
 validated content is made durable before commit, and the destination parent is synced after it.
 
-Invalid caller input (an unsafe or absolute draft path, a missing destination parent, a missing
-link or `retire` source, a `retire` that is not a distinct sibling, a writer that creates nothing,
-a `link_tree` source that contains the draft, a mode outside `0..0o777`, non-bytes Workspace
-identity) raises `ConfigurationError`; a failed builder or writer discards its stage.
+Invalid caller input (an unsafe, absolute, or already occupied draft path, a missing destination
+parent, a missing link source, a writer that creates nothing, a `link_tree` source that contains the
+draft, a mode outside `0..0o777`, non-bytes Workspace identity) raises `ConfigurationError`; a
+failed builder or writer discards its stage. `DestinationExists` means only that the canonical
+destination exists, so a worker can read it as "already published" and a builder bug can never pass
+for that.
 
 ## Errors
 
 Every public operation runs inside one error boundary (`_fs.Boundary`) where an `OSError` becomes
 the error a caller can act on, so no raw `OSError` escapes publication, Workspaces, or the campaign
 store. A missing entry is `ConfigurationError` (`NotFound` in the store); a denied, read-only,
-overlong, or otherwise unusable location is `ConfigurationError`; a cross-device operation is
-`CrossDeviceError`; anything else (no space, quota, I/O errors, descriptor exhaustion) is
-transient and `Unavailable`. A file or directory its owner cannot read is `ConfigurationError`
-("not readable by its owner"). `UnsafeFilesystem` is reserved for the explicit substitution, type,
-and ownership checks, so it always means "investigate". Exceptions raised by application
-callbacks (builders, writers) pass through the boundary with their identity intact.
+overlong, cross-device, or otherwise unusable location is `ConfigurationError`; anything else (no
+space, quota, I/O errors, descriptor exhaustion) is transient and `Unavailable`. A file or directory
+its owner cannot read is `ConfigurationError` ("not readable by its owner"). `UnsafeFilesystem` is
+reserved for the explicit substitution, type, and ownership checks, so it always means
+"investigate". Exceptions raised by application callbacks (builders, writers) pass through the
+boundary with their identity intact.
 
 A `Draft` is invalidated when the builder returns; later use raises `RuntimeError`, so a leaked
 draft cannot mutate a committed destination. `Draft.link(source, destination)` hard-links one
@@ -60,10 +62,10 @@ overriding any mode the writer chose. Nothing is group- or world-visible before 
 
 Linux uses `renameat2(RENAME_NOREPLACE)`, looked up once: through the libc symbol when present,
 otherwise through `syscall(SYS_renameat2)` on architectures whose syscall number is known (x86-64
-and AArch64). When neither is available the call is treated as `ENOSYS`; it is never
-`UnsupportedPlatform`. macOS uses `renameatx_np(RENAME_EXCL)`. Linux falls back only when the native
+and AArch64). When neither is available the call is treated as `ENOSYS` and takes the fallback.
+macOS uses `renameatx_np(RENAME_EXCL)`. Linux falls back only when the native
 call reports `EINVAL`, `ENOSYS`, or `EOPNOTSUPP`/`ENOTSUP`, after verifying the exact source inode
-relative to its pinned directory. Elsewhere those errors raise `UnsupportedPlatform`.
+relative to its pinned directory. Elsewhere those errors raise `ConfigurationError`.
 
 The regular-file fallback installs the member with a hard link, which remains kernel-exclusive, and
 verifies the published inode; the stage, which still holds the member's original name, is then
@@ -98,7 +100,7 @@ locker create a new inode and split the holders. Because the result of the direc
 depends only on the filesystem, every actor on one filesystem takes the same path. The lock file
 must be owned by the effective user with no group or world permissions, so a directory coordinated
 this way cannot be shared between users. When neither lock works, the operation raises
-`UnsupportedPlatform`.
+`ConfigurationError`.
 
 ## Workspaces, cleanup, and residue
 
@@ -125,11 +127,9 @@ Cleanup walks the pinned tree relative to descriptors without following links, r
 binding before removal, and removes the root only while it still names the expected inode. A
 directory lacking owner read or search permission is first made owner-accessible (`u+rwx`) by
 name relative to its pinned parent after checking the binding, and its inode is verified once
-opened. A moved, substituted, or unremovable tree remains as residue. Directory publication may
-also retire one existing owner-only destination sibling (`retire=`) only after the destination
-commit is durable.
-Every committed publication with unprovable cleanup returns `cleanup_pending=True` and makes one
-best-effort `RuntimeWarning`; cleanup state never turns a commit into apparent failure.
+opened. A moved, substituted, or unremovable tree remains as residue. Every committed publication
+with unprovable cleanup returns `cleanup_pending=True` and makes one best-effort `RuntimeWarning`;
+cleanup state never turns a commit into apparent failure.
 
 Application callbacks own contents and validation and must finish mutating before returning.
 Servatus verifies pathname and inode identity and syncs contents, but does not claim to exclude

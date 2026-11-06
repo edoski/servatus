@@ -29,12 +29,6 @@ detect or exclude concurrent content writers. A hard-linked result shares its so
 rewriting the source in place after publication changes the published content. The owner-only draft
 namespace must remain quiescent during each link call.
 
-Optional directory retirement (`retire=`) accepts one existing owner-only destination sibling.
-Servatus pins it before the builder, commits and syncs the destination first, then removes only the
-pinned tree and syncs the parent again. Missing, moved, substituted, newly permissive, or
-unremovable trees after commit are preserved as cleanup residue and cannot turn a committed
-publication into apparent failure.
-
 The hidden Workspace container is the lifecycle trust root. Its container, work directory,
 lifecycle lock, and identity file must belong to the effective user with no group or world
 permissions and are reverified through pinned descriptors. Initialization syncs the private
@@ -58,13 +52,11 @@ lock file would split its holders. It must be owned by the effective user with n
 permissions, so a directory coordinated this way cannot be shared between users; another user's
 lock file is refused.
 
-Filesystem failures surface as Servatus errors, never as a raw `OSError`: a missing, denied,
-read-only, or overlong path, or a file its owner cannot read, is `ConfigurationError` (`NotFound`
-for a missing campaign or state file); no space, quota, I/O errors, and descriptor exhaustion are
-`Unavailable`; a cross-device operation is `CrossDeviceError`. `UnsafeFilesystem` is reserved for
-explicit substitution, type (for example a symlink or file where a directory must be), and
-ownership checks, so treat it as a reason to investigate. Exceptions raised by builders, writers,
-and other application callbacks propagate unchanged.
+Filesystem failures surface as Servatus errors, never as a raw `OSError`; the
+[README](README.md#publication) and [ADR 0002](docs/adr/0002-posix-workspace-publication.md) map
+them. `UnsafeFilesystem` is reserved for explicit substitution, type (for example a symlink or file
+where a directory must be), and ownership checks, so treat it as a reason to investigate. Exceptions
+raised by builders, writers, and other application callbacks propagate unchanged.
 
 On Linux, when `renameat2(RENAME_NOREPLACE)` is unavailable (no libc wrapper and no known raw
 syscall number) or the filesystem rejects it (`EINVAL`, `ENOSYS`, `EOPNOTSUPP`/`ENOTSUP`),

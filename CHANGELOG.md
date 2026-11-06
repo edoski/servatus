@@ -6,6 +6,24 @@ All notable changes to Servatus are recorded here. The format follows
 
 ## [Unreleased]
 
+### Breaking
+
+- `publish` no longer takes `retire=`. No known consumer used it; a `Workspace` covers private work
+  beside the destination, with identity binding and residue reclaim.
+- `CrossDeviceError` and `UnsupportedPlatform` are gone. Those failures raise `ConfigurationError`
+  with the same message text.
+
+### Changed
+
+- A hard-link failure that is not a substitution uses the general filesystem wording, naming the
+  source and the draft path (for example `crosses a filesystem boundary`).
+
+### Fixed
+
+- A draft-path collision in `Draft.link` or `Draft.link_tree` raises `ConfigurationError` instead of
+  `DestinationExists`. A worker that reads `DestinationExists` as "already published" could exit 0
+  with nothing published when its builder linked two files to one path.
+
 ## [0.12.1] - 2026-10-05
 
 ### Fixed
