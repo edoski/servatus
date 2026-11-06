@@ -527,18 +527,18 @@ def probe_umask(directory: Pin) -> int:
 
 
 # -- writing ---------------------------------------------------------------------------------
-def write_new(dir_fd: int, name: str, data: bytes, *, mode: int = 0o600) -> os.stat_result:
-    """Create `name` exclusively with exactly `mode`, write all bytes, and fsync the file.
+def write_new(dir_fd: int, name: str, data: bytes) -> os.stat_result:
+    """Create `name` exclusively as owner-only (0o600), write all bytes, and fsync the file.
 
     The directory is not synced; the caller decides how the file is installed. On any failure,
     including a failing close, the new file is removed (unsynced) and the error propagates.
     """
-    fd = os.open(name, _NEW, mode, dir_fd=dir_fd)
+    fd = os.open(name, _NEW, 0o600, dir_fd=dir_fd)
     created: os.stat_result | None = None
     try:
         try:
             created = os.fstat(fd)
-            os.fchmod(fd, mode)
+            os.fchmod(fd, 0o600)  # the umask may have removed owner bits
             view = memoryview(data)
             while view:
                 written = os.write(fd, view)
@@ -554,7 +554,7 @@ def write_new(dir_fd: int, name: str, data: bytes, *, mode: int = 0o600) -> os.s
         raise
 
 
-def replace_file(dir_fd: int, name: str, data: bytes, *, mode: int = 0o600) -> None:
+def replace_file(dir_fd: int, name: str, data: bytes) -> None:
     """Atomically replace (or create) `name` in `dir_fd` with `data`, durably.
 
     Stages a synced sibling, verifies it, renames it over `name`, then syncs the directory. Readers
@@ -562,7 +562,7 @@ def replace_file(dir_fd: int, name: str, data: bytes, *, mode: int = 0o600) -> N
     may already be visible; the error still propagates.
     """
     stage = f".servatus-replace-{os.urandom(12).hex()}"
-    created = write_new(dir_fd, stage, data, mode=mode)
+    created = write_new(dir_fd, stage, data)
     try:
         current = os.stat(stage, dir_fd=dir_fd, follow_symlinks=False)
         if not same(current, created):

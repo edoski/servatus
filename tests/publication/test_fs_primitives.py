@@ -13,18 +13,18 @@ from servatus import _fs
 from servatus.errors import ConfigurationError, UnsafeFilesystem
 
 
-def test_write_new_creates_exact_mode_and_refuses_existing(tmp_path: Path) -> None:
-    previous = os.umask(0o077)
-    try:
-        with _fs.open_path(tmp_path) as directory:
-            entry = _fs.write_new(directory.fd, "state", b"payload", mode=0o640)
+def test_write_new_is_owner_only_under_any_umask_and_refuses_existing(tmp_path: Path) -> None:
+    with _fs.open_path(tmp_path) as directory:
+        previous = os.umask(0o777)
+        try:
+            entry = _fs.write_new(directory.fd, "state", b"payload")
             with pytest.raises(FileExistsError, match="exists"):
                 _fs.write_new(directory.fd, "state", b"other")
-    finally:
-        os.umask(previous)
+        finally:
+            os.umask(previous)
 
     assert (tmp_path / "state").read_bytes() == b"payload"
-    assert mode_of(tmp_path / "state") == 0o640
+    assert mode_of(tmp_path / "state") == 0o600
     assert (entry.st_ino, entry.st_size) == ((tmp_path / "state").stat().st_ino, 7)
 
 
@@ -41,12 +41,27 @@ def test_replace_file_creates_then_atomically_replaces(tmp_path: Path) -> None:
     with _fs.open_path(tmp_path) as directory:
         _fs.replace_file(directory.fd, "campaign.json", b"first")
         first = (tmp_path / "campaign.json").stat().st_ino
-        _fs.replace_file(directory.fd, "campaign.json", b"second", mode=0o644)
+        _fs.replace_file(directory.fd, "campaign.json", b"second")
 
     assert (tmp_path / "campaign.json").read_bytes() == b"second"
     assert (tmp_path / "campaign.json").stat().st_ino != first
-    assert mode_of(tmp_path / "campaign.json") == 0o644
+    assert mode_of(tmp_path / "campaign.json") == 0o600
     assert sorted(path.name for path in tmp_path.iterdir()) == ["campaign.json"]
+
+
+def test_replace_file_never_overwrites_an_existing_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "state").write_bytes(b"current")
+    stage = tmp_path / f".servatus-replace-{'00' * 12}"
+    stage.write_bytes(b"not ours")
+    monkeypatch.setattr(os, "urandom", bytes)
+
+    with _fs.open_path(tmp_path) as directory, pytest.raises(FileExistsError, match="exists"):
+        _fs.replace_file(directory.fd, "state", b"new")
+
+    assert stage.read_bytes() == b"not ours"
+    assert (tmp_path / "state").read_bytes() == b"current"
 
 
 def test_replace_file_replaces_a_symlink_without_following_it(tmp_path: Path) -> None:
