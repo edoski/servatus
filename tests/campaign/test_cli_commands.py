@@ -185,7 +185,7 @@ def test_machine_output_for_every_data_command(cli: Cli[str]) -> None:
     assert receipt["job"] == 1000
     assert receipt["task_keys"] == ["one", "two"]
     status = cli.json("status", "state")
-    assert status["format"] == "servatus.status/1" and status["counts"]["queued"] == 2
+    assert status["format"] == "servatus.status/2" and status["counts"]["queued"] == 2
     assert status["warnings"] == [] and status["tasks"][0]["exit_code"] is None
     cancelled = cli.json("cancel", "state", "--task", "one")
     assert cancelled == {

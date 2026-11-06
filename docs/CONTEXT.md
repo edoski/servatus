@@ -93,7 +93,7 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   `execution` is `UNRESOLVED` while one of its Attempts is, else the observed `Execution` of its
   latest accepted Attempt (`ACCEPTED` when the scheduler was not observed), else `NOT_SUBMITTED`
   (never accepted). `to_json()` exports
-  it as a `servatus.status/1` document; `to_document` encodes other results for JSON.
+  it as a `servatus.status/2` document; `to_document` encodes other results for JSON.
 - **Result readiness:** the sealed roster has valid results for every Task.
 - **Quiescence:** scheduler evidence was requested, Slurm lists no job of any accepted allocation
   and no stray, and no acceptance is unresolved. It is independent from result readiness.

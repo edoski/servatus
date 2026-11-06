@@ -79,7 +79,7 @@ def check_cli(root: Path) -> None:
     )
     run(executable, "create", "state", "tasks.jsonl", cwd=root)
     document = json.loads(run(executable, "status", "state", "--offline", "--json", cwd=root))
-    assert document["format"] == "servatus.status/1", document
+    assert document["format"] == "servatus.status/2", document
     assert [task["key"] for task in document["tasks"]] == ["alpha", "beta"], document
 
 

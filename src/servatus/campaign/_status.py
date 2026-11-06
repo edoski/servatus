@@ -27,7 +27,7 @@ from ._config import task_keys
 from ._evidence import Execution, Observation, Observed
 from ._state import AcceptanceState, Attempt, State, TaskHistory, history
 
-STATUS_FORMAT = "servatus.status/1"
+STATUS_FORMAT = "servatus.status/2"
 NEVER_STARTED = "never started"
 
 
@@ -107,7 +107,7 @@ class Status:
         return counts
 
     def to_json(self) -> bytes:
-        """Canonical JSON tagged ``{"format": "servatus.status/1"}``, including ``counts``.
+        """Canonical JSON tagged ``{"format": "servatus.status/2"}``, including ``counts``.
 
         Scheduler text and labels may be private; treat the document as private diagnostics.
         """

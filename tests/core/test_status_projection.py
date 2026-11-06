@@ -260,7 +260,7 @@ def test_json_is_versioned_canonical_and_round_trips() -> None:
     status = view(state, observations, {"task-0": ResultState.MISSING}, strays={stray: 77})
     data = status.to_json()
     value = json.loads(data)
-    assert value["format"] == STATUS_FORMAT == "servatus.status/1"
+    assert value["format"] == STATUS_FORMAT == "servatus.status/2"
     assert data == json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     assert value["counts"] == dict(status.counts())
     assert value["observed_at"] == "2030-01-01T00:00:00+00:00"

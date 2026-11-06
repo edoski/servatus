@@ -328,7 +328,7 @@ def test_status_offline_makes_no_scheduler_calls_and_json_is_private(world: Worl
     assert [task.result for task in offline.tasks] == [ResultState.UNOBSERVED] * 2
     data = campaign.status().to_json()
     document = json.loads(data)
-    assert document["format"] == "servatus.status/1"
+    assert document["format"] == "servatus.status/2"
     assert [task["key"] for task in document["tasks"]] == ["task-0", "task-1"]
     assert all(secret not in data for secret in (b"secret-0", b"train.py", b"SEED"))
 
