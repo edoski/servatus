@@ -10,13 +10,12 @@ All notable changes to Servatus are recorded here. The format follows
 
 - `publish` no longer takes `retire=`. No known consumer used it; a `Workspace` covers private work
   beside the destination, with identity binding and residue reclaim.
-- `CrossDeviceError` and `UnsupportedPlatform` are gone. Those failures raise `ConfigurationError`
-  with the same message text.
+- `CrossDeviceError` and `UnsupportedPlatform` are gone. Those failures raise `ConfigurationError`.
 
 ### Changed
 
-- A hard-link failure that is not a substitution uses the general filesystem wording, naming the
-  source and the draft path (for example `crosses a filesystem boundary`).
+- A hard-link failure that is not a substitution uses the general filesystem wording (for example
+  `crosses a filesystem boundary`).
 
 ### Fixed
 

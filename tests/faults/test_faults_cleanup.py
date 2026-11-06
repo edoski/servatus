@@ -69,6 +69,30 @@ def test_workspace_discard_failure_propagates(tmp_path: Path, syscalls: Syscalls
             workspace.publish(lambda draft: None)
 
 
+def test_cleanup_sync_failure_after_commit_is_nonfatal(tmp_path: Path, syscalls: Syscalls) -> None:
+    destination = tmp_path / "result"
+    failed: list[bool] = []
+
+    def fail_cleanup_sync(real: Sync, fd: int) -> None:
+        if not failed and destination.exists() and not hidden(tmp_path):
+            failed.append(True)
+            raise OSError("injected cleanup sync failure")
+        real(fd)
+
+    syscalls.on_sync(fail_cleanup_sync)
+
+    with (
+        Workspace(destination, identity=b"run") as workspace,
+        pytest.warns(RuntimeWarning, match="private cleanup remains pending"),
+    ):
+        publication = workspace.publish(lambda draft: None)
+
+    assert failed
+    assert publication.cleanup_pending is True
+    assert destination.is_dir()
+    assert hidden(tmp_path) == []
+
+
 def test_warning_filter_cannot_mask_committed_publication(
     tmp_path: Path, syscalls: Syscalls
 ) -> None:

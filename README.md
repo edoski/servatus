@@ -283,6 +283,9 @@ with parent as workspace:
     workspace.publish(lambda draft: draft.link_tree(workspace.path / "method-a", "method-a"))
 ```
 
+Entering a finished child raises `DestinationExists` for that child only: the parent has not
+necessarily published, so do not read it as "the whole result exists".
+
 **Modes.** Stages stay owner-only (0700) until commit. Just before commit, `publish` sets every
 directory in the tree to `mode` (default `0o777 & ~umask`) and leaves file modes as written;
 `publish_file` sets the file to `mode` (default `0o666 & ~umask`), overriding the writer's choice.
@@ -296,8 +299,8 @@ instead and leaves it there; another user's lock file is refused. Linux without 
 documented fallback ([SECURITY.md](https://github.com/edoski/servatus/blob/main/SECURITY.md)).
 
 **Errors.** Only an existing destination raises `DestinationExists`. Bad input or an unusable
-location raises `ConfigurationError`: an unsafe or already occupied draft path; a missing,
-unwritable, or overlong path; a missing link source; paths on different filesystems; a platform or
+location raises `ConfigurationError`: an unsafe draft path; a link onto an occupied draft path; a
+missing, unwritable, or overlong path; a missing link source; paths on different filesystems; a platform or
 filesystem without an atomic no-replace rename or a working lock; a writer that creates nothing; a
 `link_tree` source containing the draft; a file its owner cannot read; a bad `mode`. No space,
 quota, I/O errors, or too many open files raise `Unavailable`; `UnsafeFilesystem` means an entry

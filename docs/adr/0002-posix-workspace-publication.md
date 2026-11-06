@@ -23,12 +23,12 @@ Both operations reject an existing destination before entering the callback; the
 remains authoritative against a later race. Creating a stage does not sync its parent; only
 validated content is made durable before commit, and the destination parent is synced after it.
 
-Invalid caller input (an unsafe, absolute, or already occupied draft path, a missing destination
-parent, a missing link source, a writer that creates nothing, a `link_tree` source that contains the
-draft, a mode outside `0..0o777`, non-bytes Workspace identity) raises `ConfigurationError`; a
-failed builder or writer discards its stage. `DestinationExists` means only that the canonical
-destination exists, so a worker can read it as "already published" and a builder bug can never pass
-for that.
+Invalid caller input (an unsafe or absolute draft path, a link onto an occupied draft path, a
+missing destination parent, a missing link source, a writer that creates nothing, a `link_tree`
+source that contains the draft, a mode outside `0..0o777`, non-bytes Workspace identity) raises
+`ConfigurationError`; a failed builder or writer discards its stage. Servatus raises
+`DestinationExists` only for an existing destination, so a worker can read it as "already published"
+and a colliding builder does not pass for that.
 
 ## Errors
 

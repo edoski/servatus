@@ -231,8 +231,11 @@ def _digest(identity: bytes) -> bytes:
 
 def _remove_level(session: _Session, location: _Location) -> None:
     with _fs.locked(session.directory):
-        container = session.levels[-1].container
-        _fs.remove(session.directory, location.container, container, order=_removal_order)
+        _remove_container(session.directory, location, session.levels[-1].container)
+
+
+def _remove_container(directory: Pin, location: _Location, container: Pin) -> None:
+    _fs.remove(directory, location.container, container, order=_removal_order)
 
 
 def _open_lock(container: Pin, location: _Location, *, exclusive: bool) -> Pin:
@@ -302,7 +305,7 @@ def _claim(
             if not exclusive:
                 _upgrade(lock, location)
             _check_identity(container, location)
-            _fs.remove(parent, location.container, container, order=_removal_order)
+            _remove_container(parent, location, container)
     raise UnsafeFilesystem(f"workspace container keeps reappearing: {location.path}")
 
 
@@ -344,7 +347,7 @@ def _remove_leftover(
         else:
             with container.open("work", expected=work) as pinned:
                 _Level(container, lock, pinned).verify(parent, location)
-        _fs.remove(parent, location.container, container, order=_removal_order)
+        _remove_container(parent, location, container)
     except Exception as error:
         existing.add_note(f"Servatus kept private work at {location.path}: {error}")
         return False

@@ -260,10 +260,10 @@ def test_directory_fallback_rejects_source_substitution(
 def test_directory_fallback_releases_its_lock_before_returning(tmp_path: Path) -> None:
     (tmp_path / "stage").mkdir()
 
-    pinned_commit(tmp_path, "stage", "result")
-
-    with _fs.open_path(tmp_path) as other:
-        fcntl.flock(other.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with _fs.open_path(tmp_path) as directory:
+        _fs.commit(directory, "stage", directory, "result", directory.present("stage"))
+        with _fs.open_path(tmp_path) as other:
+            fcntl.flock(other.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     assert (tmp_path / "result").is_dir()
 

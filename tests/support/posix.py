@@ -43,7 +43,6 @@ def key(entry: os.stat_result) -> tuple[int, int]:
 class Syscalls:
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._monkeypatch = monkeypatch
-        self._sync_hooks: list[Callable[[Callable[[int], None], int], None]] = []
         full_sync = getattr(fcntl, "F_FULLFSYNC", None)
         if full_sync is not None:
             # Behave like a filesystem without F_FULLFSYNC so every durability request reaches
