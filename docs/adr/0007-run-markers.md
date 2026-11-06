@@ -56,7 +56,8 @@ eight allocations and otherwise the three suffixes. Per slot:
 | --- | --- | --- |
 | live, queued | any | `QUEUED` |
 | live, running or settling | slot end | `SUCCEEDED` (0) or `FAILED` (exit code) |
-| live, running or settling | no slot end | `RUNNING` |
+| live, running | no slot end | `RUNNING` |
+| live, settling | no slot end | `ENDING` |
 | gone | slot end | `SUCCEEDED` or `FAILED` |
 | gone | start and stop, no slot end | `STOPPED` (cancel, time limit) |
 | gone | no start | `STOPPED`, never started |
@@ -114,7 +115,7 @@ cache a directory listing (NFS `acdirmax`, about a minute by default). With `Min
 never purges jobs, so their Tasks would stay `ACTIVE`; with a `MinJobAge` shorter than the cache, a
 stale listing could misread finished work as `STOPPED` or `LOST`. `servatus doctor` refuses a
 `MinJobAge` under 120 s and any process tracking but `proctrack/cgroup`. `STOPPED`, `LOST`, and
-every retry wait for `MinJobAge`, so a cancelled Task reads `RUNNING` until the purge and
+every retry wait for `MinJobAge`, so a cancelled Task reads `ENDING` until the purge and
 `--retry-failed` waits minutes longer than before.
 Markers accumulate in `log_root` like logs; a listing that names many allocations reads every
 marker there, so keep campaigns of tens of thousands of allocations in their own `log_root`. Markers

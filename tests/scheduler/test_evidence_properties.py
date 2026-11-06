@@ -60,7 +60,7 @@ def expected(seen: Observation, slot: int) -> tuple[Execution, int | None]:
     if code is not None:
         return (Execution.SUCCEEDED if code == 0 else Execution.FAILED), code
     if state is not None:
-        return Execution.RUNNING, None
+        return (Execution.ENDING if state in SETTLING else Execution.RUNNING), None
     if not seen.started:
         return Execution.STOPPED, None
     return (Execution.STOPPED if seen.stopped else Execution.LOST), None
@@ -76,7 +76,7 @@ def test_execution_follows_the_spec_table(seen: Observation, data: st.DataObject
     if seen.live:
         assert execution not in (Execution.STOPPED, Execution.LOST)
     else:
-        assert execution not in (Execution.QUEUED, Execution.RUNNING)
+        assert execution not in (Execution.QUEUED, Execution.RUNNING, Execution.ENDING)
 
 
 @settings(max_examples=500)
