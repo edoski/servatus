@@ -56,6 +56,9 @@ reportUnnecessaryIsInstance = false
 source = ["src"]
 branch = true
 
+[tool.coverage.report]
+fail_under = 97
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["tests"]

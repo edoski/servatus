@@ -29,8 +29,8 @@ The last step installs the built wheel into a throwaway environment and checks t
 (`py.typed`, no tests), the public names, that `servatus` is imported from the installed wheel,
 the console script and `--version`, an offline CLI campaign, a `FakeScheduler` plan, validate,
 submit, and retry round-trip, and publication. It takes the wheel path as its only argument. Clear
-`dist/` first if it holds older wheels. Coverage settings (`source`, branch coverage) live in
-`pyproject.toml`.
+`dist/` first if it holds older wheels. Coverage settings (`source`, branch coverage, the 97% floor)
+live in `pyproject.toml`.
 
 ## Test layout
 
