@@ -45,6 +45,7 @@ config = json.load(open({config!r}))
 name = next(item.split("=", 1)[1] for item in options if item.startswith("--job-name="))
 record = {{
     "options": options,
+    "argv": sys.argv[1:],
     "path": os.environ.get("PATH"),
     "start_marker": os.path.exists(config["start"]),
 }}
@@ -279,6 +280,10 @@ def test_steps_receive_exact_stdin_argv_and_environment(
             flags = ["--cleanenv", "--bind", f"{work}:{work}", "--bind", "/data:/data:ro"]
             flags += ["--pwd", work] + (["--nv"] if gpus else [])
             assert launch == {"flags": flags, "image": "/images/work.sif"}
+            # Other users on the node can read every process's command line. Only the GPU wrapper
+            # names the step-local device there.
+            for name in {*task.env, "SERVATUS_TASK_KEY"} - {"CUDA_VISIBLE_DEVICES"}:
+                assert not any(f"{name}=" in word for word in step["argv"]), name
 
 
 @pytest.mark.parametrize("container", [False, True], ids=["direct", "apptainer"])

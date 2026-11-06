@@ -42,9 +42,7 @@ Servatus no longer needs Slurm accounting. See
   document drops `sbatch_version` for `checks` and `verdict`.
 - `servatus.campaign.ping` is replaced by `servatus.campaign.diagnose(profile)`, which returns a
   `Diagnosis` of `Check`s with a `Verdict`.
-- Apptainer steps set their `APPTAINERENV_*` variables through `/usr/bin/env` after `srun`, the same
-  shape as the direct launcher, so a Task's environment now also shows in the step's command line
-  for other users on the node. The `apptainer` path cannot contain `=`.
+- The `apptainer` path cannot contain `=`.
 - `Scheduler` takes its `Target`, and the module-private checks of values only internal code produces
   are gone. `args` and `env` errors from a Task file now come from `Task`.
 

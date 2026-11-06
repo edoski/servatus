@@ -79,8 +79,10 @@ on every client to use Servatus, and a mount with coherent `flock` and stable in
 ## Campaigns
 
 Task arguments, stdin, and environment values are written into the submitted batch script (stdin as
-`printf` literals, environment as `/usr/bin/env` arguments of each step). Cluster administrators,
-accounting systems, and other users on the node (process listings) may read them. Do not put
+`printf` literals; environment as `/usr/bin/env` arguments of a direct step, or as `APPTAINERENV_*`
+assignments on an Apptainer step's `srun`, which keeps it out of process listings). Cluster
+administrators and accounting systems may read them, and other users on the node can read a direct
+step's command line. Do not put
 credentials or other secrets in Tasks. The batch script creates no scratch files.
 
 Values in a repository-owned `SERVATUS.toml` are editable user-side guardrails, not an enforcement

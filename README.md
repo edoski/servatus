@@ -357,12 +357,14 @@ In Python these are `Target`, `Apptainer`, `Resources`, and `Profile`;
 **Launchers.** With Apptainer, each step runs `apptainer exec --cleanenv IMAGE ARGS...` from
 `work_root`, so the Task's `args` run directly and the image's runscript is ignored (a relative
 `args[0]` resolves on the container's `PATH`; empty `args` fail at planning). `work_root` plus
-`binds` are mounted and the Task's `env` passed as `APPTAINERENV_*` through `/usr/bin/env`; GPU steps get `--nv` and
-Slurm's step-local `CUDA_VISIBLE_DEVICES`. The batch script sets `PATH=/usr/bin:/bin`, which
-`--nv` needs to find the host's `nvidia-smi`, MPS daemon and `libcuda`. Without Apptainer, each step runs the Task's absolute
-`args[0]` under `env -i` with the same variables. Either way, Task stdin and environment are
-written into the batch script and step command lines, so cluster administrators and other users on
-the node can read them: never put secrets in Tasks.
+`binds` are mounted, and the Task's `env` reaches the container as `APPTAINERENV_*` assignments
+on `srun`, never on a command line. GPU steps get `--nv` and Slurm's step-local
+`CUDA_VISIBLE_DEVICES`. The batch script sets `PATH=/usr/bin:/bin`, which `--nv` needs to find
+the host's `nvidia-smi`, MPS daemon and `libcuda`. Without Apptainer, each step runs the Task's
+absolute `args[0]` under `env -i` with the same variables passed as arguments. Either way, Task
+stdin and environment are written into the batch script, which cluster administrators can read,
+and a direct step's environment also shows in its command line to other users on the node. Keep
+secrets out of Tasks.
 
 **SSH.** Servatus runs `ssh -T -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=8 -o
 ConnectionAttempts=3 HOST`, so it never prompts, ignores login banners and shell-startup output,

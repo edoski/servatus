@@ -192,14 +192,18 @@ def _apptainer_command(
     return tuple(command)
 
 
-def _launch(target: Target, resources: Resources, task: Task, allocation_id: str, slot: int) -> str:
-    """What ``srun`` runs for one Task: ``env [-i] [PREFIX]NAME=VALUE... COMMAND...``.
+def _launch(
+    target: Target, resources: Resources, task: Task, allocation_id: str, slot: int
+) -> tuple[str, str]:
+    """The environment words before ``srun`` and the command ``srun`` runs for one Task.
 
-    The batch shell expands only ``"$job_id"`` here; everything else is single-quoted. A GPU step
-    runs through a shell that first reads the step-local visibility.
+    The direct launcher passes the environment as ``env -i NAME=VALUE...`` arguments. Apptainer
+    receives it as ``APPTAINERENV_*`` assignments on ``srun`` itself, so the values never appear on
+    a command line other users of the node can read. The batch shell expands only ``"$job_id"``;
+    everything else is single-quoted. A GPU step runs through a shell that first reads the
+    step-local visibility.
     """
-    env: tuple[str, ...]
-    command: tuple[str, ...]
+    words = _environment(task, allocation_id, slot, resources.gpus)
     if target.container is None:
         program = task.args[0] if task.args else ""
         if not program.startswith("/") or "=" in program:
@@ -207,25 +211,24 @@ def _launch(target: Target, resources: Resources, task: Task, allocation_id: str
                 f"Task {task.key!r}: without a container, args[0] must be an absolute program "
                 "path without '='"
             )
-        env, prefix, command = (_ENV, "-i"), "", task.args
-    else:
-        if not task.args:
-            raise ConfigurationError(
-                f"Task {task.key!r}: an Apptainer Task needs args; args[0] is the program to run "
-                "in the container (resolved on the container's PATH when relative)"
-            )
-        launcher = _apptainer_command(target.container, target, resources)
-        env, prefix, command = (_ENV,), "APPTAINERENV_", (*launcher, *task.args)
-    assignments = " ".join(
-        f"{prefix}{name}={word}"
-        for name, word in _environment(task, allocation_id, slot, resources.gpus)
-    )
+        assignments = " ".join(f"{name}={word}" for name, word in words)
+        if not resources.gpus:
+            return "", f"{_ENV} -i {assignments} {shlex.join(task.args)}"
+        wrapper = f'visible={_GPU_VISIBILITY}; exec {_ENV} -i CUDA_VISIBLE_DEVICES="$visible" "$@"'
+        shell = shlex.join((_SHELL, "-c", wrapper, "servatus-gpu"))
+        return "", f"{shell} {assignments} {shlex.join(task.args)}"
+    if not task.args:
+        raise ConfigurationError(
+            f"Task {task.key!r}: an Apptainer Task needs args; args[0] is the program to run "
+            "in the container (resolved on the container's PATH when relative)"
+        )
+    command = shlex.join((*_apptainer_command(target.container, target, resources), *task.args))
+    prefix = " ".join(f"APPTAINERENV_{name}={word}" for name, word in words)
     if not resources.gpus:
-        return f"{shlex.join(env)} {assignments} {shlex.join(command)}"
-    visible = f'{prefix}CUDA_VISIBLE_DEVICES="$visible"'
-    wrapper = f'visible={_GPU_VISIBILITY}; exec {shlex.join(env)} {visible} "$@"'
-    shell = shlex.join((_SHELL, "-c", wrapper, "servatus-gpu"))
-    return f"{shell} {assignments} {shlex.join(command)}"
+        return prefix, command
+    wrapper = f"APPTAINERENV_CUDA_VISIBLE_DEVICES={_GPU_VISIBILITY}; "
+    wrapper += 'export APPTAINERENV_CUDA_VISIBLE_DEVICES; exec "$@"'
+    return prefix, f"{shlex.join((_SHELL, '-c', wrapper, 'servatus-gpu'))} {command}"
 
 
 def render_batch(
@@ -258,7 +261,8 @@ def render_batch(
         ]
         if resources.gpus:
             step.append(f"--gres={target.gpu_gres}:{resources.gpus}")
-        words = f"{shlex.join(step)} {_launch(target, resources, task, allocation_id, slot)}"
+        prefix, command = _launch(target, resources, task, allocation_id, slot)
+        words = f"{prefix} {shlex.join(step)} {command}".lstrip()
         end = f'code=$?; command : > "$marker.{slot}.$code.end"; exit "$code"'
         lines.append(f"{{ printf {printf_literal(task.stdin)} | {words}; {end}; }} &")
         lines.append('pids="$pids $!"')
