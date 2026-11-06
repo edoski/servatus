@@ -156,6 +156,16 @@ def capacity(target: Target, resources: Resources, cap: int | None = None) -> in
     return cap
 
 
+def batch(
+    keys: tuple[str, ...], target: Target, cap: int
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """``keys`` split into the Tasks one submit carries (``max_allocations_per_submit``
+    allocations of ``cap``) and the deferred rest."""
+    limit = target.max_allocations_per_submit
+    bound = len(keys) if limit is None else cap * limit
+    return keys[:bound], keys[bound:]
+
+
 def pack(keys: Sequence[str], cap: int) -> tuple[tuple[str, ...], ...]:
     """Split ``keys`` in order into the fewest groups of at most ``cap``, sizes differing by
     at most one (larger groups first)."""
@@ -191,9 +201,8 @@ def _check(state: State, decision: Decision) -> None:
     for part in (decision.selected, decision.deferred, decision.retry):
         if list(part) != sorted(part, key=position.__getitem__):
             raise ConfigurationError("plan Task keys are not in roster order")
-    limit = decision.profile.target.max_allocations_per_submit
-    cap = decision.tasks_per_allocation
-    if limit is not None and len(decision.selected) > cap * limit:
+    _, over = batch(decision.selected, decision.profile.target, decision.tasks_per_allocation)
+    if over:
         raise ConfigurationError("plan exceeds the target's max_allocations_per_submit")
 
 

@@ -9,10 +9,10 @@ from hypothesis import strategies as st
 from support.builders import profile
 
 from servatus.campaign._evidence import Execution, Observation, Observed
-from servatus.campaign._policy import Hold, Retry, Selection, decide, observation_scope
+from servatus.campaign._policy import Hold, Request, Retry, Selection, decide, scope
 from servatus.campaign._state import AcceptanceState, Attempt, State, record_intent
 from servatus.campaign._status import ResultState
-from servatus.errors import ConfigurationError, PlanRefused
+from servatus.errors import PlanRefused
 
 R = ResultState
 KEY = "task-0"
@@ -35,7 +35,14 @@ def choose(
     retry: Collection[str] | Retry = (),
     only: Collection[str] | None = None,
 ) -> Selection:
-    return decide(state, evidence(observations, strays), results or {}, retry=retry, only=only)
+    request = Request.parse(retry, only)
+    return decide(state, evidence(observations, strays), results or {}, request)
+
+
+def observation_scope(
+    state: State, retry: Collection[str] | Retry = (), only: Collection[str] | None = None
+) -> tuple[str, ...]:
+    return scope(state, Request.parse(retry, only))[1]
 
 
 def once(observation: Observation) -> tuple[State, dict[str, Observation]]:
@@ -324,30 +331,6 @@ def test_a_plain_plan_without_such_history_observes_nothing() -> None:
     assert choose(state).selected == ()
 
 
-@pytest.mark.parametrize(
-    ("options", "message"),
-    [
-        ({"retry": "task-0"}, "retry must be a collection"),
-        ({"retry": [1]}, "retry must contain only Task key strings"),
-        ({"retry": None}, "retry must be a collection"),
-        ({"only": "task-0"}, "only must be a collection"),
-        ({"only": [b"task-0"]}, "only must contain only"),
-    ],
-)
-def test_malformed_requests_are_configuration_errors(
-    options: dict[str, object], message: str
-) -> None:
-    with pytest.raises(ConfigurationError, match=message):
-        choose(roster(1), **options)  # pyright: ignore[reportArgumentType]
-
-
-def test_observation_scope_validates_request_types() -> None:
-    with pytest.raises(ConfigurationError, match="retry must be a collection"):
-        observation_scope(roster(1), "task-0")
-    with pytest.raises(ConfigurationError, match="only must be a collection"):
-        observation_scope(roster(1), (), "task-0")
-
-
 # --- properties ------------------------------------------------------------------------------
 
 KEYS = ("task-0", "task-1", "task-2")
@@ -456,7 +439,7 @@ def test_policy_safety_properties(
     state, observed, results = scenario
     expected = expected_refusals(state, observed, results, retry, only)
     try:
-        selection = decide(state, observed, results, retry=retry, only=only)
+        selection = decide(state, observed, results, Request.parse(retry, only))
     except PlanRefused as refusal:
         assert set(refusal.keys) == expected and expected
         assert len(refusal.keys) == len(set(refusal.keys))
@@ -486,7 +469,7 @@ def test_policy_safety_properties(
         {name: value for name, value in observed.attempts.items() if name in scope},
         {name: job for name, job in observed.strays.items() if name in scope},
     )
-    assert decide(state, narrowed, results, retry=retry, only=only) == selection
+    assert decide(state, narrowed, results, Request.parse(retry, only)) == selection
     if selection.selected:
         record_intent(
             state,
@@ -506,4 +489,4 @@ def test_bulk_selectors_never_raise(
     only: tuple[str, ...] | None,
 ) -> None:
     state, observed, results = scenario
-    decide(state, observed, results, retry=retry, only=only)
+    decide(state, observed, results, Request.parse(retry, only))

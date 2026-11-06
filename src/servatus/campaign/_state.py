@@ -130,6 +130,40 @@ class State:
         raise NotFound(f"unknown allocation: {allocation_id}")
 
 
+@dataclass(frozen=True, slots=True)
+class TaskHistory:
+    """One Task's Attempts in state order: accepted ones (with the Task's slot in each), ones
+    recorded as not submitted, and the unresolved one, which the invariant makes the last."""
+
+    accepted: tuple[tuple[Attempt, int], ...] = ()
+    not_submitted: tuple[Attempt, ...] = ()
+    unresolved: Attempt | None = None
+
+
+def history(state: State) -> dict[str, TaskHistory]:
+    """Every roster Task's history, from one pass over the Attempts."""
+    accepted: dict[str, list[tuple[Attempt, int]]] = {}
+    not_submitted: dict[str, list[Attempt]] = {}
+    unresolved: dict[str, Attempt] = {}
+    for attempt in state.attempts:
+        acceptance = attempt.acceptance
+        for slot, key in enumerate(attempt.task_keys):
+            if acceptance is AcceptanceState.ACCEPTED:
+                accepted.setdefault(key, []).append((attempt, slot))
+            elif acceptance is AcceptanceState.NOT_SUBMITTED:
+                not_submitted.setdefault(key, []).append(attempt)
+            else:
+                unresolved[key] = attempt
+    return {
+        task.key: TaskHistory(
+            tuple(accepted.get(task.key, ())),
+            tuple(not_submitted.get(task.key, ())),
+            unresolved.get(task.key),
+        )
+        for task in state.tasks
+    }
+
+
 def check(state: State) -> None:
     """The single Campaign invariant, linear in tasks plus attempted Task references."""
     revision, sealed = state.revision, state.sealed_revision

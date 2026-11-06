@@ -271,12 +271,26 @@ def test_valid_results_are_never_retried(world: World) -> None:
         campaign.plan(cpu_profile(), retry=["task-0"])
 
 
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"retry": "task-0"}, "retry must be a collection"),
+        ({"retry": [1]}, "retry must contain only Task key strings"),
+        ({"retry": None}, "retry must be a collection"),
+        ({"only": "task-0"}, "only must be a collection"),
+        ({"only": [1]}, "only must contain only Task key strings"),
+    ],
+)
+def test_malformed_requests_are_configuration_errors(
+    world: World, options: dict[str, Any], message: str
+) -> None:
+    campaign = world.create(jobs(1))
+    with pytest.raises(ConfigurationError, match=message):
+        campaign.plan(cpu_profile(), **options)
+
+
 def test_selector_shapes_and_probe_requirements_are_checked(world: World) -> None:
     campaign = world.create(jobs(1))
-    with pytest.raises(ConfigurationError, match="retry must be a collection"):
-        campaign.plan(cpu_profile(), retry="task-0")
-    with pytest.raises(ConfigurationError, match="only must contain only Task key strings"):
-        campaign.plan(cpu_profile(), only=[1])  # pyright: ignore[reportArgumentType]
     with pytest.raises(ConfigurationError, match="Retry.INCOMPLETE needs a result probe"):
         campaign.plan(cpu_profile(), retry=Retry.INCOMPLETE)
     with pytest.raises(ConfigurationError, match="profile must be a Profile"):
