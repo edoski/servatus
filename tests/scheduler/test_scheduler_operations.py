@@ -24,6 +24,7 @@ ARGV = (SBATCH, "--parsable", "--no-requeue", "--export=NIL", f"--job-name={IDEN
 ROOT = PurePosixPath(LOG_ROOT)
 FIND = (
     "/usr/bin/find",
+    "-H",
     LOG_ROOT,
     "-maxdepth",
     "1",
@@ -122,7 +123,7 @@ def test_queue_row_of_an_unrelated_job_is_a_conflict() -> None:
 # --- markers ---------------------------------------------------------------------------------
 
 
-def test_markers_list_log_root_once_and_group_by_allocation() -> None:
+def test_markers_of_a_few_allocations_are_named_exactly_in_one_read() -> None:
     other = allocation(9)
     reply = listing(
         f"{ALLOCATION}.42.start",
@@ -132,14 +133,24 @@ def test_markers_list_log_root_once_and_group_by_allocation() -> None:
     )
     transport = Scripted().queue("find", ok(reply))
     found = scheduler(transport).markers(ROOT, {ALLOCATION: 2, other: 1})
-    assert transport.calls == [FIND]
+    names = tuple(sorted((f"{ALLOCATION}.*", f"{other}.*")))
+    assert transport.calls == [(*FIND[:8], "-name", names[0], "-o", "-name", names[1], ")")]
     assert found == {ALLOCATION: (Start(42), End(42, 1, 3)), other: (Stop(43),)}
+
+
+def test_exact_names_stay_within_the_argument_bound() -> None:
+    ids = {allocation(index): 1 for index in range(8)}
+    transport = Scripted()
+    scheduler(transport).markers(ROOT, ids)
+    assert len(transport.calls) == 1 and len(transport.calls[0]) == 32
+    assert transport.calls[0][9::3] == tuple(sorted(f"{name}.*" for name in ids))
 
 
 def test_markers_split_the_listing_by_leading_hex_digit_only_when_large() -> None:
     first, second, third = f"a{ALLOCATION[1:]}", f"3{ALLOCATION[1:]}", f"a{allocation(1)[1:]}"
+    many = {allocation(index): 4 for index in range(10, 19)}
     small = Scripted()
-    scheduler(small).markers(ROOT, {first: 4, second: 4})
+    scheduler(small).markers(ROOT, many)
     assert small.calls == [FIND]
 
     large = Scripted().queue(
@@ -147,13 +158,18 @@ def test_markers_split_the_listing_by_leading_hex_digit_only_when_large() -> Non
         ok(listing(f"{second}.30.start")),
         ok(listing(f"{first}.10.start", f"{third}.11.stop")),
     )
-    found = scheduler(large).markers(ROOT, {first: 20_000, second: 20_000, third: 1})
-    assert [call[8::3] for call in large.calls] == [
+    extra = {f"a{allocation(index)[1:]}": 1 for index in range(20, 26)}
+    found = scheduler(large).markers(ROOT, {first: 20_000, second: 20_000, third: 1} | extra)
+    assert [call[9::3] for call in large.calls] == [
         ("3*.start", "3*.stop", "3*.end"),
         ("a*.start", "a*.stop", "a*.end"),
     ]
     assert all(call[:8] == FIND[:8] and call[-1] == ")" for call in large.calls)
-    assert found == {first: (Start(10),), second: (Start(30),), third: (Stop(11),)}
+    assert {name: found[name] for name in (first, second, third)} == {
+        first: (Start(10),),
+        second: (Start(30),),
+        third: (Stop(11),),
+    }
 
 
 @pytest.mark.parametrize(

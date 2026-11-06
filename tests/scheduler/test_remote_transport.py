@@ -422,3 +422,18 @@ def test_scheduler_over_noisy_ssh_reads_exact_replies(tmp_path: Path) -> None:
     assert scheduler.queue([ALLOCATION]) == {ALLOCATION: (QueueRow(42, "COMPLETED"),)}
     markers = scheduler.markers(PurePosixPath(logs), {ALLOCATION: 1})
     assert sorted(markers[ALLOCATION], key=repr) == [End(42, 0, 0), Start(42)]
+
+
+@pytest.mark.parametrize("many", [False, True], ids=["named", "every"])
+def test_real_find_follows_a_symlinked_log_root(tmp_path: Path, many: bool) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / f"{ALLOCATION}.42.start").touch()
+    (logs / f"{ALLOCATION}.42.0.3.end").touch()
+    link = tmp_path / "link"
+    link.symlink_to(logs)
+    counts = {ALLOCATION: 1}
+    if many:
+        counts |= {f"{index:024x}": 1 for index in range(8)}
+    markers = Scheduler(Local(), "/usr/bin").markers(PurePosixPath(link), counts)
+    assert sorted(markers[ALLOCATION], key=repr) == [End(42, 0, 3), Start(42)]

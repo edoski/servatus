@@ -23,6 +23,8 @@ FIND = "/usr/bin/find"
 SQUEUE_OPTIONS = ("--me", "--all", "--states=all", "--noheader")
 SQUEUE_FORMAT = "--format=%i|%j|%T"
 MARKER_SUFFIXES = (".start", ".stop", ".end")
+# Each name pattern costs three find arguments; eight keep one listing within the 32-argument bound.
+MAX_NAME_PATTERNS = 8
 # Generous per-marker line length beyond log_root: "/", 24 hex digits, and the longest suffix.
 _MARKER_LINE_BYTES = 64
 
@@ -41,12 +43,34 @@ def _require_ok(completed: Completed, what: str, *, quiet: bool = True) -> Compl
     return completed
 
 
-def find_argv(log_root: PurePosixPath, prefix: str = "") -> tuple[str, ...]:
-    """List the run markers in ``log_root`` whose names start with ``prefix``."""
+def find_argv(log_root: PurePosixPath, patterns: Sequence[str]) -> tuple[str, ...]:
+    """List the regular files in ``log_root`` whose names match any of ``patterns``. ``-H``
+    follows ``log_root`` itself when it is a symbolic link, as Slurm and the batch script do."""
     names: list[str] = []
-    for suffix in MARKER_SUFFIXES:
-        names.extend(("-o", "-name", f"{prefix}*{suffix}"))
-    return (FIND, str(log_root), "-maxdepth", "1", "-type", "f", "(", *names[1:], ")")
+    for pattern in patterns:
+        names.extend(("-o", "-name", pattern))
+    return (FIND, "-H", str(log_root), "-maxdepth", "1", "-type", "f", "(", *names[1:], ")")
+
+
+def marker_patterns(
+    log_root: PurePosixPath, task_counts: Mapping[str, int]
+) -> list[tuple[str, ...]]:
+    """The name patterns of each directory read for these allocations' markers.
+
+    A few allocations are named exactly (``<id>.*``; logs are ``<id>-...``), so the read stays
+    small however many other markers share ``log_root``. Many allocations take one read of every
+    marker, split by leading hex digit when their own markers could exceed the stream bound.
+    """
+    allocation_ids = sorted(task_counts)
+    if len(allocation_ids) <= MAX_NAME_PATTERNS:
+        return [tuple(f"{allocation_id}.*" for allocation_id in allocation_ids)]
+    estimate = sum(
+        (3 + count) * (len(str(log_root)) + _MARKER_LINE_BYTES) for count in task_counts.values()
+    )
+    prefixes = [""]
+    if estimate > MAX_STREAM_BYTES // 2:
+        prefixes = sorted({allocation_id[0] for allocation_id in allocation_ids})
+    return [tuple(f"{prefix}*{suffix}" for suffix in MARKER_SUFFIXES) for prefix in prefixes]
 
 
 class Scheduler:
@@ -115,23 +139,15 @@ class Scheduler:
     def markers(
         self, log_root: PurePosixPath, task_counts: Mapping[str, int]
     ) -> dict[str, tuple[Marker, ...]]:
-        """The run markers of each allocation (by id, with its Task count) in ``log_root``.
-
-        One directory read, split by the allocations' leading hex digit only when their own
-        markers could exceed the transport's stream bound.
-        """
+        """The run markers of each allocation (by id, with its Task count) in ``log_root``, read
+        as ``marker_patterns`` says."""
         allocation_ids = tuple(task_counts)
-        estimate = sum(
-            (3 + count) * (len(str(log_root)) + _MARKER_LINE_BYTES)
-            for count in task_counts.values()
-        )
-        prefixes = [""]
-        if estimate > MAX_STREAM_BYTES // 2:
-            prefixes = sorted({allocation_id[0] for allocation_id in allocation_ids})
         found: dict[str, list[Marker]] = {allocation_id: [] for allocation_id in allocation_ids}
-        for prefix in prefixes:
+        if not allocation_ids:
+            return {}
+        for patterns in marker_patterns(log_root, task_counts):
             completed = _require_ok(
-                self._transport.run(find_argv(log_root, prefix)), f"listing {log_root}"
+                self._transport.run(find_argv(log_root, patterns)), f"listing {log_root}"
             )
             for allocation_id, items in parse_markers(
                 completed.stdout, log_root, allocation_ids

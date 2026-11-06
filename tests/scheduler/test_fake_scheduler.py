@@ -217,12 +217,18 @@ def test_find_lists_only_marker_files_directly_in_the_root() -> None:
         f"/elsewhere/{allocation(1)}.5.start",
     ]:
         harness.fake.write_file(path)
-    listing = harness.fake.run(find_argv(harness.root)).stdout
+    every = ("*.start", "*.stop", "*.end")
+    listing = harness.fake.run(find_argv(harness.root, every)).stdout
     assert listing == "".join(f"{path}\n" for path in sorted(wanted)).encode()
-    prefixed = harness.fake.run(find_argv(harness.root, "a")).stdout
+    prefixed = harness.fake.run(find_argv(harness.root, ("a*.start", "a*.stop", "a*.end"))).stdout
     assert prefixed == f"{root}/a.5.0.0.end\n".encode()
+    named = harness.fake.run(find_argv(harness.root, (f"{allocation(1)}.*",))).stdout
+    assert named == (
+        f"{root}/{allocation(1)}.5.start\n{root}/{allocation(1)}.5.start.tmp\n".encode()
+    )
 
     harness.fake.remove_file(wanted[0])
+    harness.fake.remove_file(f"{root}/{allocation(1)}.5.start.tmp")
     assert wanted[0] not in harness.fake.files
     assert harness.scheduler.markers(harness.root, {allocation(1): 1}) == {allocation(1): ()}
 
@@ -244,8 +250,9 @@ def test_find_lists_only_marker_files_directly_in_the_root() -> None:
         ("/opt/slurm/bin/scancel", "--me", "--name=servatus-x", "42"),
         ("/opt/slurm/bin/scancel", "--name=servatus-x"),
         ("/opt/slurm/bin/scancel", "42"),
-        ("/usr/bin/find", "/logs", "-maxdepth", "2", "-type", "f", "(", "-name", "*.start", ")"),
-        (*find_argv(PurePosixPath("/logs"))[:-1], "-print0", ")"),
+        ("/usr/bin/find", "/logs", "-maxdepth", "1", "-type", "f", "(", "-name", "*.start", ")"),
+        ("/usr/bin/find", "-H", "/logs", "-maxdepth", "2", "-type", "f", "(", "-name", "x", ")"),
+        (*find_argv(PurePosixPath("/logs"), ("*.end",))[:-1], "-print0", ")"),
         ("/usr/bin/tail", "-n", "5", "--", "/log"),
     ],
 )

@@ -158,8 +158,9 @@ _PRELUDE = (
     'job_id="${SLURM_JOB_ID:?Slurm did not set SLURM_JOB_ID}"',
 )
 # The trap signals the whole process group: each slot's subshell dies before it can write an end
-# marker, so an interrupted step is recorded as stopped, never as a failure of its own. `command :`
-# keeps a failed marker write (quota, ESTALE) from exiting the shell and orphaning the steps.
+# marker, so a step the trap interrupts is recorded as stopped, not as a failure of its own.
+# `command :` keeps a failed marker write (quota, ESTALE) from exiting the shell and orphaning the
+# steps.
 _TRAP = (
     "pids=",
     "interrupt() {",

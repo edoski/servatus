@@ -537,7 +537,9 @@ def _parser() -> argparse.ArgumentParser:
     logs.add_argument("--output", type=Path, metavar="FILE", help="write a new 0600 file")
     text = "resolve every unresolved allocation from Slurm evidence"
     command("reconcile", _reconcile, text, "state")
-    cancel = command("cancel", _cancel, "scancel the matching accepted allocations", "state")
+    cancel = command(
+        "cancel", _cancel, "scancel the matching queued or running allocations", "state"
+    )
     cancel.add_argument("--task", **_KEYS)
     cancel.add_argument("--allocation", action="append", default=[], metavar="ID")
     profile_options(command("doctor", _doctor, "check the profile and the scheduler connection"))

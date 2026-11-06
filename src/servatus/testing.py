@@ -363,12 +363,9 @@ class FakeScheduler:
         return Completed(0, b"", b"")
 
     def _find_files(self, argv: tuple[str, ...], _stdin: bytes) -> Completed:
-        if len(argv) < 9 or not argv[8].endswith("*.start"):
+        root, patterns = (argv[2], argv[9:-1:3]) if len(argv) > 10 else ("", ())
+        if not patterns or argv != find_argv(PurePosixPath(root), patterns):
             raise AssertionError(f"FakeScheduler does not understand {argv!r}")
-        root, prefix = argv[1], argv[8].removesuffix("*.start")
-        if argv != find_argv(PurePosixPath(root), prefix):
-            raise AssertionError(f"FakeScheduler does not understand {argv!r}")
-        patterns = [argv[index] for index in range(8, len(argv) - 1, 3)]
         found = sorted(
             path
             for path in self._files
