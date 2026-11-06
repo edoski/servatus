@@ -6,16 +6,28 @@ All notable changes to Servatus are recorded here. The format follows
 
 ## [Unreleased]
 
-Servatus no longer needs Slurm accounting. See
-[ADR 0007](https://github.com/edoski/servatus/blob/main/docs/adr/0007-run-markers.md).
+## [0.13.0]
+
+Servatus no longer needs Slurm accounting, and a new cluster is a new profile, not new code. It
+observes work from `squeue` and empty run markers each batch script writes (see
+[ADR 0007](https://github.com/edoski/servatus/blob/main/docs/adr/0007-run-markers.md)),
+`servatus doctor` checks what a profile needs from its cluster, and the README configures both
+DISI clusters. Like 0.12, this is a clean break with no compatibility layer.
+
+**Upgrading from 0.12.** This is a migration, not a version bump. Schema 7 campaign state and
+`servatus.plan/1` plan files are rejected, so finish or abandon 0.12 campaigns with 0.12 first, then
+create new campaigns and plans under 0.13. Published results and Workspaces are unaffected, so a
+Task rerun in a new campaign still resumes its private work. Replace `mark-accepted` and
+`mark-not-submitted` with `reconcile`, stop passing `--allow-duplicate-risk`, `--cluster`, and
+`retire=`, read `servatus.status/2` from `status --json`, and run `servatus doctor` on every profile.
 
 ### Breaking
 
-- Campaign state uses schema 8 and saved plans are tagged `servatus.plan/2`. Schema 7 state and
-  `servatus.plan/1` files from 0.12 are rejected; finish or abandon 0.12 campaigns with 0.12.
-  Schema 8 stores only what history cannot derive: an Attempt keeps its job and outcome revision
-  (no `acceptance` or `retry`), and each roster entry nests its Task under `"task"`. A saved
-  plan's Decision has no `retry`; `Plan.retry` derives it, and `servatus plan --json` shows it.
+- Campaign state uses schema 8, saved plans are tagged `servatus.plan/2`, and `status --json` prints
+  `servatus.status/2`. Schema 8 stores only what history cannot derive: an Attempt keeps its job and
+  outcome revision (no `acceptance` or `retry`), and each roster entry nests its Task under `"task"`.
+  A saved plan's Decision has no `retry`; `Plan.retry` derives it, and `servatus plan --json` shows
+  it.
 - Observation reads `squeue --me --all --states=all` and empty run markers that each batch script
   writes to `log_root` (`<allocation>.<job>.start`, `<allocation>.<job>.<slot>.<exit code>.end`,
   `<allocation>.<job>.stop`), never `sacct`. An outcome is decided only after Slurm purges the job
@@ -24,6 +36,10 @@ Servatus no longer needs Slurm accounting. See
   started), and `LOST` (vanished without recording an outcome). `AllocationState`, `UNKNOWN`,
   `CANCELLED`, `SchedulerEvidence`, `StepEvidence`, and `JobRef` are replaced by `Execution` and
   `Observation`; job numbers are plain integers and `TaskStatus.exit_code` is the step's exit code.
+- `TaskStatus.execution` is the one field for a Task's state: its observed `Execution`, or
+  `AcceptanceState.UNRESOLVED`, `ACCEPTED` (scheduler not observed), or `NOT_SUBMITTED`.
+  `TaskStatus.unresolved` is removed, the `status` table shows these names instead of `-`, and the
+  `unsubmitted` count is now `not_submitted`.
 - The `UNOBSERVABLE` hold, duplicate-risk acknowledgement (`allow_duplicate_risk`,
   `--allow-duplicate-risk`, `Decision.duplicate_risk`), federation clusters (`--cluster`), and
   `SERVATUS_RESTART_COUNT` are removed. `ACTIVE` means Slurm still lists earlier work, finished but
@@ -35,23 +51,16 @@ Servatus no longer needs Slurm accounting. See
   `mark_accepted`, `mark_not_submitted`, their CLI commands, and `ReconciliationError` are removed.
 - Jobs are submitted with `--no-requeue` and without `--comment`; `sbatch --parsable` must print a
   bare job number. `cancel` runs `scancel --me --name=<identity>` without a job number.
-- `TaskStatus.execution` is the one field for a Task's state: its observed `Execution`, or
-  `AcceptanceState.UNRESOLVED`, `ACCEPTED` (scheduler not observed), or `NOT_SUBMITTED`.
-  `TaskStatus.unresolved` is removed, the `status` table shows these names instead of `-`, and
-  the `unsubmitted` count is now `not_submitted`.
+- `servatus doctor` checks what a profile needs from its cluster and reports each check as `pass`,
+  `fail`, or `unavailable`: Slurm 23.02 or later, `squeue` under the scrubbed environment,
+  `MinJobAge` of at least 120 s, `proctrack/cgroup`, writable `work_root` and `log_root`, and a
+  one-Task `sbatch --test-only`. It exits 1 if a check fails and 75 if one went unanswered. Its
+  `--json` document drops `sbatch_version` for `checks` and `verdict`.
+- `servatus.campaign.ping` is replaced by `servatus.campaign.diagnose(profile)`, which returns a
+  `Diagnosis` of `Check`s with a `Verdict`.
 - `servatus.testing.FakeScheduler` models the new protocol: queue rows that settle until `purge`,
   run markers in an in-memory `log_root`, `scancel` by name, and `find`. Its controls are `start`,
   `finish_step`, `finish`, `interrupt`, `lose`, `purge`, `write_file`, and `remove_file`.
-- `servatus doctor` checks what a profile needs from its cluster and reports each check as `pass`,
-  `fail`, or `unavailable`: Slurm 23.02 or later, `squeue` under the scrubbed environment, `MinJobAge`
-  of at least 120 s, `proctrack/cgroup`, writable `work_root` and `log_root`, and a one-Task
-  `sbatch --test-only`. It exits 1 if a check fails and 75 if one went unanswered. Its `--json`
-  document drops `sbatch_version` for `checks` and `verdict`.
-- `servatus.campaign.ping` is replaced by `servatus.campaign.diagnose(profile)`, which returns a
-  `Diagnosis` of `Check`s with a `Verdict`.
-- The `apptainer` path cannot contain `=`.
-- `Scheduler` takes its `Target`, and the module-private checks of values only internal code produces
-  are gone. `args` and `env` errors from a Task file now come from `Task`.
 - `publish` no longer takes `retire=`. No known consumer used it; a `Workspace` covers private work
   beside the destination, with identity binding and residue reclaim.
 - `CrossDeviceError` and `UnsupportedPlatform` are gone. Those failures raise `ConfigurationError`.
@@ -67,23 +76,24 @@ Servatus no longer needs Slurm accounting. See
   `cancel --allocation` can stop it.
 - `TaskStatus.detail` (`"never started"` for a stopped job that started no Task).
 - `scripts/cluster_e2e.py`, a live end-to-end check against a real cluster, never run by CI. It can
-  also run a one-GPU Task and an Apptainer Task.
+  also run a one-GPU Task, an Apptainer Task, and a one-GPU Apptainer Task.
 
 ### Changed
 
+- `args` and `env` errors from a Task file now come from `Task`, so they read the same as in Python.
 - A hard-link failure that is not a substitution uses the general filesystem wording (for example
   `crosses a filesystem boundary`).
 
 ### Fixed
 
+- A draft-path collision in `Draft.link` or `Draft.link_tree` raises `ConfigurationError` instead of
+  `DestinationExists`. A worker that reads `DestinationExists` as "already published" could exit 0
+  with nothing published when its builder linked two files to one path.
 - A status poll over SSH could fail at the 30 s deadline when one TCP connection never opened, which
   happened about once in 100 connections from a laptop on a phone hotspot. `ssh` now gives each
   connection three attempts of 8 s. Only the connection is retried, never a command, and a stalled
   banner exchange still fails, after 8 s. The deadline error names the command, and `ssh`'s own
   failure (exit 255) reports its message.
-- A draft-path collision in `Draft.link` or `Draft.link_tree` raises `ConfigurationError` instead of
-  `DestinationExists`. A worker that reads `DestinationExists` as "already published" could exit 0
-  with nothing published when its builder linked two files to one path.
 
 ## [0.12.1] - 2026-10-05
 
@@ -276,6 +286,7 @@ A clean break: no compatibility aliases and no migration of earlier campaign sta
 
 Versions before 0.12.0 had no changelog. See the git history for their changes.
 
-[Unreleased]: https://github.com/edoski/servatus/compare/v0.12.1...HEAD
+[Unreleased]: https://github.com/edoski/servatus/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/edoski/servatus/releases/tag/v0.13.0
 [0.12.1]: https://github.com/edoski/servatus/releases/tag/v0.12.1
 [0.12.0]: https://github.com/edoski/servatus/releases/tag/v0.12.0
