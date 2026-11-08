@@ -2,7 +2,9 @@
 
 The stubs emulate only what the script relies on: ``srun`` sets step-local GPU visibility and
 executes the step command with the batch environment; ``apptainer exec --cleanenv`` executes the
-command with exactly the ``APPTAINERENV_`` variables. Nothing contacts Slurm or Apptainer.
+command with exactly the ``APPTAINERENV_`` variables. Nothing contacts Slurm or Apptainer. The
+``srun`` stub becomes the worker, so a signal to the batch script's process group reaches the
+worker as Slurm's ``srun`` forwards ``SIGUSR1`` to its step.
 
 The interrupt trap signals its whole process group, so every script runs in its own session.
 """
@@ -18,6 +20,7 @@ import sys
 import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, suppress
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -25,10 +28,12 @@ import pytest
 from scheduler_fixtures import ALLOCATION
 from support.builders import target
 
-from servatus.campaign._config import Apptainer, Resources, Target, Task
-from servatus.campaign._script import render_batch
+from servatus.campaign._config import YIELD_EXIT, Apptainer, Resources, Target, Task
+from servatus.campaign._script import Chained, continues, render_batch
 
 JOB = "4242"
+NEXT = "fedcba9876543210fedcba98"
+DIED_OF_USR1 = 128 + signal.SIGUSR1
 SHELLS = [
     shell for shell in ("/bin/sh", "/bin/dash", "/bin/bash", "/bin/ksh") if Path(shell).exists()
 ]
@@ -101,6 +106,35 @@ sys.exit(7 if mode == "fail" else 0)
 """
 
 
+# A chain step: it records its SERVATUS_ environment, then exits at once (``exit=N``), exits N on
+# the pre-limit signal (``usr1=N``; ``usr1=die`` dies of it like an app that never handles it), or
+# only counts the signal and waits to be stopped (``hold``).
+CHAIN_WORKER = """#!{python}
+import json, os, signal, sys, time
+out, mode = sys.argv[1], sys.argv[2]
+with open(out + ".json", "w") as handle:
+    json.dump({{k: v for k, v in os.environ.items() if k.startswith("SERVATUS_")}}, handle)
+def usr1(*_):
+    with open(out + ".usr1", "a") as handle:
+        handle.write("x")
+    if mode == "usr1=die":
+        signal.signal(signal.SIGUSR1, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGUSR1)
+    if mode.startswith("usr1="):
+        os._exit(int(mode[5:]))
+def term(*_):
+    open(out + ".stopped", "w").close()
+    os._exit(143)
+signal.signal(signal.SIGUSR1, usr1)
+signal.signal(signal.SIGTERM, term)
+open(out + ".started", "w").close()
+if mode.startswith("exit="):
+    sys.exit(int(mode[5:]))
+while True:
+    time.sleep(0.05)
+"""
+
+
 def wait_until(condition: Callable[[], bool], what: str, seconds: float = 20) -> None:
     deadline = time.monotonic() + seconds
     while not condition():
@@ -130,6 +164,7 @@ class Runtime:
             "worker",
             WORKER.format(python=python, noise=INTERPRETER_NOISE, stop=str(self.marker("stop"))),
         )
+        self.chain_worker = self._stub("chain-worker", CHAIN_WORKER.format(python=python))
         apptainer = Apptainer(
             executable=str(self.bin / "apptainer"),
             image="/images/work.sif",
@@ -152,18 +187,26 @@ class Runtime:
     def marker(self, suffix: str) -> Path:
         return self.logs / f"{ALLOCATION}.{JOB}.{suffix}"
 
-    def markers(self) -> set[str]:
-        prefix = f"{ALLOCATION}.{JOB}."
-        return {path.name.removeprefix(prefix) for path in self.logs.iterdir()}
-
     def task(self, key: str, mode: str = "read", *extra: str, **options: Any) -> Task:
         return Task(key, (str(self.worker), str(self.out / key), mode, *extra), **options)
 
-    def script(self, tasks: tuple[Task, ...], gpus: int = 0) -> Path:
-        resources = Resources(cpus=1, memory_mib=100, time_limit="00:10:00", gpus=gpus)
+    def script(self, tasks: tuple[Task, ...], gpus: int = 0, chain: Chained | None = None) -> Path:
+        resources = Resources(
+            cpus=1, memory_mib=100, time_limit="00:10:00", gpus=gpus, signal_before_end="00:01:00"
+        )
         path = self.root / "batch.sh"
-        path.write_bytes(render_batch(self.target, resources, tasks, ALLOCATION))
+        path.write_bytes(render_batch(self.target, resources, tasks, ALLOCATION, chain))
         return path
+
+    def link(self, key: str, mode: str) -> Task:
+        return Task(key, (str(self.chain_worker), str(self.out / key), mode))
+
+    def handoff(self, slot: int, allocation_id: str = NEXT) -> Path:
+        return self.logs / f"{allocation_id}.{slot}.go"
+
+    def signals(self, key: str) -> int:
+        path = self.out / f"{key}.usr1"
+        return len(path.read_text()) if path.exists() else 0
 
     @staticmethod
     def environment(**env: str) -> dict[str, str]:
@@ -181,6 +224,14 @@ class Runtime:
             check=False,
             start_new_session=True,
         )
+
+    def markers(self) -> set[str]:
+        prefix = f"{ALLOCATION}.{JOB}."
+        return {
+            path.name.removeprefix(prefix)
+            for path in self.logs.iterdir()
+            if path.name.startswith(prefix)
+        }
 
     @contextmanager
     def spawn(self, shell: str, script: Path) -> Generator[subprocess.Popen[bytes]]:
@@ -400,3 +451,191 @@ def test_interrupt_before_any_launch_exits_without_errors(tmp_path: Path, shell:
     assert result.stderr == b""
     assert not runtime.started("t")
     assert runtime.markers() == {"stop"}
+
+
+# --- chain links -----------------------------------------------------------------------------
+
+BUDGET = timedelta(hours=30)
+SPENT = timedelta(seconds=5400)
+
+
+def first_link(count: int = 2, slots: int = 1, spent: timedelta = SPENT) -> Chained:
+    return Chained(1, BUDGET, (count,) * slots, (spent,) * slots, NEXT if count > 1 else None)
+
+
+def drive(
+    child: subprocess.Popen[bytes], runtime: Runtime, key: str, limited: bool, stop: bool
+) -> int:
+    """Wait for the step, deliver the pre-limit signal and the interrupt as asked, and return the
+    batch script's exit status."""
+    wait_until(lambda: runtime.started(key) or child.poll() is not None, "the step never started")
+    if limited:
+        child.send_signal(signal.SIGUSR1)
+        wait_until(lambda: runtime.signals(key) > 0, "the step never got SIGUSR1")
+    if stop:
+        child.send_signal(signal.SIGTERM)
+    return child.wait(timeout=20)
+
+
+ROWS = [
+    pytest.param(code, limited, interrupted, id=f"{code}-limited={limited}-stop={interrupted}")
+    for interrupted in (False, True)
+    for limited in (False, True)
+    for code in ((None,) if interrupted else (0, YIELD_EXIT, 3, DIED_OF_USR1))
+]
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize(("code", "limited", "interrupted"), ROWS)
+def test_a_slot_hands_off_exactly_when_continues_says(
+    tmp_path: Path, shell: str, code: int | None, limited: bool, interrupted: bool
+) -> None:
+    runtime = Runtime(tmp_path, container=False)
+    if interrupted:
+        mode = "hold"
+    elif limited:
+        mode = "usr1=die" if code == DIED_OF_USR1 else f"usr1={code}"
+    else:
+        mode = f"exit={code}"
+    script = runtime.script((runtime.link("t", mode),), chain=first_link())
+    with runtime.spawn(shell, script) as child:
+        status = drive(child, runtime, "t", limited, interrupted)
+    if code == DIED_OF_USR1:
+        # The stub step really dies of the signal, which ksh reports as 256 + N; real srun
+        # returns 128 + N for it.
+        (end,) = {name for name in runtime.markers() if name.endswith(".end")}
+        assert int(end.split(".")[1]) in (DIED_OF_USR1, DIED_OF_USR1 + 128)
+        code = int(end.split(".")[1])
+    expected = continues(code, interrupted=interrupted, limited=limited)
+    assert runtime.handoff(0).exists() == expected
+    assert status == (1 if expected else 0)
+    markers: set[str] = {"start", "stop" if interrupted else f"0.{code}.end"}
+    if limited:
+        markers.add("limit")
+    assert runtime.markers() == markers
+    if expected:
+        seconds = int(runtime.handoff(0).read_text())
+        assert runtime.handoff(0).read_text().endswith("\n")
+        assert SPENT.total_seconds() <= seconds < SPENT.total_seconds() + 30
+    assert runtime.signals("t") == int(limited)
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_the_step_learns_its_link_budget_and_run_time(tmp_path: Path, shell: str) -> None:
+    runtime = Runtime(tmp_path, container=False)
+    tasks = (runtime.link("a", "exit=0"), runtime.link("b", "exit=0"))
+    chain = Chained(1, BUDGET, (3, 1), (SPENT, timedelta(0)), NEXT)
+    result = runtime.run(shell, runtime.script(tasks, chain=chain))
+    assert result.returncode == 0, result.stderr
+    first = json.loads((runtime.out / "a.json").read_text())
+    assert {name: first[name] for name in first if name not in ("SERVATUS_JOB_ID",)} == {
+        "SERVATUS_TASK_KEY": "a",
+        "SERVATUS_ALLOCATION_ID": ALLOCATION,
+        "SERVATUS_SLOT": "0",
+        "SERVATUS_LINK": "1",
+        "SERVATUS_LINKS": "3",
+        "SERVATUS_BUDGET": "108000",
+        "SERVATUS_RUN_TIME": "5400",
+    }
+    second = json.loads((runtime.out / "b.json").read_text())
+    assert (second["SERVATUS_LINKS"], second["SERVATUS_RUN_TIME"]) == ("1", "0")
+    unbudgeted = Chained(1, None, (2,), (timedelta(0),), NEXT)
+    runtime.run(shell, runtime.script((runtime.link("c", "exit=0"),), chain=unbudgeted))
+    assert "SERVATUS_BUDGET" not in json.loads((runtime.out / "c.json").read_text())
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_gated_link_launches_exactly_the_handed_slots(tmp_path: Path, shell: str) -> None:
+    runtime = Runtime(tmp_path, container=False)
+    keys = ("a", "b", "c", "d", "e", "f")
+    contents = {0: "7200\n", 2: "abc\n", 3: "-5\n", 4: "0120\n", 5: "7200"}
+    for slot, text in contents.items():
+        runtime.handoff(slot, ALLOCATION).write_text(text)
+    chain = Chained(2, BUDGET, (3,) * 6, (timedelta(0),) * 6, NEXT)
+    tasks = tuple(runtime.link(key, "exit=75") for key in keys)
+    result = runtime.run(shell, runtime.script(tasks, chain=chain))
+    assert result.returncode == 1, result.stderr
+    assert [runtime.started(key) for key in keys] == [True, False, False, False, False, False]
+    assert json.loads((runtime.out / "a.json").read_text())["SERVATUS_RUN_TIME"] == "7200"
+    assert runtime.markers() == {"start", "0.75.end"}
+    assert 7200 <= int(runtime.handoff(0).read_text()) < 7230
+    assert not runtime.handoff(1).exists()
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_link_with_nothing_handed_exits_0_without_running_a_step(
+    tmp_path: Path, shell: str
+) -> None:
+    runtime = Runtime(tmp_path, container=False)
+    chain = Chained(2, BUDGET, (3, 3), (timedelta(0),) * 2, NEXT)
+    tasks = (runtime.link("a", "exit=75"), runtime.link("b", "exit=75"))
+    result = runtime.run(shell, runtime.script(tasks, chain=chain))
+    assert (result.returncode, result.stderr) == (0, b"")
+    assert list(runtime.records.iterdir()) == []
+    assert runtime.markers() == {"start"}
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_the_pre_limit_signal_reaches_every_step_once_and_waiting_survives_it(
+    tmp_path: Path, shell: str
+) -> None:
+    runtime = Runtime(tmp_path, container=False)
+    tasks = (runtime.link("a", "hold"), runtime.link("b", "hold"))
+    script = runtime.script(tasks, chain=first_link(slots=2))
+    with runtime.spawn(shell, script) as child:
+        wait_until(lambda: runtime.started("a") and runtime.started("b"), "steps never started")
+        child.send_signal(signal.SIGUSR1)
+        wait_until(lambda: min(runtime.signals("a"), runtime.signals("b")) > 0, "USR1 missed")
+        child.send_signal(signal.SIGUSR1)
+        time.sleep(0.3)
+        assert child.poll() is None, "a wait interrupted by the signal counted a slot as done"
+        assert (runtime.signals("a"), runtime.signals("b")) == (1, 1)
+        assert runtime.markers() == {"start", "limit"}
+        child.send_signal(signal.SIGTERM)
+        assert child.wait(timeout=20) == 1
+    assert runtime.handoff(0).exists() and runtime.handoff(1).exists()
+    assert runtime.markers() == {"start", "limit", "stop"}
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_link_exits_0_only_when_no_slot_handed_off(tmp_path: Path, shell: str) -> None:
+    runtime = Runtime(tmp_path, container=False)
+    chain = first_link(count=2, slots=2)
+    done = (runtime.link("a", "exit=0"), runtime.link("b", "exit=3"))
+    assert runtime.run(shell, runtime.script(done, chain=chain)).returncode == 0
+    assert not runtime.handoff(0).exists() and not runtime.handoff(1).exists()
+    mixed = (runtime.link("c", "exit=0"), runtime.link("d", "exit=75"))
+    assert runtime.run(shell, runtime.script(mixed, chain=chain)).returncode == 1
+    assert not runtime.handoff(0).exists() and runtime.handoff(1).exists()
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_slot_on_its_last_link_records_its_end_and_never_hands_off(
+    tmp_path: Path, shell: str
+) -> None:
+    runtime = Runtime(tmp_path, container=False)
+    chain = Chained(1, BUDGET, (1, 2), (timedelta(0), timedelta(0)), NEXT)
+    tasks = (runtime.link("a", "hold"), runtime.link("b", "hold"))
+    with runtime.spawn(shell, runtime.script(tasks, chain=chain)) as child:
+        assert drive(child, runtime, "a", limited=True, stop=True) == 1
+    assert not runtime.handoff(0).exists() and runtime.handoff(1).exists()
+    assert runtime.markers() == {"start", "limit", "stop"}
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_the_last_link_keeps_the_plain_shape_and_reads_its_handoff(
+    tmp_path: Path, shell: str
+) -> None:
+    runtime = Runtime(tmp_path, container=False)
+    runtime.handoff(0, ALLOCATION).write_text("9000\n")
+    runtime.handoff(1, ALLOCATION).write_text("9001\n")
+    chain = Chained(3, BUDGET, (3, 3, 3), (timedelta(0),) * 3)
+    tasks = (runtime.link("a", "exit=0"), runtime.link("b", "exit=3"), runtime.link("c", "exit=0"))
+    script = runtime.script(tasks, chain=chain)
+    assert b"limit" not in script.read_bytes() and b"next=" not in script.read_bytes()
+    result = runtime.run(shell, script)
+    assert result.returncode == 1, result.stderr
+    assert runtime.markers() == {"start", "0.0.end", "1.3.end"}
+    assert json.loads((runtime.out / "b.json").read_text())["SERVATUS_RUN_TIME"] == "9001"
+    assert not runtime.started("c")
+    assert not any(path.name.startswith(NEXT) for path in runtime.logs.iterdir())

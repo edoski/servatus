@@ -13,6 +13,9 @@ from support.builders import resources, target
 from servatus.campaign._codec import format_duration, parse_duration
 from servatus.campaign._config import Apptainer, Resources, Task, whole_minutes
 from servatus.campaign._script import (
+    Chained,
+    continues,
+    dependency_options,
     job_name,
     log_path,
     printf_literal,
@@ -291,3 +294,119 @@ def test_apptainer_tasks_need_a_program_regardless_of_the_runscript() -> None:
 def test_render_rejects_a_script_over_its_byte_bound() -> None:
     with pytest.raises(ConfigurationError, match="exceeds target max_script_bytes"):
         render((task(),), max_script_bytes=100)
+
+
+# --- Chain links -----------------------------------------------------------------------------
+
+SIGNALLED = resources(gpus=0, time_limit="16:00:00", signal_before_end="00:10:00")
+NEXT = "7" * 24
+ZERO = timedelta(0)
+
+
+def chained(index: int, counts: tuple[int, ...], next_id: str | None = NEXT) -> Chained:
+    return Chained(index, timedelta(days=3), counts, (ZERO,) * len(counts), next_id)
+
+
+def link(chain: Chained | None, count: int = 2) -> str:
+    tasks = tuple(task(f"t{slot}") for slot in range(count))
+    return render_batch(target(container=None), SIGNALLED, tasks, ALLOCATION, chain).decode()
+
+
+def test_one_flag_selects_the_batch_shell_signal_and_the_relay() -> None:
+    plain = sbatch_argv(target(), SIGNALLED, 2, ALLOCATION)
+    assert plain[-1] == "--signal=USR1@600"
+    for chain, relayed in [
+        (None, False),
+        (chained(1, (1, 1), None), False),
+        (chained(3, (3, 3), None), False),
+        (chained(1, (2, 1)), True),
+        (chained(2, (3, 2)), True),
+    ]:
+        assert chain is None or chain.hands_off == relayed
+        signal = sbatch_argv(target(), SIGNALLED, 2, ALLOCATION, chain)[-1]
+        assert signal == ("--signal=B:USR1@600" if relayed else "--signal=USR1@600")
+        script = link(chain)
+        assert ("trap limit USR1" in script) == relayed
+        assert ('exit "$continued"' in script) == relayed
+        assert ('for pid in $pids; do wait "$pid" || status=1; done' in script) != relayed
+
+
+def test_a_plain_allocation_renders_none_of_the_chain_machinery() -> None:
+    script = link(None)
+    for word in ("own=", "next=", "handed", "previous", "SERVATUS_LINK", "date", "limit"):
+        assert word not in script
+
+
+def test_only_links_after_the_first_are_gated_and_only_present_slots_render() -> None:
+    first = link(chained(1, (3, 1)))
+    assert "own=" not in first and "handed" not in first
+    assert first.count("previous=0") == 2 and "$next.0.go" in first and "$next.1.go" not in first
+    second = link(chained(2, (3, 1)))
+    assert "if handed 0; then" in second and "handed 1" not in second
+    assert "servatus-" + ALLOCATION + "-1" not in second
+    assert f"own={LOG}/{ALLOCATION}\n" in second and f"next={LOG}/{NEXT}\n" in second
+
+
+def test_chain_steps_learn_their_position_budget_and_run_time() -> None:
+    chain = Chained(1, timedelta(hours=30), (4, 2), (timedelta(seconds=90), ZERO), NEXT)
+    script = link(chain)
+    assert script.count("SERVATUS_BUDGET=108000") == 2
+    assert "SERVATUS_LINK=1 SERVATUS_LINKS=4 " in script
+    assert "SERVATUS_LINKS=2 " in script
+    assert script.count('SERVATUS_RUN_TIME="$previous"') == 2
+    assert "previous=90\n" in script and "previous=0\n" in script
+    unbudgeted = link(Chained(1, None, (2, 2), (ZERO, ZERO), NEXT))
+    assert "SERVATUS_BUDGET" not in unbudgeted
+
+
+@pytest.mark.parametrize(
+    ("index", "counts", "spent", "next_id", "message"),
+    [
+        (1, (2,), (ZERO, ZERO), NEXT, "one count and run time per slot"),
+        (0, (2,), (ZERO,), NEXT, "one count and run time per slot"),
+        (3, (2,), (ZERO,), None, "one count and run time per slot"),
+        (1, (2,), (ZERO,), None, "names its next link exactly when it hands off"),
+        (2, (2,), (ZERO,), NEXT, "names its next link exactly when it hands off"),
+    ],
+)
+def test_impossible_chain_links_are_refused(
+    index: int,
+    counts: tuple[int, ...],
+    spent: tuple[timedelta, ...],
+    next_id: str | None,
+    message: str,
+) -> None:
+    with pytest.raises(ConfigurationError, match=message):
+        Chained(index, None, counts, spent, next_id)
+
+
+def test_a_chain_link_renders_one_slot_per_task() -> None:
+    with pytest.raises(ConfigurationError, match="one count and run time per slot"):
+        link(chained(1, (2, 2, 2)))
+
+
+def test_a_later_link_depends_on_every_earlier_link() -> None:
+    assert dependency_options(()) == ()
+    assert dependency_options((41, 42, 1000)) == (
+        "--dependency=afternotok:41:42:1000",
+        "--kill-on-invalid-dep=yes",
+    )
+
+
+@pytest.mark.parametrize(
+    ("code", "interrupted", "limited", "expected"),
+    [
+        (0, False, False, False),
+        (0, False, True, False),
+        (75, False, False, True),
+        (75, False, True, True),
+        (3, False, False, False),
+        (138, False, True, True),
+        (None, True, True, True),
+        (None, True, False, False),
+    ],
+)
+def test_continues_is_the_compute_node_table(
+    code: int | None, interrupted: bool, limited: bool, expected: bool
+) -> None:
+    assert continues(code, interrupted=interrupted, limited=limited) is expected
