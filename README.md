@@ -229,6 +229,20 @@ accepted, or a Task whose earlier work Slurm still lists refuses the whole plan 
 listing every key). Eligible Tasks beyond the target's `max_allocations_per_submit` are
 **deferred** to the next plan.
 
+To rerun failed work with more resources, plan it with a bigger profile. `status --json` shows each
+Task's `exit_code`, so you can pick the Tasks that ran out of memory (137: the kernel's
+out-of-memory killer ends a step with `SIGKILL`) and name only those:
+
+```sh
+servatus plan state --retry-failed --profile bigger --output retry.json   # every failed or stopped Task
+servatus status state --json | jq -r '.tasks[] | select(.exit_code == 137) | .key'
+servatus plan state --retry lr-1e-3 --retry lr-3e-4 --profile bigger --output retry.json
+```
+
+Servatus never raises a Task's resources on its own: every resubmission is an explicit plan you
+review, so a bigger request, and what it costs in queue time and allocation, is always your
+decision.
+
 ## Budgeted continuation
 
 A long training Task can resume from its own checkpoint. Give its plan a lifetime run-time budget,
