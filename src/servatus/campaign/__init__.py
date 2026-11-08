@@ -22,7 +22,7 @@ from ._config import (
 )
 from ._doctor import Check, Diagnosis, Verdict, diagnose
 from ._evidence import Execution, Observation, StepEnd, StopReason
-from ._plan import Decision, Plan, PlannedAllocation, capacity
+from ._plan import Decision, Plan, PlannedAllocation, Totals, capacity
 from ._policy import Extension, Hold, Retry
 from ._remote import Completed, Transport, connect
 from ._results import (
@@ -76,6 +76,7 @@ __all__ = [
     "Target",
     "Task",
     "TaskStatus",
+    "Totals",
     "Transport",
     "UnattemptedAllocation",
     "UnresolvedSubmission",

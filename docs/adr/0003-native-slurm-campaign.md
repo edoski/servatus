@@ -58,8 +58,8 @@ finds the host NVIDIA binaries and libraries on it. Each allocation starts one
 `servatus-<allocation_id>-<slot>` with `--job-name`. Each step's stdin is a single-quoted `printf`
 literal piped into `srun`: printable ASCII verbatim, every other byte as `\ooo`. The script needs
 no scratch directory, `mktemp`, `base64`, or cleanup. Every step receives the Task environment plus
-`SERVATUS_TASK_KEY`, `SERVATUS_ALLOCATION_ID`, `SERVATUS_SLOT`, and `SERVATUS_JOB_ID` (from
-`$SLURM_JOB_ID`).
+`SERVATUS_TASK_KEY`, `SERVATUS_ALLOCATION_ID`, `SERVATUS_SLOT`, `SERVATUS_JOB_ID` (from
+`$SLURM_JOB_ID`), and `SERVATUS_JOB_END_TIME` (from `$SLURM_JOB_END_TIME`).
 
 - **Apptainer launcher:** `apptainer exec --cleanenv` with `--bind WORK_ROOT:WORK_ROOT`, one
   `--bind` per Target bind, `--pwd WORK_ROOT`, and `--nv` for GPU work, then the image and the

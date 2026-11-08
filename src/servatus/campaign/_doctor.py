@@ -23,7 +23,8 @@ from ._scheduler import CommandFailed, Scheduler
 from ._script import check_command, render_batch, sbatch_argv
 
 MIN_SLURM = (23, 2)
-"""``sbatch --export=NIL`` first exists in Slurm 23.02."""
+"""Slurm 23.02 first has ``sbatch --export=NIL`` and sets ``SLURM_JOB_END_TIME``, which every
+batch script requires."""
 MIN_JOB_AGE_SECONDS = 120
 """Run markers are read after the purge, which must outlast a cached NFS directory listing."""
 _PROBE_ALLOCATION = "0" * 24
@@ -87,7 +88,7 @@ def _slurm_version(version: str) -> tuple[bool, str]:
     if (int(match.group(1)), int(match.group(2))) < MIN_SLURM:
         return False, (
             f"{version} is older than 23.02: sbatch rejects --export=NIL, which every Servatus "
-            "submission uses"
+            "submission uses, and jobs lack SLURM_JOB_END_TIME, which every batch script needs"
         )
     return True, version
 

@@ -60,8 +60,16 @@ checks that the profile fits its ceilings and that the cluster has what Servatus
 ### 2. Write the worker
 
 Each Task runs one process in its own `srun` step. The process gets its Task's arguments, stdin
-bytes, and environment, plus `SERVATUS_TASK_KEY`, `SERVATUS_ALLOCATION_ID`, `SERVATUS_SLOT`, and
-`SERVATUS_JOB_ID`.
+bytes, and environment, plus these reserved variables (no `SLURM_*` variable reaches it):
+
+| Variable | Meaning |
+| --- | --- |
+| `SERVATUS_TASK_KEY` | The Task's key. |
+| `SERVATUS_ALLOCATION_ID`, `SERVATUS_SLOT` | The allocation running it and the Task's 0-based slot in it. |
+| `SERVATUS_JOB_ID` | Slurm's job number. |
+| `SERVATUS_JOB_END_TIME` | When Slurm will end the job, in UNIX seconds: its projected end when the job started (`SLURM_JOB_END_TIME`). A later `scontrol update TimeLimit` does not change it. |
+
+A chain step also gets the [continuation variables](#the-application-protocol).
 
 ```python
 # train.py, in work_root
@@ -167,7 +175,10 @@ servatus logs state --task lr-1e-3 --output lr-1e-3.log
 servatus plan state --retry-failed --output retry.json    # later: rerun failed or stopped Tasks
 ```
 
-Without `--output`, `plan` only prints. `submit` rebuilds the reviewed plan, refuses it with
+Without `--output`, `plan` only prints. After its allocations it prints the most the plan can
+use, with every allocation run to its time limit; for the two Tasks above, `requests at most 384.0
+CPU-hours, 24.0 GPU-hours, 1536.0 GiB-hours` (GPU-hours only when it asks for GPUs). `submit`
+rebuilds the reviewed plan, refuses it with
 `StalePlan` if the campaign changed, and pings Slurm and rechecks eligibility before recording
 anything. `status` shows each Task's execution: `QUEUED`, `RUNNING`, `ENDING` (Slurm
 says the job ended; the outcome is final a few minutes later, once Slurm forgets it),
@@ -218,6 +229,21 @@ accepted, or a Task whose earlier work Slurm still lists refuses the whole plan 
 listing every key). Eligible Tasks beyond the target's `max_allocations_per_submit` are
 **deferred** to the next plan.
 
+To rerun failed work with more resources, plan it with a bigger profile. `status --json` shows each
+Task's `exit_code`, so you can name only some Tasks. Exit 137 means the step's process was killed
+with `SIGKILL`, most often by the out-of-memory killer; its step log (`servatus logs`) confirms it.
+A Task whose child process ran out of memory may exit 1 instead.
+
+```sh
+servatus plan state --retry-failed --profile bigger --output retry.json   # every failed or stopped Task
+servatus status state --json | jq -r '.tasks[] | select(.exit_code == 137) | .key'   # killed, exit 137
+servatus plan state --retry lr-1e-3 --retry lr-3e-4 --profile bigger --output retry.json
+```
+
+Servatus never raises a Task's resources on its own: every resubmission is an explicit plan you
+review, so a bigger request, and what it costs in queue time and allocation, is always your
+decision.
+
 ## Budgeted continuation
 
 A long training Task can resume from its own checkpoint. Give its plan a lifetime run-time budget,
@@ -237,6 +263,7 @@ servatus plan state --profile l40s --budget 3-00:00:00 --output plan.json
 #   selected: 1 Task in 5 allocations
 #     9a1c5d0e7b3f2a8c4d6e1b09  1 Task, 32 CPUs, 64000 MiB, 1 GPUs, 16:00:00, link 1/5
 #     ...                       1 Task, 32 CPUs, 64000 MiB, 1 GPUs, 08:00:00, link 5/5
+#   requests at most 2304.0 CPU-hours, 72.0 GPU-hours, 4500.0 GiB-hours
 servatus submit state plan.json   # queues all five links now; close the laptop
 servatus status state             # RUN TIME 1-09:12:03 / 3-00:00:00, LINK 3/5
 ```
@@ -742,7 +769,9 @@ memory_mib = 98304
 `--config PATH` is given. Output is human-readable, with every non-printable character escaped
 (except `--show-scripts`); every command except `logs` accepts `--json` for exact machine output.
 `status --json` prints a `servatus.status/3` document (`tasks`, `attempts`, `counts`, `quiescent`,
-`results_ready`, `warnings`). Each Task carries `run_time` (`{"total", "complete"}`, or `null`
+`results_ready`, `warnings`). `plan --json` prints the saved plan document plus `retry`,
+`extensions`, `allocations`, `warnings`, `saved`, and `totals` (`{"cpu_hours", "gpu_hours",
+"memory_gib_hours"}`, `Plan.totals`). Each Task carries `run_time` (`{"total", "complete"}`, or `null`
 offline), `detail` (why a `STOPPED` Task stopped: `never started`, `time limit`, `yielded`, or
 `budget spent`), and `link`; each Attempt's `observation` carries the mtimes of its start, stop,
 and limit markers, each slot's end (`{"exit_code", "at"}` or `null`), and which slots it was
@@ -757,7 +786,7 @@ integer job number.
 | `ensure STATE TASKS.jsonl [--sealed]` | Create (appendable unless `--sealed`), or append unseen Tasks; existing keys must match. |
 | `append STATE TASKS.jsonl` | Append new Tasks to an appendable campaign. |
 | `seal STATE` | End authoring irreversibly. |
-| `plan STATE [--profile NAME] [--output FILE]` | Show selected, held, and deferred Tasks; `--output` saves the plan (0600, never overwrites). |
+| `plan STATE [--profile NAME] [--output FILE]` | Show selected, held, and deferred Tasks and the CPU-, GPU-, and GiB-hours the plan requests at most; `--output` saves the plan (0600, never overwrites). |
 | `  --retry KEY`, `--retry-failed` | Retry named Tasks (`LOST` ones included), or every Task whose latest work failed or stopped. |
 | `  --only KEY`, `--tasks-per-allocation N`, `--show-scripts` | Restrict the plan; lower packing; print batch scripts (sensitive). |
 | `  --budget DURATION`, `--max-links K` | Continue each Task through a chain of links until its lifetime budget is spent ([budgeted continuation](#budgeted-continuation)). |

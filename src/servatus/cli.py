@@ -9,6 +9,7 @@ escapes non-printable characters; ``--json`` output is exact.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import shlex
 import sys
@@ -213,6 +214,7 @@ def _plan_document(plan: Plan, scripts: bool, saved: Path | None) -> dict[str, o
         retry=list(plan.retry),
         extensions=list(plan.extensions),
         allocations=allocations,
+        totals=dataclasses.asdict(plan.totals),
         warnings=list(plan.warnings),
         saved=None if saved is None else str(saved),
     )
@@ -259,6 +261,11 @@ def _print_plan(plan: Plan, scripts: bool, saved: Path | None) -> None:
         tasks = _plural(len(item.task_keys), "Task")
         print(f"  {item.allocation_id}  {tasks}, {_shape(item)}{place}")
         print(f"    {_keys(item.task_keys)}")
+    totals = plan.totals
+    gpu = f", {totals.gpu_hours} GPU-hours" if totals.gpu_hours else ""
+    print(
+        f"requests at most {totals.cpu_hours} CPU-hours{gpu}, {totals.memory_gib_hours} GiB-hours"
+    )
     if plan.retry:
         print(f"retry: {_keys(plan.retry)}")
     print(f"held: {_plural(len(decision.held), 'Task')}")

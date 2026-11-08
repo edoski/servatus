@@ -81,6 +81,20 @@ class PlannedAllocation:
 
 
 @dataclass(frozen=True, slots=True)
+class Totals:
+    """The most a plan's allocations can hold, every chain link included: each allocation's CPUs,
+    GPUs, and memory times its time limit, summed, in hours rounded up to the hundredth."""
+
+    cpu_hours: float
+    gpu_hours: float
+    memory_gib_hours: float
+
+
+def _hours(minutes: int, per_unit: int = 1) -> float:
+    return -(-minutes * 100 // (60 * per_unit)) / 100
+
+
+@dataclass(frozen=True, slots=True)
 class Plan:
     """A reviewed ``decision`` plus what it derives: allocations (every chain's link 1, then every
     link 2, and so on), the digest, and ``retry``, the selected or deferred Tasks that resubmit
@@ -99,6 +113,16 @@ class Plan:
     def extensions(self) -> tuple[str, ...]:
         """The selected Tasks that extend finished work, in roster order."""
         return tuple(key for key in self.decision.selected if key in self.decision.extensions)
+
+    @property
+    def totals(self) -> Totals:
+        """The upper bound the plan requests from Slurm, if every allocation ran to its limit."""
+        spans = [(item, item.time_limit // MINUTE) for item in self.allocations]
+        return Totals(
+            cpu_hours=_hours(sum(item.cpus * span for item, span in spans)),
+            gpu_hours=_hours(sum(item.gpus * span for item, span in spans)),
+            memory_gib_hours=_hours(sum(item.memory_mib * span for item, span in spans), 1024),
+        )
 
     @property
     def warnings(self) -> tuple[str, ...]:

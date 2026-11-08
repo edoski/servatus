@@ -11,7 +11,8 @@ controller running while it does: `plan --budget` queues a chain of allocations 
 each link hands its Tasks on to the next through a marker it writes after their steps returned (see
 [ADR 0008](https://github.com/edoski/servatus/blob/main/docs/adr/0008-chains.md)). `status` shows
 every Task's run time, summed over its allocations from run-marker mtimes. Plans without a budget
-render exactly the batch scripts and `sbatch` requests 0.13 did.
+render the batch scripts and `sbatch` requests 0.13 did, plus `SERVATUS_JOB_END_TIME` in every
+step.
 
 **Upgrading from 0.13.** Schema 8 campaign state and `servatus.plan/2` plan files are rejected, so
 finish or abandon 0.13 campaigns with 0.13 first, then create new campaigns and plans. Published
@@ -68,6 +69,12 @@ exit 75 to read as `STOPPED (yielded)`, make sure the login host has GNU `find` 
 - `FakeScheduler` emulates chains: `afternotok` dependencies with `--kill-on-invalid-dep=yes`, gated
   links, `signal_limit` for the pre-limit signal, and handoffs by the same rule the shell
   implements. `FakeJob` gains `dependencies`.
+- Every step learns its job's deadline as `SERVATUS_JOB_END_TIME` (UNIX seconds), passed from
+  Slurm's `SLURM_JOB_END_TIME`, which Slurm 23.02 and later set in every batch job. Like
+  `SLURM_JOB_ID`, the batch script requires it and exits before any run marker without it.
+- `plan` prints the most a plan requests, `requests at most N CPU-hours, N GPU-hours, N GiB-hours`
+  over every allocation and chain link at its time limit (GPU-hours only when nonzero). `plan
+  --json` carries it as `totals`, and the library as `Plan.totals`, a public `Totals`.
 
 ## [0.13.0] - 2026-11-06
 

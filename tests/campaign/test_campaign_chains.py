@@ -24,6 +24,7 @@ from servatus.campaign import (
     Retry,
     RunTime,
     StopReason,
+    Totals,
 )
 from servatus.errors import (
     ConfigurationError,
@@ -206,6 +207,7 @@ def test_chains_of_different_lengths_share_one_plan(world: World) -> None:
     ]
     assert plan.allocations[4].time_limit == timedelta(minutes=40)
     assert plan.warnings == ()
+    assert plan.totals == Totals(12.34, 0.0, 6.17), "370 link minutes, rounded up"
 
 
 @pytest.mark.parametrize(

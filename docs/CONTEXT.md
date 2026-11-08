@@ -73,7 +73,8 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   (`spent`, with a continuation), and its extensions.
 - **Plan (`Plan`):** a Decision (`plan.decision`) plus what it derives from the current state:
   `PlannedAllocation`s (Task keys, totals, batch script, `sbatch` argv), the digest, and `retry`
-  (the selected or deferred Tasks that resubmit accepted work), with `warnings` for deferred work
+  (the selected or deferred Tasks that resubmit accepted work), `totals` (the CPU-, GPU-, and
+  GiB-hours its allocations request at most, every link included), with `warnings` for deferred work
   and for budgets a chain cannot spend as asked. A saved plan (`servatus.plan/3`) holds only the
   Decision and digest. Submission rebuilds the plan
   from its Decision and the current state and refuses it when it differs.
