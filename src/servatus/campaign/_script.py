@@ -240,18 +240,35 @@ _EPILOGUE = (
     'exit "$status"',
     "",
 )
-# A trap interrupts `wait` with a made-up status (128 + N, or 1 in ksh), so `reap` waits again
-# until the status repeats or the shell no longer knows the child (127).
+
+
+def _wait(pid: str, indent: str) -> tuple[str, ...]:
+    """Wait for ``pid`` and leave its exit status in ``$code``. A trap interrupts `wait` with a
+    made-up status (128 + N, or 1 in ksh), so it waits again until the status repeats or the
+    shell no longer knows the child (127)."""
+    return (
+        f'{indent}wait "{pid}"',
+        f"{indent}code=$?",
+        f'{indent}while wait "{pid}" 2>/dev/null; again=$?; '
+        '[ "$again" -ne 127 ] && [ "$again" -ne "$code" ]',
+        f"{indent}do code=$again; done",
+    )
+
+
+def owned_directory(variable: str) -> str:
+    """Shell that makes the directory named by ``$variable`` if needed and succeeds only when it
+    is a real directory this user owns, so nobody else can plant or read what is in it."""
+    path = f'"${variable}"'
+    return f"mkdir -p -- {path} 2>/dev/null; [ -d {path} ] && [ ! -h {path} ] && [ -O {path} ]"
+
+
 _RELAY = (
     "pids=",
     "continued=0",
     "reap() {",
     '  while [ -n "$pids" ]; do',
     "    set -- $pids",
-    '    wait "$1"',
-    "    code=$?",
-    '    while wait "$1" 2>/dev/null; again=$?; [ "$again" -ne 127 ] && [ "$again" -ne "$code" ]',
-    "    do code=$again; done",
+    *_wait("$1", "    "),
     "    shift",
     "    pids=$*",
     '    [ "$code" -eq 0 ] || continued=1',
@@ -494,9 +511,9 @@ _TAKE = (
 # One step: it sources its order (its run time and `launch`), waits for its `srun` whatever
 # signal arrives, and records its end. A stop request gets the pre-limit treatment: SIGUSR1,
 # which srun forwards as-is, then after `grace` SIGTERM, which srun turns into SIGKILL; a step
-# still waiting for room never started, so its srun gets SIGTERM at once. The watcher ignores
-# USR1 and the step's shell catches it, so the relayed pre-limit signal kills neither, while
-# srun, started from a shell that catches it, keeps forwarding it.
+# still waiting for room never started, so its srun gets SIGTERM at once. The step's shell
+# catches USR1 and forks the watcher while ignoring it, so the relayed pre-limit signal kills
+# neither, while srun, started from a shell that catches it, keeps forwarding it.
 _RUN = (
     "run() {",
     "  trap : USR1",
@@ -504,8 +521,8 @@ _RUN = (
     '  . "$orders/$1.run"',
     "  launch",
     "  step=$!",
+    "  trap '' USR1",
     "  (",
-    "    trap '' USR1",
     f'    until [ -e "$m.stop" ]; do sleep {POLL_SECONDS}; done',
     '    if [ -e "$m.start" ]; then',
     '      kill -s USR1 "$step" 2>/dev/null || exit 0',
@@ -514,19 +531,17 @@ _RUN = (
     '    kill -s TERM "$step" 2>/dev/null',
     "  ) &",
     "  watch=$!",
-    '  wait "$step"',
-    "  code=$?",
-    '  while wait "$step" 2>/dev/null; again=$?; [ "$again" -ne 127 ] && [ "$again" -ne "$code" ]',
-    "  do code=$again; done",
+    "  trap : USR1",
+    *_wait("$step", "  "),
     '  kill "$watch" 2>/dev/null',
     '  command : > "$m.0.$code.end"',
     "}",
 )
-# The lease takes an order at most once, never after its pre-limit signal, and never one whose
-# claim the client won. Its loop never waits for a step, and it never exits on its own, so the
-# next link of a chain of leases always becomes eligible when this one ends. Its idle sleep
-# ignores the relayed pre-limit signal, which would otherwise kill it and make some shells log
-# the death.
+# The lease takes an order at most once, never one whose claim the client won, and starts none
+# once its pre-limit signal arrived, even one it claimed as the signal came. Its loop never waits
+# for a step, and it never exits on its own, so the next link of a chain of leases always becomes
+# eligible when this one ends. Its idle sleep ignores the relayed pre-limit signal, which would
+# otherwise kill it and make some shells log the death.
 _SERVE = (
     "seen=",
     "while :; do",
@@ -539,6 +554,7 @@ _SERVE = (
     '    case $seen in *" $id"*) continue ;; esac',
     '    if taken "$id"; then',
     '      seen="$seen $id"',
+    '      [ "$limited" = 0 ] || break',
     '      run "$id" &',
     '      pids="$pids $!"',
     '    elif [ -h "$orders/$id.claim" ]; then',
@@ -574,8 +590,7 @@ def render_lease(target: Target, resources: Resources, lease_id: str) -> bytes:
         *_LIMIT,
         "trap limit USR1",
         _START,
-        'mkdir -p "$orders" 2>/dev/null',
-        '[ -d "$orders" ] && [ ! -h "$orders" ] && [ -O "$orders" ] || exit 1',
+        f"{owned_directory('orders')} || exit 1",
         *_TAKE,
         *_RUN,
         *_SERVE,

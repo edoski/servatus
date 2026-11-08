@@ -15,7 +15,7 @@ from ..errors import ConfigurationError, EvidenceConflict, Unavailable
 from ._config import Target
 from ._evidence import Marker, QueueRow, parse_markers, parse_queue, parse_receipt
 from ._remote import MAX_STREAM_BYTES, Completed, Transport, diagnostic
-from ._script import MAX_ARGS, job_name, order_directory
+from ._script import MAX_ARGS, job_name, order_directory, owned_directory
 
 MAX_QUERY_NAMES = 100
 TAIL = "/usr/bin/tail"
@@ -25,11 +25,7 @@ SQUEUE_OPTIONS = ("--me", "--all", "--states=all", "--noheader")
 SQUEUE_FORMAT = "--format=%i|%j|%T"
 MARKER_SUFFIXES = (".start", ".stop", ".limit", ".void", ".end", ".go")
 MARKER_FORMAT = "%T@ %p\n"
-# The order directory must be this user's own, so nobody else can plant or read an order.
-_ORDERS = (
-    'umask 077; d=$1; mkdir -p -- "$d" 2>/dev/null; '
-    '[ -d "$d" ] && [ ! -h "$d" ] && [ -O "$d" ] || exit 1; '
-)
+_ORDERS = f"umask 077; d=$1; {owned_directory('d')} || exit 1; "
 ORDER = (
     "/bin/sh",
     "-c",
