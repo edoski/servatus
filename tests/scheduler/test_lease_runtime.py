@@ -202,6 +202,15 @@ class Lease:
         path = self.orders / f"{step_id}.claim"
         return os.readlink(path) if path.is_symlink() else None
 
+    def stderr(self) -> str:
+        # bash, unlike dash or ksh, reports a subshell that the relayed SIGUSR1 reached between fork
+        # and its own trap (macOS /bin/sh is bash 3.2). The subshell dies as it would in any shell.
+        return "".join(
+            line
+            for line in self.errors.read_text().splitlines(keepends=True)
+            if "run_pending_traps:" not in line
+        )
+
     def started(self, key: str) -> bool:
         return (self.out / f"{key}.started").exists()
 
@@ -289,7 +298,7 @@ def test_a_lease_runs_each_order_it_claims_with_exact_stdin_and_environment(
     assert claims == {f"{first}.claim", f"{second}.claim"}
     assert not any(lease.started(f"ignored{index}") for index in range(len(ignored)))
     assert lease.markers(LEASE) == {"start"}
-    assert lease.errors.read_bytes() == b""
+    assert lease.stderr() == ""
 
 
 @pytest.mark.parametrize("shell", SHELLS)
@@ -312,7 +321,7 @@ def test_an_order_withdrawn_before_the_lease_takes_it_never_runs(
     assert lease.srun_options(gone) is None
     assert lease.claim(kept) == "taken"
     assert lease.markers(kept) == {"start", "0.0.end", "stop"}
-    assert lease.errors.read_bytes() == b""
+    assert lease.stderr() == ""
 
 
 ROUNDS = 15
@@ -329,9 +338,12 @@ def test_a_lease_and_a_withdrawal_racing_for_an_order_agree_on_one_winner(
     with lease.spawn(shell) as child:
         for round_ in range(ROUNDS):
             steps = [step(round_ * ORDERS_PER_ROUND + index) for index in range(ORDERS_PER_ROUND)]
-            for step_id in steps:
-                lease.order(step_id, lease.task(step_id, "exit=0"))
-            time.sleep(pace.uniform(0, 0.15))
+            # Odd rounds start withdrawing first, so a slow host still sees both sides win.
+            delay = pace.uniform(0, 0.15)
+            if round_ % 2 == 0:
+                for step_id in steps:
+                    lease.order(step_id, lease.task(step_id, "exit=0"))
+                time.sleep(delay)
             withdrawals = [
                 (
                     step_id,
@@ -343,6 +355,10 @@ def test_a_lease_and_a_withdrawal_racing_for_an_order_agree_on_one_winner(
                 )
                 for step_id in steps
             ]
+            if round_ % 2 == 1:
+                time.sleep(delay)
+                for step_id in steps:
+                    lease.order(step_id, lease.task(step_id, "exit=0"))
             for step_id, withdrawal in withdrawals:
                 answers[step_id] = withdrawal.communicate(timeout=20)[0].decode().strip()
                 assert withdrawal.returncode == 0
@@ -380,7 +396,7 @@ def test_a_stop_signals_a_running_step_then_terminates_it_after_grace(
     code = lease.end(step_id)
     assert lease.markers(step_id) == {"start", "stop", f"0.{code}.end"}
     assert mtime(lease.marker(step_id, "stop")) < mtime(lease.marker(step_id, f"0.{code}.end"))
-    assert lease.errors.read_bytes() == b""
+    assert lease.stderr() == ""
 
 
 @pytest.mark.parametrize("shell", SHELLS)
@@ -436,7 +452,7 @@ def test_the_pre_limit_signal_is_relayed_once_and_stops_still_work_after_it(
     assert lease.claim(after) is None
     assert not lease.started("after")
     assert lease.markers(LEASE) == {"start", "limit"}
-    assert lease.errors.read_bytes() == b""
+    assert lease.stderr() == ""
 
 
 @pytest.mark.parametrize("shell", SHELLS)
