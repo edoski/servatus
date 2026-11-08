@@ -12,7 +12,8 @@ this order:
    scheduler state is not consulted (the work may still be queued, running, or long finished),
    so plans without retries do not depend on (or observe) scheduler evidence.
 6. Slurm still lists a job of any accepted (or not-submitted) allocation of the Task, settling
-   ones included (a chain's pending links too): ``ACTIVE``.
+   ones included (a chain's pending links too), or a step of the Task has neither ended nor been
+   withdrawn while Slurm lists its lease: ``ACTIVE``.
 7. Under a budget, a Task whose run time leaves no room for one more link: ``SPENT``.
 8. Otherwise the retry selector decides from the Task's current execution (``_status.current``:
    the latest accepted Attempt that was handed the Task).

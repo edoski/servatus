@@ -94,8 +94,10 @@ relayed pre-limit signal kills neither, while `srun`, started from a shell that 
 than ignores it, keeps forwarding it.
 
 **After the pre-limit signal the lease starts nothing more.** Its trap writes `<lease>.<job>.limit`
-and relays `SIGUSR1` to its process group, as a chain link that hands off does. Orders it has not
-taken stay unclaimed: the operator orders them into the next link, or cancels them.
+and relays `SIGUSR1` to its process group, as a chain link that hands off does. It checks the limit
+before every claim and again after one, so it starts no step once the signal arrived. Orders it has
+not taken stay unclaimed and keep their Tasks held, since the lease could still take one claimed
+as the signal came: `cancel` withdraws them, and they can then start in the next link.
 
 **A step is observed through its lease.** `observe_step` combines the lease's queue row and limit
 marker, the step's own start and end markers, the earlier of the step's stop request and the
@@ -118,9 +120,11 @@ lease's stop marker, and whether the order was withdrawn. Evaluated top to botto
 | gone | start, no stop | `LOST` |
 
 A step stops being live, and its Task becomes eligible for retry, as soon as its end marker or its
-void exists, while the lease runs on; it is also not live once Slurm forgets the lease. Run time
-counts from the step's own start marker to its end, and a step asked to stop counts until now
-until its end marker appears. An allocation's table in ADR 0007 is unchanged.
+void exists, while the lease runs on; it is also not live once Slurm forgets the lease. A stopped
+step's Task can start again once its end marker appears. Run time counts from the step's own start
+marker to its end; a step asked to stop counts until now until its end marker appears, and one the
+lease's interrupt ended counts until the lease's stop marker. An allocation's table in ADR 0007 is
+unchanged.
 
 **`reconcile` resolves a step at once.** It contends for the claim: when the client's claim wins,
 the step was not submitted and a late order is never taken; when the lease had taken the order,
@@ -201,7 +205,10 @@ stopping take up to a poll interval plus the filesystem's attribute cache on the
 which on NFS is about a minute. Task keys stay immutable, so changed work is a new key, and a lease
 Campaign stays appendable. A lease holds its resources whether or not a step runs. Steps do not
 carry over to the next lease link; order new steps into the next link, or use budgeted chains for
-single runs longer than one allocation.
+single runs longer than one allocation. Orders and claims stay in the lease's owner-only order
+directory after it ends, as logs and run markers stay in `log_root`; an order holds its Task's
+arguments, environment, and stdin, so remove `<log_root>/<lease>.d` once the lease is gone if they
+are sensitive.
 
 Facts only a live cluster proves, which `scripts/cluster_e2e.py` exercises in its lease scenario:
 how long an order takes to become visible on the compute node; that a step that does not fit waits

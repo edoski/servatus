@@ -401,7 +401,7 @@ servatus status gpu
 #   lease 3f9c0e2a7b1d4c5e6f708192: job 41234 RUNNING, 2 slots
 
 servatus cancel gpu --task train-a                       # stops the step; the lease stays
-servatus start gpu train.jsonl --lease 3f9c0e2a7b1d4c5e6f708192 --retry train-a
+servatus start gpu train.jsonl --lease 3f9c0e2a7b1d4c5e6f708192 --retry train-a   # once STOPPED
 servatus logs gpu --task train-a --output train-a.log
 servatus cancel gpu --allocation 3f9c0e2a7b1d4c5e6f708192   # ends the lease and every step in it
 ```
@@ -429,11 +429,12 @@ How it behaves:
   Task reads `STOPPED (never started)`. Otherwise the lease stops the step: a running step gets
   `SIGUSR1`, the same signal it gets before a time limit, then `SIGTERM` (which `srun` turns into
   `SIGKILL`) after `signal_before_end`; a step still waiting for room ends without starting. It reads
-  `STOPPED`, or `SUCCEEDED` if your application exits 0 on the signal.
+  `STOPPED`, or `SUCCEEDED` if your application exits 0 on the signal, and can be started again from
+  then on.
 - **The end of the lease.** At `signal_before_end` before the limit, the lease takes no more orders
   and relays `SIGUSR1` to every step. A step that then exits nonzero, or is stopped at the limit,
-  reads `STOPPED (time limit)`. Orders it never took read `STOPPED (never started)` once Slurm
-  forgets the lease.
+  reads `STOPPED (time limit)`. Orders it never took stay `QUEUED`, holding their Tasks, until you
+  `cancel` them or Slurm forgets the lease; then start them in the next link.
 - **Longer than one limit.** `plan --hold N --max-links K` queues K leases, each starting when the
   one before it ended. `--lease` accepts any of their ids and starts steps in the current one: the
   first that Slurm lists, has not ended, and has not had its pre-limit signal. A step runs in the
