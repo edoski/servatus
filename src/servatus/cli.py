@@ -25,6 +25,7 @@ from .campaign import (
     Campaign,
     Connect,
     Continuation,
+    Execution,
     Plan,
     Profile,
     Receipt,
@@ -503,12 +504,24 @@ def _print_status(status: Status, path: Path) -> None:
     hints: list[str] = []
     if any(attempt.acceptance is AcceptanceState.UNRESOLVED for attempt in status.attempts):
         hints.append(f"servatus reconcile {state}")
-    spent = [task for task in status.tasks if task.detail is StopReason.BUDGET_SPENT]
-    if counts["failed"] + counts["stopped"] > len(spent):
+    leases: set[str] = set()
+    elsewhere = False
+    for task in status.tasks:
+        ended = task.execution in (Execution.FAILED, Execution.STOPPED)
+        if not ended or task.detail is StopReason.BUDGET_SPENT:
+            continue
+        within = attempts[cast(str, task.current_allocation_id)].within
+        if within is None:
+            elsewhere = True
+        else:
+            leases.add(within)
+    if elsewhere:
         hints.append(f"servatus plan {state} --retry-failed --output PLAN.json")
+    for lease in sorted(leases):
+        hints.append(f"servatus plan {state} --lease {lease} --retry-failed --output PLAN.json")
     if counts["lost"]:
         hints.append(f"servatus plan {state} --retry KEY --output PLAN.json  (LOST Tasks)")
-    if spent:
+    if any(task.detail is StopReason.BUDGET_SPENT for task in status.tasks):
         larger = f"servatus plan {state} --retry KEY --budget LARGER --output PLAN.json"
         hints.append(f"{larger}  (to extend a spent budget)")
     if counts["not_submitted"]:

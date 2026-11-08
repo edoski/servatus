@@ -160,6 +160,10 @@ def test_status_shows_steps_in_their_lease_and_one_line_per_lease(cli: Cli) -> N
     assert code == 0
     assert re.search(rf"^one  UNOBSERVED  RUNNING .* {step} \(lease {lease}\)$", out, re.M)
     assert f"\nlease {lease}: job 1000 RUNNING, 2 slots\n" in out
+    cli.fake.end_step(step, 3)
+    code, out, _ = cli("status", "state")
+    assert f"next: servatus plan state --lease {lease} --retry-failed --output PLAN.json\n" in out
+    assert "next: servatus plan state --retry-failed" not in out
     document = cli.json("status", "state")
     assert document["format"] == "servatus.status/4"
     attempts = {item["allocation_id"]: item for item in document["attempts"]}
