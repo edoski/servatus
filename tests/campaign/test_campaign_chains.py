@@ -4,7 +4,6 @@ through ``FakeScheduler``, which emulates Slurm dependencies and the chain scrip
 from __future__ import annotations
 
 import json
-from dataclasses import astuple
 from datetime import timedelta
 from typing import Any
 
@@ -25,6 +24,7 @@ from servatus.campaign import (
     Retry,
     RunTime,
     StopReason,
+    Totals,
 )
 from servatus.errors import (
     ConfigurationError,
@@ -207,7 +207,7 @@ def test_chains_of_different_lengths_share_one_plan(world: World) -> None:
     ]
     assert plan.allocations[4].time_limit == timedelta(minutes=40)
     assert plan.warnings == ()
-    assert astuple(plan.totals) == (12.34, 0.0, 6.17), "370 link minutes, rounded up"
+    assert plan.totals == Totals(12.34, 0.0, 6.17), "370 link minutes, rounded up"
 
 
 @pytest.mark.parametrize(

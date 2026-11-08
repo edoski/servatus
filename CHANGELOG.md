@@ -74,7 +74,7 @@ exit 75 to read as `STOPPED (yielded)`, make sure the login host has GNU `find` 
   `SLURM_JOB_ID`, the batch script requires it and exits before any run marker without it.
 - `plan` prints the most a plan requests, `requests at most N CPU-hours, N GPU-hours, N GiB-hours`
   over every allocation and chain link at its time limit (GPU-hours only when nonzero). `plan
-  --json` carries it as `totals`, and the library as `Plan.totals`.
+  --json` carries it as `totals`, and the library as `Plan.totals`, a public `Totals`.
 
 ## [0.13.0] - 2026-11-06
 
