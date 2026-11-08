@@ -60,8 +60,16 @@ checks that the profile fits its ceilings and that the cluster has what Servatus
 ### 2. Write the worker
 
 Each Task runs one process in its own `srun` step. The process gets its Task's arguments, stdin
-bytes, and environment, plus `SERVATUS_TASK_KEY`, `SERVATUS_ALLOCATION_ID`, `SERVATUS_SLOT`, and
-`SERVATUS_JOB_ID`.
+bytes, and environment, plus these reserved variables (no `SLURM_*` variable reaches it):
+
+| Variable | Meaning |
+| --- | --- |
+| `SERVATUS_TASK_KEY` | The Task's key. |
+| `SERVATUS_ALLOCATION_ID`, `SERVATUS_SLOT` | The allocation running it and the Task's 0-based slot in it. |
+| `SERVATUS_JOB_ID` | Slurm's job number. |
+| `SERVATUS_JOB_END_TIME` | When Slurm will end the job, in UNIX seconds: its projected end when the job started (`SLURM_JOB_END_TIME`). A later `scontrol update TimeLimit` does not change it. |
+
+A chain step also gets the [continuation variables](#the-application-protocol).
 
 ```python
 # train.py, in work_root

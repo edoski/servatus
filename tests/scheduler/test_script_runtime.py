@@ -32,6 +32,7 @@ from servatus.campaign._config import YIELD_EXIT, Apptainer, Resources, Target, 
 from servatus.campaign._script import Chained, continues, render_batch
 
 JOB = "4242"
+END_TIME = "1798761600"
 NEXT = "fedcba9876543210fedcba98"
 DIED_OF_USR1 = 128 + signal.SIGUSR1
 SHELLS = [
@@ -210,7 +211,7 @@ class Runtime:
     @staticmethod
     def environment(**env: str) -> dict[str, str]:
         # Slurm's --export=NIL: the batch starts with (almost) nothing but SLURM_* variables.
-        values = {"SLURM_JOB_ID": JOB, **env}
+        values = {"SLURM_JOB_ID": JOB, "SLURM_JOB_END_TIME": END_TIME, **env}
         return {key: value for key, value in values.items() if value}
 
     def run(self, shell: str, script: Path, **env: str) -> subprocess.CompletedProcess[bytes]:
@@ -307,6 +308,7 @@ def test_steps_receive_exact_stdin_argv_and_environment(
             SERVATUS_ALLOCATION_ID=ALLOCATION,
             SERVATUS_SLOT=str(slot),
             SERVATUS_JOB_ID=JOB,
+            SERVATUS_JOB_END_TIME=END_TIME,
         )
         assert record["env"] == expected
         step = json.loads((runtime.records / f"servatus-{ALLOCATION}-{slot}.srun.json").read_text())
@@ -336,12 +338,15 @@ def test_steps_receive_exact_stdin_argv_and_environment(
                 assert not any(f"{name}=" in word for word in step["argv"]), name
 
 
+@pytest.mark.parametrize("variable", ["SLURM_JOB_ID", "SLURM_JOB_END_TIME"])
 @pytest.mark.parametrize("container", [False, True], ids=["direct", "apptainer"])
-def test_missing_job_id_fails_before_any_marker_or_step(tmp_path: Path, container: bool) -> None:
+def test_missing_job_identity_fails_before_any_marker_or_step(
+    tmp_path: Path, container: bool, variable: str
+) -> None:
     runtime = Runtime(tmp_path, container=container)
-    result = runtime.run("/bin/sh", runtime.script((runtime.task("t"),)), SLURM_JOB_ID="")
+    result = runtime.run("/bin/sh", runtime.script((runtime.task("t"),)), **{variable: ""})
     assert result.returncode != 0
-    assert b"Slurm did not set SLURM_JOB_ID" in result.stderr
+    assert f"Slurm did not set {variable}".encode() in result.stderr
     assert not runtime.started("t")
     assert list(runtime.records.iterdir()) == []
     assert list(runtime.logs.iterdir()) == []
@@ -527,13 +532,15 @@ def test_the_step_learns_its_link_budget_and_run_time(tmp_path: Path, shell: str
     result = runtime.run(shell, runtime.script(tasks, chain=chain))
     assert result.returncode == 0, result.stderr
     first = json.loads((runtime.out / "a.json").read_text())
-    assert {name: first[name] for name in first if name not in ("SERVATUS_JOB_ID",)} == {
+    assert first == {
         "SERVATUS_TASK_KEY": "a",
         "SERVATUS_ALLOCATION_ID": ALLOCATION,
         "SERVATUS_SLOT": "0",
         "SERVATUS_LINK": "1",
         "SERVATUS_LINKS": "3",
         "SERVATUS_BUDGET": "108000",
+        "SERVATUS_JOB_ID": JOB,
+        "SERVATUS_JOB_END_TIME": END_TIME,
         "SERVATUS_RUN_TIME": "5400",
     }
     second = json.loads((runtime.out / "b.json").read_text())
