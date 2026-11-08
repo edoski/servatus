@@ -633,6 +633,7 @@ def test_a_slot_on_its_last_link_records_its_end_and_never_hands_off(
     chain = Chained(1, BUDGET, (1, 2), (timedelta(0), timedelta(0)), NEXT)
     tasks = (runtime.link("a", "hold"), runtime.link("b", "hold"))
     with runtime.spawn(shell, runtime.script(tasks, chain=chain)) as child:
+        wait_until(lambda: runtime.started("b"), "b never started")
         assert drive(child, runtime, "a", limited=True, stop=True) == 1
     assert not runtime.handoff(0).exists() and runtime.handoff(1).exists()
     assert runtime.markers() == {"start", "limit", "stop"}
