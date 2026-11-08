@@ -207,6 +207,7 @@ _PRELUDE = (
     # libraries (nvidia-smi, MPS, libcuda) on it; without one it binds nothing.
     "export PATH=/usr/bin:/bin",
     'job_id="${SLURM_JOB_ID:?Slurm did not set SLURM_JOB_ID}"',
+    'end_time="${SLURM_JOB_END_TIME:?Slurm did not set SLURM_JOB_END_TIME}"',
 )
 # The trap signals the whole process group: each slot's subshell dies before it can write an end
 # marker, so a step the trap interrupts is recorded as stopped, not as a failure of its own.
@@ -306,6 +307,7 @@ def _environment(
             values["SERVATUS_BUDGET"] = str(chain.budget // timedelta(seconds=1))
     words = [(name, shlex.quote(value)) for name, value in values.items()]
     words.append(("SERVATUS_JOB_ID", '"$job_id"'))
+    words.append(("SERVATUS_JOB_END_TIME", '"$end_time"'))
     if chain is not None:
         words.append(("SERVATUS_RUN_TIME", '"$previous"'))
     return tuple(words)
@@ -336,9 +338,9 @@ def _launch(
 
     The direct launcher passes the environment as ``env -i NAME=VALUE...`` arguments. Apptainer
     receives it as ``APPTAINERENV_*`` assignments on ``srun`` itself, so the values never appear on
-    a command line other users of the node can read. The batch shell expands only ``"$job_id"``
-    and a chain link's ``"$previous"``; everything else is single-quoted. A GPU step runs through
-    a shell that first reads the step-local visibility.
+    a command line other users of the node can read. The batch shell expands only ``"$job_id"``,
+    ``"$end_time"``, and a chain link's ``"$previous"``; everything else is single-quoted. A GPU
+    step runs through a shell that first reads the step-local visibility.
     """
     words = _environment(task, allocation_id, slot, resources.gpus, chain)
     if target.container is None:

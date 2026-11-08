@@ -218,9 +218,13 @@ def test_servatus_variables_are_injected_with_runtime_job_identity() -> None:
         f"APPTAINERENV_SERVATUS_ALLOCATION_ID={ALLOCATION}",
         "APPTAINERENV_SERVATUS_SLOT=0",
         'APPTAINERENV_SERVATUS_JOB_ID="$job_id"',
+        'APPTAINERENV_SERVATUS_JOB_END_TIME="$end_time"',
     ):
         assert assignment in script
     assert 'job_id="${SLURM_JOB_ID:?' in script
+    assert 'end_time="${SLURM_JOB_END_TIME:?' in script
+    direct = render((task(),), container=None, gpus=0)
+    assert 'SERVATUS_JOB_ID="$job_id" SERVATUS_JOB_END_TIME="$end_time" ' in direct
     assert "RESTART_COUNT" not in script
 
 

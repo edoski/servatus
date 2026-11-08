@@ -36,6 +36,8 @@ from servatus.campaign._script import POLL_SECONDS, Chained, render_lease, rende
 
 LEASE = "0123456789abcdef01234567"
 JOB = "4242"
+END_TIME = "1798761600"
+SLURM = {"SLURM_JOB_ID": JOB, "SLURM_JOB_END_TIME": END_TIME}
 SHELLS = [
     shell for shell in ("/bin/sh", "/bin/dash", "/bin/bash", "/bin/ksh") if Path(shell).exists()
 ]
@@ -231,7 +233,7 @@ class Lease:
         with self.errors.open("wb") as errors:
             child = subprocess.Popen(
                 [shell, str(self.script)],
-                env={"SLURM_JOB_ID": JOB},
+                env=SLURM,
                 cwd=self.root,
                 stdout=subprocess.DEVNULL,
                 stderr=errors,
@@ -286,6 +288,7 @@ def test_a_lease_runs_each_order_it_claims_with_exact_stdin_and_environment(
         "SERVATUS_LINKS": "1",
         "SERVATUS_BUDGET": "108000",
         "SERVATUS_JOB_ID": JOB,
+        "SERVATUS_JOB_END_TIME": END_TIME,
         "SERVATUS_RUN_TIME": "5400",
     }
     environment = lease.record("second")["env"]
@@ -465,12 +468,15 @@ def test_an_interrupt_records_the_stop_then_terminates_every_step(
         assert lease.markers(step_id) == {"start"}, "an interrupted step recorded an outcome"
 
 
+@pytest.mark.parametrize("variable", sorted(SLURM))
 @pytest.mark.parametrize("shell", SHELLS)
-def test_a_lease_without_a_job_id_fails_before_any_marker(tmp_path: Path, shell: str) -> None:
+def test_a_lease_without_a_job_id_fails_before_any_marker(
+    tmp_path: Path, shell: str, variable: str
+) -> None:
     lease = Lease(tmp_path)
     result = subprocess.run(
         [shell, str(lease.script)],
-        env={},
+        env={name: value for name, value in SLURM.items() if name != variable},
         cwd=tmp_path,
         capture_output=True,
         timeout=20,
@@ -478,7 +484,7 @@ def test_a_lease_without_a_job_id_fails_before_any_marker(tmp_path: Path, shell:
         start_new_session=True,
     )
     assert result.returncode != 0
-    assert b"Slurm did not set SLURM_JOB_ID" in result.stderr
+    assert f"Slurm did not set {variable}".encode() in result.stderr
     assert list(lease.logs.iterdir()) == []
 
 

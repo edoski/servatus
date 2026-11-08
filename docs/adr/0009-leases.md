@@ -134,9 +134,10 @@ of its chain, newest first, which ends every step in them.
 
 **Steps get the Campaign's step interface.** An order renders through the same function as a
 Campaign step, with a link 1 of 1 chain: `SERVATUS_TASK_KEY`, `SERVATUS_ALLOCATION_ID` (the step's
-id), `SERVATUS_SLOT=0`, `SERVATUS_JOB_ID` (the lease's job), `SERVATUS_LINK=1`,
-`SERVATUS_LINKS=1`, `SERVATUS_RUN_TIME` (measured at planning), and `SERVATUS_BUDGET` when the step
-plan carries a budget, under which a Task whose run time leaves no room is held `SPENT`.
+id), `SERVATUS_SLOT=0`, `SERVATUS_JOB_ID` and `SERVATUS_JOB_END_TIME` (the lease's job and its
+deadline), `SERVATUS_LINK=1`, `SERVATUS_LINKS=1`, `SERVATUS_RUN_TIME` (measured at planning), and
+`SERVATUS_BUDGET` when the step plan carries a budget, under which a Task whose run time leaves no
+room is held `SPENT`. A step plan requests nothing new from Slurm, so its `Plan.totals` are zero.
 
 **One command starts work.** `servatus start STATE TASKS.jsonl --lease ID` registers the file's
 unseen Tasks, refusing a changed Task under an existing key as `ensure` does, plans exactly the

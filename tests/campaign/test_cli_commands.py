@@ -147,6 +147,7 @@ def test_human_workflow_from_creation_to_status(cli: Cli[str]) -> None:
     code, out, _ = cli("plan", "state", "--output", "plan.json")
     assert code == 0
     assert "selected: 2 Tasks in 1 allocation" in out and "saved: plan.json" in out
+    assert "requests at most 0.67 CPU-hours, 0.34 GiB-hours\n" in out
     assert (cli.root / "state" / "campaign.json").read_bytes() == before
     assert stat.S_IMODE((cli.root / "plan.json").stat().st_mode) == 0o600
 
@@ -179,6 +180,7 @@ def test_machine_output_for_every_data_command(cli: Cli[str]) -> None:
     plan = cli.json("plan", "state", "--output", "plan.json")
     assert plan["format"] == "servatus.plan/4" and plan["selected"] == ["one", "two"]
     assert plan["saved"] == "plan.json" and plan["warnings"] == [] and plan["extensions"] == []
+    assert plan["totals"] == {"cpu_hours": 0.67, "gpu_hours": 0.0, "memory_gib_hours": 0.34}
     allocation = plan["allocations"][0]
     assert "script" not in allocation and allocation["cpus"] == 4
     assert allocation["link"] == {

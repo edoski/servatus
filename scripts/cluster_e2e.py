@@ -24,6 +24,9 @@ It drives small sweeps through the ``servatus`` CLI over SSH, one Task per alloc
   signal to the step (``yield`` logs it), ``afternotok`` with ``--kill-on-invalid-dep=yes``
   pruning the chain, the exact-name handoff lookup across nodes, and ``date`` on compute nodes
   (link 2 learns a positive ``SERVATUS_RUN_TIME``).
+- Link 2 of each chain (direct launcher) and, with ``--image-partition``, the Apptainer step
+  under ``--cleanenv`` must learn a positive ``SERVATUS_JOB_END_TIME`` from Slurm's
+  ``SLURM_JOB_END_TIME``.
 - Leases: ``plan --hold 2 --max-links 2`` holds two 1-CPU slots on 10-minute links with a
   90-second pre-limit signal. In link 1, ``servatus start`` runs ``a`` (exits 0) and ``b`` (traps
   ``SIGUSR1``), so ``c`` waits for room and starts only after ``a`` ended, reading QUEUED meanwhile
@@ -64,7 +67,10 @@ TASKS = {
     "long": "sleep 900",
 }
 POLL_SECONDS = 20
-REPORT = 'echo "link $SERVATUS_LINK of $SERVATUS_LINKS ran $SERVATUS_RUN_TIME of $SERVATUS_BUDGET"'
+REPORT = (
+    'echo "link $SERVATUS_LINK of $SERVATUS_LINKS ran $SERVATUS_RUN_TIME of $SERVATUS_BUDGET'
+    ' ends $SERVATUS_JOB_END_TIME"'
+)
 CHAIN_TASKS = {
     "yield": (
         f'{REPORT}; if [ "$SERVATUS_LINK" = 1 ]; then '
@@ -73,7 +79,9 @@ CHAIN_TASKS = {
     "die": f'{REPORT}; if [ "$SERVATUS_LINK" = 1 ]; then sleep 600; fi; exit 0',
 }
 DIED_OF_USR1 = 138
-STEP_REPORT = 'echo "$SERVATUS_TASK_KEY $SERVATUS_ALLOCATION_ID $SERVATUS_JOB_ID"'
+STEP_REPORT = (
+    'echo "$SERVATUS_TASK_KEY $SERVATUS_ALLOCATION_ID $SERVATUS_JOB_ID $SERVATUS_JOB_END_TIME"'
+)
 LEASE_TASKS = {
     "a": f"{STEP_REPORT}; sleep 30; exit 0",
     "b": f'{STEP_REPORT}; trap "echo got USR1; exit 75" USR1; sleep 600 & wait $!',
@@ -83,7 +91,10 @@ LEASE_TASKS = {
 IMAGE_SOURCE = "docker://debian:12-slim"
 PULL_JOB = "servatus-e2e-pull"
 PULL_SECONDS = 600
-IMAGE_TASK = 'cat /etc/debian_version; printf "%s %s\\n" "$SERVATUS_TASK_KEY" "$PWD"'
+IMAGE_TASK = (
+    'cat /etc/debian_version; printf "%s %s %s\\n" "$SERVATUS_TASK_KEY" "$PWD" '
+    '"$SERVATUS_JOB_END_TIME"'
+)
 IMAGE_GPU_TASK = (
     'cat /etc/debian_version && nvidia-smi -L && printf "%s %s\\n" "$SERVATUS_TASK_KEY" '
     '"$CUDA_VISIBLE_DEVICES"'
@@ -315,8 +326,10 @@ def pull_image(arguments: argparse.Namespace, run: PurePosixPath) -> None:
 def image_check(root: Path, run: PurePosixPath, deadline: float) -> dict[str, Any]:
     job, text = one_task(root, "image", ["/bin/sh", "-c", IMAGE_TASK], deadline)
     release, identity = text.splitlines()[-2:]
+    identity, end_time = identity.rsplit(" ", 1)
     assert release.startswith("12."), text
     assert identity == f"image {run}/work", text
+    assert positive(end_time), f"the Apptainer step learned no job end time: {text}"
     return {"job": job, "debian": release}
 
 
@@ -326,6 +339,10 @@ def image_gpu_check(root: Path, deadline: float) -> dict[str, Any]:
     key, visible = lines[-1].split(" ", 1)
     assert lines[-3].startswith("12.") and key == "image-gpu" and visible, text
     return {"job": job, "debian": lines[-3], "gpus": one_gpu(text), "visible": visible}
+
+
+def positive(text: str) -> bool:
+    return text.isdigit() and int(text) > 0
 
 
 def seconds(duration: str) -> int:
@@ -412,6 +429,7 @@ def chain_check(root: Path, deadline: float) -> dict[str, Any]:
         line = second.strip().splitlines()[0].split()
         assert line[:4] == ["link", "2", "of", "3"] and line[7] == "540", second
         assert int(line[5]) > 0, f"{key}: link 2 learned no run time: {second}"
+        assert line[8] == "ends" and positive(line[9]), f"{key}: no job end time: {second}"
         if key == "yield":
             assert "got USR1" in step_log(root, chain[1]["allocation_id"], key, deadline)
         summary[key] = {
@@ -548,7 +566,10 @@ def lease_check(
     stop_seconds = round(time.monotonic() - stopping)
     b = next(task for task in stopped["tasks"] if task["key"] == "b")
     assert b["exit_code"] == 75, b
-    assert "got USR1" in lease_step_log(root, "lease", steps["b"], deadline)
+    report = lease_step_log(root, "lease", steps["b"], deadline)
+    key, step, job, end_time = report.splitlines()[0].split()
+    assert (key, step) == ("b", steps["b"]) and int(job) > 0 and int(end_time) > 0, report
+    assert "got USR1" in report, report
     assert slurm_state(stopped, first) == "RUNNING", "the lease ended with its step"
 
     again = start(root, "lease", "lease.jsonl", first, "--retry", "a")

@@ -15,7 +15,8 @@ allocation, GPUs included, for its whole time limit, and Tasks start, stop, and 
 it from the operator's machine as steps: `plan --hold N` and `submit` make one, `start` starts the
 Tasks of a file in it, and `cancel`, `status`, `logs`, and `reconcile` work as for any Attempt (see
 [ADR 0009](https://github.com/edoski/servatus/blob/main/docs/adr/0009-leases.md)). Plans without a
-budget or a lease render exactly the batch scripts and `sbatch` requests 0.13 did.
+budget or a lease render the batch scripts and `sbatch` requests 0.13 did, plus
+`SERVATUS_JOB_END_TIME` in every step.
 
 **Upgrading from 0.13.** Schema 8 campaign state and `servatus.plan/2` plan files are rejected, so
 finish or abandon 0.13 campaigns with 0.13 first, then create new campaigns and plans. Published
@@ -77,6 +78,12 @@ planning with `--budget` or holding a lease. `plan` and `doctor` still read `./S
 - `FakeScheduler` emulates chains: `afternotok` dependencies with `--kill-on-invalid-dep=yes`, gated
   links, `signal_limit` for the pre-limit signal, and handoffs by the same rule the shell
   implements. `FakeJob` gains `dependencies`.
+- Every step learns its job's deadline as `SERVATUS_JOB_END_TIME` (UNIX seconds), passed from
+  Slurm's `SLURM_JOB_END_TIME`, which Slurm 23.02 and later set in every batch job. Like
+  `SLURM_JOB_ID`, the batch script requires it and exits before any run marker without it.
+- `plan` prints the most a plan requests, `requests at most N CPU-hours, N GPU-hours, N GiB-hours`
+  over every allocation and chain link at its time limit (GPU-hours only when nonzero). `plan
+  --json` carries it as `totals`, and the library as `Plan.totals`, a public `Totals`.
 - Leases: `plan --hold N [--max-links K]` (`Campaign.hold(profile, slots=N)`) plans one lease of N
   slots of the profile's per-Task resources, or a chain of K, and `submit` sends it as one job that
   gets the pre-limit signal in its batch shell. `plan --lease ID [--slots K]`
@@ -91,7 +98,8 @@ planning with `--budget` or holding a lease. `plan` and `doctor` still read `./S
   pre-limit signal the lease takes no more orders. A step stops being live as soon as it ended or
   was withdrawn, so its Task can be started again in the same lease. `reconcile` resolves an
   unresolved step at once. A new run marker, `<step>.<job>.void`, records a withdrawn step. Steps
-  get the Campaign's step environment. `Kind` is public, and `FakeScheduler` emulates leases with
+  get the Campaign's step environment, `SERVATUS_JOB_END_TIME` included, and request nothing in
+  `Plan.totals`. `Kind` is public, and `FakeScheduler` emulates leases with
   `poll`, `begin_step`, `end_step`, and `honor_stops`.
 
 ## [0.13.0] - 2026-11-06

@@ -39,6 +39,7 @@ PRELUDE = (
     "umask 077\n"
     "export PATH=/usr/bin:/bin\n"
     'job_id="${SLURM_JOB_ID:?Slurm did not set SLURM_JOB_ID}"\n'
+    'end_time="${SLURM_JOB_END_TIME:?Slurm did not set SLURM_JOB_END_TIME}"\n'
 )
 
 
@@ -137,7 +138,8 @@ def test_campaign_batch_scripts_are_unchanged_by_leases() -> None:
         f"--job-name=servatus-{ALLOCATION}-0 --export=ALL "
         f"--output={LOG}/{ALLOCATION}-%j-0.out --error={LOG}/{ALLOCATION}-%j-0.out "
         f"/usr/bin/env -i SERVATUS_TASK_KEY=t SERVATUS_ALLOCATION_ID={ALLOCATION} "
-        'SERVATUS_SLOT=0 SERVATUS_JOB_ID="$job_id" /opt/app/run --flag'
+        'SERVATUS_SLOT=0 SERVATUS_JOB_ID="$job_id" SERVATUS_JOB_END_TIME="$end_time" '
+        "/opt/app/run --flag"
     )
     assert plain == (
         f'{PRELUDE}marker={LOG}/{ALLOCATION}."$job_id"\n'
@@ -221,7 +223,8 @@ def test_an_order_tells_its_step_it_is_link_1_of_1(target_value: Target, prefix:
         f"{prefix}SERVATUS_ALLOCATION_ID={STEP} ",
         f"{prefix}SERVATUS_SLOT=0 ",
         f"{prefix}SERVATUS_LINK=1 {prefix}SERVATUS_LINKS=1 ",
-        f'{prefix}SERVATUS_JOB_ID="$job_id" {prefix}SERVATUS_RUN_TIME="$previous" ',
+        f'{prefix}SERVATUS_JOB_ID="$job_id" {prefix}SERVATUS_JOB_END_TIME="$end_time" '
+        f'{prefix}SERVATUS_RUN_TIME="$previous" ',
     ):
         assert word in unbudgeted
     assert "SERVATUS_BUDGET" not in unbudgeted
