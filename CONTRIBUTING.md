@@ -47,8 +47,10 @@ live in `pyproject.toml`.
 `tests/` is on the import path, so tests import helpers as `from support.builders import target`.
 
 `scripts/cluster_e2e.py` is the live check against a real cluster: direct and Apptainer launchers,
-CPU and one GPU, and two budgeted chains on 3-minute links. CI and pytest never run it. Run it
-before a release, and after any change to a Slurm command, a batch script, or a run marker.
+CPU and one GPU, two budgeted chains on 3-minute links, and a chain of two leases whose steps run,
+wait for room, stop, and rerun. CI and pytest never run it. Run it
+before a release, and after any change to a Slurm command, a batch script, an order, or a run
+marker.
 
 ## Rules
 
