@@ -8,7 +8,8 @@ through the store. Scheduler contact never happens while the campaign lock is he
 from __future__ import annotations
 
 import secrets
-from collections.abc import Callable, Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from functools import reduce
 from pathlib import PurePosixPath
@@ -25,9 +26,18 @@ from ..errors import (
     SubmissionInterrupted,
     Unavailable,
 )
-from ._config import Profile, Target, Task, task_keys
+from ._config import Continuation, Profile, Target, Task, task_keys
 from ._evidence import Marker, Observation, Observed, QueueRow, evidenced_job, observe, queue_row
-from ._plan import Decision, Plan, PlannedAllocation, batch, build_plan, capacity, decode_decision
+from ._plan import (
+    Decision,
+    Plan,
+    PlannedAllocation,
+    batch,
+    build_plan,
+    capacity,
+    decode_decision,
+    link_profile,
+)
 from ._policy import Request, Retry, decide, scope
 from ._remote import Transport
 from ._remote import connect as connect_target
@@ -42,19 +52,20 @@ from ._results import (
     WaitingAllocation,
 )
 from ._scheduler import Scheduler
-from ._script import log_path
+from ._script import dependency_options, log_path
 from ._state import (
     AcceptanceState,
     Attempt,
     State,
     append,
+    chain_jobs,
     create,
     history,
     record_intent,
     record_outcome,
     seal,
 )
-from ._status import ResultState, Status, classify_results, project
+from ._status import ResultState, Status, classify_results, current, project, run_time
 from ._store import Store
 
 ResultProbe = Callable[[Sequence[Task]], Collection[str]]
@@ -65,6 +76,9 @@ Clock = Callable[[], datetime]
 
 _ACCEPTED = AcceptanceState.ACCEPTED
 _PRIVATE = object()
+_ZERO = timedelta(0)
+_PLAIN = Continuation()
+_LATER_LINK = ("--kill-on-invalid-dep=yes",)
 NOT_SUBMITTED_AFTER = timedelta(minutes=15)
 """How long an unresolved allocation without any evidence waits before ``reconcile`` records it
 as not submitted: long past any ``sbatch`` still in flight when its reply was lost."""
@@ -91,6 +105,18 @@ def _merge(state: State, tasks: tuple[Task, ...]) -> State:
             raise Conflict(f"Task {task.key!r} differs from the registered Task with that key")
     unseen = [task for task in tasks if task.key not in known]
     return append(state, unseen) if unseen else state
+
+
+def _budgeted(
+    request: Request, continuation: Continuation, profile: Profile, spent: Mapping[str, timedelta]
+) -> Request:
+    """``request`` under ``continuation``'s budget: the Tasks with no room for one more link."""
+    if continuation.budget is None:
+        return request
+    exhausted = frozenset(
+        key for key, ran in spent.items() if not continuation.link_limits(profile.resources, ran)
+    )
+    return replace(request, exhausted=exhausted)
 
 
 def _interrupted(
@@ -238,7 +264,8 @@ class Campaign:
         """The last ``max_bytes`` (1 B to 1 MiB, checked before any contact) of an allocation
         log, or of one Task's step log.
 
-        ``task`` alone reads that Task's step log in its current accepted allocation.
+        ``task`` alone reads that Task's step log in its current allocation; in a chain, finding
+        it observes the chain's later links.
         """
         if task is None and allocation is None:
             raise ConfigurationError("read_log needs a task, an allocation, or both")
@@ -267,23 +294,38 @@ class Campaign:
         retry: Collection[str] | Retry = (),
         only: Collection[str] | None = None,
         tasks_per_allocation: int | None = None,
+        continuation: Continuation = _PLAIN,
     ) -> Plan:
-        """Decide which Tasks to submit with ``profile`` and pack them into allocations.
+        """Decide which Tasks to submit with ``profile`` and pack them into chains of
+        allocations, one link each unless ``continuation`` asks for more.
 
         Only Tasks never accepted, or requested for retry, are probed; scheduler evidence is
-        gathered only for the accepted Attempts of retry candidates.
+        gathered only for the accepted Attempts of retry candidates. An active continuation
+        measures each candidate's run time from that evidence and records it in the Decision.
         """
         if not isinstance(profile, Profile):
             raise ConfigurationError("profile must be a Profile")
+        if not isinstance(continuation, Continuation):
+            raise ConfigurationError("continuation must be a Continuation")
         request = Request.parse(retry, only)
         if request.retry is Retry.INCOMPLETE and self._probe is None:
             raise ConfigurationError("Retry.INCOMPLETE needs a result probe")
         cap = capacity(profile.target, profile.resources, tasks_per_allocation)
+        continuation.check(profile.resources)
         state = self._store.read()
         observed, results = self._consult(state, request)
         self._unchanged(state)
+        spent = self._spent(state, observed) if continuation.active else {}
+        request = _budgeted(request, continuation, profile, spent)
         selection = decide(state, observed, results, request)
-        selected, deferred = batch(selection.selected, profile.target, cap)
+
+        def links(group: tuple[str, ...]) -> int:
+            return max(
+                len(continuation.link_limits(profile.resources, spent.get(key, _ZERO)))
+                for key in group
+            )
+
+        selected, deferred = batch(selection.selected, profile.target, cap, links)
         decision = Decision(
             campaign_id=state.campaign_id,
             revision=state.revision,
@@ -294,6 +336,11 @@ class Campaign:
             deferred=deferred,
             tasks_per_allocation=cap,
             probe_required=self._probe is not None,
+            continuation=continuation,
+            spent={key: spent.get(key, _ZERO) for key in selected} if continuation.active else {},
+            extensions={
+                key: reason for key, reason in selection.extensions.items() if key in selected
+            },
         )
         return build_plan(state, decision)
 
@@ -306,24 +353,29 @@ class Campaign:
         return plan
 
     def validate(self, plan: Plan) -> tuple[ShapeCheck, ...]:
-        """Ask ``sbatch --test-only`` once per distinct allocation shape. Records nothing."""
+        """Ask ``sbatch --test-only`` once per distinct allocation shape. Records nothing.
+
+        A shape of a later chain link also carries ``--kill-on-invalid-dep=yes``; its
+        dependency needs job numbers that exist only at submission."""
         plan = self._verified(plan)
         if not plan.allocations:
             return ()
         scheduler = self._scheduler(plan.decision.profile.target)
-        shapes: dict[int, PlannedAllocation] = {}
+        shapes: dict[tuple[int, timedelta, bool, bool], PlannedAllocation] = {}
         for item in plan.allocations:
-            shapes.setdefault(len(item.task_keys), item)
+            later = item.link.index > 1
+            relay = any(word.startswith("--signal=B:") for word in item.argv)
+            shapes.setdefault((len(item.task_keys), item.time_limit, later, relay), item)
         return tuple(
             ShapeCheck(
-                count,
+                len(item.task_keys),
                 item.cpus,
                 item.memory_mib,
                 item.gpus,
                 item.time_limit,
-                *scheduler.test_only(item.argv, item.script),
+                *scheduler.test_only((*item.argv, *(_LATER_LINK if later else ())), item.script),
             )
-            for count, item in shapes.items()
+            for (_, _, later, _), item in shapes.items()
         )
 
     # --- Submission ---------------------------------------------------------------------------
@@ -332,9 +384,10 @@ class Campaign:
         """Submit exactly the reviewed plan, recording durable intent before each ``sbatch``.
 
         The plan is rebuilt and compared first, the scheduler is pinged, and every planned Task
-        must still be eligible; all of that happens before any intent. A stop after that raises
-        ``SubmissionInterrupted`` whose ``result`` lists receipts, unresolved allocations, and
-        unattempted allocations.
+        must still be eligible, with the run time it was planned with; all of that happens before
+        any intent. Links go in order, every chain's link 1 first, and each later link depends on
+        the jobs of the links before it. A stop after that raises ``SubmissionInterrupted`` whose
+        ``result`` lists receipts, unresolved allocations, and unattempted allocations.
         """
         plan = self._verified(plan)
         decision = plan.decision
@@ -353,7 +406,7 @@ class Campaign:
             unresolved = (UnresolvedSubmission(item.allocation_id, item.task_keys),)
             try:
                 # Each allocation adds an intent and a receipt; any other change is stale.
-                self._claim(decision, item, decision.revision + 2 * index)
+                claimed = self._claim(decision, item, decision.revision + 2 * index)
             except Exception as error:
                 if self._recorded(item.allocation_id):  # durable, though the commit failed
                     stop = "recording the intent failed after it became durable"
@@ -361,7 +414,8 @@ class Campaign:
                 stop = "the next intent was not recorded"
                 raise _interrupted(stop, error, receipts, (), plan.allocations[index:]) from error
             try:
-                job = scheduler.submit(item.argv, item.script)
+                after = dependency_options(chain_jobs(claimed, item.link))
+                job = scheduler.submit((*item.argv, *after), item.script)
             except Exception as error:
                 stop = "scheduler acceptance is unresolved"
                 raise _interrupted(stop, error, receipts, unresolved, later) from error
@@ -420,8 +474,12 @@ class Campaign:
         """``scancel`` the chosen allocations that Slurm still lists as queued or running.
 
         ``tasks`` selects every allocation of each Task that was accepted or recorded as not
-        submitted. Returns a receipt (with the job Slurm listed) for each allocation that was
-        asked to stop; packed allocations stop all their Tasks.
+        submitted. A chosen chain link brings every later link of its chain. Allocations are
+        cancelled newest first, so no later link becomes eligible while an earlier one stops; after
+        a failed ``scancel``, no earlier link of that chain is tried, and an unresolved link of a
+        chosen chain is a ``Conflict``.
+        Returns a receipt (with the job Slurm listed) for each allocation that was asked to stop;
+        packed allocations stop all their Tasks.
         """
         keys = () if tasks is None else task_keys(tasks, "tasks")
         identities = () if allocations is None else task_keys(allocations, "allocations")
@@ -443,10 +501,28 @@ class Campaign:
         ]
         if missing := [key for key in keys if not any(key in item.task_keys for item in chosen)]:
             raise Conflict(f"Task {missing[0]!r} has no submitted allocation to cancel")
-        rows, _ = self._evidence(chosen)
+        first: dict[str, int] = {}
+        for item in chosen:
+            first.setdefault(item.link.chain, item.link.index)
+        chained = [
+            item
+            for item in state.attempts
+            if item.link.chain in first and item.link.index >= first[item.link.chain]
+        ]
+        for item in chained:
+            if item.acceptance is AcceptanceState.UNRESOLVED:
+                raise Conflict(f"allocation {item.allocation_id} is unresolved; reconcile it first")
+        rows, _ = self._evidence(chained)
         cancelled: list[Receipt] = []
         failed: list[str] = []
-        for attempt in chosen:
+        broken: set[str] = set()
+        skipped: list[str] = []
+        for attempt in reversed(chained):
+            if attempt.link.chain in broken:
+                # An earlier link stopped after its pre-limit signal would hand off to the link
+                # that is still queued.
+                skipped.append(attempt.allocation_id)
+                continue
             row = queue_row(attempt.allocation_id, rows[attempt.allocation_id], attempt.job)
             if row is None or row.settling:
                 continue
@@ -454,11 +530,15 @@ class Campaign:
                 self._scheduler(attempt.profile.target).cancel(attempt.allocation_id)
             except Unavailable as error:
                 failed.append(f"{attempt.allocation_id} ({error})")
+                broken.add(attempt.link.chain)
             else:
                 cancelled.append(Receipt(attempt.allocation_id, row.job, attempt.task_keys))
         if failed:
             done = ", ".join(item.allocation_id for item in cancelled) or "none"
-            raise Unavailable(f"cancel failed for {'; '.join(failed)}; cancelled: {done}")
+            message = f"cancel failed for {'; '.join(failed)}; cancelled: {done}"
+            if skipped:
+                message += f"; not attempted: {', '.join(skipped)}"
+            raise Unavailable(message)
         return tuple(cancelled)
 
     # --- Internals ----------------------------------------------------------------------------
@@ -518,7 +598,12 @@ class Campaign:
             name = attempt.allocation_id
             if attempt.job is not None:
                 observations[name] = observe(
-                    name, attempt.job, len(attempt.task_keys), rows[name], markers[name]
+                    name,
+                    attempt.job,
+                    len(attempt.task_keys),
+                    rows[name],
+                    markers[name],
+                    gated=attempt.link.index > 1,
                 )
             elif (row := queue_row(name, rows[name], None)) is not None:
                 strays[name] = row.job
@@ -531,9 +616,12 @@ class Campaign:
     def _current(self, state: State, key: str) -> Attempt:
         if (past := history(state).get(key)) is None:
             raise NotFound(f"unknown Task: {key!r}")
-        if not past.accepted:
+        chained = [attempt.allocation_id for attempt, _ in past.accepted if attempt.link.index > 1]
+        observed = self._observe(state, chained) if chained else Observed({}, {})
+        found = current(past, observed)
+        if found is None:
             raise NotFound(f"Task {key!r} has no accepted allocation")
-        return past.accepted[-1][0]
+        return found[0]
 
     def _verified(self, plan: Plan) -> Plan:
         """Rebuild ``plan`` the way a saved plan is loaded; refuse it unless it is exactly what
@@ -558,6 +646,11 @@ class Campaign:
         past = history(state)
         request = Request(frozenset(key for key in keys if past[key].accepted), frozenset(keys))
         observed, results = self._consult(state, request)
+        continuation, profile = decision.continuation, decision.profile
+        spent = self._spent(state, observed) if continuation.active else {}
+        if continuation.active and {key: spent.get(key) for key in keys} != decision.spent:
+            raise StalePlan("a planned Task's measured run time changed after planning; plan again")
+        request = _budgeted(request, continuation, profile, spent)
         try:
             selection = decide(state, observed, results, request)
         except PlanRefused as error:
@@ -567,6 +660,8 @@ class Campaign:
                 f"{key!r} ({selection.held[key]})" for key in keys if key in selection.held
             )
             raise StalePlan(f"planned Tasks are no longer eligible: {held}; plan again")
+        if selection.extensions != decision.extensions:
+            raise StalePlan("what the planned extensions extend changed after planning; plan again")
 
     def _consult(self, state: State, request: Request) -> tuple[Observed, dict[str, ResultState]]:
         """Probe and observe, once, exactly what ``decide`` may consult for ``request``."""
@@ -574,9 +669,9 @@ class Campaign:
         results = self._results(tasks)
         return self._observe(state, allocation_ids), results
 
-    def _claim(self, decision: Decision, item: PlannedAllocation, expected: int) -> None:
-        """Record intent if the campaign is still at revision ``expected``."""
-        keys = item.task_keys
+    def _claim(self, decision: Decision, item: PlannedAllocation, expected: int) -> State:
+        """Record intent if the campaign is still at revision ``expected``; the committed state."""
+        profile = link_profile(decision.profile, item.time_limit)
 
         def claim(state: State) -> State:
             if state.revision != expected:
@@ -584,12 +679,24 @@ class Campaign:
             return record_intent(
                 state,
                 allocation_id=item.allocation_id,
-                task_keys=keys,
-                profile=decision.profile,
+                link=item.link,
+                task_keys=item.task_keys,
+                profile=profile,
                 at=self._time(),
             )
 
-        self._store.update(claim)
+        return self._store.update(claim)
+
+    def _spent(self, state: State, observed: Observed) -> dict[str, timedelta]:
+        """The run time of every Task whose accepted Attempts were all observed; a Task never
+        accepted has run for no time."""
+        now = self._time()
+        spent: dict[str, timedelta] = {}
+        for key, past in history(state).items():
+            measured = run_time(past, observed, now)
+            if measured is not None:
+                spent[key] = measured.total
+        return spent
 
     def _recorded(self, allocation_id: str) -> bool:
         """Whether an intent is durable; an unreadable campaign counts as recorded."""

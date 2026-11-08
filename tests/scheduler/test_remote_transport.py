@@ -6,6 +6,7 @@ import selectors
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
@@ -14,11 +15,31 @@ from scheduler_fixtures import ALLOCATION, IDENTITY
 from support.builders import target
 
 import servatus.campaign._remote as _remote
-from servatus.campaign._evidence import End, QueueRow, Start
+from servatus.campaign._evidence import End, Handoff, QueueRow, Start
 from servatus.campaign._remote import Completed, Local, Ssh, after_marker, connect
 from servatus.campaign._scheduler import CommandFailed, Scheduler
 from servatus.campaign._script import check_command
 from servatus.errors import ConfigurationError, Unavailable
+
+GNU_FIND = (
+    subprocess.run(
+        ("/usr/bin/find", "/dev/null", "-maxdepth", "0", "-printf", ""),
+        capture_output=True,
+        check=False,
+    ).returncode
+    == 0
+)
+needs_gnu_find = pytest.mark.skipif(
+    not GNU_FIND, reason="clusters run GNU find, whose -printf this host's find lacks"
+)
+MARKED_AT = datetime(2030, 1, 1, 12, 0, 0, 250000, tzinfo=UTC)
+
+
+def stamp(path: Path, at: datetime = MARKED_AT) -> None:
+    path.touch()
+    nanoseconds = (at - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(microseconds=1) * 1000
+    os.utime(path, ns=(nanoseconds, nanoseconds))
+
 
 FAKE_SSH = """#!{python}
 import json, os, sys, time
@@ -415,6 +436,7 @@ def test_every_spawn_failure_is_unavailable(
         Local().run(("/bin/true",))
 
 
+@needs_gnu_find
 def test_scheduler_over_noisy_ssh_reads_exact_replies(tmp_path: Path) -> None:
     # End to end: the fake ssh prints a banner and shell noise, then really executes stub Slurm
     # commands and the real find under the scrubbed remote environment.
@@ -423,7 +445,7 @@ def test_scheduler_over_noisy_ssh_reads_exact_replies(tmp_path: Path) -> None:
     slurm.mkdir()
     logs.mkdir()
     for name in (f"{ALLOCATION}.42.start", f"{ALLOCATION}.42.0.0.end", f"{ALLOCATION}-42.out"):
-        (logs / name).touch()
+        stamp(logs / name)
     replies = {
         "sbatch": "printf '42\\n'",
         "squeue": f"printf '42|{IDENTITY}|COMPLETED\\n'",
@@ -438,22 +460,34 @@ def test_scheduler_over_noisy_ssh_reads_exact_replies(tmp_path: Path) -> None:
     assert scheduler.submit(argv, b"#!/bin/sh\n") == 42
     assert scheduler.queue([ALLOCATION]) == {ALLOCATION: (QueueRow(42, "COMPLETED"),)}
     markers = scheduler.markers({ALLOCATION: 1})
-    assert sorted(markers[ALLOCATION], key=repr) == [End(42, 0, 0), Start(42)]
+    assert sorted(markers[ALLOCATION], key=repr) == [
+        End(42, 0, 0, MARKED_AT),
+        Start(42, MARKED_AT),
+    ]
 
 
+@needs_gnu_find
 @pytest.mark.parametrize("many", [False, True], ids=["named", "every"])
-def test_real_find_follows_a_symlinked_log_root(tmp_path: Path, many: bool) -> None:
+def test_real_find_follows_a_symlinked_log_root_and_reads_exact_mtimes(
+    tmp_path: Path, many: bool
+) -> None:
     logs = tmp_path / "logs"
     logs.mkdir()
-    (logs / f"{ALLOCATION}.42.start").touch()
-    (logs / f"{ALLOCATION}.42.0.3.end").touch()
+    ended = MARKED_AT + timedelta(hours=3, microseconds=1)
+    stamp(logs / f"{ALLOCATION}.42.start")
+    stamp(logs / f"{ALLOCATION}.42.0.3.end", ended)
+    stamp(logs / f"{ALLOCATION}.0.go")
     link = tmp_path / "link"
     link.symlink_to(logs)
     counts = {ALLOCATION: 1}
     if many:
         counts |= {f"{index:024x}": 1 for index in range(8)}
     markers = Scheduler(Local(), target(slurm_bin="/usr/bin", log_root=link)).markers(counts)
-    assert sorted(markers[ALLOCATION], key=repr) == [End(42, 0, 3), Start(42)]
+    assert sorted(markers[ALLOCATION], key=repr) == [
+        End(42, 0, 3, ended),
+        Handoff(0, MARKED_AT),
+        Start(42, MARKED_AT),
+    ]
 
 
 def test_writable_directory_tells_a_writable_directory_from_anything_else(tmp_path: Path) -> None:

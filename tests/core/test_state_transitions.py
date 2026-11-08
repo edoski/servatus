@@ -16,6 +16,7 @@ from servatus.campaign._state import (
     SCHEMA_VERSION,
     AcceptanceState,
     Attempt,
+    Link,
     RegisteredTask,
     State,
     append,
@@ -135,8 +136,10 @@ def test_outcome_survives_unrelated_authoring() -> None:
 
 
 def _intent(state: State, **changes: Any) -> State:
+    identity = allocation_id(len(state.attempts) + 1)
     values: dict[str, Any] = {
-        "allocation_id": allocation_id(len(state.attempts) + 1),
+        "allocation_id": identity,
+        "link": Link(identity, 1, 1),
         "task_keys": ("task-0",),
         "profile": profile(),
         "at": NOW,
@@ -153,6 +156,9 @@ def _intent(state: State, **changes: Any) -> State:
         ({"task_keys": ("task-0", "task-0")}, "invalid attempt task references"),
         ({"task_keys": ("foreign",)}, "invalid attempt task references"),
         ({"task_keys": ("task-1", "task-0")}, "not in roster order"),
+        ({"link": Link("a" * 24, 1, 1)}, "link 1 must name its own chain"),
+        ({"link": "link"}, "invalid link"),
+        ({"link": Link(allocation_id(1), 2, 2)}, "must follow the accepted previous link"),
     ],
 )
 def test_record_intent_rejects_invalid_attempts_as_conflicts(
@@ -168,6 +174,73 @@ def test_record_intent_rejects_overlap_with_unresolved_work() -> None:
         _intent(state, task_keys=("task-0", "task-1"))
     accepted, _ = submit(roster(2), ["task-0"])
     assert _intent(accepted, task_keys=("task-0", "task-1")).revision == 3
+
+
+@pytest.mark.parametrize(
+    ("chain", "index", "count", "budget", "message"),
+    [
+        ("X" * 24, 1, 1, None, "invalid chain identity"),
+        ("a" * 24, 0, 1, None, "invalid link position"),
+        ("a" * 24, 2, 1, None, "invalid link position"),
+        ("a" * 24, 1, 33, None, "invalid link position"),
+        ("a" * 24, True, 1, None, "invalid link position"),
+        ("a" * 24, 1, 1, timedelta(seconds=90), "invalid link budget"),
+        ("a" * 24, 1, 1, timedelta(0), "invalid link budget"),
+    ],
+)
+def test_links_reject_impossible_positions(
+    chain: str, index: int, count: int, budget: timedelta | None, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        Link(chain, index, count, budget)
+
+
+def _chain(count: int = 3, budget: timedelta | None = timedelta(hours=3)) -> tuple[State, str]:
+    """Link 1 of a ``count``-link chain of task-0 and task-1, accepted."""
+    first = allocation_id(1)
+    return submit(roster(3), ["task-0", "task-1"], link=Link(first, 1, count, budget))
+
+
+def test_a_link_follows_the_accepted_previous_link_of_its_chain() -> None:
+    state, first = _chain()
+    state, second = submit(state, ["task-0", "task-1"], link=Link(first, 2, 3, timedelta(hours=3)))
+    state, third = intend(state, ["task-0", "task-1"], link=Link(first, 3, 3, timedelta(hours=3)))
+    assert [attempt.link.index for attempt in state.attempts] == [1, 2, 3]
+    assert decode(encode(state)) == state
+    assert state.attempt(third).link.chain == state.attempt(second).link.chain == first
+
+
+@pytest.mark.parametrize(
+    ("keys", "link"),
+    [
+        (["task-0"], Link(allocation_id(1), 2, 3, timedelta(hours=3))),
+        (["task-0", "task-1"], Link(allocation_id(1), 2, 4, timedelta(hours=3))),
+        (["task-0", "task-1"], Link(allocation_id(1), 2, 3, None)),
+        (["task-0", "task-1"], Link(allocation_id(1), 3, 3, timedelta(hours=3))),
+    ],
+    ids=["other-tasks", "other-count", "other-budget", "skips-a-link"],
+)
+def test_a_link_that_does_not_continue_its_chain_is_a_conflict(keys: list[str], link: Link) -> None:
+    state, _ = _chain()
+    with pytest.raises(Conflict, match="must follow the accepted previous link"):
+        intend(state, keys, link=link)
+
+
+@pytest.mark.parametrize("resolved", [False, True], ids=["unresolved", "not-submitted"])
+def test_a_link_needs_its_previous_link_accepted_first(resolved: bool) -> None:
+    first = allocation_id(1)
+    state, _ = intend(roster(2), ["task-0"], link=Link(first, 1, 2))
+    if resolved:
+        state = record_outcome(state, first, None)
+    with pytest.raises(Conflict, match="must follow the accepted previous link"):
+        intend(state, ["task-0"], link=Link(first, 2, 2))
+
+
+def test_a_chain_link_is_recorded_once() -> None:
+    state, first = _chain(count=2, budget=None)
+    state, _ = submit(state, ["task-0", "task-1"], link=Link(first, 2, 2))
+    with pytest.raises(Conflict, match="duplicate chain link"):
+        intend(state, ["task-0", "task-1"], link=Link(first, 2, 2))
 
 
 # --- documents -------------------------------------------------------------------------------
@@ -190,15 +263,22 @@ def test_documents_round_trip_canonically() -> None:
     assert data.endswith(b"\n") and data == reencode(json.loads(data))
     assert decode(data) == state
     raw = json.loads(data)
-    assert raw["schema_version"] == SCHEMA_VERSION == 8
+    assert raw["schema_version"] == SCHEMA_VERSION == 9
     assert raw["tasks"][3] == {
         "task": {"key": "task-3", "args": ["x"], "stdin": "", "env": {"A": "1"}},
         "revision": 3,
     }
     assert [attempt["job"] for attempt in raw["attempts"]] == [101, 102, None, None]
     assert [attempt["outcome_revision"] for attempt in raw["attempts"]] == [2, 5, 8, None]
+    assert raw["attempts"][0]["link"] == {
+        "chain": raw["attempts"][0]["allocation_id"],
+        "index": 1,
+        "count": 1,
+        "budget": None,
+    }
     assert {key for attempt in raw["attempts"] for key in attempt} == {
         "allocation_id",
+        "link",
         "task_keys",
         "profile",
         "intent_revision",
@@ -236,6 +316,12 @@ def _unresolve_first(raw: dict[str, Any]) -> None:
     raw["attempts"][0].update(job=None, outcome_revision=None)
 
 
+def _reuse_identity(raw: dict[str, Any]) -> None:
+    identity = raw["attempts"][0]["allocation_id"]
+    raw["attempts"][1].update(allocation_id=identity)
+    raw["attempts"][1]["link"].update(chain=identity)
+
+
 def _task(raw: dict[str, Any], index: int = 0) -> dict[str, Any]:
     return raw["tasks"][index]["task"]
 
@@ -249,10 +335,7 @@ EDITS: list[tuple[str, Callable[[dict[str, Any]], None]]] = [
     ("duplicate task key", lambda r: _task(r, 2).update(key="task-0")),
     ("conflicting seal revision", lambda r: r.update(sealed_revision=3)),
     ("invalid event revision", lambda r: r["attempts"][0].update(outcome_revision=3)),
-    (
-        "duplicate allocation identity",
-        lambda r: r["attempts"][1].update(allocation_id=r["attempts"][0]["allocation_id"]),
-    ),
+    ("duplicate allocation identity", lambda r: _reuse_identity(r)),
     ("invalid intent revision", lambda r: r["attempts"][1].update(intent_revision=1)),
     (
         "invalid attempt task references",
@@ -268,7 +351,11 @@ EDITS: list[tuple[str, Callable[[dict[str, Any]], None]]] = [
     ("unresolved intent has a job", lambda r: r["attempts"][3].update(job=1)),
     ("invalid outcome revision", lambda r: r["attempts"][0].update(outcome_revision=1)),
     ("invalid job number", lambda r: r["attempts"][0].update(job=0)),
-    ("unsupported campaign schema; expected 8", lambda r: r.update(schema_version=7)),
+    ("unsupported campaign schema; expected 9", lambda r: r.update(schema_version=8)),
+    ("link 1 must name its own chain", lambda r: r["attempts"][0]["link"].update(chain="a" * 24)),
+    ("invalid link position", lambda r: r["attempts"][0]["link"].update(index=2)),
+    ("invalid link budget", lambda r: r["attempts"][0]["link"].update(budget="00:00:30")),
+    ("missing key 'link'", lambda r: r["attempts"][0].pop("link")),
     ("profile key does not match its content", lambda r: _rename_profile(r)),
     ("profiles do not match attempt references", lambda r: _add_unused_profile(r)),
     ("expected int", lambda r: r["attempts"][0].update(job=True)),
@@ -305,14 +392,12 @@ def test_every_defect_is_corrupt_state_with_its_reason(
         decode(_edit(edit))
 
 
-def test_a_schema_7_document_is_corrupt_state() -> None:
+def test_a_schema_8_document_is_corrupt_state() -> None:
     raw = json.loads(encode(history()))
-    raw["schema_version"] = 7
+    raw["schema_version"] = 8
     for attempt in raw["attempts"]:
-        attempt["duplicate_risk"] = []
-        if attempt["job"] is not None:
-            attempt["job"] = {"job_id": attempt["job"], "cluster": None}
-    with pytest.raises(CorruptState, match="unsupported campaign schema; expected 8"):
+        del attempt["link"]
+    with pytest.raises(CorruptState, match="unsupported campaign schema; expected 9"):
         decode(reencode(raw))
 
 
@@ -369,6 +454,7 @@ def test_direct_construction_checks_attempt_time_and_job() -> None:
     with pytest.raises(ValueError, match="intent time must be UTC"):
         Attempt(
             allocation_id=allocation_id(1),
+            link=Link(allocation_id(1), 1, 1),
             task_keys=("task-0",),
             profile=profile(),
             intent_revision=1,
@@ -377,6 +463,7 @@ def test_direct_construction_checks_attempt_time_and_job() -> None:
     with pytest.raises(ValueError, match="invalid job number"):
         Attempt(
             allocation_id=allocation_id(1),
+            link=Link(allocation_id(1), 1, 1),
             task_keys=("task-0",),
             profile=profile(),
             intent_revision=1,
@@ -394,6 +481,7 @@ def large_state(task_count: int = 1000, attempt_count: int = 3000) -> State:
     attempts = tuple(
         Attempt(
             allocation_id=allocation_id(index + 1),
+            link=Link(allocation_id(index + 1), 1, 1),
             task_keys=(keys[index % task_count],),
             profile=profile(),
             intent_revision=2 * index + 1,

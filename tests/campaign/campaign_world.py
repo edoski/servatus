@@ -32,7 +32,8 @@ START = datetime(2030, 1, 1, 12, 0, 0, tzinfo=UTC)
 
 
 class Clock:
-    """A settable UTC clock for the Campaign: intent times and reconcile deadlines."""
+    """A settable UTC clock shared by the Campaign (intent times, reconcile deadlines) and the
+    fake cluster (marker mtimes)."""
 
     def __init__(self, now: datetime = START) -> None:
         self.now = now
@@ -171,5 +172,6 @@ class World:
 
 
 def make_world(root: Path) -> World:
-    fake = FakeScheduler()
-    return World(root, Clock(), fake, Wire(fake))
+    clock = Clock()
+    fake = FakeScheduler(clock=clock)
+    return World(root, clock, fake, Wire(fake))

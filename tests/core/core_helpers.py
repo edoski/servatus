@@ -10,8 +10,15 @@ from support.builders import profile, tasks
 
 from servatus.campaign import _codec
 from servatus.campaign._config import Profile
-from servatus.campaign._evidence import Observation, Observed
-from servatus.campaign._state import AcceptanceState, State, create, record_intent, record_outcome
+from servatus.campaign._evidence import Observation, Observed, StepEnd
+from servatus.campaign._state import (
+    AcceptanceState,
+    Link,
+    State,
+    create,
+    record_intent,
+    record_outcome,
+)
 from servatus.campaign._status import ResultState
 
 NOW = datetime(2030, 1, 1, tzinfo=UTC)
@@ -27,13 +34,19 @@ def roster(count: int = 3, *, appendable: bool = False) -> State:
 
 
 def intend(
-    state: State, keys: Iterable[str], *, profile_value: Profile | None = None
+    state: State,
+    keys: Iterable[str],
+    *,
+    profile_value: Profile | None = None,
+    link: Link | None = None,
 ) -> tuple[State, str]:
-    """Record intent for ``keys``; the identity numbers the Attempt."""
+    """Record intent for ``keys``, as link 1 of 1 unless ``link`` says otherwise; the identity
+    numbers the Attempt."""
     identity = allocation_id(len(state.attempts) + 1)
     changed = record_intent(
         state,
         allocation_id=identity,
+        link=link or Link(identity, 1, 1),
         task_keys=tuple(keys),
         profile=profile_value or profile(),
         at=NOW + timedelta(minutes=len(state.attempts)),
@@ -47,9 +60,10 @@ def submit(
     *,
     accepted: bool = True,
     profile_value: Profile | None = None,
+    link: Link | None = None,
 ) -> tuple[State, str]:
     """Intent plus outcome: job ``100 + attempt count`` when accepted, else non-submission."""
-    changed, identity = intend(state, keys, profile_value=profile_value)
+    changed, identity = intend(state, keys, profile_value=profile_value, link=link)
     job = len(changed.attempts) + 100 if accepted else None
     return record_outcome(changed, identity, job), identity
 
@@ -59,10 +73,24 @@ def seen(
     *exit_codes: int | None,
     started: bool = True,
     stopped: bool = False,
+    limited: bool = False,
+    handed: tuple[bool, ...] | None = None,
 ) -> Observation:
     """One allocation's evidence: its squeue state (``None`` once purged), markers, and one exit
-    code per slot (a single unfinished slot by default)."""
-    return Observation(slurm_state, started, stopped, exit_codes or (None,))
+    code per slot (a single unfinished slot by default). A started allocation started at ``NOW``;
+    steps return 10 minutes later, after the pre-limit signal (5 minutes) when ``limited``, and a
+    stop comes 20 minutes later."""
+    codes = exit_codes or (None,)
+    return Observation(
+        slurm_state,
+        NOW if started else None,
+        NOW + timedelta(minutes=20) if stopped else None,
+        NOW + timedelta(minutes=5) if limited else None,
+        tuple(
+            None if code is None else StepEnd(code, NOW + timedelta(minutes=10)) for code in codes
+        ),
+        handed or (True,) * len(codes),
+    )
 
 
 def evidence(
@@ -91,11 +119,12 @@ SLURM_STATES = st.sampled_from([None, None, "PENDING", "RUNNING", "COMPLETED", "
 
 @st.composite
 def observations_of(draw: st.DrawFn, task_count: int) -> Observation:
-    return Observation(
+    return seen(
         draw(SLURM_STATES),
-        draw(st.booleans()),
-        draw(st.booleans()),
-        tuple(draw(st.none() | st.integers(0, 255)) for _ in range(task_count)),
+        *(draw(st.none() | st.integers(0, 255)) for _ in range(task_count)),
+        started=draw(st.booleans()),
+        stopped=draw(st.booleans()),
+        limited=draw(st.booleans()),
     )
 
 

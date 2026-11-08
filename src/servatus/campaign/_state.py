@@ -15,9 +15,9 @@ from typing import Any, cast
 
 from ..errors import ConfigurationError, Conflict, CorruptState, NotFound
 from . import _codec
-from ._config import Profile, Task
+from ._config import MAX_LINKS, MINUTE, Profile, Task
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 class _Invalid(ValueError):
@@ -41,6 +41,34 @@ class RegisteredTask:
     revision: int
 
 
+@dataclass(frozen=True, slots=True)
+class Link:
+    """One Attempt's place in its chain of allocations. A plain allocation is link 1 of 1.
+
+    ``chain`` is the allocation id of link 1. ``budget`` is the lifetime run-time budget the
+    chain's plan granted each of its Tasks; status shows it, and nothing decides from it.
+    """
+
+    chain: str
+    index: int
+    count: int
+    budget: timedelta | None = None
+
+    def __post_init__(self) -> None:
+        _require(_codec.is_hex(self.chain, 24), "invalid chain identity")
+        _require(
+            type(self.index) is int
+            and type(self.count) is int
+            and 1 <= self.index <= self.count <= MAX_LINKS,
+            "invalid link position",
+        )
+        budget = self.budget
+        _require(
+            budget is None or (budget > timedelta(0) and budget % MINUTE == timedelta(0)),
+            "invalid link budget",
+        )
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Attempt:
     """One allocation's durable record: intent before scheduler contact, then one outcome.
@@ -49,6 +77,7 @@ class Attempt:
     """
 
     allocation_id: str
+    link: Link
     task_keys: tuple[str, ...]
     profile: Profile
     intent_revision: int
@@ -58,6 +87,11 @@ class Attempt:
 
     def __post_init__(self) -> None:
         _require(_codec.is_hex(self.allocation_id, 24), "invalid allocation identity")
+        _require(isinstance(self.link, Link), "invalid link")
+        _require(
+            self.link.index > 1 or self.link.chain == self.allocation_id,
+            "link 1 must name its own chain",
+        )
         _require(self.intent_at.utcoffset() == timedelta(0), "intent time must be UTC")
         keys = self.task_keys
         _require(bool(keys) and len(set(keys)) == len(keys), "invalid attempt task references")
@@ -163,12 +197,26 @@ def _check(state: State) -> None:
         events.add(value)
 
     identities: set[str] = set()
+    links: dict[tuple[str, int], Attempt] = {}
     busy_until: dict[str, float] = {}
     last_intent = 0
     for attempt in state.attempts:
-        intent, keys = attempt.intent_revision, attempt.task_keys
+        intent, keys, link = attempt.intent_revision, attempt.task_keys, attempt.link
         _require(attempt.allocation_id not in identities, "duplicate allocation identity")
         identities.add(attempt.allocation_id)
+        _require((link.chain, link.index) not in links, "duplicate chain link")
+        if link.index > 1:
+            previous = links.get((link.chain, link.index - 1))
+            _require(
+                previous is not None
+                and previous.link.count == link.count
+                and previous.link.budget == link.budget
+                and previous.task_keys == keys
+                and previous.job is not None
+                and cast(int, previous.outcome_revision) < intent,
+                "a link must follow the accepted previous link of its chain",
+            )
+        links[link.chain, link.index] = attempt
         _require(intent > last_intent, "invalid intent revision")
         last_intent = intent
         event(intent)
@@ -246,19 +294,34 @@ def record_intent(
     state: State,
     *,
     allocation_id: str,
+    link: Link,
     task_keys: tuple[str, ...],
     profile: Profile,
     at: datetime,
 ) -> State:
+    """Record intent for one allocation. A link after the first must follow the accepted
+    previous link of its chain, with the same Tasks; otherwise ``Conflict``."""
     with _rejected():
         attempt = Attempt(
             allocation_id=allocation_id,
+            link=link,
             task_keys=task_keys,
             profile=profile,
             intent_revision=state.revision + 1,
             intent_at=at,
         )
     return _changed(state, revision=attempt.intent_revision, attempts=state.attempts + (attempt,))
+
+
+def chain_jobs(state: State, link: Link) -> tuple[int, ...]:
+    """The jobs of the links before ``link`` in its chain, in order. The invariant guarantees
+    that each was accepted before ``link``'s intent."""
+    jobs = {
+        attempt.link.index: attempt.job
+        for attempt in state.attempts
+        if attempt.link.chain == link.chain and attempt.link.index < link.index
+    }
+    return tuple(cast(int, jobs[index]) for index in range(1, link.index))
 
 
 def record_outcome(state: State, allocation_id: str, job: int | None) -> State:
@@ -276,12 +339,13 @@ def record_outcome(state: State, allocation_id: str, job: int | None) -> State:
     return _changed(state, revision=revision, attempts=attempts)
 
 
-# --- Document (schema 8) ---------------------------------------------------------------------
+# --- Document (schema 9) ---------------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _AttemptDocument:
     allocation_id: str
+    link: Link
     task_keys: tuple[str, ...]
     profile: str
     intent_revision: int

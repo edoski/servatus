@@ -326,8 +326,10 @@ def test_saved_plans_are_compact_private_and_round_trip_without_observation(worl
     plan = campaign.plan(cpu_profile())
     data = plan.to_json()
     document = json.loads(data)
-    assert document["format"] == "servatus.plan/2" and document["digest"] == plan.digest
+    assert document["format"] == "servatus.plan/3" and document["digest"] == plan.digest
     assert document["selected"] == list(keys(0, 1, 2)) and document["probe_required"] is True
+    assert document["continuation"] == {"budget": None, "max_links": None}
+    assert document["spent"] == {} and document["extensions"] == {}
     assert all(secret not in data for secret in (b"secret-", b"train.py", b"SEED"))
     destination = world.root / "plan.json"
     plan.save(destination)
@@ -386,7 +388,9 @@ def test_saved_plans_out_of_roster_order_or_over_the_batch_bound_are_refused(
         campaign.load_plan(json.dumps(document).encode())
 
 
-@pytest.mark.parametrize("data", [b"", b"[]", b"{", b'{"format": "servatus.plan/2"}'])
+@pytest.mark.parametrize(
+    "data", [b"", b"[]", b"{", b'{"format": "servatus.plan/3"}', b'{"format": "servatus.plan/2"}']
+)
 def test_malformed_plan_documents_are_refused(world: World, data: bytes) -> None:
     campaign = world.create(jobs(1))
     with pytest.raises(ConfigurationError, match="invalid plan document"):
@@ -399,6 +403,14 @@ def test_a_saved_plan_goes_stale_when_the_campaign_changes(world: World) -> None
     campaign.append(jobs(2)[1:])
     with pytest.raises(StalePlan, match="revision 0 is now 1"):
         campaign.load_plan(data)
+
+
+def test_validate_groups_shapes_without_a_signal_or_site_options(world: World) -> None:
+    campaign = world.create(jobs(8))
+    bare = cpu_profile(account=None, max_tasks_per_allocation=1)
+    plan = campaign.plan(bare)
+    assert len(plan.allocations) == 8
+    assert [check.task_count for check in campaign.validate(plan)] == [1]
 
 
 def test_validate_checks_each_distinct_shape_without_recording(world: World) -> None:

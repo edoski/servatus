@@ -7,18 +7,27 @@ single-quoted ``printf`` literal, whose environment is rebuilt from nothing, and
 it to the allocation identity and slot. The script records its run in empty marker files in
 ``log_root`` (see ``_evidence``): a start marker before any step, one end marker per returned step,
 and a stop marker when it is interrupted.
+
+A chain link (``Chained``) after the first launches a slot only once its handoff marker exists
+and holds a plain decimal; anything else counts as no handoff.
+A link that hands some slot on to the next link gets the pre-limit signal in its batch shell
+(``--signal=B:USR1@N``): a trap writes a limit marker and relays the signal to the steps, and each
+slot that ``continues`` writes the next link's handoff marker after its step returned. That link
+exits 0 only when no slot handed off, which lets Slurm delete the rest of the chain. Every other
+allocation keeps the plain shape, with ``--signal=USR1@N`` sent to the steps by Slurm.
 """
 
 from __future__ import annotations
 
 import shlex
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import PurePosixPath
 
 from ..errors import ConfigurationError
 from ._codec import format_duration
-from ._config import Apptainer, Resources, Target, Task
+from ._config import YIELD_EXIT, Apptainer, Resources, Target, Task
 
 # Printable ASCII is copied verbatim except printf's own metacharacters and the quote itself.
 _VERBATIM = frozenset(range(0x20, 0x7F)) - {ord("%"), ord("\\"), ord("'")}
@@ -92,10 +101,69 @@ def printf_literal(data: bytes) -> str:
     return "'" + "".join(chr(byte) if byte in _VERBATIM else f"\\{byte:03o}" for byte in data) + "'"
 
 
+@dataclass(frozen=True, slots=True)
+class Chained:
+    """One chain link's script inputs, all decided at planning.
+
+    ``index`` is the link's 1-based position. ``counts`` holds each slot's own link count, so a
+    slot runs in this link only while ``index <= counts[slot]`` and hands off while ``index <
+    counts[slot]``. ``spent`` is each slot's run time before the chain, the run time link 1
+    reports to its steps; later links read it from their handoff markers. ``next_id`` names the
+    next link, which a link that hands off writes markers for.
+    """
+
+    index: int
+    budget: timedelta | None
+    counts: tuple[int, ...]
+    spent: tuple[timedelta, ...]
+    next_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if len(self.spent) != len(self.counts) or not 1 <= self.index <= max(self.counts):
+            raise ConfigurationError("a chain link needs one count and run time per slot")
+        if (self.next_id is not None) != self.hands_off:
+            raise ConfigurationError("a chain link names its next link exactly when it hands off")
+
+    @property
+    def hands_off(self) -> bool:
+        """Whether some slot continues in the next link."""
+        return any(self.index < count for count in self.counts)
+
+
+def continues(code: int | None, *, interrupted: bool, limited: bool) -> bool:
+    """Whether a slot of a link that hands off continues in the next link: the rule the rendered
+    shell implements, given the step's exit ``code`` (``None`` when interrupted), whether the
+    batch script was interrupted, and whether the pre-limit signal had arrived.
+
+    Interrupted, it continues only after the pre-limit signal (a time limit, not a cancel).
+    Otherwise exit 75 continues, and so does any nonzero exit after the signal; exit 0 is done.
+    """
+    if interrupted:
+        return limited
+    return code == YIELD_EXIT or (limited and code != 0)
+
+
+def dependency_options(jobs: Sequence[int]) -> tuple[str, ...]:
+    """The ``sbatch`` options of a link that follows ``jobs`` (every earlier link of its chain):
+    it may start only once each ended without exit 0, and Slurm deletes it once any exits 0."""
+    if not jobs:
+        return ()
+    return (
+        f"--dependency=afternotok:{':'.join(map(str, jobs))}",
+        "--kill-on-invalid-dep=yes",
+    )
+
+
 def sbatch_argv(
-    target: Target, resources: Resources, task_count: int, allocation_id: str
+    target: Target,
+    resources: Resources,
+    task_count: int,
+    allocation_id: str,
+    chain: Chained | None = None,
 ) -> tuple[str, ...]:
-    """The complete ``sbatch`` request for one single-node allocation of ``task_count`` Tasks."""
+    """The complete ``sbatch`` request for one single-node allocation of ``task_count`` Tasks.
+
+    A chain link that hands off asks for the pre-limit signal in its batch shell (``B:``)."""
     identity = job_name(allocation_id)
     output = log_path(target.log_root, allocation_id, "%j")
     argv = [
@@ -124,7 +192,8 @@ def sbatch_argv(
         argv.append(f"--gres={target.gpu_gres}:{task_count * resources.gpus}")
     if resources.signal_before_end is not None:
         seconds = resources.signal_before_end // timedelta(seconds=1)
-        argv.append(f"--signal=USR1@{seconds}")
+        relay = "B:" if chain is not None and chain.hands_off else ""
+        argv.append(f"--signal={relay}USR1@{seconds}")
     return tuple(argv)
 
 
@@ -159,14 +228,61 @@ _EPILOGUE = (
     'exit "$status"',
     "",
 )
+# A trap interrupts `wait` with a made-up status (128 + N, or 1 in ksh), so `reap` waits again
+# until the status repeats or the shell no longer knows the child (127).
+_RELAY = (
+    "pids=",
+    "continued=0",
+    "reap() {",
+    '  while [ -n "$pids" ]; do',
+    "    set -- $pids",
+    '    wait "$1"',
+    "    code=$?",
+    '    while wait "$1" 2>/dev/null; again=$?; [ "$again" -ne 127 ] && [ "$again" -ne "$code" ]',
+    "    do code=$again; done",
+    "    shift",
+    "    pids=$*",
+    '    [ "$code" -eq 0 ] || continued=1',
+    "  done",
+    "}",
+    "interrupt() {",
+    "  trap '' HUP INT TERM USR1",
+    '  command : > "$marker.stop"',
+    "  kill -s TERM 0 2>/dev/null || :",
+    "  reap",
+    '  exit "$continued"',
+    "}",
+    "limit() {",
+    "  trap '' USR1",
+    '  command : > "$marker.limit"',
+    "  kill -s USR1 0 2>/dev/null || :",
+    "}",
+    "trap interrupt HUP INT TERM",
+    "trap limit USR1",
+    ': > "$marker.start" || exit 1',
+    "started=$(date +%s)",
+)
+_REAP = ("reap", 'exit "$continued"', "")
+# Each handoff name is looked up exactly once, by the one link that may run it, on a node that
+# never looked it up before, after the previous link ended; so the lookup cannot hit a cached
+# negative entry and needs no wait or poll.
+_GATE = (
+    "handed() {",
+    "  previous=",
+    '  read -r previous 2>/dev/null < "$own.$1.go" || return 1',
+    "  case $previous in ''|*[!0-9]*|0?*|??????????*) return 1 ;; esac",
+    "}",
+)
+_HANDOFF = 'printf \'%s\\n\' "$((previous + $(date +%s) - started))" > "$next.{slot}.go"'
 # Step-local GPU visibility exists only inside the step; read it there and fail when absent.
 _GPU_VISIBILITY = '"${CUDA_VISIBLE_DEVICES:?Slurm did not set step GPU visibility}"'
 
 
 def _environment(
-    task: Task, allocation_id: str, slot: int, gpus: int
+    task: Task, allocation_id: str, slot: int, gpus: int, chain: Chained | None
 ) -> tuple[tuple[str, str], ...]:
-    """Ordered ``NAME=<shell word>`` pairs; Servatus names override Task values for GPU steps."""
+    """Ordered ``NAME=<shell word>`` pairs; Servatus names override Task values for GPU steps.
+    A chain link adds the slot's link position, the budget, and its run time so far."""
     values = dict(task.env)
     if gpus:
         values.pop("CUDA_VISIBLE_DEVICES", None)
@@ -174,8 +290,15 @@ def _environment(
     values["SERVATUS_TASK_KEY"] = task.key
     values["SERVATUS_ALLOCATION_ID"] = allocation_id
     values["SERVATUS_SLOT"] = str(slot)
+    if chain is not None:
+        values["SERVATUS_LINK"] = str(chain.index)
+        values["SERVATUS_LINKS"] = str(chain.counts[slot])
+        if chain.budget is not None:
+            values["SERVATUS_BUDGET"] = str(chain.budget // timedelta(seconds=1))
     words = [(name, shlex.quote(value)) for name, value in values.items()]
     words.append(("SERVATUS_JOB_ID", '"$job_id"'))
+    if chain is not None:
+        words.append(("SERVATUS_RUN_TIME", '"$previous"'))
     return tuple(words)
 
 
@@ -193,17 +316,22 @@ def _apptainer_command(
 
 
 def _launch(
-    target: Target, resources: Resources, task: Task, allocation_id: str, slot: int
+    target: Target,
+    resources: Resources,
+    task: Task,
+    allocation_id: str,
+    slot: int,
+    chain: Chained | None,
 ) -> tuple[str, str]:
     """The environment words before ``srun`` and the command ``srun`` runs for one Task.
 
     The direct launcher passes the environment as ``env -i NAME=VALUE...`` arguments. Apptainer
     receives it as ``APPTAINERENV_*`` assignments on ``srun`` itself, so the values never appear on
-    a command line other users of the node can read. The batch shell expands only ``"$job_id"``;
-    everything else is single-quoted. A GPU step runs through a shell that first reads the
-    step-local visibility.
+    a command line other users of the node can read. The batch shell expands only ``"$job_id"``
+    and a chain link's ``"$previous"``; everything else is single-quoted. A GPU step runs through
+    a shell that first reads the step-local visibility.
     """
-    words = _environment(task, allocation_id, slot, resources.gpus)
+    words = _environment(task, allocation_id, slot, resources.gpus, chain)
     if target.container is None:
         program = task.args[0] if task.args else ""
         if not program.startswith("/") or "=" in program:
@@ -231,42 +359,98 @@ def _launch(
     return prefix, f"{shlex.join((_SHELL, '-c', wrapper, 'servatus-gpu'))} {command}"
 
 
+def _step(
+    target: Target,
+    resources: Resources,
+    task: Task,
+    allocation_id: str,
+    slot: int,
+    chain: Chained | None,
+) -> str:
+    """``printf STDIN | [ENV] srun ... COMMAND`` for one slot."""
+    srun = str(target.slurm_bin / "srun")
+    path = log_path(target.log_root, allocation_id, "%j", slot)
+    step = [
+        srun,
+        "--exclusive",
+        "--exact",
+        "--nodes=1",
+        "--ntasks=1",
+        f"--cpus-per-task={resources.cpus}",
+        f"--mem={resources.memory_mib}M",
+        f"--chdir={target.work_root}",
+        f"--job-name={step_name(allocation_id, slot)}",
+        "--export=ALL",
+        f"--output={path}",
+        f"--error={path}",
+    ]
+    if resources.gpus:
+        step.append(f"--gres={target.gpu_gres}:{resources.gpus}")
+    prefix, command = _launch(target, resources, task, allocation_id, slot, chain)
+    words = f"{prefix} {shlex.join(step)} {command}".lstrip()
+    return f"printf {printf_literal(task.stdin)} | {words}"
+
+
+def _relayed(step: str, slot: int, hands_off: bool) -> str:
+    """One slot of a link that hands off: it waits for its step whatever signal arrives, records
+    the end unless interrupted, then writes the handoff when the slot ``continues``."""
+    traps = "interrupted=0; limited=0; trap 'interrupted=1' HUP INT TERM; trap 'limited=1' USR1"
+    if not hands_off:
+        end = f'[ "$interrupted" = 1 ] || command : > "$marker.{slot}.$code.end"; exit 0'
+        return f"{{ {traps}; {step}; code=$?; {end}; }} &"
+    decide = (
+        'go=0; if [ "$interrupted" = 1 ]; then go=$limited; '
+        f'else command : > "$marker.{slot}.$code.end"; '
+        f'if [ "$code" = {YIELD_EXIT} ] || {{ [ "$limited" = 1 ] && [ "$code" != 0 ]; }}; '
+        "then go=1; fi; fi; "
+        f'if [ "$go" = 1 ]; then {_HANDOFF.format(slot=slot)}; fi; exit "$go"'
+    )
+    return f"{{ {traps}; {step}; code=$?; {decide}; }} &"
+
+
 def render_batch(
-    target: Target, resources: Resources, tasks: Sequence[Task], allocation_id: str
+    target: Target,
+    resources: Resources,
+    tasks: Sequence[Task],
+    allocation_id: str,
+    chain: Chained | None = None,
 ) -> bytes:
     """The complete ``#!/bin/sh`` batch script that launches one exact step per Task.
 
     Steps start concurrently in slot order, each in a subshell that writes the slot's end marker
-    as soon as its step returns; the script then waits for every step and exits nonzero if any
-    failed. An interrupt writes the stop marker, then terminates every step.
+    as soon as its step returns. A plain allocation, or a chain link that hands nothing off, then
+    waits for every step and exits nonzero if any failed; an interrupt writes the stop marker,
+    then terminates every step. A chain link that hands off exits 0 only when no slot continues.
     """
-    srun = str(target.slurm_bin / "srun")
     marker = shlex.quote(str(target.log_root / allocation_id))
-    lines: list[str] = [*_PRELUDE, f'marker={marker}."$job_id"', *_TRAP]
+    lines: list[str] = [*_PRELUDE, f'marker={marker}."$job_id"']
+    if chain is not None and len(chain.counts) != len(tasks):
+        raise ConfigurationError("a chain link needs one count and run time per slot")
+    gated = chain is not None and chain.index > 1
+    relay = chain is not None and chain.hands_off
+    if gated:
+        lines.append(f"own={marker}")
+    if chain is not None and chain.next_id is not None:
+        lines.append(f"next={shlex.quote(str(target.log_root / chain.next_id))}")
+    lines.extend(_RELAY if relay else _TRAP)
+    if gated:
+        lines.extend(_GATE)
     for slot, task in enumerate(tasks):
-        path = log_path(target.log_root, allocation_id, "%j", slot)
-        step = [
-            srun,
-            "--exclusive",
-            "--exact",
-            "--nodes=1",
-            "--ntasks=1",
-            f"--cpus-per-task={resources.cpus}",
-            f"--mem={resources.memory_mib}M",
-            f"--chdir={target.work_root}",
-            f"--job-name={step_name(allocation_id, slot)}",
-            "--export=ALL",
-            f"--output={path}",
-            f"--error={path}",
-        ]
-        if resources.gpus:
-            step.append(f"--gres={target.gpu_gres}:{resources.gpus}")
-        prefix, command = _launch(target, resources, task, allocation_id, slot)
-        words = f"{prefix} {shlex.join(step)} {command}".lstrip()
-        end = f'code=$?; command : > "$marker.{slot}.$code.end"; exit "$code"'
-        lines.append(f"{{ printf {printf_literal(task.stdin)} | {words}; {end}; }} &")
-        lines.append('pids="$pids $!"')
-    lines.extend(_EPILOGUE)
+        if chain is not None and chain.index > chain.counts[slot]:
+            continue
+        step = _step(target, resources, task, allocation_id, slot, chain)
+        if chain is not None and relay:
+            launch = _relayed(step, slot, chain.index < chain.counts[slot])
+        else:
+            end = f'code=$?; command : > "$marker.{slot}.$code.end"; exit "$code"'
+            launch = f"{{ {step}; {end}; }} &"
+        if gated:
+            lines.extend((f"if handed {slot}; then", launch, 'pids="$pids $!"', "fi"))
+            continue
+        if chain is not None:
+            lines.append(f"previous={chain.spent[slot] // timedelta(seconds=1)}")
+        lines.extend((launch, 'pids="$pids $!"'))
+    lines.extend(_REAP if relay else _EPILOGUE)
     script = "\n".join(lines).encode("utf-8")
     if len(script) > target.max_script_bytes:
         raise ConfigurationError(

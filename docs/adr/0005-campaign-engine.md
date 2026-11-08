@@ -2,11 +2,18 @@
 
 Status: accepted (rewritten for 0.12); recovery, duplicate risk, the hold and retry rules that
 depend on scheduler evidence, and the status rule are superseded by
-[ADR 0007](0007-run-markers.md), and the state document is schema 8
+[ADR 0007](0007-run-markers.md); chains, the state document (schema 9), and the invariant's wording
+are amended by [ADR 0008](0008-chains.md)
 
 Campaign owns generic execution lifecycle facts. Applications own Task meaning, result schemas,
 aggregate validation, and publication. One typed persisted state and explicit atomic transactions
 own the roster and Attempt history.
+
+> Amended by [ADR 0008](0008-chains.md): a budgeted plan queues a chain of links per packed group,
+> every link an ordinary Attempt with its own intent, each later one depending on the earlier ones.
+> The invariant is "never two executions of a Task": several links of a Task can be listed, but at
+> most one runs it. Run time is measured from run-marker mtimes in the shell (`Campaign.plan`) and
+> recorded in the Decision, so planning stays pure. Cancellation goes newest first.
 
 ## Functional core, imperative shell
 

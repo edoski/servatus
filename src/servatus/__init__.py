@@ -2,7 +2,16 @@
 
 from importlib.metadata import version
 
-from .campaign import Apptainer, Campaign, Profile, Resources, Retry, Target, Task
+from .campaign import (
+    Apptainer,
+    Campaign,
+    Continuation,
+    Profile,
+    Resources,
+    Retry,
+    Target,
+    Task,
+)
 from .errors import ServatusError
 from .publication import Draft, Publication, Workspace, publish, publish_file
 
@@ -11,6 +20,7 @@ __version__ = version("servatus")
 __all__ = [
     "Apptainer",
     "Campaign",
+    "Continuation",
     "Draft",
     "Profile",
     "Publication",

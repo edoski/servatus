@@ -6,6 +6,69 @@ All notable changes to Servatus are recorded here. The format follows
 
 ## [Unreleased]
 
+A long Task can now continue across allocations under a lifetime run-time budget, with no
+controller running while it does: `plan --budget` queues a chain of allocations at submission, and
+each link hands its Tasks on to the next through a marker it writes after their steps returned (see
+[ADR 0008](https://github.com/edoski/servatus/blob/main/docs/adr/0008-chains.md)). `status` shows
+every Task's run time, summed over its allocations from run-marker mtimes. Plans without a budget
+render exactly the batch scripts and `sbatch` requests 0.13 did.
+
+**Upgrading from 0.13.** Schema 8 campaign state and `servatus.plan/2` plan files are rejected, so
+finish or abandon 0.13 campaigns with 0.13 first, then create new campaigns and plans. Published
+results and Workspaces are unaffected, so a Task rerun in a new campaign still resumes its private
+work. Read `servatus.status/3` from `status --json` (timed observations, `run_time`, `link`), expect
+exit 75 to read as `STOPPED (yielded)`, make sure the login host has GNU `find` (run
+`servatus doctor`), and add `signal_before_end` to a profile before planning with `--budget`.
+
+### Breaking
+
+- Campaign state uses schema 9: every Attempt records its `link`, its place in a chain of
+  allocations (`chain`, the allocation id of link 1, its 1-based `index`, the chain's `count`, and
+  the `budget` the chain was planned with). A plain allocation is link 1 of 1. The invariant
+  requires every later link to follow the accepted previous link of its chain with the same Tasks.
+  Schema 8 is rejected; there is no migration.
+- `status --json` prints `servatus.status/3`. Each Task gains `run_time` (`{"total", "complete"}`,
+  `null` offline) and `link`, and `detail` is one of `never started`, `time limit`, `yielded`, or
+  `budget spent`. Each Attempt gains `link`, and its `observation` replaces `started`, `stopped`,
+  and `exit_codes` with `started_at`, `stopped_at`, `limit_at`, `ends` (`{"exit_code", "at"}` or
+  `null` per slot), and `handed`. `Observation.execution` returns the execution, the exit code,
+  and a `StopReason`.
+- A step that exits 75 reads as `STOPPED (yielded)` with exit code 75 in every campaign, not
+  `FAILED`. `Retry.FAILED` selects both, as before.
+- Run markers are listed with `find -printf '%T@ %p\n'`, which needs GNU find on the login host.
+  `servatus doctor` gains a `find -printf` check.
+- Saved plans are `servatus.plan/3`: the Decision gains `continuation`, `spent` (each selected
+  Task's measured run time, with a continuation), and `extensions`. `PlannedAllocation` gains
+  `link`, and its `argv` of a later link lacks the dependency that `submit` adds.
+- `cancel` stops allocations newest first, and cancelling a chain link also cancels every later
+  link of its chain.
+- `logs --task`, status, and `--retry-failed` follow a Task's current allocation: its latest
+  accepted Attempt that was handed the Task.
+
+### Added
+
+- Run-time accounting: `status` shows each Task's `RUN TIME`, summed over every allocation that ran
+  it from run-marker mtimes, and a `LINK` column. `RunTime`, `StepEnd`, `StopReason`, and `Link` are
+  public.
+- `FakeScheduler` stamps file mtimes from a clock (`clock=`, or an internal one moved by
+  `advance`), reports them through `find -printf`, and exposes `mtime(path)` and `now()`.
+- Budgeted continuation: `plan --budget DURATION [--max-links K]`
+  (`Campaign.plan(..., continuation=Continuation(budget=..., max_links=...))`) gives each selected
+  Task a lifetime run-time budget and queues a chain of links to spend it, full `time_limit` links
+  and one shorter last link. Each later link depends on the earlier ones (`afternotok`,
+  `--kill-on-invalid-dep=yes`) and runs only the Tasks handed to it. A link that hands off gets the
+  pre-limit signal in its batch shell (`--signal=B:USR1@N`), writes a limit marker, and relays it to
+  its steps. Steps learn `SERVATUS_BUDGET`, `SERVATUS_RUN_TIME`, `SERVATUS_LINK`, and
+  `SERVATUS_LINKS`; exit 75 (`YIELD_EXIT`) continues, exit 0 is done. `validate` checks later-link
+  shapes with `--kill-on-invalid-dep=yes`.
+- Extension: `--retry KEY --budget D` continues a `SUCCEEDED` Task, or one whose probe reports
+  `VALID`, with a larger lifetime budget; `Plan.extensions` and the plan output name each. A new
+  hold, `SPENT`, keeps a Task whose budget is spent from rerunning. `Continuation`, `Extension`,
+  `MAX_LINKS`, and `YIELD_EXIT` are public.
+- `FakeScheduler` emulates chains: `afternotok` dependencies with `--kill-on-invalid-dep=yes`, gated
+  links, `signal_limit` for the pre-limit signal, and handoffs by the same rule the shell
+  implements. `FakeJob` gains `dependencies`.
+
 ## [0.13.0] - 2026-11-06
 
 Servatus no longer needs Slurm accounting, and a new cluster is a new profile, not new code. It

@@ -32,38 +32,71 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   `Check` with a `Verdict` (`pass`, `fail` when a command ran and said no, `unavailable` when no
   answer came) for each capability Servatus needs from a profile's cluster: Slurm 23.02 or later,
   `squeue` under the scrubbed environment, `MinJobAge` of at least 120 s, `proctrack/cgroup`,
-  writable roots, and a one-Task `sbatch --test-only`.
+  writable roots, `find -printf` on `log_root`, and a one-Task `sbatch --test-only`.
 - **Allocation:** one single-node Slurm job named `servatus-<allocation_id>`, submitted with
   `--no-requeue`, running its Tasks as concurrent exact steps. Each step is named
   `servatus-<allocation_id>-<slot>`.
-- **Run marker:** an empty file the batch script creates in `log_root`:
+- **Run marker:** a file the batch script creates in `log_root`, read by name and mtime:
   `<allocation_id>.<job>.start` before any step, `<allocation_id>.<job>.<slot>.<exit code>.end`
   when that slot's step returns, and `<allocation_id>.<job>.stop` when the script is interrupted.
+  A chain link that hands off also writes `<allocation_id>.<job>.limit` when its batch shell gets
+  the pre-limit signal.
+- **Chain:** the allocations, called links, that one budgeted plan queues for one packed group of
+  Tasks. `submit` sends them all at once, in order; each later link depends on every earlier one
+  (`afternotok`, `--kill-on-invalid-dep=yes`), so it starts only after they ended without exit 0,
+  and Slurm deletes it once one exits 0. A Task runs in at most one link at a time: never two
+  executions of a Task.
+- **Handoff marker:** `<allocation_id>.<slot>.go`, written by a chain link into the next link's
+  name once that slot's step returned and the slot continues (exit 75, or stopped by or a nonzero
+  exit after the pre-limit signal). Its content is the Task's run time so far in seconds, for the
+  next step. A later link runs only the slots handed to it.
+- **Budget:** a Task's lifetime run-time limit across all its allocations, given by
+  `plan --budget` (`Continuation`). A Task's own links are full `time_limit` links and one shorter
+  last link that never add up to more; Tasks packed with different run times share links sized
+  for the neediest, and the plan warns. A step learns it as `SERVATUS_BUDGET`, with `SERVATUS_RUN_TIME`,
+  `SERVATUS_LINK`, and `SERVATUS_LINKS`; exit 75 (`YIELD_EXIT`) asks to continue.
+- **Continuation (`Continuation`):** how far one plan continues its Tasks: an optional `budget`
+  and an optional `max_links` (at most `MAX_LINKS`, 32). `Continuation()` is a plain plan.
+- **Extension:** an explicit retry under a budget of a Task that already `SUCCEEDED`, or whose
+  probe reports `VALID`; the plan names it (`Plan.extensions`). It is the only way to give a Task
+  more time.
+- **Run time (`RunTime`):** how long a Task has run, summed over every allocation that ran it,
+  each the span between its run markers' mtimes. A step still running counts until now, and a
+  `LOST` one counts its allocation's whole time limit; either makes the total incomplete. Gaps
+  between allocations never count.
 - **Capacity (`capacity`):** how many Tasks of one Resources fit one allocation under every Target
   ceiling, optionally lowered by `tasks_per_allocation`.
 - **Slot:** a Task's zero-based position within its allocation.
 - **Decision (`Decision`):** the reviewed part of a plan: Campaign identity and revision, Profile,
-  selected, held, and deferred Tasks, packing, whether a probe was used, and a random nonce from
-  which allocation identities derive.
+  selected, held, and deferred Tasks, packing, whether a probe was used, a random nonce from which
+  allocation identities derive, the `Continuation`, each selected Task's measured run time
+  (`spent`, with a continuation), and its extensions.
 - **Plan (`Plan`):** a Decision (`plan.decision`) plus what it derives from the current state:
   `PlannedAllocation`s (Task keys, totals, batch script, `sbatch` argv), the digest, and `retry`
-  (the selected or deferred Tasks that resubmit accepted work), with `warnings` for deferred work.
-  A saved plan (`servatus.plan/2`) holds only the Decision and digest. Submission rebuilds the plan
+  (the selected or deferred Tasks that resubmit accepted work), with `warnings` for deferred work
+  and for budgets a chain cannot spend as asked. A saved plan (`servatus.plan/3`) holds only the
+  Decision and digest. Submission rebuilds the plan
   from its Decision and the current state and refuses it when it differs.
 - **Hold (`Hold`):** why a Task is not selected: `VALID` (valid result), `UNRESOLVED` (intent
   without outcome), `SUBMITTED` (accepted work and not requested for retry; the scheduler is not
   consulted), `ACTIVE` (Slurm still lists earlier work of the Task, finished but not yet purged
-  included, or a job of an allocation recorded as not submitted), or `NOT_REQUESTED` (outside
-  `only`).
-- **Deferred Task:** eligible work beyond the plan's `max_allocations_per_submit` batch.
+  or a chain's pending links included, or a job of an allocation recorded as not submitted),
+  `SPENT` (under a budget, the Task's run time leaves no room for one more link), or
+  `NOT_REQUESTED` (outside `only`).
+- **Deferred Task:** eligible work beyond the plan's `max_allocations_per_submit` batch, which
+  counts every link of a chain; whole chains are deferred.
 - **Retry selector (`Retry`):** a bulk retry choice. `Retry.FAILED` selects Tasks whose current
-  (latest accepted) execution is `FAILED` or `STOPPED`, never `LOST`; `Retry.INCOMPLETE` selects
+  execution is `FAILED` or `STOPPED`, never `LOST`; `Retry.INCOMPLETE` selects
   Tasks whose current execution is terminal and whose probed result is missing, and requires a
   probe. Explicit retry keys name single Tasks and are checked strictly (`PlanRefused` for unknown
   keys, valid results, Tasks never accepted, and live work); they accept `LOST`.
-- **Attempt:** one durable allocation record: Profile, Task keys, intent revision and time, then
-  exactly one outcome revision with the accepted job, or with none for not submitted. Its
+- **Attempt:** one durable allocation record: Profile, `Link`, Task keys, intent revision and time,
+  then exactly one outcome revision with the accepted job, or with none for not submitted. Its
   `acceptance` follows from those, and an Attempt's retried Tasks are those accepted earlier.
+- **Link (`Link`):** an Attempt's place in its chain of allocations: the chain (the allocation id
+  of link 1), its 1-based index, the chain's planned count, and the lifetime budget the chain was
+  planned with. A plain allocation is link 1 of 1. Every later link follows the accepted previous
+  link of its chain, with the same Tasks.
 - **Intent:** the synced unresolved Attempt recorded before scheduler contact.
 - **Receipt (`Receipt`):** a positive Slurm job number proving acceptance, not completion.
 - **Unresolved allocation:** an intent without an outcome. It blocks its Tasks until `reconcile`
@@ -80,28 +113,35 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   results are valid. It is bound to a Campaign handle, called once per operation, and never stored.
 - **Observation (`Observation`):** one accepted allocation's transient evidence: its `squeue`
   state while Slurm lists the job (`None` once purged; a terminal state is still settling and
-  live), whether its start and stop markers exist, and one exit code per slot from its end markers.
+  live), the mtimes of its start, stop, and limit markers, each slot's end (`StepEnd`: exit code
+  and mtime), and which slots it was handed.
 - **Execution (`Execution`):** a Task's state in its current allocation, from its slot:
   `QUEUED`, `RUNNING`, `ENDING` (Slurm reports the job ended but still lists it, and the slot
-  has no end marker; its outcome is final once Slurm forgets the job), `SUCCEEDED` or `FAILED`
-  (from the end marker's exit code), `STOPPED` (interrupted, or never started), or `LOST`
-  (started, then vanished without a stop marker). `ENDING` and `LOST` are not terminal.
-  Exit codes accompany `SUCCEEDED` and `FAILED` only.
+  has no end marker; its outcome is final once Slurm forgets the job), `SUCCEEDED` (exit 0),
+  `FAILED` (another exit code), `STOPPED` (interrupted, never started, or exited 75), or `LOST`
+  (started, then vanished without a stop marker). `ENDING` and `LOST` are not terminal. Exit codes
+  accompany steps that returned. A `StopReason` says why a `STOPPED` Task stopped when the
+  evidence says: `never started`, `yielded` (exit 75), `time limit`, or `budget spent`.
 - **Observation scope:** the Attempts a plan needs to observe: the accepted and not-submitted
   Attempts of Tasks that could be retried, and the not-submitted Attempts of Tasks never accepted.
   Plans of fresh Tasks without such history observe nothing.
 - **Status (`Status`):** one transient revision-bound projection of Tasks (`TaskStatus`) and
   Attempts (`AttemptStatus`), with counts, result readiness, and quiescence. A Task's
   `execution` is `UNRESOLVED` while one of its Attempts is, else the observed `Execution` of its
-  latest accepted Attempt (`ACCEPTED` when the scheduler was not observed), else `NOT_SUBMITTED`
-  (never accepted). `to_json()` exports it as a `servatus.status/2` document; `to_document` encodes
-  other results for JSON.
+  current allocation (`ACCEPTED` when the scheduler was not observed), else `NOT_SUBMITTED`
+  (never accepted). Each Task also shows its run time and its current Attempt's `Link`.
+  `to_json()` exports it as a `servatus.status/3` document; `to_document` encodes other results
+  for JSON.
+- **Current allocation:** the latest accepted Attempt that was handed the Task: link 1 of a chain
+  always is, and a later link once its handoff marker appeared. Status, retry selection, and
+  `logs --task` all follow it.
 - **Result readiness:** the sealed roster has valid results for every Task.
 - **Quiescence:** scheduler evidence was requested, Slurm lists no job of any accepted allocation
   and no stray, and no acceptance is unresolved. It is independent from result readiness.
 - **Cancellation:** `scancel --me --name=servatus-<allocation_id>` of the chosen accepted or
   not-submitted allocations that Slurm lists as queued or running, by allocation or for every such
-  allocation of a Task. Every chosen allocation is tried. It is a request; it retries nothing.
+  allocation of a Task, newest first. A chosen chain link brings every later link of its chain.
+  Every chosen allocation is tried. It is a request; it retries nothing.
 - **Log snapshot (`LogSnapshot`):** a bounded binary suffix of an allocation or Task log. It is
   sensitive, untrusted, and has no lifecycle authority.
 

@@ -9,8 +9,8 @@ from hypothesis import strategies as st
 from support.builders import profile
 
 from servatus.campaign._evidence import Execution, Observation, Observed
-from servatus.campaign._policy import Hold, Request, Retry, Selection, decide, scope
-from servatus.campaign._state import AcceptanceState, Attempt, State, record_intent
+from servatus.campaign._policy import Extension, Hold, Request, Retry, Selection, decide, scope
+from servatus.campaign._state import AcceptanceState, Attempt, Link, State, record_intent
 from servatus.campaign._status import ResultState
 from servatus.errors import PlanRefused
 
@@ -360,7 +360,7 @@ def busy(state: State, observed: Observed, key: str) -> bool:
 
 def current(state: State, observed: Observed, key: str) -> Execution:
     latest = history(state, key, AcceptanceState.ACCEPTED)[-1]
-    execution, _ = observed.attempts[latest.allocation_id].execution(latest.task_keys.index(key))
+    execution, _, _ = observed.attempts[latest.allocation_id].execution(latest.task_keys.index(key))
     return execution
 
 
@@ -431,6 +431,7 @@ def test_policy_safety_properties(
         record_intent(
             state,
             allocation_id="f" * 24,
+            link=Link("f" * 24, 1, 1),
             task_keys=selection.selected,
             profile=profile(),
             at=NOW,
@@ -446,3 +447,38 @@ def test_bulk_selectors_never_raise(
 ) -> None:
     state, observed, results = scenario
     decide(state, observed, results, Request.parse(retry, only))
+
+
+@settings(max_examples=1000, deadline=None)
+@given(
+    scenarios(every_accepted_observed=True),
+    st.sampled_from(list(Retry)) | st.lists(st.sampled_from(KEYS), unique=True).map(tuple),
+    st.sets(st.sampled_from(KEYS)),
+)
+def test_a_budget_never_reruns_spent_work_and_only_named_keys_extend(
+    scenario: tuple[State, Observed, dict[str, ResultState]],
+    retry: tuple[str, ...] | Retry,
+    exhausted: set[str],
+) -> None:
+    state, observed, results = scenario
+    request = Request.parse(retry)
+    budgeted = Request(request.retry, request.only, frozenset(exhausted))
+    try:
+        selection = decide(state, observed, results, budgeted)
+    except PlanRefused as refusal:
+        assert not isinstance(retry, Retry) and refusal.keys
+        return
+    for key in selection.selected:
+        if history(state, key, AcceptanceState.ACCEPTED):
+            assert key not in exhausted
+    assert set(selection.extensions) <= set(selection.selected)
+    for key, reason in selection.extensions.items():
+        if reason is Extension.VALID:
+            assert not isinstance(retry, Retry) and key in retry
+            assert results.get(key) is ResultState.VALID
+        else:
+            assert current(state, observed, key) is Execution.SUCCEEDED
+    for key in selection.selected:
+        if history(state, key, AcceptanceState.ACCEPTED) and key not in selection.extensions:
+            assert current(state, observed, key) is not Execution.SUCCEEDED
+    assert all(hold is not Hold.SPENT or key in exhausted for key, hold in selection.held.items())

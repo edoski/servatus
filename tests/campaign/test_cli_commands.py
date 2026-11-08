@@ -41,6 +41,9 @@ time_limit = "00:10:00"
 
 [profiles.wide.target]
 partitions = ["wide"]
+
+[profiles.chained.resources]
+signal_before_end = "00:02:00"
 """
 
 
@@ -159,9 +162,10 @@ def test_human_workflow_from_creation_to_status(cli: Cli[str]) -> None:
     cli.fake.finish_step(1000, 1, exit_code=3)
     code, out, _ = cli("status", "state")
     assert code == 0
-    assert re.search(r"^KEY  RESULT      EXECUTION  EXIT  ALLOCATION$", out, re.M)
-    assert re.search(r"^one  UNOBSERVED  RUNNING    -     [0-9a-f]{24}$", out, re.M)
-    assert re.search(r"^two  UNOBSERVED  FAILED     3     [0-9a-f]{24}$", out, re.M)
+    assert re.search(r"^KEY  RESULT      EXECUTION  EXIT  RUN TIME   LINK  ALLOCATION$", out, re.M)
+    id_ = r"[0-9a-f]{24}$"
+    assert re.search(rf"^one  UNOBSERVED  RUNNING    -     ~00:00:00  -     {id_}", out, re.M)
+    assert re.search(rf"^two  UNOBSERVED  FAILED     3     00:00:00   -     {id_}", out, re.M)
     assert "counts: tasks 2, unobserved 2, running 1, failed 1" in out
     assert "next: servatus plan state --retry-failed --output PLAN.json" in out
     cli.fake.finish(1000)
@@ -173,10 +177,16 @@ def test_machine_output_for_every_data_command(cli: Cli[str]) -> None:
     created = cli.json("create", "state", "tasks.jsonl")
     assert created["tasks"] == 2 and created["sealed"] is True
     plan = cli.json("plan", "state", "--output", "plan.json")
-    assert plan["format"] == "servatus.plan/2" and plan["selected"] == ["one", "two"]
-    assert plan["saved"] == "plan.json" and plan["warnings"] == []
+    assert plan["format"] == "servatus.plan/3" and plan["selected"] == ["one", "two"]
+    assert plan["saved"] == "plan.json" and plan["warnings"] == [] and plan["extensions"] == []
     allocation = plan["allocations"][0]
     assert "script" not in allocation and allocation["cpus"] == 4
+    assert allocation["link"] == {
+        "chain": allocation["allocation_id"],
+        "index": 1,
+        "count": 1,
+        "budget": None,
+    }
     checks = cli.json("validate", "state", "plan.json")["checks"]
     assert [check["accepted"] for check in checks] == [True]
     submitted = cli.json("submit", "state", "plan.json")
@@ -185,7 +195,7 @@ def test_machine_output_for_every_data_command(cli: Cli[str]) -> None:
     assert receipt["job"] == 1000
     assert receipt["task_keys"] == ["one", "two"]
     status = cli.json("status", "state")
-    assert status["format"] == "servatus.status/2" and status["counts"]["queued"] == 2
+    assert status["format"] == "servatus.status/3" and status["counts"]["queued"] == 2
     assert status["warnings"] == [] and status["tasks"][0]["exit_code"] is None
     cancelled = cli.json("cancel", "state", "--task", "one")
     assert cancelled == {
@@ -209,7 +219,7 @@ def test_machine_output_for_every_data_command(cli: Cli[str]) -> None:
         "tasks_per_allocation": 4,
         "verdict": "pass",
     }
-    assert [check["verdict"] for check in checks] == ["pass"] * 7
+    assert [check["verdict"] for check in checks] == ["pass"] * 8
     assert checks[0] == {"name": "slurm version", "verdict": "pass", "detail": "slurm 23.11.4"}
 
 
@@ -433,9 +443,10 @@ def test_status_explains_outcomes_warnings_and_next_steps(cli: Cli[str]) -> None
         cli.fake.purge(job)
     code, out, _ = cli("status", "state")
     assert code == 0
-    assert re.search(r"^a\s+UNOBSERVED  FAILED\s+3\s+[0-9a-f]{24}$", out, re.M)
-    assert re.search(r"^b\s+UNOBSERVED  STOPPED \(never started\)  -\s+[0-9a-f]{24}$", out, re.M)
-    assert re.search(r"^c\s+UNOBSERVED  LOST\s+-\s+[0-9a-f]{24}$", out, re.M)
+    assert re.search(r"^a\s+UNOBSERVED  FAILED\s+3\s+00:00:00\s+-\s+[0-9a-f]{24}$", out, re.M)
+    never = r"^b\s+UNOBSERVED  STOPPED \(never started\)  -\s+00:00:00\s+-\s+[0-9a-f]{24}$"
+    assert re.search(never, out, re.M)
+    assert re.search(r"^c\s+UNOBSERVED  LOST\s+-\s+~00:10:00\s+-\s+[0-9a-f]{24}$", out, re.M)
     assert "counts: tasks 3, unobserved 3, failed 1, stopped 1, lost 1" in out
     assert "quiescent: yes; results ready: no" in out
     assert "next: servatus plan state --retry-failed --output PLAN.json" in out
@@ -516,3 +527,43 @@ def test_doctor_exits_by_its_worst_verdict(cli: Cli[str]) -> None:
     cli.fake.fail_next("sh", Completed(1, b"", b""))
     code, out, _ = cli("doctor", "--json")
     assert code == 1 and json.loads(out)["verdict"] == "fail"
+
+
+def test_a_budgeted_chain_from_plan_to_a_spent_budget(cli: Cli[str]) -> None:
+    cli("create", "state", "tasks.jsonl")
+    code, out, err = cli(
+        "plan", "state", "--profile", "chained", "--budget", "00:25:00", "--output", "plan.json"
+    )
+    assert code == 0, err
+    assert "continuation: lifetime budget 00:25:00 per Task" in out
+    assert "  one  run time 00:00:00, budget left 00:25:00, 3 links" in out
+    assert "selected: 2 Tasks in 3 allocations" in out and ", 00:05:00, link 3/3" in out
+    document = cli.json("plan", "state", "--profile", "chained", "--budget", "00:25:00")
+    assert document["continuation"] == {"budget": "00:25:00", "max_links": None}
+    assert [item["link"]["index"] for item in document["allocations"]] == [1, 2, 3]
+    assert cli("submit", "state", "plan.json")[0] == 0
+    fake = cli.fake
+    fake.start(1000)
+    fake.advance(minutes=8)
+    fake.signal_limit(1000)
+    fake.advance(minutes=2)
+    fake.interrupt(1000, "TIMEOUT")
+    fake.start(1001)
+    code, out, _ = cli("status", "state")
+    assert re.search(r"^one  UNOBSERVED  RUNNING    -     ~00:10:00 / 00:25:00  2/3  ", out, re.M)
+    fake.advance(minutes=4)
+    fake.finish(1001, exit_code=75)
+    fake.start(1002)
+    fake.advance(minutes=5)
+    fake.finish(1002, exit_code=75)
+    for job in (1000, 1001, 1002):
+        fake.purge(job)
+    code, out, _ = cli("status", "state")
+    assert re.search(
+        r"^one  UNOBSERVED  STOPPED \(budget spent\)  75    00:19:00 / 00:25:00  3/3", out, re.M
+    )
+    assert "--budget LARGER --output PLAN.json  (to extend a spent budget)" in out
+    code, _, err = cli("plan", "state", "--profile", "chained", "--max-links", "0")
+    assert code == 1 and "max_links must be an integer from 1 to 32" in err
+    code, _, err = cli("plan", "state", "--budget", "01:00:00")
+    assert code == 1 and "needs resources.signal_before_end" in err

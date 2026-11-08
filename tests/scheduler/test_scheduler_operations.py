@@ -5,6 +5,7 @@ from pathlib import PurePosixPath
 import pytest
 from scheduler_fixtures import (
     ALLOCATION,
+    AT,
     IDENTITY,
     LOG_ROOT,
     SLURM_BIN,
@@ -23,6 +24,7 @@ from servatus.errors import ConfigurationError, EvidenceConflict, Unavailable
 SBATCH = f"{SLURM_BIN}/sbatch"
 ARGV = (SBATCH, "--parsable", "--no-requeue", "--export=NIL", f"--job-name={IDENTITY}")
 ROOT = PurePosixPath(LOG_ROOT)
+PRINTF = ("-printf", "%T@ %p\n")
 FIND = (
     "/usr/bin/find",
     "-H",
@@ -39,8 +41,15 @@ FIND = (
     "*.stop",
     "-o",
     "-name",
+    "*.limit",
+    "-o",
+    "-name",
     "*.end",
+    "-o",
+    "-name",
+    "*.go",
     ")",
+    *PRINTF,
 )
 
 
@@ -135,21 +144,23 @@ def test_markers_of_a_few_allocations_are_named_exactly_in_one_read() -> None:
     transport = Scripted().queue("find", ok(reply))
     found = scheduler(transport).markers({ALLOCATION: 2, other: 1})
     names = tuple(sorted((f"{ALLOCATION}.*", f"{other}.*")))
-    assert transport.calls == [(*FIND[:8], "-name", names[0], "-o", "-name", names[1], ")")]
-    assert found == {ALLOCATION: (Start(42), End(42, 1, 3)), other: (Stop(43),)}
+    assert transport.calls == [
+        (*FIND[:8], "-name", names[0], "-o", "-name", names[1], ")", *PRINTF)
+    ]
+    assert found == {ALLOCATION: (Start(42, AT), End(42, 1, 3, AT)), other: (Stop(43, AT),)}
 
 
 def test_exact_names_stay_within_the_argument_bound() -> None:
-    ids = {allocation(index): 1 for index in range(8)}
+    ids = {allocation(index): 1 for index in range(7)}
     transport = Scripted()
     scheduler(transport).markers(ids)
-    assert len(transport.calls) == 1 and len(transport.calls[0]) == 32
-    assert transport.calls[0][9::3] == tuple(sorted(f"{name}.*" for name in ids))
+    assert len(transport.calls) == 1 and len(transport.calls[0]) == 31
+    assert transport.calls[0][9:-3:3] == tuple(sorted(f"{name}.*" for name in ids))
 
 
 def test_markers_split_the_listing_by_leading_hex_digit_only_when_large() -> None:
     first, second, third = f"a{ALLOCATION[1:]}", f"3{ALLOCATION[1:]}", f"a{allocation(1)[1:]}"
-    many = {allocation(index): 4 for index in range(10, 19)}
+    many = {allocation(index): 4 for index in range(10, 18)}
     small = Scripted()
     scheduler(small).markers(many)
     assert small.calls == [FIND]
@@ -161,15 +172,15 @@ def test_markers_split_the_listing_by_leading_hex_digit_only_when_large() -> Non
     )
     extra = {f"a{allocation(index)[1:]}": 1 for index in range(20, 26)}
     found = scheduler(large).markers({first: 20_000, second: 20_000, third: 1} | extra)
-    assert [call[9::3] for call in large.calls] == [
-        ("3*.start", "3*.stop", "3*.end"),
-        ("a*.start", "a*.stop", "a*.end"),
+    assert [call[9:-3:3] for call in large.calls] == [
+        ("3*.start", "3*.stop", "3*.limit", "3*.end", "3*.go"),
+        ("a*.start", "a*.stop", "a*.limit", "a*.end", "a*.go"),
     ]
-    assert all(call[:8] == FIND[:8] and call[-1] == ")" for call in large.calls)
+    assert all(call[:8] == FIND[:8] and call[-3:] == (")", *PRINTF) for call in large.calls)
     assert {name: found[name] for name in (first, second, third)} == {
-        first: (Start(10),),
-        second: (Start(30),),
-        third: (Stop(11),),
+        first: (Start(10, AT),),
+        second: (Start(30, AT),),
+        third: (Stop(11, AT),),
     }
 
 

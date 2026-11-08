@@ -15,7 +15,7 @@ from ..errors import ConfigurationError, EvidenceConflict, Unavailable
 from ._config import Target
 from ._evidence import Marker, QueueRow, parse_markers, parse_queue, parse_receipt
 from ._remote import MAX_STREAM_BYTES, Completed, Transport, diagnostic
-from ._script import job_name
+from ._script import MAX_ARGS, job_name
 
 MAX_QUERY_NAMES = 100
 TAIL = "/usr/bin/tail"
@@ -23,11 +23,9 @@ FIND = "/usr/bin/find"
 WRITABLE_DIRECTORY = ("/bin/sh", "-c", 'test -d "$1" && test -w "$1"', "servatus")
 SQUEUE_OPTIONS = ("--me", "--all", "--states=all", "--noheader")
 SQUEUE_FORMAT = "--format=%i|%j|%T"
-MARKER_SUFFIXES = (".start", ".stop", ".end")
-# Each name pattern costs three find arguments; eight keep one listing within the 32-argument bound.
-MAX_NAME_PATTERNS = 8
-# Generous per-marker line length beyond log_root: "/", 24 hex digits, and the longest suffix.
-_MARKER_LINE_BYTES = 64
+MARKER_SUFFIXES = (".start", ".stop", ".limit", ".end", ".go")
+MARKER_FORMAT = "%T@ %p\n"
+_MARKER_LINE_BYTES = len("0000000000.0000000000 /") + 24 + len(".4294967295.4294967295.255.end")
 
 
 class CommandFailed(Unavailable):
@@ -42,12 +40,30 @@ def _require_ok(completed: Completed, what: str, *, quiet: bool = True) -> Compl
 
 
 def find_argv(log_root: PurePosixPath, patterns: Sequence[str]) -> tuple[str, ...]:
-    """List the regular files in ``log_root`` whose names match any of ``patterns``. ``-H``
-    follows ``log_root`` itself when it is a symbolic link, as Slurm and the batch script do."""
+    """List the regular files in ``log_root`` whose names match any of ``patterns``, each with
+    its mtime. ``-H`` follows ``log_root`` itself when it is a symbolic link, as Slurm and the
+    batch script do."""
     names: list[str] = []
     for pattern in patterns:
         names.extend(("-o", "-name", pattern))
-    return (FIND, "-H", str(log_root), "-maxdepth", "1", "-type", "f", "(", *names[1:], ")")
+    return (
+        FIND,
+        "-H",
+        str(log_root),
+        "-maxdepth",
+        "1",
+        "-type",
+        "f",
+        "(",
+        *names[1:],
+        ")",
+        "-printf",
+        MARKER_FORMAT,
+    )
+
+
+MAX_NAME_PATTERNS = (MAX_ARGS - len(find_argv(PurePosixPath("/"), ("*",)))) // 3 + 1
+"""How many name patterns one listing holds within ``check_command``'s argument bound."""
 
 
 def marker_patterns(
@@ -63,7 +79,8 @@ def marker_patterns(
     if len(allocation_ids) <= MAX_NAME_PATTERNS:
         return [tuple(f"{allocation_id}.*" for allocation_id in allocation_ids)]
     estimate = sum(
-        (3 + count) * (len(str(log_root)) + _MARKER_LINE_BYTES) for count in task_counts.values()
+        (3 + 2 * count) * (len(str(log_root)) + _MARKER_LINE_BYTES)
+        for count in task_counts.values()
     )
     prefixes = [""]
     if estimate > MAX_STREAM_BYTES // 2:

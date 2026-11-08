@@ -16,10 +16,18 @@ It drives small sweeps through the ``servatus`` CLI over SSH, one Task per alloc
   Apptainer launcher. A failed pull fails the check, so leave this off where nodes have no network.
 - Both: one one-GPU Task runs ``nvidia-smi -L`` inside the image through ``--nv``. It must list
   exactly one GPU and see Slurm's step-local ``CUDA_VISIBLE_DEVICES``.
+- Budgeted chains: ``plan --budget 00:09:00`` on 3-minute links with a 90-second pre-limit
+  signal queues two chains of three links. On link 1, ``yield`` traps ``SIGUSR1`` and exits 75,
+  and ``die`` dies of it. Each must continue on link 2, which exits 0, after which Slurm must
+  delete link 3 unstarted. This proves on the cluster what the test suite can only emulate:
+  ``--signal=B:USR1`` reaching the batch shell (its limit marker), ``srun`` forwarding the relayed
+  signal to the step (``yield`` logs it), ``afternotok`` with ``--kill-on-invalid-dep=yes``
+  pruning the chain, the exact-name handoff lookup across nodes, and ``date`` on compute nodes
+  (link 2 learns a positive ``SERVATUS_RUN_TIME``).
 
 Everything it writes on the cluster lives in a new ``WORK_DIR/run-<timestamp>`` directory. It
-submits at most seven small jobs, at most three at a time, and cancels whatever it leaves behind.
-It prints one JSON summary line last.
+submits at most thirteen small jobs, at most three running at a time, and cancels whatever it
+leaves behind. It prints one JSON summary line last.
 """
 
 from __future__ import annotations
@@ -42,6 +50,15 @@ TASKS = {
     "long": "sleep 900",
 }
 POLL_SECONDS = 20
+REPORT = 'echo "link $SERVATUS_LINK of $SERVATUS_LINKS ran $SERVATUS_RUN_TIME of $SERVATUS_BUDGET"'
+CHAIN_TASKS = {
+    "yield": (
+        f'{REPORT}; if [ "$SERVATUS_LINK" = 1 ]; then '
+        'trap "echo got USR1; exit 75" USR1; sleep 600 & wait $!; fi; exit 0'
+    ),
+    "die": f'{REPORT}; if [ "$SERVATUS_LINK" = 1 ]; then sleep 600; fi; exit 0',
+}
+DIED_OF_USR1 = 138
 # glibc, not Alpine's musl: --nv binds the host's nvidia-smi, which needs a glibc loader.
 IMAGE_SOURCE = "docker://debian:12-slim"
 PULL_JOB = "servatus-e2e-pull"
@@ -134,6 +151,11 @@ def configuration(arguments: argparse.Namespace, run: PurePosixPath, image: bool
         'time_limit = "00:10:00"\n'
         "\n[profiles.e2e.target]\n"
         f"partitions = [{json.dumps(arguments.partition)}]\n"
+        "\n[profiles.chain.target]\n"
+        f"partitions = [{json.dumps(arguments.partition)}]\n"
+        "\n[profiles.chain.resources]\n"
+        'time_limit = "00:03:00"\n'
+        'signal_before_end = "00:01:30"\n'
     )
     if arguments.gpu_partition is not None:
         document += (
@@ -271,6 +293,99 @@ def image_gpu_check(root: Path, deadline: float) -> dict[str, Any]:
     return {"job": job, "debian": lines[-3], "gpus": one_gpu(text), "visible": visible}
 
 
+def seconds(duration: str) -> int:
+    days, _, clock = duration.rpartition("-")
+    hours, minutes, rest = (int(part) for part in clock.split(":"))
+    return int(days or 0) * 86_400 + hours * 3_600 + minutes * 60 + rest
+
+
+def step_log(root: Path, allocation_id: str, key: str, deadline: float) -> str:
+    output = root / f"chain-{allocation_id}-{key}.log"
+    while True:
+        read = servatus(
+            root,
+            "logs",
+            "chain",
+            "--allocation",
+            allocation_id,
+            "--task",
+            key,
+            "--output",
+            str(output),
+            check=False,
+        )
+        if read.returncode == 0:
+            return output.read_text()
+        if time.monotonic() > deadline:
+            raise SystemExit(f"cannot read the {key} log of {allocation_id}:\n{read.stderr}")
+        time.sleep(POLL_SECONDS)
+
+
+def chain_check(root: Path, deadline: float) -> dict[str, Any]:
+    """Two budgeted chains of three links: each continues once, ends on link 2, and Slurm deletes
+    link 3 before it starts."""
+    diagnose(root, "chain")
+    (root / "chain.jsonl").write_text(
+        "".join(
+            json.dumps({"key": key, "args": ["/bin/sh", "-c", command]}) + "\n"
+            for key, command in CHAIN_TASKS.items()
+        )
+    )
+    servatus(root, "create", "chain", "chain.jsonl")
+    planned = json.loads(
+        servatus(
+            root,
+            "plan",
+            "chain",
+            "--profile",
+            "chain",
+            "--budget",
+            "00:09:00",
+            "--output",
+            "chain.plan.json",
+            "--json",
+        ).stdout
+    )
+    links = [(item["link"]["index"], item["time_limit"]) for item in planned["allocations"]]
+    assert links == [(index, "00:03:00") for index in (1, 1, 2, 2, 3, 3)], planned
+    servatus(root, "validate", "chain", "chain.plan.json")
+    submitted = json.loads(servatus(root, "submit", "chain", "chain.plan.json", "--json").stdout)
+    assert len(submitted["receipts"]) == 6, submitted
+    log(f"submitted chain jobs {[receipt['job'] for receipt in submitted['receipts']]}")
+    final = wait_for(
+        root,
+        "the chains to end and Slurm to purge them",
+        deadline,
+        lambda d: d["quiescent"],
+        "chain",
+    )
+    tasks = {task["key"]: task for task in final["tasks"]}
+    links_of: dict[str, dict[int, dict[str, Any]]] = {}
+    for attempt in final["attempts"]:
+        links_of.setdefault(attempt["task_keys"][0], {})[attempt["link"]["index"]] = attempt
+    summary: dict[str, Any] = {}
+    for key, code in (("yield", 75), ("die", DIED_OF_USR1)):
+        task, chain = tasks[key], links_of[key]
+        assert (task["execution"], task["exit_code"]) == ("SUCCEEDED", 0), task
+        assert (task["link"]["index"], task["link"]["count"]) == (2, 3), task
+        assert task["run_time"]["complete"], task
+        first, last = chain[1]["observation"], chain[3]["observation"]
+        assert first["limit_at"] is not None, f"{key}: the batch shell never got SIGUSR1"
+        assert first["ends"][0]["exit_code"] == code, first
+        assert last["started_at"] is None, f"{key}: Slurm started link 3"
+        second = step_log(root, chain[2]["allocation_id"], key, deadline)
+        line = second.strip().splitlines()[0].split()
+        assert line[:4] == ["link", "2", "of", "3"] and line[7] == "540", second
+        assert int(line[5]) > 0, f"{key}: link 2 learned no run time: {second}"
+        if key == "yield":
+            assert "got USR1" in step_log(root, chain[1]["allocation_id"], key, deadline)
+        summary[key] = {
+            "run_time": seconds(task["run_time"]["total"]),
+            "link_2_learned": int(line[5]),
+        }
+    return summary
+
+
 def sweep(arguments: argparse.Namespace, root: Path, run: PurePosixPath) -> dict[str, Any]:
     started = time.monotonic()
     deadline = started + arguments.timeout
@@ -314,7 +429,7 @@ def sweep(arguments: argparse.Namespace, root: Path, run: PurePosixPath) -> dict
     assert outcome == expected, outcome
     long_attempt = next(item for item in final["attempts"] if item["job"] == jobs["long"])
     observation = long_attempt["observation"]
-    assert observation["started"] and observation["stopped"], long_attempt
+    assert observation["started_at"] and observation["stopped_at"], long_attempt
 
     retry = json.loads(servatus(root, "plan", "state", "--retry-failed", "--json").stdout)
     assert retry["selected"] == ["fail", "long"], retry
@@ -333,6 +448,7 @@ def sweep(arguments: argparse.Namespace, root: Path, run: PurePosixPath) -> dict
         summary["apptainer"] = image_check(root, run, deadline)
         if image_gpu:
             summary["apptainer_gpu"] = image_gpu_check(root, deadline)
+    summary["chains"] = chain_check(root, deadline)
     summary["seconds"] = round(time.monotonic() - started)
     return summary
 
@@ -348,6 +464,7 @@ def cancel_leftovers(arguments: argparse.Namespace, root: Path) -> None:
         ("gpu", ("gpu",)),
         ("image", ("image",)),
         ("image-gpu", ("image-gpu",)),
+        ("chain", tuple(CHAIN_TASKS)),
     ):
         if (root / state).exists():
             for key in keys:
@@ -368,7 +485,7 @@ def main() -> None:
     parser.add_argument("--gpu-gres", default="gpu", help="count-free GRES for --gpu-partition")
     parser.add_argument("--image-partition", help="also pull an image and run a Task in it here")
     parser.add_argument("--apptainer", default="/usr/bin/apptainer")
-    parser.add_argument("--timeout", type=int, default=1500, help="seconds for the whole sweep")
+    parser.add_argument("--timeout", type=int, default=2700, help="seconds for the whole sweep")
     arguments = parser.parse_args()
     work_dir = PurePosixPath(arguments.work_dir)
     if not work_dir.is_absolute():
