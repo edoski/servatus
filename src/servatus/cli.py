@@ -258,7 +258,7 @@ def _print_plan(plan: Plan, scripts: bool, saved: Path | None) -> None:
     print(f"digest: {plan.digest}")
     for line in _continuation(plan):
         print(line)
-    if decision.within is None and decision.slots is not None:
+    if decision.slots is not None:
         print(f"lease: {_plural(decision.slots, 'slot')} of {_shape(decision.profile.resources)}")
         for item in plan.allocations:
             place = "" if item.link.count == 1 else f", link {item.link.index}/{item.link.count}"
@@ -267,7 +267,7 @@ def _print_plan(plan: Plan, scripts: bool, saved: Path | None) -> None:
         noun = "allocation"
         if decision.within is not None:
             noun = "step"
-            print(f"in lease {decision.within}: {_plural(decision.slots or 1, 'slot')} per step")
+            print(f"in lease {decision.within}: one slot per step")
         allocations = _plural(len(plan.allocations), noun)
         print(f"selected: {_plural(len(decision.selected), 'Task')} in {allocations}")
         for item in plan.allocations:
@@ -321,20 +321,18 @@ def _plan(arguments: argparse.Namespace) -> int:
     campaign = _open(arguments)
     continuation = Continuation(budget=arguments.budget, max_links=arguments.max_links)
     if arguments.hold is not None:
-        _refuse(arguments, "--hold", "--lease", "--slots", "--retry", "--retry-failed", "--only")
+        _refuse(arguments, "--hold", "--lease", "--retry", "--retry-failed", "--only")
         _refuse(arguments, "--hold", "--tasks-per-allocation", "--budget")
         plan = campaign.hold(_profile(arguments), slots=arguments.hold, continuation=continuation)
     elif arguments.lease is not None:
         _refuse(arguments, "--lease", "--config", "--profile", "--tasks-per-allocation")
         plan = campaign.plan(
             lease=arguments.lease,
-            slots=arguments.slots,
             retry=_selection(arguments),
             only=tuple(arguments.only) if arguments.only else None,
             continuation=continuation,
         )
     else:
-        _refuse(arguments, "a plan without --lease", "--slots")
         plan = campaign.plan(
             _profile(arguments),
             retry=_selection(arguments),
@@ -424,7 +422,6 @@ def _start(arguments: argparse.Namespace) -> int:
     campaign = Campaign.ensure(arguments.state, tasks, connect=arguments.connect)
     plan = campaign.plan(
         lease=arguments.lease,
-        slots=arguments.slots,
         retry=_selection(arguments),
         only=tuple(task.key for task in tasks),
         continuation=Continuation(budget=arguments.budget),
@@ -535,7 +532,7 @@ def _print_status(status: Status, path: Path) -> None:
 def _lease_line(attempt: AttemptStatus) -> str | None:
     """One line per lease Slurm still lists: its job, state, slots, and link."""
     observation = attempt.observation
-    if attempt.slots is None or attempt.within is not None or observation is None:
+    if attempt.slots is None or observation is None:
         return None
     if observation.slurm_state is None:
         return None
@@ -684,7 +681,6 @@ def _parser() -> argparse.ArgumentParser:
     def lease_options(sub: argparse.ArgumentParser, *, required: bool) -> None:
         text = "start the Tasks as steps in this lease (any of its links)"
         sub.add_argument("--lease", required=required, metavar="ID", help=text)
-        sub.add_argument("--slots", type=int, metavar="K", help="lease slots per step (default 1)")
 
     text = "create a campaign; sealed unless --appendable"
     flag(command("create", _create, text, "state", "tasks"), "--appendable", "allow appending")

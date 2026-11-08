@@ -362,7 +362,6 @@ class Campaign:
         profile: Profile | None = None,
         *,
         lease: str | None = None,
-        slots: int | None = None,
         retry: Collection[str] | Retry = (),
         only: Collection[str] | None = None,
         tasks_per_allocation: int | None = None,
@@ -376,24 +375,20 @@ class Campaign:
         measures each candidate's run time from that evidence and records it in the Decision.
 
         With ``lease`` instead of a profile (the id of any link of a lease of this campaign),
-        each selected Task starts as a step using ``slots`` (default 1) of the lease's current
-        link: the first one Slurm lists that has not ended or reached its pre-limit signal
-        (``Conflict`` when there is none). Steps use the lease's Profile, always learn their run
-        time, and are never deferred; ``continuation`` may carry a budget but not ``max_links``.
+        each selected Task starts as a step using one slot of the lease's current link: the first
+        one Slurm lists that has not ended or reached its pre-limit signal (``Conflict`` when there
+        is none). Steps use the lease's Profile, always learn their run time, and are never
+        deferred; ``continuation`` may carry a budget but not ``max_links``.
         """
         if not isinstance(continuation, Continuation):
             raise ConfigurationError("continuation must be a Continuation")
         if lease is None:
             if not isinstance(profile, Profile):
                 raise ConfigurationError("profile must be a Profile")
-            if slots is not None:
-                raise ConfigurationError("slots needs a lease")
         elif profile is not None or tasks_per_allocation is not None:
             raise ConfigurationError("a step plan takes its Profile from its lease, one Task each")
         elif continuation.max_links is not None:
             raise ConfigurationError("steps do not continue across links; plan without max_links")
-        elif slots is not None and (type(slots) is not int or slots < 1):
-            raise ConfigurationError("slots must be a positive integer")
         request = Request.parse(retry, only)
         if request.retry is Retry.INCOMPLETE and self._probe is None:
             raise ConfigurationError("Retry.INCOMPLETE needs a result probe")
@@ -401,9 +396,7 @@ class Campaign:
         within, cap = None, 1
         if lease is not None:
             held = self._lease_link(state, lease)
-            within, profile, slots = held.allocation_id, held.profile, slots or 1
-            if slots > cast(int, held.slots):
-                raise ConfigurationError(f"lease {within} holds only {held.slots} slots")
+            within, profile = held.allocation_id, held.profile
         profile = cast(Profile, profile)
         if within is None:
             cap = capacity(profile.target, profile.resources, tasks_per_allocation)
@@ -440,7 +433,6 @@ class Campaign:
             extensions={
                 key: reason for key, reason in selection.extensions.items() if key in selected
             },
-            slots=slots,
             within=within,
         )
         return build_plan(state, decision)

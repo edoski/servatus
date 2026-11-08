@@ -24,7 +24,8 @@ from servatus.errors import Conflict, CorruptState
 
 OTHER = profile(label="other")
 STEP_REFUSED = "a step must run in a lease accepted before its intent"
-UNFIT = "a step must fit its lease's Profile and slots"
+UNFIT = "a step must use its lease's Profile"
+ONE_SLOT = "a step uses one slot of its lease"
 
 
 def leased(slots: int = 4) -> tuple[State, str]:
@@ -56,7 +57,6 @@ def _intent(state: State, **changes: Any) -> State:
     [
         (None, None, Kind.ALLOCATION),
         (4, None, Kind.LEASE),
-        (2, "a" * 24, Kind.STEP),
         (None, "a" * 24, Kind.STEP),
     ],
 )
@@ -66,10 +66,10 @@ def test_slots_and_within_name_the_kind(slots: int | None, within: str | None, k
 
 def test_a_lease_holds_slots_and_a_step_runs_in_it() -> None:
     state, lease = leased()
-    state, step = submit(state, ["task-0"], slots=2, within=lease, job=job_of(state, lease))
+    state, step = submit(state, ["task-0"], within=lease, job=job_of(state, lease))
     assert state.attempt(lease).kind is Kind.LEASE and state.attempt(lease).task_keys == ()
     assert state.attempt(step).kind is Kind.STEP
-    assert (state.attempt(step).slots, state.attempt(step).within) == (2, lease)
+    assert (state.attempt(step).slots, state.attempt(step).within) == (None, lease)
 
 
 # --- Attempt shapes --------------------------------------------------------------------------
@@ -80,19 +80,13 @@ def test_a_lease_holds_slots_and_a_step_runs_in_it() -> None:
     [
         ({"slots": 2}, "invalid lease task references"),
         ({"task_keys": ()}, "invalid allocation task references"),
-        ({"task_keys": (), "slots": 1, "within": "LEASE"}, "invalid step task references"),
-        (
-            {"task_keys": ("task-0", "task-1"), "slots": 1, "within": "LEASE"},
-            "invalid step task references",
-        ),
-        ({"within": "LEASE"}, "a step is one link with a slot count"),
-        (
-            {"slots": 1, "within": "LEASE", "link": Link(allocation_id(2), 1, 2)},
-            "a step is one link with a slot count",
-        ),
+        ({"task_keys": (), "within": "LEASE"}, "invalid step task references"),
+        ({"task_keys": ("task-0", "task-1"), "within": "LEASE"}, "invalid step task references"),
+        ({"slots": 1, "within": "LEASE"}, ONE_SLOT),
+        ({"within": "LEASE", "link": Link(allocation_id(2), 1, 2)}, "a step is one link"),
         ({"task_keys": (), "slots": 0}, "invalid slot count"),
         ({"task_keys": (), "slots": True}, "invalid slot count"),
-        ({"slots": 1, "within": "X" * 24}, "invalid lease identity"),
+        ({"within": "X" * 24}, "invalid lease identity"),
     ],
 )
 def test_impossible_lease_and_step_attempts_are_conflicts(
@@ -121,22 +115,19 @@ def test_impossible_lease_and_step_attempts_are_conflicts(
 def test_a_step_needs_an_accepted_lease(build: Callable[[], tuple[State, str]]) -> None:
     state, within = build()
     with pytest.raises(Conflict, match=STEP_REFUSED):
-        intend(state, ["task-0"], slots=1, within=within)
+        intend(state, ["task-0"], within=within)
 
 
-@pytest.mark.parametrize(
-    ("slots", "profile_value"), [(5, None), (1, OTHER)], ids=["too-many-slots", "other-profile"]
-)
-def test_a_step_fits_its_lease(slots: int, profile_value: Any) -> None:
+def test_a_step_uses_its_lease_profile() -> None:
     state, lease = leased(4)
     with pytest.raises(Conflict, match=UNFIT):
-        intend(state, ["task-0"], slots=slots, within=lease, profile_value=profile_value)
-    assert intend(state, ["task-0"], slots=4, within=lease)[0].attempts[-1].slots == 4
+        intend(state, ["task-0"], within=lease, profile_value=OTHER)
+    assert intend(state, ["task-0"], within=lease)[0].attempts[-1].within == lease
 
 
 def test_a_step_accepts_only_its_lease_job() -> None:
     state, lease = leased()
-    state, step = intend(state, ["task-0"], slots=1, within=lease)
+    state, step = intend(state, ["task-0"], within=lease)
     with pytest.raises(Conflict, match="a step's job must be its lease's job"):
         record_outcome(state, step, job_of(state, lease) + 1)
     assert record_outcome(state, step, job_of(state, lease)).attempt(step).job == job_of(
@@ -156,7 +147,7 @@ def test_a_lease_link_keeps_the_slots_of_its_chain() -> None:
 
 def test_history_ignores_leases_and_puts_a_step_task_in_slot_0() -> None:
     state, lease = leased()
-    state, step = submit(state, ["task-1"], slots=3, within=lease, job=job_of(state, lease))
+    state, step = submit(state, ["task-1"], within=lease, job=job_of(state, lease))
     past = history(state)
     assert past["task-1"].accepted == ((state.attempt(step), 0),)
     assert all(not own.accepted for key, own in past.items() if key != "task-1")
@@ -166,10 +157,10 @@ def test_history_ignores_leases_and_puts_a_step_task_in_slot_0() -> None:
 
 
 def documented() -> State:
-    """An allocation on another Profile, an accepted lease of 4, and a step of 2 in it."""
+    """An allocation on another Profile, an accepted lease of 4, and a step in it."""
     state, _ = submit(roster(3), ["task-1"], profile_value=OTHER)
     state, lease = submit(state, [], slots=4)
-    state, _ = submit(state, ["task-0"], slots=2, within=lease, job=job_of(state, lease))
+    state, _ = submit(state, ["task-0"], within=lease, job=job_of(state, lease))
     return state
 
 
@@ -182,7 +173,7 @@ def test_leases_and_steps_round_trip_with_their_slots_and_lease() -> None:
     assert [(item["slots"], item["within"]) for item in raw["attempts"]] == [
         (None, None),
         (4, None),
-        (2, lease),
+        (None, lease),
     ]
     assert raw["attempts"][1]["task_keys"] == [] and raw["attempts"][2]["job"] == 102
 
@@ -197,10 +188,9 @@ EDITS: list[tuple[str, Callable[[dict[str, Any]], None]]] = [
     (STEP_REFUSED, lambda r: r["attempts"][2].update(within=r["attempts"][0]["allocation_id"])),
     (STEP_REFUSED, _late_lease),
     (UNFIT, lambda r: r["attempts"][2].update(profile=r["attempts"][0]["profile"])),
-    (UNFIT, lambda r: r["attempts"][2].update(slots=5)),
+    (ONE_SLOT, lambda r: r["attempts"][2].update(slots=1)),
     ("a step's job must be its lease's job", lambda r: r["attempts"][2].update(job=7)),
-    ("a step is one link with a slot count", lambda r: r["attempts"][2].update(slots=None)),
-    ("a step is one link with a slot count", lambda r: r["attempts"][2]["link"].update(count=2)),
+    ("a step is one link", lambda r: r["attempts"][2]["link"].update(count=2)),
     (
         "invalid step task references",
         lambda r: r["attempts"][2].update(task_keys=["task-0", "task-2"]),

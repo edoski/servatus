@@ -168,7 +168,7 @@ def test_status_shows_steps_in_their_lease_and_one_line_per_lease(cli: Cli) -> N
     assert document["format"] == "servatus.status/4"
     attempts = {item["allocation_id"]: item for item in document["attempts"]}
     assert (attempts[lease]["slots"], attempts[lease]["within"]) == (2, None)
-    assert (attempts[step]["slots"], attempts[step]["within"]) == (1, lease)
+    assert (attempts[step]["slots"], attempts[step]["within"]) == (None, lease)
 
 
 def test_plan_documents_carry_slots_and_the_lease(cli: Cli) -> None:
@@ -177,11 +177,11 @@ def test_plan_documents_carry_slots_and_the_lease(cli: Cli) -> None:
     assert (held["slots"], held["within"], held["selected"]) == (2, None, [])
     assert held["allocations"][0]["slots"] == 2 and held["allocations"][0]["task_keys"] == []
     lease = cli.lease()
-    steps = cli.json("plan", "state", "--lease", lease, "--slots", "2", "--output", "s.json")
-    assert (steps["slots"], steps["within"], steps["selected"]) == (2, lease, ["one", "two"])
-    assert [item["cpus"] for item in steps["allocations"]] == [4, 4]
+    steps = cli.json("plan", "state", "--lease", lease, "--output", "s.json")
+    assert (steps["slots"], steps["within"], steps["selected"]) == (None, lease, ["one", "two"])
+    assert [item["cpus"] for item in steps["allocations"]] == [2, 2]
     code, out, _ = cli("plan", "state", "--lease", lease, "--only", "one")
-    assert code == 0 and f"in lease {lease}: 1 slot per step\n" in out
+    assert code == 0 and f"in lease {lease}: one slot per step\n" in out
     assert "selected: 1 Task in 1 step\n" in out
     assert cli("validate", "state", "s.json") == (
         0,
@@ -204,7 +204,6 @@ def test_plan_documents_carry_slots_and_the_lease(cli: Cli) -> None:
             ("--lease", "x", "--tasks-per-allocation", "1"),
             "--lease takes no --tasks-per-allocation",
         ),
-        (("--slots", "1"), "a plan without --lease takes no --slots"),
     ],
 )
 def test_plan_refuses_options_that_do_not_belong_to_its_mode(

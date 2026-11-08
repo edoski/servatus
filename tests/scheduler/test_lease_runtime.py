@@ -30,7 +30,6 @@ import pytest
 from support.builders import target
 
 from servatus.campaign._config import Resources, Task
-from servatus.campaign._plan import slot_resources
 from servatus.campaign._scheduler import ORDER, WITHDRAW
 from servatus.campaign._script import POLL_SECONDS, Chained, render_lease, render_order
 
@@ -156,16 +155,8 @@ class Lease:
     def task(self, key: str, mode: str, stdin: bytes = b"", **env: str) -> Task:
         return Task(key, (str(self.worker), str(self.out / key), mode), stdin=stdin, env=env)
 
-    def order(
-        self,
-        step_id: str,
-        task: Task,
-        chain: Chained | None = None,
-        resources: Resources | None = None,
-    ) -> None:
-        script = render_order(
-            self.target, resources or self.resources, task, step_id, chain or link()
-        )
+    def order(self, step_id: str, task: Task, chain: Chained | None = None) -> None:
+        script = render_order(self.target, self.resources, task, step_id, chain or link())
         result = subprocess.run(
             [*ORDER, str(self.orders), step_id],
             input=script,
@@ -490,17 +481,16 @@ def test_a_lease_without_a_job_id_fails_before_any_marker(
 
 @pytest.mark.parametrize("shell", SHELLS)
 @pytest.mark.parametrize("gpus", [0, 1])
-def test_a_step_of_k_slots_asks_srun_for_k_copies(tmp_path: Path, shell: str, gpus: int) -> None:
+def test_a_step_asks_srun_for_one_slot(tmp_path: Path, shell: str, gpus: int) -> None:
     lease = Lease(tmp_path, gpus=gpus)
     step_id = step(0)
-    resources = slot_resources(lease.resources, 2)
-    lease.order(step_id, lease.task("t", "exit=0"), resources=resources)
+    lease.order(step_id, lease.task("t", "exit=0"))
     with lease.spawn(shell):
         wait_until(lambda: lease.end(step_id) is not None, "the step never ended")
     assert lease.end(step_id) == 0
     options = lease.srun_options(step_id)
     assert options is not None
-    assert "--cpus-per-task=4" in options
-    assert "--mem=200M" in options
+    assert "--cpus-per-task=2" in options
+    assert "--mem=100M" in options
     gres = [option for option in options if option.startswith("--gres=")]
-    assert gres == (["--gres=gpu:a100:2"] if gpus else [])
+    assert gres == (["--gres=gpu:a100:1"] if gpus else [])

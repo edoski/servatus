@@ -11,7 +11,7 @@ import pytest
 from support.builders import profile, resources, target, tasks
 
 from servatus.campaign._config import Continuation, Profile
-from servatus.campaign._plan import Decision, Plan, build_plan, decode_decision, slot_resources
+from servatus.campaign._plan import Decision, Plan, build_plan, decode_decision
 from servatus.campaign._policy import Hold
 from servatus.campaign._script import Chained, render_lease, render_order, sbatch_argv
 from servatus.campaign._state import Kind, Link, State, create, record_intent, record_outcome
@@ -25,7 +25,7 @@ HELD = resources(
 LEASED = profile(resource_value=HELD)
 LEASE_JOB = 500
 NOT_A_LEASE = "a step plan must fit an accepted lease of the campaign"
-ONE_EACH = "a lease or step plan needs a slot count and one Task each"
+ONE_EACH = "a lease or step plan has one Task per allocation"
 
 
 def identity(number: int) -> str:
@@ -88,7 +88,7 @@ def steps(state: State, lease: str, **changes: Any) -> Decision:
     values: dict[str, Any] = {
         "selected": selected,
         "spent": dict.fromkeys(selected, timedelta(0)),
-        "slots": 1,
+        "slots": None,
         "within": lease,
     }
     return decision(state, **(values | changes))
@@ -124,7 +124,7 @@ def test_a_lease_decision_builds_a_chain_of_leases_holding_its_slots() -> None:
         ({"selected": ("task-0",)}, "a lease plan selects no Task and takes no budget"),
         ({"continuation": Continuation(budget="03:00:00")}, "selects no Task and takes no budget"),
         ({"tasks_per_allocation": 2}, ONE_EACH),
-        ({"slots": 0}, ONE_EACH),
+        ({"slots": 0}, "a lease plan needs a positive slot count"),
     ],
 )
 def test_impossible_lease_decisions_are_refused(changes: dict[str, Any], message: str) -> None:
@@ -136,23 +136,22 @@ def test_impossible_lease_decisions_are_refused(changes: dict[str, Any], message
 # --- Steps -----------------------------------------------------------------------------------
 
 
-def test_a_step_decision_builds_one_order_per_selected_task_in_the_lease() -> None:
+def test_a_step_decision_builds_one_order_per_selected_task_in_one_slot_of_the_lease() -> None:
     state, lease = leased()
     budget = Continuation(budget="02:00:00")
     spent = {"task-0": timedelta(seconds=90), "task-2": timedelta(0)}
-    plan = build_plan(state, steps(state, lease, slots=2, continuation=budget, spent=spent))
+    plan = build_plan(state, steps(state, lease, continuation=budget, spent=spent))
     assert plan.decision.kind is Kind.STEP and plan.decision.measured
     assert [item.task_keys for item in plan.allocations] == [("task-0",), ("task-2",)]
-    scaled = slot_resources(HELD, 2)
     roster = dict(zip(KEYS, tasks(3), strict=True))
     for item in plan.allocations:
         (key,) = item.task_keys
         assert item.link == Link(item.allocation_id, 1, 1, timedelta(hours=2))
-        assert (item.argv, item.slots, item.within) == ((), 2, lease)
-        assert (item.cpus, item.memory_mib, item.gpus) == (8, 2048, 2)
+        assert (item.argv, item.slots, item.within) == ((), None, lease)
+        assert (item.cpus, item.memory_mib, item.gpus) == (HELD.cpus, HELD.memory_mib, HELD.gpus)
         assert item.time_limit == timedelta(hours=1)
         chain = Chained(1, timedelta(hours=2), (1,), (spent[key],))
-        expected = render_order(LEASED.target, scaled, roster[key], item.allocation_id, chain)
+        expected = render_order(LEASED.target, HELD, roster[key], item.allocation_id, chain)
         assert item.script == expected
     assert len({item.allocation_id for item in plan.allocations} | {lease}) == 3
 
@@ -184,8 +183,7 @@ def allocation() -> tuple[State, str]:
         (not_submitted, {}, NOT_A_LEASE),
         (allocation, {}, NOT_A_LEASE),
         (leased, {"profile": profile(label="other", resource_value=HELD)}, NOT_A_LEASE),
-        (leased, {"slots": 5}, NOT_A_LEASE),
-        (leased, {"slots": None}, ONE_EACH),
+        (leased, {"slots": 1}, "a step uses one slot of its lease and takes no slot count"),
         (leased, {"tasks_per_allocation": 2}, ONE_EACH),
         (
             leased,
@@ -204,8 +202,7 @@ def allocation() -> tuple[State, str]:
         "not-submitted",
         "allocation",
         "other-profile",
-        "too-many-slots",
-        "no-slots",
+        "slot-count",
         "packed",
         "deferred",
         "max-links",
@@ -238,7 +235,7 @@ def built(kind: str) -> tuple[State, Plan]:
     state, lease = leased()
     if kind == "lease":
         return state, build_plan(state, decision(state, slots=3))
-    return state, build_plan(state, steps(state, lease, slots=2))
+    return state, build_plan(state, steps(state, lease))
 
 
 @pytest.mark.parametrize("kind", ["lease", "step"])

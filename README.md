@@ -374,7 +374,8 @@ A lease belongs to a Campaign, and its Tasks are the Campaign's Tasks. Keys are 
 changed work is a new key in an appendable Campaign.
 
 ```toml
-# SERVATUS.toml: a lease holds `slots` copies of the profile's per-Task resources.
+# SERVATUS.toml: a lease holds `--hold N` slots, each a copy of the profile's per-Task resources,
+# and each step uses exactly one slot. For a step that needs 2 GPUs, use a profile with gpus = 2.
 [profiles.l40s.resources]
 cpus = 104
 memory_mib = 196608
@@ -414,9 +415,15 @@ it with `--retry-failed`. To review first, use `plan --lease ID --output PLAN.js
 How it behaves:
 
 - **Slots.** `--hold N` asks Slurm for N times the profile's per-Task resources, as an allocation of
-  N Tasks would, so `capacity` and every ceiling apply. A step uses one slot, or `--slots K`. Slurm
-  places steps: a step that does not fit yet waits inside the lease until enough slots free up, and
-  reads `QUEUED`. Slurm does not promise first-in, first-out among waiting steps.
+  N Tasks would, so `capacity` and every ceiling apply. Every step uses exactly one slot; a run
+  that needs more resources needs a lease of a larger profile. Steps of several slots are not
+  possible: the lease is one task per slot, and Slurm refuses a step whose per-task CPUs exceed the
+  job's (`Job step's --cpus-per-task value exceeds that of job (2 > 1). Job step may never run.`)
+  instead of letting it wait.
+- **Waiting for a slot.** A step started while every slot is busy waits inside the lease and reads
+  `QUEUED`. Slurm, not Servatus, chooses which waiting step starts when a slot frees, so it need
+  not be the first one you started. It can start up to about two minutes after the slot frees,
+  because `srun` backs off between its retries.
 - **Starting.** `start` and `submit` write one order per Task into the lease's directory on the
   cluster's filesystem, and the lease looks for new orders every 5 seconds. On NFS a new order can
   take up to about a minute to become visible on the compute node. Orders written while the lease is
@@ -455,7 +462,7 @@ Python:
 from servatus import Campaign, Profile, Task
 
 campaign = Campaign.ensure("gpu", tasks)
-held = campaign.hold(Profile.load("SERVATUS.toml", name="l40s"), slots=2)
+held = campaign.hold(Profile.load("SERVATUS.toml", name="l40s"), slots=2)  # --hold 2
 lease = campaign.submit(held).receipts[0].allocation_id
 
 campaign.append([Task("eval-7", ["python", "eval.py"], stdin=b'{"ckpt": 7}')])
@@ -882,7 +889,7 @@ offline), `detail` (why a `STOPPED` Task stopped: `never started`, `time limit`,
 `budget spent`), and `link`; each Attempt's `observation` carries the mtimes of its start, stop,
 and limit markers, each slot's end (`{"exit_code", "at"}` or `null`), which slots it was handed,
 and whether it observes a `step`. Each Attempt also carries `slots` and `within`: a lease has
-`slots` alone, a step both. Saved plans are `servatus.plan/4` documents. Receipts, submit and
+`slots`, a step `within`. Saved plans are `servatus.plan/4` documents. Receipts, submit and
 reconcile results, shape checks, and planned allocations are encoded with
 `servatus.campaign.to_document`; a receipt is `{"allocation_id", "job", "task_keys"}` with an
 integer job number.
@@ -898,8 +905,8 @@ integer job number.
 | `  --only KEY`, `--tasks-per-allocation N`, `--show-scripts` | Restrict the plan; lower packing; print batch scripts (sensitive). |
 | `  --budget DURATION`, `--max-links K` | Continue each Task through a chain of links until its lifetime budget is spent ([budgeted continuation](#budgeted-continuation)). |
 | `  --hold N` | Plan a lease of N slots of the profile's per-Task resources, or K leases with `--max-links K` ([leases](#leases-hold-an-allocation-start-tasks-in-it)). |
-| `  --lease ID [--slots K]` | Plan the selected Tasks as steps of K slots (default 1) in the lease's current link; no `--profile` or `--config`. |
-| `start STATE TASKS.jsonl --lease ID` | Register the file's new Tasks and start its keys as steps in the lease; takes `--slots`, `--retry`, `--retry-failed`, `--budget`. Exit 3 if interrupted. |
+| `  --lease ID` | Plan the selected Tasks as steps of one slot each in the lease's current link; no `--profile` or `--config`. |
+| `start STATE TASKS.jsonl --lease ID` | Register the file's new Tasks and start its keys as steps in the lease; takes `--retry`, `--retry-failed`, `--budget`. Exit 3 if interrupted. |
 | `validate STATE PLAN` | `sbatch --test-only` once per distinct allocation shape; exit 1 if any is rejected. |
 | `submit STATE PLAN` | Submit the reviewed plan. Exit 3 if interrupted. |
 | `status STATE [--offline]` | Task and allocation status; `--offline` skips Slurm. |

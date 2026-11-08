@@ -72,7 +72,7 @@ class TaskStatus:
 
 @dataclass(frozen=True, slots=True)
 class AttemptStatus:
-    """One Attempt: an allocation, a lease of ``slots``, or a step using ``slots`` of the lease
+    """One Attempt: an allocation, a lease of ``slots``, or a step using one slot of the lease
     it runs ``within`` (``kind``)."""
 
     allocation_id: str

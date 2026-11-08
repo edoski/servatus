@@ -3,7 +3,7 @@
 A ``Decision`` is everything an operator reviews: which Tasks a plan submits, why every other
 Task is held or deferred, the Profile it uses, and how far it continues them (``Continuation``,
 with each selected Task's measured run time). A Decision of ``slots`` alone holds a lease of that
-many slots; one with ``within`` starts its Tasks as steps of ``slots`` each in that lease.
+many slots; one with ``within`` starts each of its Tasks as a step in one slot of that lease.
 ``build_plan`` derives the rest (chains of allocations or leases, steps, their identities, batch
 scripts and orders, ``sbatch`` argv, and the digest) from a Decision and the current Campaign
 state, so a saved plan stays compact (no Task arguments or stdin) and a submitted plan can always
@@ -56,9 +56,8 @@ class Decision:
 
     ``slots`` and ``within`` say what the plan submits (``kind``): with neither, allocations of
     up to ``tasks_per_allocation`` Tasks; with ``slots`` alone, a lease holding that many copies
-    of the Profile's Resources and selecting no Task; with both, one step per selected Task in the
-    lease ``within``, each using ``slots`` of it. A lease or step plan has one Task per
-    allocation.
+    of the Profile's Resources and selecting no Task; with ``within`` alone, one step per selected
+    Task in that lease, each using one slot. A lease or step plan has one Task per allocation.
     """
 
     campaign_id: str
@@ -344,19 +343,6 @@ def _budget_notes(decision: Decision) -> list[str]:
     return notes
 
 
-def slot_resources(resources: Resources, slots: int) -> Resources:
-    """What a step using ``slots`` of a lease of ``resources`` asks for."""
-    if slots == 1:
-        return resources
-    return Resources(
-        cpus=slots * resources.cpus,
-        memory_mib=slots * resources.memory_mib,
-        time_limit=resources.time_limit,
-        gpus=slots * resources.gpus,
-        signal_before_end=resources.signal_before_end,
-    )
-
-
 def link_profile(profile: Profile, time_limit: timedelta) -> Profile:
     """``profile`` with one link's time limit."""
     resources = profile.resources
@@ -402,19 +388,22 @@ def _check(state: State, decision: Decision) -> None:
     kind = decision.kind
     if kind is Kind.ALLOCATION:
         return
-    if decision.tasks_per_allocation != 1 or type(decision.slots) is not int or decision.slots < 1:
-        raise ConfigurationError("a lease or step plan needs a slot count and one Task each")
+    if decision.tasks_per_allocation != 1:
+        raise ConfigurationError("a lease or step plan has one Task per allocation")
     if kind is Kind.LEASE:
+        if type(decision.slots) is not int or decision.slots < 1:
+            raise ConfigurationError("a lease plan needs a positive slot count")
         if decision.selected or decision.deferred or continuation.budget is not None:
             raise ConfigurationError("a lease plan selects no Task and takes no budget")
         return
+    if decision.slots is not None:
+        raise ConfigurationError("a step uses one slot of its lease and takes no slot count")
     lease = next((item for item in state.attempts if item.allocation_id == decision.within), None)
     if (
         lease is None
         or lease.kind is not Kind.LEASE
         or lease.job is None
         or lease.profile != decision.profile
-        or decision.slots > cast(int, lease.slots)
     ):
         raise ConfigurationError("a step plan must fit an accepted lease of the campaign")
     if decision.deferred or continuation.max_links is not None:
@@ -437,7 +426,7 @@ def build_plan(state: State, decision: Decision) -> Plan:
     )
     kind = decision.kind
     profile = decision.profile
-    size = decision.slots if kind is Kind.LEASE else decision.tasks_per_allocation
+    size = cast(int, decision.slots) if kind is Kind.LEASE else decision.tasks_per_allocation
     capacity(profile.target, profile.resources, size)
     document = _codec.dump(decision)
     by_key = {task.key: task for task in state.tasks}
@@ -543,8 +532,7 @@ def _steps(
 ) -> list[PlannedAllocation]:
     """One step per selected Task, link 1 of 1 of its own chain, rendered as an order."""
     profile, continuation = decision.profile, decision.continuation
-    slots = cast(int, decision.slots)
-    resources = slot_resources(profile.resources, slots)
+    resources = profile.resources
     steps: list[PlannedAllocation] = []
     for index, key in enumerate(decision.selected):
         step_id = _identity(document, index, 1)
@@ -560,7 +548,6 @@ def _steps(
                 time_limit=resources.time_limit,
                 script=render_order(profile.target, resources, by_key[key], step_id, chain),
                 argv=(),
-                slots=slots,
                 within=decision.within,
             )
         )

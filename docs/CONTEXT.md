@@ -52,7 +52,10 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   exiting on its own, and after its pre-limit signal it takes no more. `max_links` queues a chain
   of leases. It needs `signal_before_end`.
 - **Step:** an Attempt of one Task that runs inside a lease link (`Kind.STEP`, `within` the lease)
-  as one exact `srun` step of the lease's job, using K of its slots. Planned by
+  as one exact `srun` step of the lease's job, using exactly one of its slots (Slurm refuses a
+  step whose per-task CPUs exceed the job's, so a larger run needs a lease of a larger Profile).
+  When every slot is busy it waits; Slurm chooses which waiting step starts, up to about two
+  minutes after a slot frees (`srun` retry backoff). Planned by
   `Campaign.plan(lease=...)`, `plan --lease ID`, or `start`, always into the lease's current link:
   the first of its chain that Slurm lists, has not ended, and had no pre-limit signal. A step is
   link 1 of 1 of its own chain, writes its own start marker once Slurm gave it room, and stops being
@@ -90,8 +93,8 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
 - **Decision (`Decision`):** the reviewed part of a plan: Campaign identity and revision, Profile,
   selected, held, and deferred Tasks, packing, whether a probe was used, a random nonce from which
   allocation identities derive, the `Continuation`, each selected Task's measured run time
-  (`spent`, with a continuation or for steps), and its extensions. `slots` alone makes it a lease
-  plan; `slots` and `within` a step plan.
+  (`spent`, with a continuation or for steps), and its extensions. `slots` makes it a lease plan;
+  `within` a step plan.
 - **Plan (`Plan`):** a Decision (`plan.decision`) plus what it derives from the current state:
   `PlannedAllocation`s (Task keys, totals, batch script, `sbatch` argv), the digest, and `retry`
   (the selected or deferred Tasks that resubmit accepted work), `totals` (the CPU-, GPU-, and

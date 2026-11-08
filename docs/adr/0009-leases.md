@@ -34,12 +34,13 @@ An Attempt records `slots` and `within`, and `Kind` names what it holds:
 | --- | --- | --- | --- | --- |
 | allocation | one or more | none | none | its own |
 | lease | none | N held | none | its own |
-| step | exactly one | K used | the lease link | the lease's |
+| step | exactly one | none (one slot) | the lease link | the lease's |
 
 A lease holds N copies of its Profile's per-Task Resources, exactly as an allocation of N Tasks
-would ask for them, so `capacity` and every ceiling apply. A step uses K of those slots (whole
-units, K ≤ N) and runs as one exact `srun` step of the lease's job. The invariant requires a step
-to name a lease accepted before the step's intent, to use the lease's Profile, to fit its slots,
+would ask for them, so `capacity` and every ceiling apply. A step uses exactly one slot, the
+Profile's per-Task Resources, and runs as one exact `srun` step of the lease's job; a run that needs
+two GPUs uses a lease whose Profile has `gpus = 2`. The invariant requires a step to name a lease
+accepted before the step's intent, to use the lease's Profile, to hold no slot count of its own,
 and, once accepted, to carry the lease's job. A lease chain keeps its slots on every link. Every
 other rule (intent, roster order, unresolved overlap) applies unchanged, so `history`, the current
 allocation, run time, retry, holds, and logs all work: a step is slot 0 of its own Attempt.
@@ -51,7 +52,17 @@ lease needs `signal_before_end` and refuses a budget. It always asks for the pre
 its batch shell (`--signal=B:USR1@N`), and its batch script never exits on its own, so the next
 link starts whenever one ends, unless the chain is cancelled through Servatus.
 
-**Contact for a step is an order.** `Campaign.plan(lease=ID, slots=K)` (`plan --lease ID`) picks
+**One slot per step, because Slurm refuses a larger one.** The lease is submitted as
+`--ntasks=N --cpus-per-task=C`, so a step asking for `--cpus-per-task=K*C` exceeds the job's
+per-task CPUs, and Slurm refuses it at once instead of letting it wait for room. On the university
+cluster (Slurm 24.11.5, `select/cons_tres`, `CR_CPU_MEMORY`), a two-slot step in a lease of two
+1-CPU slots, one of them busy, exited 1 with `Job step's --cpus-per-task value exceeds that of job
+(2 > 1). Job step may never run.` and then `Unable to create step for job …: Memory required by
+task is not available`. One-slot steps behave as designed: with every slot busy, the next step
+waited (`step creation temporarily disabled, retrying (Requested nodes are busy)`) and started once
+a slot freed.
+
+**Contact for a step is an order.** `Campaign.plan(lease=ID)` (`plan --lease ID`) picks
 the lease's current link: the first accepted link of the lease's chain that Slurm lists, has not
 ended, and has no limit marker. Any link's id names the chain. Each selected Task becomes a step,
 link 1 of 1 of its own chain; steps are not Slurm jobs, so they never count against
@@ -75,9 +86,13 @@ prelude, start marker, and interrupt trap (`<lease>.<job>.stop`, `TERM` to the p
 the pre-limit signal has arrived (checked before every order), it claims the order and starts it in
 a background subshell. That subshell sources the order, which defines the step's run time and one
 `launch` function rendered by the Campaign's step renderer, runs it, waits for its `srun` whatever
-signal arrives, and writes `<step>.<job>.0.<code>.end`. Slurm's step scheduler packs steps: an
-`srun --exact` that does not fit waits inside the allocation until enough slots free up, so the
-script does no accounting and the compute node needs no Python.
+signal arrives, and writes `<step>.<job>.0.<code>.end`. Slurm's step scheduler places steps: an
+`srun --exact` that finds every slot busy waits inside the allocation until one frees up, so the
+script does no accounting and the compute node needs no Python. Slurm, not Servatus, chooses which
+waiting step starts; three steps ordered together on the university cluster did not start in roster
+order. A waiting step can start up to about two minutes after a slot frees, because `srun` backs
+off between retries of step creation (measured twice on the university cluster: about 2 minutes
+from one step's end to the next one's start).
 
 **The step writes its own start marker.** The order's `srun` runs `sh -c 'command : > "$1" || exit
 1; shift; exec "$@"'` before the launcher, so `<step>.<job>.start` appears only once Slurm gave
@@ -150,9 +165,9 @@ with `--retry KEY` or selected by `--retry-failed`. Stopping is `cancel --task K
 `status` and `logs --task KEY`.
 
 **State is schema 10, plans are `servatus.plan/4`, status is `servatus.status/4`.** Attempts gain
-`slots` and `within`; the Decision gains `slots` and `within` (a lease plan has `slots` alone, a
-step plan both); `PlannedAllocation` and `AttemptStatus` gain the same two fields and
-`Observation` gains `step`. There is no migration.
+`slots` and `within` (a lease has `slots`, a step `within`); the Decision gains the same two fields
+(a lease plan has `slots`, a step plan `within`); `PlannedAllocation` and `AttemptStatus` gain the
+same two fields and `Observation` gains `step`. There is no migration.
 
 ## The invariant: never two executions of a Task
 
@@ -186,6 +201,8 @@ taken at most once, by the one lease link whose directory it is in.
   `--overlap` gives up GPU isolation.
 - **`srun --jobid --async`.** Beta in Slurm 26.05, needs the step manager, forwards no stdin, and
   reports exit codes only through accounting; the reference clusters run 23.11 and 24.11.
+- **Steps of K slots.** An `srun` asking for K times the per-task CPUs exceeds the lease's
+  `--cpus-per-task`, and Slurm refuses it instead of queueing it (see Decision).
 - **A Python dispatcher that packs shares itself.** Needed only to reap steps and account for
   resources; per-order subshells and `srun --exact` remove both reasons.
 - **Withdrawal by renaming the order plus a void created exclusively.** The create was not
@@ -199,21 +216,23 @@ taken at most once, by the one lease link whose directory it is in.
 
 ## Consequences
 
-Slots are homogeneous: a CPU-only Task in a GPU lease takes a slot's GPU with it. Slurm, not
-Servatus, orders steps waiting for room, so a large step can wait behind smaller ones. Starting and
-stopping take up to a poll interval plus the filesystem's attribute cache on the compute node,
-which on NFS is about a minute. Task keys stay immutable, so changed work is a new key, and a lease
-Campaign stays appendable. A lease holds its resources whether or not a step runs. Steps do not
-carry over to the next lease link; order new steps into the next link, or use budgeted chains for
-single runs longer than one allocation. Orders and claims stay in the lease's owner-only order
-directory after it ends, as logs and run markers stay in `log_root`; an order holds its Task's
-arguments, environment, and stdin, so remove `<log_root>/<lease>.d` once the lease is gone if they
-are sensitive.
+Slots are homogeneous, and a step is one slot: a CPU-only Task in a GPU lease takes a slot's GPU
+with it, and a Task that needs more than one slot needs a lease of a larger Profile. Slurm, not
+Servatus, chooses which waiting step starts when a slot frees, and the start can lag the free slot
+by up to about two minutes of `srun` retry backoff. Starting and stopping take up to a poll interval
+plus the filesystem's attribute cache on the compute node, which on NFS is about a minute. Task keys
+stay immutable, so changed work is a new key, and a lease Campaign stays appendable. A lease holds
+its resources whether or not a step runs. Steps do not carry over to the next lease link; order new
+steps into the next link, or use budgeted chains for single runs longer than one allocation. Orders
+and claims stay in the lease's owner-only order directory after it ends, as logs and run markers
+stay in `log_root`; an order holds its Task's arguments, environment, and stdin, so remove
+`<log_root>/<lease>.d` once the lease is gone if they are sensitive.
 
-Facts only a live cluster proves, which `scripts/cluster_e2e.py` exercises in its lease scenario:
-how long an order takes to become visible on the compute node; that a step that does not fit waits
-inside the allocation and gets exactly its GRES when it starts; that `SIGUSR1`, then `SIGTERM`, on
-a step's `srun` stops it while the lease survives, and what a waiting `srun` does on `SIGTERM`;
-that a no-replace symbolic link created from a login node and a compute node lets exactly one win;
-that `test -O` works in the compute node's `/bin/sh`; that a held GPU stays held while steps come
+`scripts/cluster_e2e.py` exercises the lease on a live cluster. A CPU run on the university cluster
+showed one-slot steps waiting for a free slot and starting once one freed, stopping through
+`SIGUSR1` (exit 75), claims, `test -O`, order pickup, and the held allocation outliving its steps.
+Still unproven there: how long an order takes to become visible on the compute node on every
+filesystem; that a GPU step gets exactly its GRES and its own `CUDA_VISIBLE_DEVICES`; what a
+waiting `srun` does on `SIGTERM`; that a no-replace symbolic link created from a login node and a
+compute node at the same moment lets exactly one win; that a held GPU stays held while steps come
 and go; and that a lease chain's next link starts when one ends.

@@ -603,7 +603,7 @@ def render_order(
 ) -> bytes:
     """One step's order, which its lease sources: the run time the step reports
     (``previous``) and ``launch``, the Campaign's exact ``srun`` step of ``task`` with
-    ``resources`` (the slots it uses), its environment from link 1 of 1 ``chain``, and a start
+    ``resources`` (one slot of the lease), its environment from link 1 of 1 ``chain``, and a start
     marker the step writes itself, so a step waiting for room is not yet running."""
     step = _step(target, resources, task, step_id, 0, chain, '"$m.start"')
     lines = (

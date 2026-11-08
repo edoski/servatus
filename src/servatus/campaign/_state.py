@@ -32,7 +32,7 @@ def _require(condition: bool, message: str) -> None:
 class Kind(StrEnum):
     """What an Attempt holds. An ``allocation`` runs its Tasks as one Slurm job. A ``lease`` is a
     Slurm job that holds ``slots`` copies of its Profile's per-Task Resources and runs no Task of
-    its own. A ``step`` runs one Task in ``slots`` of the lease it is ``within``, as an ``srun``
+    its own. A ``step`` runs one Task in one slot of the lease it is ``within``, as an ``srun``
     step of the lease's job."""
 
     ALLOCATION = "allocation"
@@ -91,8 +91,8 @@ class Attempt:
     """One allocation's durable record: intent before scheduler contact, then one outcome.
 
     The outcome is its revision plus the accepted ``job``, or ``None`` for not submitted. A lease
-    has no Tasks and holds ``slots``; a step has one Task, the ``slots`` it uses, and the lease it
-    runs ``within``, whose job is its job (``kind``).
+    has no Tasks and holds ``slots``; a step has one Task and the lease it runs ``within``, whose
+    job is its job, and uses one of the lease's slots (``kind``).
     """
 
     allocation_id: str
@@ -118,15 +118,13 @@ class Attempt:
         _require(len(set(keys)) == len(keys), "invalid attempt task references")
         _require(slots is None or (type(slots) is int and slots >= 1), "invalid slot count")
         _require(self.within is None or _codec.is_hex(self.within, 24), "invalid lease identity")
+        _require(slots is None or self.within is None, "a step uses one slot of its lease")
         kind = self.kind
         _require(
             len(keys) == 1 if kind is Kind.STEP else bool(keys) == (kind is Kind.ALLOCATION),
             f"invalid {kind} task references",
         )
-        _require(
-            kind is not Kind.STEP or (slots is not None and self.link.count == 1),
-            "a step is one link with a slot count",
-        )
+        _require(kind is not Kind.STEP or self.link.count == 1, "a step is one link")
         if self.outcome_revision is None:
             _require(self.job is None, "unresolved intent has a job")
         else:
@@ -279,8 +277,8 @@ def _check(state: State) -> None:
 
 
 def _check_step(step: Attempt, lease: Attempt | None) -> None:
-    """A step runs in an earlier lease accepted before its intent, on the lease's Profile and
-    within its slots; once accepted, its job is the lease's job."""
+    """A step runs in an earlier lease accepted before its intent, on the lease's Profile; once
+    accepted, its job is the lease's job."""
     _require(
         lease is not None
         and lease.job is not None
@@ -288,10 +286,7 @@ def _check_step(step: Attempt, lease: Attempt | None) -> None:
         "a step must run in a lease accepted before its intent",
     )
     lease = cast(Attempt, lease)
-    _require(
-        step.profile == lease.profile and cast(int, step.slots) <= cast(int, lease.slots),
-        "a step must fit its lease's Profile and slots",
-    )
+    _require(step.profile == lease.profile, "a step must use its lease's Profile")
     _require(step.job is None or step.job == lease.job, "a step's job must be its lease's job")
 
 

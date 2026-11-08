@@ -12,7 +12,6 @@ from scheduler_fixtures import ALLOCATION, allocation
 from support.builders import resources, target
 
 from servatus.campaign._config import Resources, Target, Task
-from servatus.campaign._plan import slot_resources
 from servatus.campaign._script import (
     _INTERRUPT,  # pyright: ignore[reportPrivateUsage]
     _START,  # pyright: ignore[reportPrivateUsage]
@@ -246,23 +245,12 @@ def test_an_order_never_leaves_task_values_unquoted() -> None:
         assert shlex.quote(value) in step
 
 
-def test_an_order_requests_the_slots_it_uses() -> None:
-    request = resources(cpus=4, memory_mib=1000, gpus=1, signal_before_end="00:05:00")
-    step = launch(order(task(), target(), slot_resources(request, 3)))
-    assert " --cpus-per-task=12 --mem=3000M " in step and " --gres=gpu:a100:3 " in step
+def test_an_order_requests_one_slot_of_the_lease() -> None:
+    request = resources(cpus=4, memory_mib=1000, gpus=2, signal_before_end="00:05:00")
+    step = launch(order(task(), target(), request))
+    assert " --cpus-per-task=4 --mem=1000M " in step and " --gres=gpu:a100:2 " in step
 
 
 def test_an_order_is_bounded() -> None:
     with pytest.raises(ConfigurationError, match="exceeds target max_script_bytes"):
         order(task(), target(container=None, max_script_bytes=200))
-
-
-def test_slot_resources_scale_the_per_task_request_but_not_its_time() -> None:
-    request = resources(
-        cpus=4, memory_mib=1000, gpus=1, time_limit="02:00:00", signal_before_end="00:05:00"
-    )
-    assert slot_resources(request, 1) is request
-    scaled = slot_resources(request, 3)
-    assert (scaled.cpus, scaled.memory_mib, scaled.gpus) == (12, 3000, 3)
-    assert scaled.time_limit == timedelta(hours=2)
-    assert scaled.signal_before_end == timedelta(minutes=5)

@@ -236,7 +236,7 @@ def check(doc: Any) -> None:
         need(slots is None or (is_int(slots) and slots >= 1))
         need(within is None or is_hex(within, 24))
         if within is not None:
-            need(len(keys) == 1 and slots is not None and count == 1)
+            need(len(keys) == 1 and slots is None and count == 1)
             need(
                 any(
                     other["allocation_id"] == within
@@ -245,7 +245,6 @@ def check(doc: Any) -> None:
                     and other["job"] is not None
                     and other["outcome_revision"] < intent
                     and other["profile"] == raw["profile"]
-                    and slots <= other["slots"]
                     and raw["job"] in (None, other["job"])
                     for other in prior
                 )
@@ -338,12 +337,10 @@ def histories(draw: st.DrawFn) -> State:
             if not free or not leases:
                 continue
             lease = draw(st.sampled_from(leases))
-            slots = draw(st.integers(1, lease.slots or 1))
             state, _ = intend(
                 state,
                 (draw(st.sampled_from(free)),),
                 profile_value=lease.profile,
-                slots=slots,
                 within=lease.allocation_id,
             )
         elif operation == "next link":
@@ -530,7 +527,7 @@ def test_mutation_corpus_exercises_both_verdicts() -> None:
     state, _ = intend(state, ["task-4"], link=Link(chain, 2, 3, timedelta(hours=2)))
     state, lease = intend(state, (), link=Link(f"{7:024x}", 1, 2), slots=2)
     state = record_outcome(state, lease, 44)
-    state, step = intend(state, ["task-2"], slots=1, within=lease)
+    state, step = intend(state, ["task-2"], within=lease)
     state = record_outcome(state, step, 44)
     state, _ = intend(state, (), link=Link(lease, 2, 2), slots=2)
     base = json.loads(encode(state))

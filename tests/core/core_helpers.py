@@ -43,7 +43,7 @@ def intend(
     within: str | None = None,
 ) -> tuple[State, str]:
     """Record intent for ``keys``, as link 1 of 1 unless ``link`` says otherwise; the identity
-    numbers the Attempt. ``slots`` alone makes a lease; with ``within``, a step in that lease."""
+    numbers the Attempt. ``slots`` makes a lease; ``within``, a step in that lease."""
     identity = allocation_id(len(state.attempts) + 1)
     changed = record_intent(
         state,

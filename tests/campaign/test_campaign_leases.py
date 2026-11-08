@@ -161,7 +161,7 @@ def test_steps_are_orders_that_run_once_the_lease_takes_them_and_slurm_finds_roo
     plan = campaign.plan(lease=lease)
     assert plan.decision.selected == ("task-0", "task-1")
     assert all(
-        item.argv == () and (item.slots, item.within) == (1, lease) for item in plan.allocations
+        item.argv == () and (item.slots, item.within) == (None, lease) for item in plan.allocations
     )
     assert dict(plan.decision.spent) == {"task-0": timedelta(0), "task-1": timedelta(0)}
     result = campaign.submit(plan)
@@ -183,7 +183,7 @@ def test_steps_are_orders_that_run_once_the_lease_takes_them_and_slurm_finds_roo
     assert (found.execution, found.exit_code) == (Execution.SUCCEEDED, 0)
     assert found.run_time is not None and found.run_time.total == 10 * MINUTE
     attempt = next(item for item in campaign.status().attempts if item.allocation_id == steps[0])
-    assert (attempt.slots, attempt.within, attempt.job) == (1, lease, 1000)
+    assert (attempt.slots, attempt.within, attempt.job) == (None, lease, 1000)
 
 
 def test_orders_written_while_the_lease_is_queued_are_taken_once_it_starts(
@@ -243,8 +243,6 @@ def test_steps_start_in_the_first_link_of_a_lease_chain_that_takes_orders(world:
         ({"profile": lease_profile()}, "takes its Profile from its lease"),
         ({"tasks_per_allocation": 1}, "takes its Profile from its lease"),
         ({"continuation": Continuation(max_links=2)}, "plan without max_links"),
-        ({"slots": 3}, "holds only 2 slots"),
-        ({"slots": 0}, "slots must be a positive integer"),
     ],
 )
 def test_step_plan_refusals(world: World, options: dict[str, Any], message: str) -> None:
@@ -255,8 +253,6 @@ def test_step_plan_refusals(world: World, options: dict[str, Any], message: str)
 
 def test_a_step_plan_needs_a_lease_of_the_campaign(world: World) -> None:
     campaign = world.create(jobs(2))
-    with pytest.raises(ConfigurationError, match="slots needs a lease"):
-        campaign.plan(cpu_profile(), slots=1)
     campaign.submit(campaign.plan(cpu_profile(), only=["task-0"]))
     plain = campaign.status().attempts[0].allocation_id
     with pytest.raises(ConfigurationError, match=f"allocation {plain} is not a lease"):
@@ -280,12 +276,12 @@ def test_a_saved_step_plan_goes_stale_when_its_lease_stops_taking_orders(
     assert world.fake.count("sh") == 0
 
 
-def test_steps_of_k_slots_ask_for_k_times_the_resources(world: World) -> None:
+def test_a_step_asks_for_one_slot_of_its_lease(world: World) -> None:
     campaign, (lease, *_) = leased(world)
-    plan = campaign.plan(lease=lease, slots=2, only=["task-0"])
+    plan = campaign.plan(lease=lease, only=["task-0"])
     (item,) = plan.allocations
-    assert (item.slots, item.cpus, item.memory_mib) == (2, 4, 2048)
-    assert b"--cpus-per-task=4 --mem=2048M" in item.script
+    assert (item.slots, item.cpus, item.memory_mib) == (None, 2, 1024)
+    assert b"--cpus-per-task=2 --mem=1024M" in item.script
 
 
 def test_a_budget_reaches_the_step_and_holds_a_task_with_no_room(world: World) -> None:

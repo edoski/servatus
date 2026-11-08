@@ -31,10 +31,11 @@ planning with `--budget` or holding a lease. `plan` and `doctor` still read `./S
 
 - Campaign state uses schema 10: every Attempt records its `link`, its place in a chain of
   allocations (`chain`, the allocation id of link 1, its 1-based `index`, the chain's `count`, and
-  the `budget` the chain was planned with), and its `slots` and `within`, which make it a lease or
-  a step. A plain allocation is link 1 of 1. The invariant requires every later link to follow the
-  accepted previous link of its chain with the same Tasks and slots, and a step to fit a lease
-  accepted before it, on the lease's Profile and job. Schema 8 is rejected; there is no migration.
+  the `budget` the chain was planned with), and its `slots` and `within`, which make it a lease (its
+  slot count) or a step (its lease). A plain allocation is link 1 of 1. The invariant requires every
+  later link to follow the accepted previous link of its chain with the same Tasks and slots, and a
+  step to run in a lease accepted before it, on the lease's Profile and job. Schema 8 is rejected;
+  there is no migration.
 - `status --json` prints `servatus.status/4`. Each Task gains `run_time` (`{"total", "complete"}`,
   `null` offline) and `link`, and `detail` is one of `never started`, `time limit`, `yielded`, or
   `budget spent`. Each Attempt gains `link`, `slots`, and `within`, and its `observation` replaces
@@ -86,21 +87,23 @@ planning with `--budget` or holding a lease. `plan` and `doctor` still read `./S
   --json` carries it as `totals`, and the library as `Plan.totals`, a public `Totals`.
 - Leases: `plan --hold N [--max-links K]` (`Campaign.hold(profile, slots=N)`) plans one lease of N
   slots of the profile's per-Task resources, or a chain of K, and `submit` sends it as one job that
-  gets the pre-limit signal in its batch shell. `plan --lease ID [--slots K]`
-  (`Campaign.plan(lease=ID, slots=K)`) plans each selected Task as a step of K slots in the lease's
-  current link, and `submit` writes its order into the lease's owner-only order directory instead
-  of calling `sbatch`. `servatus start STATE TASKS.jsonl --lease ID` registers the file's new Tasks
-  and starts its keys in one command. The lease's POSIX `sh` batch script starts each step only
-  after its no-replace claim on the order won, the same claim `cancel` and `reconcile` contend
-  for; the step writes its own start marker once Slurm gave it room, so a waiting step reads
-  `QUEUED` and accrues no run time. `cancel --task KEY` withdraws a step the lease has not taken,
-  or has the lease stop it with `SIGUSR1`, then `SIGTERM` after `signal_before_end`; after the
-  pre-limit signal the lease takes no more orders. A step stops being live as soon as it ended or
-  was withdrawn, so its Task can be started again in the same lease. `reconcile` resolves an
-  unresolved step at once. A new run marker, `<step>.<job>.void`, records a withdrawn step. Steps
+  gets the pre-limit signal in its batch shell. `plan --lease ID` (`Campaign.plan(lease=ID)`) plans
+  each selected Task as a step of exactly one slot in the lease's current link (Slurm refuses a step
+  whose per-task CPUs exceed the lease's, so a larger run needs a lease of a larger profile), and
+  `submit` writes its order into the lease's owner-only order directory instead of calling `sbatch`.
+  `servatus start STATE TASKS.jsonl --lease ID` registers the file's new Tasks and starts its keys
+  in one command. The lease's POSIX `sh` batch script starts each step only after its no-replace
+  claim on the order won, the same claim `cancel` and `reconcile` contend for; the step writes its
+  own start marker once Slurm gave it room, so a waiting step reads `QUEUED` and accrues no run
+  time. Slurm chooses which waiting step starts when a slot frees, and `srun`'s retry backoff can
+  delay that start by up to about two minutes. `cancel --task KEY` withdraws a step the lease has
+  not taken, or has the lease stop it with `SIGUSR1`, then `SIGTERM` after `signal_before_end`;
+  after the pre-limit signal the lease takes no more orders. A step stops being live as soon as it
+  ended or was withdrawn, so its Task can be started again in the same lease. `reconcile` resolves
+  an unresolved step at once. A new run marker, `<step>.<job>.void`, records a withdrawn step. Steps
   get the Campaign's step environment, `SERVATUS_JOB_END_TIME` included, and request nothing in
-  `Plan.totals`. `Kind` is public, and `FakeScheduler` emulates leases with
-  `poll`, `begin_step`, `end_step`, and `honor_stops`.
+  `Plan.totals`. `Kind` is public, and `FakeScheduler` emulates leases with `poll`, `begin_step`,
+  `end_step`, and `honor_stops`.
 
 ## [0.13.0] - 2026-11-06
 
