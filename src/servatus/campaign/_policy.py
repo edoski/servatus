@@ -36,7 +36,7 @@ probe reports VALID instead of being refused, extends finished work: it is selec
 from __future__ import annotations
 
 from collections.abc import Collection, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from types import MappingProxyType
 from typing import cast
@@ -123,7 +123,7 @@ class Selection:
 
     selected: tuple[str, ...]
     held: Mapping[str, Hold]
-    extensions: Mapping[str, Extension] = MappingProxyType({})
+    extensions: Mapping[str, Extension] = field(default_factory=lambda: MappingProxyType({}))
 
 
 def scope(state: State, request: Request) -> tuple[tuple[Task, ...], tuple[str, ...]]:
