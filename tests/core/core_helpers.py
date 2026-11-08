@@ -11,7 +11,14 @@ from support.builders import profile, tasks
 from servatus.campaign import _codec
 from servatus.campaign._config import Profile
 from servatus.campaign._evidence import Observation, Observed
-from servatus.campaign._state import AcceptanceState, State, create, record_intent, record_outcome
+from servatus.campaign._state import (
+    AcceptanceState,
+    Link,
+    State,
+    create,
+    record_intent,
+    record_outcome,
+)
 from servatus.campaign._status import ResultState
 
 NOW = datetime(2030, 1, 1, tzinfo=UTC)
@@ -27,13 +34,19 @@ def roster(count: int = 3, *, appendable: bool = False) -> State:
 
 
 def intend(
-    state: State, keys: Iterable[str], *, profile_value: Profile | None = None
+    state: State,
+    keys: Iterable[str],
+    *,
+    profile_value: Profile | None = None,
+    link: Link | None = None,
 ) -> tuple[State, str]:
-    """Record intent for ``keys``; the identity numbers the Attempt."""
+    """Record intent for ``keys``, as link 1 of 1 unless ``link`` says otherwise; the identity
+    numbers the Attempt."""
     identity = allocation_id(len(state.attempts) + 1)
     changed = record_intent(
         state,
         allocation_id=identity,
+        link=link or Link(identity, 1, 1),
         task_keys=tuple(keys),
         profile=profile_value or profile(),
         at=NOW + timedelta(minutes=len(state.attempts)),
@@ -47,9 +60,10 @@ def submit(
     *,
     accepted: bool = True,
     profile_value: Profile | None = None,
+    link: Link | None = None,
 ) -> tuple[State, str]:
     """Intent plus outcome: job ``100 + attempt count`` when accepted, else non-submission."""
-    changed, identity = intend(state, keys, profile_value=profile_value)
+    changed, identity = intend(state, keys, profile_value=profile_value, link=link)
     job = len(changed.attempts) + 100 if accepted else None
     return record_outcome(changed, identity, job), identity
 

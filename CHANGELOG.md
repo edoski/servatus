@@ -6,6 +6,14 @@ All notable changes to Servatus are recorded here. The format follows
 
 ## [Unreleased]
 
+### Breaking
+
+- Campaign state uses schema 9: every Attempt records its `link`, its place in a chain of
+  allocations (`chain`, the allocation id of link 1, its 1-based `index`, the chain's `count`, and
+  the `budget` the chain was planned with). A plain allocation is link 1 of 1. The invariant
+  requires every later link to follow the accepted previous link of its chain with the same Tasks.
+  Schema 8 is rejected; there is no migration.
+
 ## [0.13.0] - 2026-11-06
 
 Servatus no longer needs Slurm accounting, and a new cluster is a new profile, not new code. It

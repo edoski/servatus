@@ -26,7 +26,7 @@ from ._results import (
     WaitingAllocation,
     to_document,
 )
-from ._state import AcceptanceState
+from ._state import AcceptanceState, Link
 from ._status import AttemptStatus, ResultState, Status, TaskStatus
 
 __all__ = [
@@ -41,6 +41,7 @@ __all__ = [
     "Diagnosis",
     "Execution",
     "Hold",
+    "Link",
     "LogSnapshot",
     "Observation",
     "Plan",

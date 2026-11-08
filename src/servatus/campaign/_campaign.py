@@ -46,6 +46,7 @@ from ._script import log_path
 from ._state import (
     AcceptanceState,
     Attempt,
+    Link,
     State,
     append,
     create,
@@ -584,6 +585,7 @@ class Campaign:
             return record_intent(
                 state,
                 allocation_id=item.allocation_id,
+                link=Link(item.allocation_id, 1, 1),
                 task_keys=keys,
                 profile=decision.profile,
                 at=self._time(),

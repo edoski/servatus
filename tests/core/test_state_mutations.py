@@ -3,7 +3,7 @@
 
 Valid histories come from the real transitions. Each document is mutated (numbers nudged, list
 items swapped/dropped/duplicated, keys removed or added, values transplanted between fields of the
-same name) and re-serialized canonically. ``reference`` restates the schema-8 rules directly and
+same name) and re-serialized canonically. ``reference`` restates the schema-9 rules directly and
 quadratically, in the style of the 0.11 decoder; only Profile decoding reuses the codec.
 """
 
@@ -24,7 +24,16 @@ from support.builders import profile, resources, target, tasks
 
 from servatus.campaign import _codec
 from servatus.campaign._config import Profile, Task
-from servatus.campaign._state import State, append, create, decode, encode, record_outcome, seal
+from servatus.campaign._state import (
+    Link,
+    State,
+    append,
+    create,
+    decode,
+    encode,
+    record_outcome,
+    seal,
+)
 from servatus.errors import ConfigurationError, CorruptState
 
 TOP = {
@@ -38,8 +47,10 @@ TOP = {
 }
 ROSTER_ENTRY = {"task", "revision"}
 TASK = {"key", "args", "stdin", "env"}
+LINK = {"chain", "index", "count", "budget"}
 ATTEMPT = {
     "allocation_id",
+    "link",
     "task_keys",
     "profile",
     "intent_revision",
@@ -126,6 +137,24 @@ def canonical_utc(value: object) -> bool:
     return at.utcoffset() == timedelta(0) and at.isoformat() == value
 
 
+def link_budget(value: object) -> bool:
+    """A canonical positive duration of whole minutes."""
+    if not isinstance(value, str):
+        return False
+    match = re.fullmatch(r"(?:(0|[1-9][0-9]*)-)?([0-9]{2,}):([0-5][0-9]):00", value)
+    if match is None or (match.group(1) and int(match.group(2)) > 23):
+        return False
+    if not match.group(1) and (len(match.group(2)) > 2 and match.group(2).startswith("0")):
+        return False
+    hours = int(match.group(2))
+    canonical = f"{hours:02d}:{match.group(3)}:00"
+    if match.group(1):
+        canonical = f"{match.group(1)}-{canonical}"
+    elif hours > 23:
+        return False
+    return value == canonical and value not in ("00:00:00", "0-00:00:00")
+
+
 def reference(doc: Any) -> bool:
     try:
         check(doc)
@@ -136,7 +165,7 @@ def reference(doc: Any) -> bool:
 
 def check(doc: Any) -> None:
     need(is_dict(doc) and set(doc) == TOP)
-    need(is_int(doc["schema_version"]) and doc["schema_version"] == 8)
+    need(is_int(doc["schema_version"]) and doc["schema_version"] == 9)
     need(is_hex(doc["campaign_id"], 32))
     revision, sealed = doc["revision"], doc["sealed_revision"]
     need(is_int(revision) and revision >= 0)
@@ -183,6 +212,18 @@ def check(doc: Any) -> None:
         need(is_dict(raw) and set(raw) == ATTEMPT)
         need(is_hex(raw["allocation_id"], 24))
         need(all(raw["allocation_id"] != other["allocation_id"] for other in prior))
+        link = raw["link"]
+        need(is_dict(link) and set(link) == LINK and is_hex(link["chain"], 24))
+        index, count = link["index"], link["count"]
+        need(is_int(index) and is_int(count) and 1 <= index <= count <= 32)
+        need(link["budget"] is None or link_budget(link["budget"]))
+        need(index > 1 or link["chain"] == raw["allocation_id"])
+        need(
+            not any(
+                other["link"]["chain"] == link["chain"] and other["link"]["index"] == index
+                for other in prior
+            )
+        )
         intent = raw["intent_revision"]
         need(is_int(intent) and 1 <= intent <= revision and intent not in events)
         need(not prior or intent > prior[-1]["intent_revision"])
@@ -199,6 +240,19 @@ def check(doc: Any) -> None:
                 if other["outcome_revision"] is None or other["outcome_revision"] >= intent
             )
         )
+        if index > 1:
+            need(
+                any(
+                    other["link"]["chain"] == link["chain"]
+                    and other["link"]["index"] == index - 1
+                    and other["link"]["count"] == count
+                    and other["link"]["budget"] == link["budget"]
+                    and other["task_keys"] == keys
+                    and other["job"] is not None
+                    and other["outcome_revision"] < intent
+                    for other in prior
+                )
+            )
         need(canonical_utc(raw["intent_at"]))
         outcome, job = raw["outcome_revision"], raw["job"]
         need(job is None or (is_int(job) and job >= 1))
@@ -223,7 +277,9 @@ def histories(draw: st.DrawFn) -> State:
     state = create(CAMPAIGN_ID, tasks(count), appendable=draw(st.booleans()))
     extra = 0
     for _ in range(draw(st.integers(0, 10))):
-        operation = draw(st.sampled_from(["append", "seal", "intent", "intent", "outcome"]))
+        operation = draw(
+            st.sampled_from(["append", "seal", "intent", "intent", "outcome", "next link"])
+        )
         unresolved = [a for a in state.attempts if a.outcome_revision is None]
         if operation == "append" and not state.sealed:
             env = draw(st.sampled_from([{}, {"A": "1"}, {"Z_9": "é"}]))
@@ -239,7 +295,27 @@ def histories(draw: st.DrawFn) -> State:
             limit = chosen_profile.target.max_tasks_per_allocation
             chosen = draw(st.lists(st.sampled_from(free), min_size=1, max_size=limit, unique=True))
             keys = [key for key in free if key in chosen]
-            state, _ = intend(state, keys, profile_value=chosen_profile)
+            identity = f"{len(state.attempts) + 1:024x}"
+            count = draw(st.sampled_from([1, 1, 3]))
+            budget = draw(st.sampled_from([None, timedelta(hours=30)]))
+            link = Link(identity, 1, count, budget)
+            state, _ = intend(state, keys, profile_value=chosen_profile, link=link)
+        elif operation == "next link":
+            busy = unresolved_keys(state)
+            taken = {(a.link.chain, a.link.index) for a in state.attempts}
+            ready = [
+                a
+                for a in state.attempts
+                if a.job is not None
+                and a.link.index < a.link.count
+                and (a.link.chain, a.link.index + 1) not in taken
+                and not busy & set(a.task_keys)
+            ]
+            if ready:
+                previous = draw(st.sampled_from(ready))
+                old = previous.link
+                link = Link(old.chain, old.index + 1, old.count, old.budget)
+                state, _ = intend(state, previous.task_keys, link=link)
         elif operation == "outcome" and unresolved:
             attempt = draw(st.sampled_from(unresolved))
             job = draw(st.sampled_from([None, 7, 8]))
@@ -275,6 +351,10 @@ SCALARS: list[object] = [
     "2030-01-01T00:00:00",
     "/a//b",
     "01:00:30",
+    "30:00:00",
+    "1-06:00:00",
+    3,
+    33,
     {"job_id": 1, "cluster": None},
 ]
 
@@ -391,6 +471,9 @@ def test_mutation_corpus_exercises_both_verdicts() -> None:
     state, third = intend(state, ["task-3"])
     state = record_outcome(seal(state), third, None)
     state, _ = intend(state, ["task-1", "task-3"], profile_value=PROFILES[1])
+    state, chain = intend(state, ["task-4"], link=Link(f"{5:024x}", 1, 3, timedelta(hours=2)))
+    state = record_outcome(state, chain, 43)
+    state, _ = intend(state, ["task-4"], link=Link(chain, 2, 3, timedelta(hours=2)))
     base = json.loads(encode(state))
     accepted = rejected = 0
     for _ in range(4000):

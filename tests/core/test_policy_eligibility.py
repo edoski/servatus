@@ -10,7 +10,7 @@ from support.builders import profile
 
 from servatus.campaign._evidence import Execution, Observation, Observed
 from servatus.campaign._policy import Hold, Request, Retry, Selection, decide, scope
-from servatus.campaign._state import AcceptanceState, Attempt, State, record_intent
+from servatus.campaign._state import AcceptanceState, Attempt, Link, State, record_intent
 from servatus.campaign._status import ResultState
 from servatus.errors import PlanRefused
 
@@ -431,6 +431,7 @@ def test_policy_safety_properties(
         record_intent(
             state,
             allocation_id="f" * 24,
+            link=Link("f" * 24, 1, 1),
             task_keys=selection.selected,
             profile=profile(),
             at=NOW,

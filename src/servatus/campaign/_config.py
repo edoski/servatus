@@ -29,7 +29,9 @@ _GRES = re.compile(r"[A-Za-z_][A-Za-z0-9._-]*(?::(?![0-9]+\Z)[A-Za-z0-9][A-Za-z0
 _CONSTRAINT = re.compile(r"[A-Za-z0-9._:+&|,*!()\[\]-]+\Z")
 RESERVED_ENV_PREFIX = "SERVATUS_"
 DEFAULT_MAX_SCRIPT_BYTES = 1024 * 1024
-_MINUTE = timedelta(minutes=1)
+MAX_LINKS = 32
+"""The most allocations one chain may queue."""
+MINUTE = timedelta(minutes=1)
 
 
 # --- Validation helpers ----------------------------------------------------------------------
@@ -127,7 +129,7 @@ def duration(value: object, name: str) -> timedelta:
 
 def whole_minutes(value: timedelta) -> timedelta:
     """Round upward once to Slurm's whole-minute resolution."""
-    return -(-value // _MINUTE) * _MINUTE
+    return -(-value // MINUTE) * MINUTE
 
 
 # --- Task ------------------------------------------------------------------------------------

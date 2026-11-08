@@ -61,9 +61,13 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   Tasks whose current execution is terminal and whose probed result is missing, and requires a
   probe. Explicit retry keys name single Tasks and are checked strictly (`PlanRefused` for unknown
   keys, valid results, Tasks never accepted, and live work); they accept `LOST`.
-- **Attempt:** one durable allocation record: Profile, Task keys, intent revision and time, then
-  exactly one outcome revision with the accepted job, or with none for not submitted. Its
+- **Attempt:** one durable allocation record: Profile, `Link`, Task keys, intent revision and time,
+  then exactly one outcome revision with the accepted job, or with none for not submitted. Its
   `acceptance` follows from those, and an Attempt's retried Tasks are those accepted earlier.
+- **Link (`Link`):** an Attempt's place in its chain of allocations: the chain (the allocation id
+  of link 1), its 1-based index, the chain's planned count, and the lifetime budget the chain was
+  planned with. A plain allocation is link 1 of 1. Every later link follows the accepted previous
+  link of its chain, with the same Tasks.
 - **Intent:** the synced unresolved Attempt recorded before scheduler contact.
 - **Receipt (`Receipt`):** a positive Slurm job number proving acceptance, not completion.
 - **Unresolved allocation:** an intent without an outcome. It blocks its Tasks until `reconcile`
