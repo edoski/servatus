@@ -39,13 +39,33 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
 - **Run marker:** a file the batch script creates in `log_root`, read by name and mtime:
   `<allocation_id>.<job>.start` before any step, `<allocation_id>.<job>.<slot>.<exit code>.end`
   when that slot's step returns, and `<allocation_id>.<job>.stop` when the script is interrupted.
-  A chain link that hands off also writes `<allocation_id>.<job>.limit` when its batch shell gets
-  the pre-limit signal.
+  A chain link that hands off, and a lease, also write `<allocation_id>.<job>.limit` when their batch
+  shell gets the pre-limit signal. A step's markers carry its lease's job (see Step).
 - **Chain:** the allocations, called links, that one budgeted plan queues for one packed group of
   Tasks. `submit` sends them all at once, in order; each later link depends on every earlier one
   (`afternotok`, `--kill-on-invalid-dep=yes`), so it starts only after they ended without exit 0,
   and Slurm deletes it once one exits 0. A Task runs in at most one link at a time: never two
   executions of a Task.
+- **Lease:** an Attempt with no Tasks of its own (`Kind.LEASE`), planned by `Campaign.hold` or
+  `plan --hold N`: one Slurm job holding N **slots**, each a copy of its Profile's per-Task
+  Resources, for its whole time limit. Its batch script serves orders until Slurm ends it, never
+  exiting on its own, and after its pre-limit signal it takes no more. `max_links` queues a chain
+  of leases. It needs `signal_before_end`.
+- **Step:** an Attempt of one Task that runs inside a lease link (`Kind.STEP`, `within` the lease)
+  as one exact `srun` step of the lease's job, using K of its slots. Planned by
+  `Campaign.plan(lease=...)`, `plan --lease ID`, or `start`, always into the lease's current link:
+  the first of its chain that Slurm lists, has not ended, and had no pre-limit signal. A step is
+  link 1 of 1 of its own chain, writes its own start marker once Slurm gave it room, and stops being
+  live as soon as it ended or was withdrawn.
+- **Order:** `<log_root>/<lease>.d/<step>.run`, a step's `srun` line and run time, written by
+  `submit` into the lease's owner-only order directory and sourced by the lease when it takes it.
+- **Claim:** `<log_root>/<lease>.d/<step>.claim`, a symbolic link created without replacing that
+  decides each order exactly once: `taken` when the lease won it, `withdrawn` when `cancel` or
+  `reconcile` did. Only the winner acts.
+- **Void marker:** `<step>.<job>.void`, written by the client after its claim on the step's order
+  won: the step never runs and reads `STOPPED (never started)`. A step's stop request is
+  `<step>.<job>.stop`, which the lease acts on with `SIGUSR1`, then `SIGTERM` after
+  `signal_before_end`.
 - **Handoff marker:** `<allocation_id>.<slot>.go`, written by a chain link into the next link's
   name once that slot's step returned and the slot continues (exit 75, or stopped by or a nonzero
   exit after the pre-limit signal). Its content is the Task's run time so far in seconds, for the
@@ -65,16 +85,17 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   `LOST` one counts its allocation's whole time limit; either makes the total incomplete. Gaps
   between allocations never count.
 - **Capacity (`capacity`):** how many Tasks of one Resources fit one allocation under every Target
-  ceiling, optionally lowered by `tasks_per_allocation`.
+  ceiling, optionally lowered by `tasks_per_allocation`, and how many slots a lease may hold.
 - **Slot:** a Task's zero-based position within its allocation.
 - **Decision (`Decision`):** the reviewed part of a plan: Campaign identity and revision, Profile,
   selected, held, and deferred Tasks, packing, whether a probe was used, a random nonce from which
   allocation identities derive, the `Continuation`, each selected Task's measured run time
-  (`spent`, with a continuation), and its extensions.
+  (`spent`, with a continuation or for steps), and its extensions. `slots` alone makes it a lease
+  plan; `slots` and `within` a step plan.
 - **Plan (`Plan`):** a Decision (`plan.decision`) plus what it derives from the current state:
   `PlannedAllocation`s (Task keys, totals, batch script, `sbatch` argv), the digest, and `retry`
   (the selected or deferred Tasks that resubmit accepted work), with `warnings` for deferred work
-  and for budgets a chain cannot spend as asked. A saved plan (`servatus.plan/3`) holds only the
+  and for budgets a chain cannot spend as asked. A saved plan (`servatus.plan/4`) holds only the
   Decision and digest. Submission rebuilds the plan
   from its Decision and the current state and refuses it when it differs.
 - **Hold (`Hold`):** why a Task is not selected: `VALID` (valid result), `UNRESOLVED` (intent
@@ -92,7 +113,8 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   keys, valid results, Tasks never accepted, and live work); they accept `LOST`.
 - **Attempt:** one durable allocation record: Profile, `Link`, Task keys, intent revision and time,
   then exactly one outcome revision with the accepted job, or with none for not submitted. Its
-  `acceptance` follows from those, and an Attempt's retried Tasks are those accepted earlier.
+  `acceptance` follows from those, and an Attempt's retried Tasks are those accepted earlier. Its
+  `slots` and `within` give its `Kind`: an allocation, a lease, or a step.
 - **Link (`Link`):** an Attempt's place in its chain of allocations: the chain (the allocation id
   of link 1), its 1-based index, the chain's planned count, and the lifetime budget the chain was
   planned with. A plain allocation is link 1 of 1. Every later link follows the accepted previous
@@ -102,7 +124,8 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
 - **Unresolved allocation:** an intent without an outcome. It blocks its Tasks until `reconcile`
   resolves it: a queue row, else a run marker, records acceptance with its job; with neither, an
   intent at least 15 minutes old is recorded as not submitted, and a younger one is reported as
-  waiting (`ReconcileResult`).
+  waiting (`ReconcileResult`). An unresolved step resolves at once through its claim: accepted when
+  the lease took its order, not submitted when the client's claim won.
 - **Stray:** a job Slurm lists for an allocation recorded as not submitted. It holds its Tasks
   `ACTIVE` and `status` warns about it until it leaves the queue.
 - **Submit result (`SubmitResult`):** receipts, unresolved, and unattempted allocations from one
@@ -130,7 +153,7 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   `execution` is `UNRESOLVED` while one of its Attempts is, else the observed `Execution` of its
   current allocation (`ACCEPTED` when the scheduler was not observed), else `NOT_SUBMITTED`
   (never accepted). Each Task also shows its run time and its current Attempt's `Link`.
-  `to_json()` exports it as a `servatus.status/3` document; `to_document` encodes other results
+  `to_json()` exports it as a `servatus.status/4` document; `to_document` encodes other results
   for JSON.
 - **Current allocation:** the latest accepted Attempt that was handed the Task: link 1 of a chain
   always is, and a later link once its handoff marker appeared. Status, retry selection, and
@@ -140,8 +163,10 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   and no stray, and no acceptance is unresolved. It is independent from result readiness.
 - **Cancellation:** `scancel --me --name=servatus-<allocation_id>` of the chosen accepted or
   not-submitted allocations that Slurm lists as queued or running, by allocation or for every such
-  allocation of a Task, newest first. A chosen chain link brings every later link of its chain.
-  Every chosen allocation is tried. It is a request; it retries nothing.
+  allocation of a Task, newest first. A chosen chain link brings every later link of its chain, and
+  a lease ends with every step in it. A live step is stopped inside its lease instead: its order is
+  withdrawn when the lease has not taken it, and otherwise the lease stops it. Every chosen
+  allocation is tried. It is a request; it retries nothing.
 - **Log snapshot (`LogSnapshot`):** a bounded binary suffix of an allocation or Task log. It is
   sensitive, untrusted, and has no lifecycle authority.
 
