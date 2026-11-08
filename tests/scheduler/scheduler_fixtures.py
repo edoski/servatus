@@ -5,6 +5,7 @@ from __future__ import annotations
 import posixpath
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from servatus.campaign._remote import MAX_STREAM_BYTES, Completed
 from servatus.campaign._script import check_command
@@ -13,15 +14,19 @@ ALLOCATION = "0123456789abcdef01234567"
 IDENTITY = f"servatus-{ALLOCATION}"
 SLURM_BIN = "/opt/slurm/bin"
 LOG_ROOT = "/cluster/logs/project"
+AT = datetime(2030, 1, 1, tzinfo=UTC)
+MTIME = "1893456000.0000000000"
+"""``AT`` as ``find -printf %T@`` prints it."""
 
 
 def allocation(index: int) -> str:
     return f"{index:024x}"
 
 
-def listing(*names: str, root: str = LOG_ROOT) -> bytes:
-    """A ``find LOG_ROOT -maxdepth 1 -type f`` reply listing ``names`` in ``root``."""
-    return "".join(f"{root}/{name}\n" for name in names).encode()
+def listing(*names: str, root: str = LOG_ROOT, mtime: str = MTIME) -> bytes:
+    """A ``find LOG_ROOT ... -printf '%T@ %p\\n'`` reply listing ``names`` in ``root``, each
+    stamped ``mtime``."""
+    return "".join(f"{mtime} {root}/{name}\n" for name in names).encode()
 
 
 Reply = Completed | BaseException | Callable[[tuple[str, ...]], Completed]

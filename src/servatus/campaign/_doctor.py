@@ -131,6 +131,18 @@ def _directory(scheduler: Scheduler, path: PurePosixPath) -> tuple[bool, str]:
     return False, f"{path} is not a directory this user can write to on the login host"
 
 
+def _marker_listing(scheduler: Scheduler) -> tuple[bool, str]:
+    try:
+        scheduler.markers({_PROBE_ALLOCATION: 1})
+    except EvidenceConflict as error:
+        return False, f"find printed something Servatus cannot read: {error}"
+    except CommandFailed as error:
+        return False, (
+            f"{error}. Servatus reads run markers and their mtimes with find -printf (GNU find)"
+        )
+    return True, "lists run markers with their mtimes"
+
+
 def _one_task_shape(scheduler: Scheduler, argv: tuple[str, ...], script: bytes) -> tuple[bool, str]:
     accepted, stdout, stderr = scheduler.test_only(argv, script)
     answer = (stderr or stdout).partition("\n")[0][:200]
@@ -164,6 +176,7 @@ def diagnose(
         "ProctrackType": lambda: _proctrack(config()),
         "work_root": lambda: _directory(scheduler, target.work_root),
         "log_root": lambda: _directory(scheduler, target.log_root),
+        "find -printf": lambda: _marker_listing(scheduler),
         "sbatch --test-only": lambda: _one_task_shape(scheduler, argv, script),
     }
     first = _check("slurm version", lambda: _slurm_version(scheduler.ping()))

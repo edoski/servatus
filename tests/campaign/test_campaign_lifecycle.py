@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from campaign_world import Probe, World, cpu_profile, jobs
+from campaign_world import START, Probe, World, cpu_profile, jobs
 
 from servatus.campaign import (
     AcceptanceState,
@@ -16,7 +17,9 @@ from servatus.campaign import (
     Observation,
     ResultState,
     Retry,
+    RunTime,
     Status,
+    StepEnd,
     Task,
     Verdict,
     diagnose,
@@ -218,14 +221,24 @@ def test_status_follows_one_allocation_from_queue_to_purge(world: World) -> None
     assert queued.counts()["queued"] == 3 and not queued.quiescent
 
     world.fake.start(receipt.job)
+    world.clock.advance(minutes=10)
     world.fake.finish_step(receipt.job, 1, exit_code=2)
+    world.clock.advance(minutes=5)
     running = campaign.status()
     assert executions(running) == [
         (Execution.RUNNING, None),
         (Execution.FAILED, 2),
         (Execution.RUNNING, None),
     ]
-    assert running.attempts[0].observation == Observation("RUNNING", True, False, (None, 2, None))
+    ended = StepEnd(2, START + timedelta(minutes=10))
+    assert running.attempts[0].observation == Observation(
+        "RUNNING", START, None, None, (None, ended, None), (True, True, True)
+    )
+    assert [task.run_time for task in running.tasks] == [
+        RunTime(timedelta(minutes=15), False),
+        RunTime(timedelta(minutes=10), True),
+        RunTime(timedelta(minutes=15), False),
+    ]
     assert not running.quiescent
 
     world.fake.finish(receipt.job)
@@ -240,7 +253,11 @@ def test_status_follows_one_allocation_from_queue_to_purge(world: World) -> None
     world.fake.purge(receipt.job)
     purged = campaign.status()
     assert executions(purged) == executions(settling)
-    assert purged.attempts[0].observation == Observation(None, True, False, (0, 2, 0))
+    done = StepEnd(0, START + timedelta(minutes=15))
+    assert purged.attempts[0].observation == Observation(
+        None, START, None, None, (done, ended, done), (True, True, True)
+    )
+    assert purged.tasks[0].run_time == RunTime(timedelta(minutes=15), True)
     assert purged.quiescent and purged.warnings == ()
 
 
@@ -302,11 +319,16 @@ def test_the_latest_accepted_attempt_owns_the_task(world: World) -> None:
     world.fake.finish(1000, exit_code=1)
     world.fake.purge(1000)
     campaign.submit(campaign.plan(cpu_profile(), retry=Retry.FAILED))
+    world.clock.advance(minutes=1)
     world.fake.start(1001)
+    world.clock.advance(minutes=2)
     status = campaign.status()
     assert status.tasks[0].current_allocation_id == status.attempts[1].allocation_id
     assert executions(status) == [(Execution.RUNNING, None)]
-    assert status.attempts[0].observation == Observation(None, True, False, (1,))
+    assert status.attempts[0].observation == Observation(
+        None, START, None, None, (StepEnd(1, START),), (True,)
+    )
+    assert status.tasks[0].run_time == RunTime(timedelta(minutes=2), False)
 
 
 def test_unresolved_acceptance_dominates_the_task(world: World) -> None:
@@ -329,7 +351,7 @@ def test_status_offline_makes_no_scheduler_calls_and_json_is_private(world: Worl
     assert [task.result for task in offline.tasks] == [ResultState.UNOBSERVED] * 2
     data = campaign.status().to_json()
     document = json.loads(data)
-    assert document["format"] == "servatus.status/2"
+    assert document["format"] == "servatus.status/3"
     assert [task["key"] for task in document["tasks"]] == ["task-0", "task-1"]
     assert all(secret not in data for secret in (b"secret-0", b"train.py", b"SEED"))
 

@@ -171,16 +171,19 @@ Without `--output`, `plan` only prints. `submit` rebuilds the reviewed plan, ref
 `StalePlan` if the campaign changed, and pings Slurm and rechecks eligibility before recording
 anything. `status` shows each Task's execution: `QUEUED`, `RUNNING`, `ENDING` (Slurm
 says the job ended; the outcome is final a few minutes later, once Slurm forgets it),
-`SUCCEEDED` or `FAILED` with its step's exit code, `STOPPED` (cancelled, out of time, or never
-started), or `LOST` (the job vanished without recording how it ended, for example on a node
-failure). A Task without an
-observed execution shows `NOT_SUBMITTED`, `UNRESOLVED` (reconcile it), or `ACCEPTED` (with
-`--offline`).
+`SUCCEEDED` or `FAILED` with its step's exit code, `STOPPED` (cancelled, out of time, never
+started, or the step exited 75 to say "stopped cleanly, continue me"), or `LOST` (the job vanished
+without recording how it ended, for example on a node failure). A Task without an observed
+execution shows `NOT_SUBMITTED`, `UNRESOLVED` (reconcile it), or `ACCEPTED` (with `--offline`).
+`RUN TIME` is how long the Task has run, summed over every allocation that ran it; gaps between
+allocations do not count, and a `~` marks a total that is still growing or that counts a `LOST` run
+at its whole time limit.
 
 Servatus needs no Slurm accounting (`sacct`). It reads `squeue` for work Slurm still lists, and
-the empty run markers each batch script writes to `log_root`: a start marker before any step, one
-end marker per step as soon as it returns, and a stop marker when the job is interrupted. A step's
-end marker shows as `SUCCEEDED` or `FAILED` at once. A finished job stays in `squeue` for the
+the run markers each batch script writes to `log_root`, by name and mtime: a start marker before
+any step, one end marker per step as soon as it returns, and a stop marker when the job is
+interrupted. A step's end marker shows as `SUCCEEDED` or `FAILED` at once. Run time is the span
+between those mtimes, which the file server stamps, so it never mixes clocks. A finished job stays in `squeue` for the
 cluster's `MinJobAge` (typically 5 minutes), and a missing marker means something only after that,
 when every marker is visible on the login node. Until then a cancelled Task shows `ENDING`
 and retries are held `ACTIVE`, so `--retry-failed` picks failed work up a few minutes after it ends.
@@ -620,8 +623,12 @@ memory_mib = 98304
 `STATE` is the campaign directory. `plan` and `doctor` read `./SERVATUS.toml` unless
 `--config PATH` is given. Output is human-readable, with every non-printable character escaped
 (except `--show-scripts`); every command except `logs` accepts `--json` for exact machine output.
-`status --json` prints a `servatus.status/2` document (`tasks`, `attempts`, `counts`, `quiescent`,
-`results_ready`, `warnings`); saved plans are `servatus.plan/2` documents. Receipts, submit and
+`status --json` prints a `servatus.status/3` document (`tasks`, `attempts`, `counts`, `quiescent`,
+`results_ready`, `warnings`). Each Task carries `run_time` (`{"total", "complete"}`, or `null`
+offline), `detail` (why a `STOPPED` Task stopped: `never started`, `time limit`, `yielded`, or
+`budget spent`), and `link`; each Attempt's `observation` carries the mtimes of its start, stop,
+and limit markers, each slot's end (`{"exit_code", "at"}` or `null`), and which slots it was
+handed. Saved plans are `servatus.plan/2` documents. Receipts, submit and
 reconcile results, shape checks, and planned allocations are encoded with
 `servatus.campaign.to_document`; a receipt is `{"allocation_id", "job", "task_keys"}` with an
 integer job number.
@@ -655,9 +662,10 @@ stops there, since every other command would wait for its deadline too:
 | `MinJobAge` | `scontrol show config` reports at least 120 s. | Outcomes are read after the purge, which must outlast a cached directory listing. |
 | `ProctrackType` | `scontrol show config` reports `proctrack/cgroup`. | A job Slurm no longer lists must have no steps left. |
 | `work_root`, `log_root` | Each is a writable directory on the login host. | Steps start in one and write logs and run markers to the other. |
+| `find -printf` | `find -printf` (GNU find) lists `log_root` with mtimes. | Outcomes and run time come from run-marker names and mtimes. |
 | `sbatch --test-only` | Slurm accepts the profile's one-Task request. | It proves the partition, account, QOS, GRES, and limits go together. It says nothing about whether a job would start soon. |
 
-`logs --task KEY` reads that Task's step log in its latest accepted allocation, `--allocation ID`
+`logs --task KEY` reads that Task's step log in its current allocation, `--allocation ID`
 the allocation log, and both that Task's step log in that allocation; `--bytes` is 1 to 1048576
 (default 65536). Key and allocation options repeat. `servatus --version` prints the version.
 

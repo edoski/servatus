@@ -2,20 +2,24 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from datetime import timedelta
 
 import pytest
-from core_helpers import NOW, evidence, intend, roster, scenarios, seen, submit
+from core_helpers import NOW, allocation_id, evidence, intend, roster, scenarios, seen, submit
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from servatus.campaign._evidence import Execution, Observation, Observed
-from servatus.campaign._state import AcceptanceState, State, record_outcome, seal
+from servatus.campaign._evidence import Execution, Observation, Observed, StepEnd, StopReason
+from servatus.campaign._state import AcceptanceState, Link, State, history, record_outcome, seal
 from servatus.campaign._status import (
     STATUS_FORMAT,
     ResultState,
+    RunTime,
     Status,
     classify_results,
+    current,
     project,
+    run_time,
 )
 from servatus.errors import ConfigurationError
 
@@ -264,7 +268,7 @@ def test_json_is_versioned_canonical_and_round_trips() -> None:
     status = view(state, observations, {"task-0": ResultState.MISSING}, strays={stray: 77})
     data = status.to_json()
     value = json.loads(data)
-    assert value["format"] == STATUS_FORMAT == "servatus.status/2"
+    assert value["format"] == STATUS_FORMAT == "servatus.status/3"
     assert data == json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     assert value["counts"] == dict(status.counts())
     assert value["observed_at"] == "2030-01-01T00:00:00+00:00"
@@ -278,14 +282,20 @@ def test_json_is_versioned_canonical_and_round_trips() -> None:
         "execution": "FAILED",
         "exit_code": 1,
         "detail": None,
+        "run_time": {"total": "00:10:00", "complete": True},
+        "link": {"chain": first, "index": 1, "count": 1, "budget": None},
     }
+    assert value["tasks"][2]["run_time"] == {"total": "00:00:00", "complete": False}
     attempt = value["attempts"][0]
     assert attempt["job"] == 101
+    assert attempt["link"] == value["tasks"][0]["link"]
     assert attempt["observation"] == {
         "slurm_state": "COMPLETED",
-        "started": True,
-        "stopped": False,
-        "exit_codes": [1, None],
+        "started_at": "2030-01-01T00:00:00+00:00",
+        "stopped_at": None,
+        "limit_at": None,
+        "ends": [{"exit_code": 1, "at": "2030-01-01T00:10:00+00:00"}, None],
+        "handed": [True, True],
     }
     assert attempt["intent_at"] == "2030-01-01T00:00:00+00:00"
     assert value["attempts"][1]["observation"] is None
@@ -340,8 +350,11 @@ def test_projection_invariants(
         assert projected.retry == tuple(key for key in durable.task_keys if key in earlier)
     owners = {attempt.allocation_id: attempt for attempt in status.attempts}
     for task in status.tasks:
-        assert (task.exit_code is not None) == (task.execution in (E.SUCCEEDED, E.FAILED))
+        assert (task.exit_code is not None) <= (
+            task.execution in (E.SUCCEEDED, E.FAILED, E.STOPPED)
+        )
         assert task.detail is None or task.execution is E.STOPPED
+        assert scheduler or task.run_time is None
         if task.current_allocation_id is None:
             assert task.execution is AcceptanceState.NOT_SUBMITTED
             continue
@@ -369,3 +382,86 @@ def test_projection_invariants(
     assert status.results_ready == (
         state.sealed and all(results.get(task.key) is ResultState.VALID for task in state.tasks)
     )
+
+
+# --- chains ----------------------------------------------------------------------------------
+
+BUDGET = timedelta(hours=3)
+
+
+def chain(links: int = 3) -> tuple[State, list[str]]:
+    """A ``links``-link budgeted chain of task-0 and task-1, every link accepted."""
+    state, first = submit(
+        roster(2), ["task-0", "task-1"], link=Link(allocation_id(1), 1, links, BUDGET)
+    )
+    identities = [first]
+    for index in range(2, links + 1):
+        state, identity = submit(
+            state, ["task-0", "task-1"], link=Link(first, index, links, BUDGET)
+        )
+        identities.append(identity)
+    return state, identities
+
+
+def handed(*slots: bool, state: str | None = None, code: int | None = None) -> Observation:
+    """A gated link that started at ``NOW`` with ``slots`` handed; a returned step ended 10
+    minutes later."""
+    end = None if code is None else StepEnd(code, NOW + timedelta(minutes=10))
+    return Observation(state, NOW, None, None, (end,) * len(slots), slots)
+
+
+def test_the_current_allocation_is_the_latest_link_that_was_handed_the_task() -> None:
+    state, (first, second, third) = chain()
+    past = history(state)
+    observed = evidence(
+        {
+            first: seen(None, 75, 75),
+            second: handed(True, False, code=75),
+            third: handed(False, False),
+        }
+    )
+    assert current(past["task-0"], observed) == (state.attempt(second), 0)
+    assert current(past["task-1"], observed) == (state.attempt(first), 1)
+    assert current(past["task-0"], evidence()) == (state.attempt(first), 0)
+
+
+def test_a_task_never_accepted_has_no_current_allocation_or_run_time() -> None:
+    state, _ = intend(roster(1), ["task-0"])
+    past = history(state)["task-0"]
+    assert current(past, evidence()) is None
+    assert run_time(past, evidence(), NOW) == RunTime(timedelta(0), True)
+
+
+def test_run_time_sums_every_link_and_counts_unseen_links_as_unknown() -> None:
+    state, (first, second, third) = chain()
+    past = history(state)["task-0"]
+    observed = evidence(
+        {
+            first: seen(None, 75, 75),
+            second: handed(True, True, code=75),
+            third: handed(True, True, state="RUNNING"),
+        }
+    )
+    later = NOW + timedelta(minutes=25, microseconds=999_999)
+    assert run_time(past, observed, later) == RunTime(timedelta(minutes=45), False)
+    assert run_time(past, evidence({first: seen(None, 75, 75)}), later) is None
+
+
+def test_status_shows_the_chain_link_its_run_time_and_why_it_stopped() -> None:
+    state, (first, second, third) = chain()
+    observed = {
+        first: seen(None, 75, 75),
+        second: handed(True, True, code=75),
+        third: handed(True, False, code=75),
+    }
+    status = view(state, observed)
+    zero, one = status.tasks
+    assert (zero.current_allocation_id, zero.link) == (third, state.attempt(third).link)
+    assert (zero.execution, zero.exit_code, zero.detail) == (E.STOPPED, 75, StopReason.BUDGET_SPENT)
+    assert zero.run_time == RunTime(timedelta(minutes=30), True)
+    assert (one.current_allocation_id, one.detail) == (second, StopReason.YIELDED)
+    assert one.run_time == RunTime(timedelta(minutes=20), True)
+    assert [attempt.link.index for attempt in status.attempts] == [1, 2, 3]
+    offline = view(state, scheduler_observed=False)
+    assert offline.tasks[0].current_allocation_id == first
+    assert offline.tasks[0].run_time is None

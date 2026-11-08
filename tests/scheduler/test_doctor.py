@@ -18,9 +18,10 @@ CHECKS = (
     "ProctrackType",
     "work_root",
     "log_root",
+    "find -printf",
     "sbatch --test-only",
 )
-READ_ONLY = {"ping", "squeue", "scontrol", "sh"}
+READ_ONLY = {"ping", "squeue", "scontrol", "sh", "find"}
 
 
 def config(age: str = "300 sec", track: str = "proctrack/cgroup") -> Completed:
@@ -168,6 +169,21 @@ def test_roots_must_be_writable_directories(position: int, name: str, path: str)
     check = answer(run(fake), name)
     assert check.verdict is Verdict.FAIL
     assert check.detail == f"{path} is not a directory this user can write to on the login host"
+
+
+def test_a_find_without_printf_fails_and_names_gnu_find() -> None:
+    fake = FakeScheduler()
+    fake.fail_next("find", Completed(1, b"", b"find: -printf: unknown primary or operator\n"))
+    check = answer(run(fake), "find -printf")
+    assert check.verdict is Verdict.FAIL
+    assert "unknown primary" in check.detail and "GNU find" in check.detail
+
+
+def test_a_marker_listing_servatus_cannot_read_fails() -> None:
+    fake = FakeScheduler()
+    fake.fail_next("find", Completed(0, b"/cluster/logs/project/x\n", b""))
+    check = answer(run(fake), "find -printf")
+    assert check.verdict is Verdict.FAIL and "cannot read" in check.detail
 
 
 def test_a_refused_shape_fails_with_slurms_reason_and_a_failure_beats_unavailable() -> None:

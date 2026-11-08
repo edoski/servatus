@@ -31,6 +31,8 @@ RESERVED_ENV_PREFIX = "SERVATUS_"
 DEFAULT_MAX_SCRIPT_BYTES = 1024 * 1024
 MAX_LINKS = 32
 """The most allocations one chain may queue."""
+YIELD_EXIT = 75
+"""A step's exit code for: stopped cleanly, continue me. Status reads it as STOPPED (yielded)."""
 MINUTE = timedelta(minutes=1)
 
 

@@ -13,7 +13,8 @@ this order:
    so plans without retries do not depend on (or observe) scheduler evidence.
 6. Slurm still lists a job of any accepted (or not-submitted) allocation of the Task, settling
    ones included: ``ACTIVE``.
-7. Otherwise the retry selector decides from the Task's current (latest accepted) execution.
+7. Otherwise the retry selector decides from the Task's current execution (``_status.current``:
+   the latest accepted Attempt that was handed the Task).
 
 Resubmission is always explicit, in one of two forms:
 
@@ -33,12 +34,13 @@ from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from enum import Enum, StrEnum
 from types import MappingProxyType
+from typing import cast
 
 from ..errors import PlanRefused
 from ._config import Task, task_keys
 from ._evidence import Execution, Observed
-from ._state import State, TaskHistory, history
-from ._status import ResultState
+from ._state import Attempt, State, TaskHistory, history
+from ._status import ResultState, current
 
 
 class Hold(StrEnum):
@@ -185,10 +187,10 @@ def _judge(
         return _Refusal.LIVE if named else Hold.ACTIVE
     if named:
         return None
-    attempt, slot = past.accepted[-1]
-    current, _ = observed.attempts[attempt.allocation_id].execution(slot)
+    attempt, slot = cast(tuple[Attempt, int], current(past, observed))
+    execution, _, _ = observed.attempts[attempt.allocation_id].execution(slot)
     if retry is Retry.FAILED:
-        chosen = current in (Execution.FAILED, Execution.STOPPED)
+        chosen = execution in (Execution.FAILED, Execution.STOPPED)
     else:
-        chosen = current.terminal and result is ResultState.MISSING
+        chosen = execution.terminal and result is ResultState.MISSING
     return None if chosen else Hold.SUBMITTED

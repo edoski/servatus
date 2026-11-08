@@ -29,6 +29,7 @@ from .campaign import (
     Status,
     SubmitResult,
     Task,
+    TaskStatus,
     Verdict,
     diagnose,
     to_document,
@@ -329,27 +330,52 @@ def _submit(arguments: argparse.Namespace) -> int:
 # --- Status and logs -------------------------------------------------------------------------
 
 
+def _run_time(task: TaskStatus) -> str:
+    """``RUN TIME``: the total, ``~`` first while it is not exact, and the chain's budget."""
+    if task.run_time is None:
+        return "-"
+    shown = str(to_document(task.run_time.total))
+    if not task.run_time.complete:
+        shown = f"~{shown}"
+    if task.link is not None and task.link.budget is not None:
+        shown = f"{shown} / {to_document(task.link.budget)}"
+    return shown
+
+
+def _link(task: TaskStatus) -> str:
+    if task.link is None or task.link.count == 1:
+        return "-"
+    return f"{task.link.index}/{task.link.count}"
+
+
 def _print_status(status: Status, path: Path) -> None:
     state = _safe(path)
     kind = "sealed" if status.sealed else "appendable"
     observed = "observed" if status.scheduler_observed else "not observed (--offline)"
     print(f"campaign {status.campaign_id}: revision {status.revision}, {kind}")
     print(f"at {status.observed_at.isoformat(timespec='seconds')}; scheduler {observed}")
-    rows = [("KEY", "RESULT", "EXECUTION", "EXIT", "ALLOCATION")]
+    rows = [("KEY", "RESULT", "EXECUTION", "EXIT", "RUN TIME", "LINK", "ALLOCATION")]
     for task in status.tasks:
         execution = task.execution.value
         if task.detail is not None:
-            execution = f"{execution} ({task.detail})"
+            execution = f"{execution} ({task.detail.value})"
         exit_code = "-" if task.exit_code is None else str(task.exit_code)
         allocation = task.current_allocation_id or "-"
-        rows.append((_safe(task.key), task.result.value, execution, exit_code, allocation))
-    widths = [max(len(row[column]) for row in rows) for column in range(4)]
-    for row in rows:
-        print(
-            "  ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=False))
-            + "  "
-            + row[4]
+        rows.append(
+            (
+                _safe(task.key),
+                task.result.value,
+                execution,
+                exit_code,
+                _run_time(task),
+                _link(task),
+                allocation,
+            )
         )
+    widths = [max(len(row[column]) for row in rows) for column in range(len(rows[0]) - 1)]
+    for row in rows:
+        cells = zip(row, widths, strict=False)
+        print("  ".join(cell.ljust(width) for cell, width in cells) + "  " + row[-1])
     counts = status.counts()
     shown = ", ".join(
         f"{name} {value}" for name, value in counts.items() if value or name == "tasks"

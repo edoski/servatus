@@ -1,10 +1,11 @@
 """Scheduler evidence: execution states, queue rows, run markers, and their pure parsing.
 
 Servatus observes an allocation from two sources: the job's ``squeue`` row while Slurm still lists
-it, and the empty marker files its batch script writes to ``log_root``. A finished job stays in
-``squeue --states=all`` for ``MinJobAge`` (minutes), far longer than an NFS client caches a
-directory listing, so markers read once the row is gone are complete. The functions here are pure;
-``_scheduler`` runs the commands.
+it, and the marker files its batch script writes to ``log_root``, read by name and mtime. A finished
+job stays in ``squeue --states=all`` for ``MinJobAge`` (minutes), far longer than an NFS client
+caches a directory listing, so markers read once the row is gone are complete. Run time comes from
+the same markers: the file server stamps every mtime, so durations never mix clocks. The functions
+here are pure; ``_scheduler`` runs the commands.
 """
 
 from __future__ import annotations
@@ -12,11 +13,12 @@ from __future__ import annotations
 import re
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import PurePosixPath
 
 from ..errors import EvidenceConflict
-from ._config import CONTROL, TOKEN
+from ._config import CONTROL, TOKEN, YIELD_EXIT
 
 
 class Execution(StrEnum):
@@ -24,7 +26,8 @@ class Execution(StrEnum):
 
     ``ENDING``: Slurm reports the job ended, but its outcome is final only once Slurm forgets the
     job (``MinJobAge`` later), when every run marker is certain to be visible.
-    ``STOPPED``: the allocation was interrupted (cancel, time limit) or never started the Task.
+    ``STOPPED``: the allocation was interrupted (cancel, time limit), never started the Task, or
+    the step stopped to continue later (exit 75, or a nonzero exit after the pre-limit signal).
     ``LOST``: the batch shell vanished without recording anything (SIGKILL, node failure); the
     step may even still run on a node cut off from the controller.
     """
@@ -83,6 +86,7 @@ class Start:
     """``<allocation>.<job>.start``: the batch script began; without it no Task process ran."""
 
     job: int
+    at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +94,16 @@ class Stop:
     """``<allocation>.<job>.stop``: the batch script was interrupted and stopped its steps."""
 
     job: int
+    at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class Limit:
+    """``<allocation>.<job>.limit``: the batch shell of a link that hands off received the
+    pre-limit signal and relayed it to its steps."""
+
+    job: int
+    at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,39 +113,107 @@ class End:
     job: int
     slot: int
     exit_code: int
+    at: datetime
 
 
-Marker = Start | Stop | End
+@dataclass(frozen=True, slots=True)
+class Handoff:
+    """``<allocation>.<slot>.go``: the previous link of the chain handed this slot on. It exists
+    before this link runs, so it names no job and never proves acceptance. Its content, the
+    Task's run time so far, is for the step; Servatus reads only its name and mtime."""
+
+    slot: int
+    at: datetime
+
+
+Marker = Start | Stop | Limit | End | Handoff
+
+
+class StopReason(StrEnum):
+    """Why a ``STOPPED`` Task stopped, when the evidence says.
+
+    ``TIME_LIMIT``: the step was stopped by, or exited nonzero after, the pre-limit signal of a
+    link that hands off. ``YIELDED``: the step exited 75. ``BUDGET_SPENT``: either of those on
+    the last link of a budgeted chain. ``NEVER_STARTED``: the allocation never ran the Task.
+    """
+
+    TIME_LIMIT = "time limit"
+    YIELDED = "yielded"
+    BUDGET_SPENT = "budget spent"
+    NEVER_STARTED = "never started"
+
+
+@dataclass(frozen=True, slots=True)
+class StepEnd:
+    """When a slot's step returned, and its exit code."""
+
+    exit_code: int
+    at: datetime
+
+
+def _clamp(value: timedelta, bound: timedelta) -> timedelta:
+    return min(max(value, timedelta(0)), bound)
 
 
 @dataclass(frozen=True, slots=True)
 class Observation:
     """What one accepted allocation showed: its ``squeue`` state while Slurm lists the job
-    (``None`` once purged) and its run markers, with one exit code per slot (``None`` until that
-    slot's step returned)."""
+    (``None`` once purged), the mtimes of its start, stop, and limit markers, each slot's
+    ``StepEnd`` (``None`` until its step returned), and whether each slot was ``handed`` to this
+    allocation. Link 1 has every slot. A later link has a slot once its handoff marker appeared,
+    unless it appeared only after this link started (a predecessor cut off from Slurm)."""
 
     slurm_state: str | None
-    started: bool
-    stopped: bool
-    exit_codes: tuple[int | None, ...]
+    started_at: datetime | None
+    stopped_at: datetime | None
+    limit_at: datetime | None
+    ends: tuple[StepEnd | None, ...]
+    handed: tuple[bool, ...]
 
     @property
     def live(self) -> bool:
         """Slurm still lists the job, settling included; retry waits until it is purged."""
         return self.slurm_state is not None
 
-    def execution(self, slot: int) -> tuple[Execution, int | None]:
-        """The Task in ``slot`` and its exit code (terminal steps only)."""
-        state, code = self.slurm_state, self.exit_codes[slot]
+    def execution(self, slot: int) -> tuple[Execution, int | None, StopReason | None]:
+        """The Task in ``slot``, its exit code (steps that returned), and why it stopped."""
+        state, end = self.slurm_state, self.ends[slot]
         if state is not None and _queued(state):
-            return Execution.QUEUED, None
-        if code is not None:
-            return (Execution.SUCCEEDED if code == 0 else Execution.FAILED), code
+            return Execution.QUEUED, None, None
+        if not self.handed[slot]:
+            return Execution.STOPPED, None, StopReason.NEVER_STARTED
+        if end is not None:
+            code = end.exit_code
+            if code == 0:
+                return Execution.SUCCEEDED, code, None
+            if code == YIELD_EXIT:
+                return Execution.STOPPED, code, StopReason.YIELDED
+            if self.limit_at is not None and self.limit_at <= end.at:
+                return Execution.STOPPED, code, StopReason.TIME_LIMIT
+            return Execution.FAILED, code, None
         if state is not None:
-            return (Execution.ENDING if state in _ENDED else Execution.RUNNING), None
-        if self.stopped or not self.started:
-            return Execution.STOPPED, None
-        return Execution.LOST, None
+            return (Execution.ENDING if state in _ENDED else Execution.RUNNING), None, None
+        if self.started_at is None:
+            return Execution.STOPPED, None, StopReason.NEVER_STARTED
+        if self.stopped_at is not None:
+            reason = None if self.limit_at is None else StopReason.TIME_LIMIT
+            return Execution.STOPPED, None, reason
+        return Execution.LOST, None, None
+
+    def run_time(self, slot: int, now: datetime, bound: timedelta) -> tuple[timedelta, bool]:
+        """How long ``slot`` ran in this allocation, at most ``bound`` (its time limit), and
+        whether that is exact: a step still running counts until ``now``, and a LOST one counts
+        ``bound``, both inexact. A slot never handed or never started ran for no time."""
+        started = self.started_at
+        if not self.handed[slot] or started is None:
+            return timedelta(0), True
+        end = self.ends[slot]
+        stopped = end.at if end is not None else self.stopped_at
+        if stopped is not None:
+            return _clamp(stopped - started, bound), True
+        if self.live:
+            return _clamp(now - started, bound), False
+        return bound, False
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,7 +231,11 @@ MAX_REPLY_LINES = 4096
 _DECIMAL = re.compile(rb"[1-9][0-9]*\Z")
 _RECEIPT = re.compile(rb"([1-9][0-9]*)\n?\Z")
 _EXIT_CODE = r"(?:[0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])"
-_MARKER = re.compile(rf"([1-9][0-9]*)\.(?:(start|stop)|(0|[1-9][0-9]*)\.({_EXIT_CODE})\.end)\Z")
+_MARKER = re.compile(
+    rf"(?:([1-9][0-9]*)\.(?:(start|stop|limit)|(0|[1-9][0-9]*)\.({_EXIT_CODE})\.end)"
+    r"|(0|[1-9][0-9]*)\.go)\Z"
+)
+_TIMED = re.compile(rb"([0-9]{1,12})(?:\.([0-9]{1,10}))? (.+)")
 _ALLOCATION = re.compile(rb"([0-9a-f]{24})\.")
 
 
@@ -196,20 +282,31 @@ def parse_queue(output: bytes, identities: Collection[str]) -> dict[str, list[Qu
     return rows
 
 
+def _mtime(seconds: bytes, fraction: bytes | None) -> datetime:
+    """An exact UTC time from ``find -printf %T@`` (epoch seconds, optional fraction)."""
+    micro = int((fraction or b"0")[:6].ljust(6, b"0"))
+    return datetime.fromtimestamp(int(seconds), UTC) + timedelta(microseconds=micro)
+
+
 def parse_markers(
     output: bytes, log_root: PurePosixPath, allocation_ids: Collection[str]
 ) -> dict[str, list[Marker]]:
-    """Markers of the queried allocations in a ``find LOG_ROOT -maxdepth 1 -type f`` listing.
+    """Markers of the queried allocations in a ``find LOG_ROOT ... -printf '%T@ %p\\n'``
+    listing: one line per file, its mtime in epoch seconds, a space, then its path.
 
-    Files of other allocations are ignored. A name with a queried allocation prefix that breaks
-    the marker grammar is an ``EvidenceConflict`` naming that allocation.
+    Files of other allocations are ignored. A line that is not ``<mtime> <path>``, or a name with
+    a queried allocation prefix that breaks the marker grammar, is an ``EvidenceConflict``.
     """
     markers: dict[str, list[Marker]] = {allocation_id: [] for allocation_id in allocation_ids}
     root = str(log_root).rstrip("/").encode() + b"/"
     for line in _lines(output, None):
-        name = line.removeprefix(root)
+        timed = _TIMED.fullmatch(line)
+        if timed is None:
+            raise EvidenceConflict("the run marker listing is malformed")
+        path = timed.group(3)
+        name = path.removeprefix(root)
         match = _ALLOCATION.match(name)
-        if name == line or match is None or match.group(1).decode() not in markers:
+        if name == path or match is None or match.group(1).decode() not in markers:
             continue
         allocation_id = match.group(1).decode()
         try:
@@ -218,14 +315,19 @@ def parse_markers(
             parsed = None
         if parsed is None:
             raise EvidenceConflict(f"allocation {allocation_id} has a malformed run marker")
-        job, kind, slot, code = parsed.groups()
+        at = _mtime(timed.group(1), timed.group(2))
+        job, kind, slot, code, handed = parsed.groups()
         marker: Marker
-        if kind == "start":
-            marker = Start(int(job))
+        if handed is not None:
+            marker = Handoff(int(handed), at)
+        elif kind == "start":
+            marker = Start(int(job), at)
         elif kind == "stop":
-            marker = Stop(int(job))
+            marker = Stop(int(job), at)
+        elif kind == "limit":
+            marker = Limit(int(job), at)
         else:
-            marker = End(int(job), int(slot), int(code))
+            marker = End(int(job), int(slot), int(code), at)
         markers[allocation_id].append(marker)
     return markers
 
@@ -255,36 +357,56 @@ def observe(
     task_count: int,
     rows: Sequence[QueueRow],
     markers: Iterable[Marker],
+    *,
+    gated: bool = False,
 ) -> Observation:
-    """One accepted allocation's ``Observation``; evidence of another job, or of a slot it does
-    not have, is an ``EvidenceConflict`` naming the allocation."""
+    """One accepted allocation's ``Observation``. ``gated`` allocations (chain links after the
+    first) run a slot only once it is handed to them. Evidence of another job, of a slot the
+    allocation does not have, or a handoff to an ungated allocation is an ``EvidenceConflict``
+    naming the allocation."""
     row = queue_row(allocation_id, rows, job)
-    started = stopped = False
-    exit_codes: list[int | None] = [None] * task_count
+    started = stopped = limited = None
+    ends: list[StepEnd | None] = [None] * task_count
+    handoffs: list[datetime | None] = [None] * task_count
     for marker in markers:
-        if marker.job != job:
+        if isinstance(marker, Handoff):
+            if not gated or marker.slot >= task_count:
+                raise EvidenceConflict(
+                    f"allocation {allocation_id}: unexpected handoff marker for slot {marker.slot}"
+                )
+            handoffs[marker.slot] = marker.at
+        elif marker.job != job:
             raise EvidenceConflict(
                 f"allocation {allocation_id}: a run marker names job {marker.job}, not the "
                 f"accepted job {job}"
             )
-        if isinstance(marker, Start):
-            started = True
+        elif isinstance(marker, Start):
+            started = marker.at
         elif isinstance(marker, Stop):
-            stopped = True
-        elif marker.slot >= task_count or exit_codes[marker.slot] is not None:
+            stopped = marker.at
+        elif isinstance(marker, Limit):
+            limited = marker.at
+        elif marker.slot >= task_count or ends[marker.slot] is not None:
             raise EvidenceConflict(
                 f"allocation {allocation_id}: unexpected end marker for slot {marker.slot}"
             )
         else:
-            exit_codes[marker.slot] = marker.exit_code
-    return Observation(None if row is None else row.state, started, stopped, tuple(exit_codes))
+            ends[marker.slot] = StepEnd(marker.exit_code, marker.at)
+    handed = tuple(
+        not gated or (at is not None and (started is None or at <= started)) for at in handoffs
+    )
+    return Observation(
+        None if row is None else row.state, started, stopped, limited, tuple(ends), handed
+    )
 
 
 def evidenced_job(
     allocation_id: str, rows: Sequence[QueueRow], markers: Iterable[Marker]
 ) -> int | None:
-    """The job that queue rows or run markers prove for an unresolved allocation, if any."""
-    jobs = sorted({row.job for row in rows} | {marker.job for marker in markers})
+    """The job that queue rows or run markers prove for an unresolved allocation, if any.
+    Handoff markers name no job, so they prove nothing."""
+    named = {marker.job for marker in markers if not isinstance(marker, Handoff)}
+    jobs = sorted({row.job for row in rows} | named)
     if len(jobs) > 1:
         shown = ", ".join(map(str, jobs))
         raise EvidenceConflict(f"allocation {allocation_id}: evidence names jobs {shown}")

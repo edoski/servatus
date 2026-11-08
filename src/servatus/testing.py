@@ -14,6 +14,9 @@ and inject failures::
     fake.finish(job)     # every step returns 0; the job settles as COMPLETED in squeue
     fake.purge(job)      # Slurm forgets the job (MinJobAge); its markers stay
 
+Every file carries an mtime from the fake's clock (``clock``, or an internal one that ``advance``
+moves), which ``find -printf`` reports, so run time is measured as on a real cluster.
+
 Controls and ``count`` name commands by basename (``"sbatch"``, ``"squeue"``, ``"find"``, ...),
 except the ``sbatch --version`` connectivity check that precedes every submission, which is
 ``"ping"``: so ``fail_next("sbatch")`` affects the next real submission, and ``fail_next("ping")``
@@ -27,6 +30,7 @@ import fnmatch
 import posixpath
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 
 from .campaign._config import Resources, Target
@@ -39,6 +43,7 @@ __all__ = ["FakeJob", "FakeScheduler"]
 
 _RUNNING = "RUNNING"
 _PENDING = "PENDING"
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +118,14 @@ def _lines(rows: Sequence[str]) -> bytes:
     return "".join(f"{row}\n" for row in rows).encode("utf-8")
 
 
+def _epoch(moment: datetime) -> str:
+    """``find -printf %T@``: epoch seconds with GNU find's ten fractional digits."""
+    elapsed = moment - _EPOCH
+    seconds = elapsed // timedelta(seconds=1)
+    micro = (elapsed - timedelta(seconds=seconds)) // timedelta(microseconds=1)
+    return f"{seconds}.{micro:06d}0000"
+
+
 def _exit_code(value: object) -> int:
     if type(value) is not int or not 0 <= value <= 255:
         raise ConfigurationError("exit_code must be an integer from 0 to 255")
@@ -123,16 +136,28 @@ class FakeScheduler:
     """An in-memory Slurm cluster that answers Servatus' scheduler commands.
 
     Job numbers count up from ``first_job_id``. ``version`` is the ``sbatch --version`` text.
-    Every Target reaches the same cluster and the same files, keyed by absolute path.
+    Every Target reaches the same cluster and the same files, keyed by absolute path. ``clock``
+    stamps file mtimes (default: an internal clock at 2030-01-01 UTC that ``advance`` moves).
     """
 
-    def __init__(self, *, first_job_id: int = 1000, version: str = "slurm 23.11.4") -> None:
+    def __init__(
+        self,
+        *,
+        first_job_id: int = 1000,
+        version: str = "slurm 23.11.4",
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         if type(first_job_id) is not int or first_job_id < 1:
             raise ConfigurationError("first_job_id must be a positive integer")
+        if clock is not None and not callable(clock):
+            raise ConfigurationError("clock must be callable")
         self._next_job_id = first_job_id
         self._version = version
+        self._now = datetime(2030, 1, 1, tzinfo=UTC)
+        self._clock = clock
         self._jobs: list[_Job] = []
         self._files: dict[str, bytes] = {}
+        self._mtimes: dict[str, datetime] = {}
         self._calls: list[tuple[str, ...]] = []
         self._failures: dict[str, list[Completed | None]] = {}
         self._lost: dict[str, int] = {}
@@ -202,6 +227,14 @@ class FakeScheduler:
         """Every file on the fake cluster (logs and run markers) by absolute path."""
         return dict(self._files)
 
+    def mtime(self, path: str | PurePosixPath) -> datetime:
+        """When a file was last written, by the fake's clock."""
+        return self._mtimes[str(path)]
+
+    def now(self) -> datetime:
+        """The fake's current time, which stamps every file it writes."""
+        return self._clock() if self._clock is not None else self._now
+
     # --- Controls ----------------------------------------------------------------------------
 
     def start(self, job: int) -> None:
@@ -210,7 +243,7 @@ class FakeScheduler:
         if found.state != _PENDING:
             raise ConfigurationError(f"job {found.job} is not pending")
         found.state = _RUNNING
-        self._files[f"{found.marker}.start"] = b""
+        self._write(f"{found.marker}.start")
 
     def finish_step(self, job: int, slot: int, exit_code: int = 0) -> None:
         """One Task step of a running job returns: its slot's end marker appears."""
@@ -219,7 +252,7 @@ class FakeScheduler:
         if found.state != _RUNNING or not 0 <= slot < found.task_count or slot in found.ended:
             raise ConfigurationError(f"job {found.job} has no running step in slot {slot}")
         found.ended[slot] = code
-        self._files[f"{found.marker}.{slot}.{code}.end"] = b""
+        self._write(f"{found.marker}.{slot}.{code}.end")
 
     def finish(self, job: int, exit_code: int = 0) -> None:
         """Every remaining step returns ``exit_code`` (a pending job starts first). The job
@@ -252,13 +285,25 @@ class FakeScheduler:
         """Slurm forgets the job (after ``MinJobAge``); ``squeue`` no longer lists it."""
         self._find(job).in_queue = False
 
-    def write_file(self, path: str | PurePosixPath, content: bytes = b"") -> None:
-        """Create or replace a file, such as a log ``tail`` reads or a run marker."""
-        self._files[str(path)] = bytes(content)
+    def write_file(
+        self, path: str | PurePosixPath, content: bytes = b"", *, at: datetime | None = None
+    ) -> None:
+        """Create or replace a file, such as a log ``tail`` reads or a run marker, stamped
+        ``at`` (default: now)."""
+        self._write(str(path), bytes(content), at)
 
     def remove_file(self, path: str | PurePosixPath) -> None:
         """Remove a file, for example a marker an NFS client does not see yet."""
-        del self._files[str(path)]
+        del self._files[str(path)], self._mtimes[str(path)]
+
+    def advance(self, **delta: float) -> None:
+        """Move the internal clock forward by ``timedelta(**delta)``."""
+        if self._clock is not None:
+            raise ConfigurationError("advance the clock this FakeScheduler was given instead")
+        step = timedelta(**delta)
+        if step < timedelta(0):
+            raise ConfigurationError("the clock never runs backwards")
+        self._now += step
 
     def fail_next(self, command: str, reply: Completed | None = None) -> None:
         """Make the next ``command`` (by key) fail without acting.
@@ -280,11 +325,18 @@ class FakeScheduler:
 
     # --- Internals ---------------------------------------------------------------------------
 
+    def _write(self, path: str, content: bytes = b"", at: datetime | None = None) -> None:
+        moment = self.now() if at is None else at
+        if moment.utcoffset() != timedelta(0):
+            raise ConfigurationError("file times must be aware UTC datetimes")
+        self._files[path] = content
+        self._mtimes[path] = moment
+
     def _interrupt(self, found: _Job, state: str) -> None:
         if found.state not in (_PENDING, _RUNNING):
             raise ConfigurationError(f"job {found.job} already ended")
         if found.started:
-            self._files[f"{found.marker}.stop"] = b""
+            self._write(f"{found.marker}.stop")
         found.state = state
 
     def _find(self, job: int) -> _Job:
@@ -376,7 +428,7 @@ class FakeScheduler:
         return Completed(0, b"", b"")
 
     def _find_files(self, argv: tuple[str, ...], _stdin: bytes) -> Completed:
-        root, patterns = (argv[2], argv[9:-1:3]) if len(argv) > 10 else ("", ())
+        root, patterns = (argv[2], argv[9:-3:3]) if len(argv) > 12 else ("", ())
         if not patterns or argv != find_argv(PurePosixPath(root), patterns):
             raise AssertionError(f"FakeScheduler does not understand {argv!r}")
         found = sorted(
@@ -385,7 +437,7 @@ class FakeScheduler:
             if posixpath.dirname(path) == root
             and any(fnmatch.fnmatchcase(posixpath.basename(path), item) for item in patterns)
         )
-        return Completed(0, _lines(found), b"")
+        return Completed(0, _lines([f"{_epoch(self._mtimes[path])} {path}" for path in found]), b"")
 
     def _tail(self, argv: tuple[str, ...], _stdin: bytes) -> Completed:
         if argv[0] != TAIL or len(argv) != 5 or argv[1] != "-c" or argv[3] != "--":

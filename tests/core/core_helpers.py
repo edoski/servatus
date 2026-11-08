@@ -10,7 +10,7 @@ from support.builders import profile, tasks
 
 from servatus.campaign import _codec
 from servatus.campaign._config import Profile
-from servatus.campaign._evidence import Observation, Observed
+from servatus.campaign._evidence import Observation, Observed, StepEnd
 from servatus.campaign._state import (
     AcceptanceState,
     Link,
@@ -73,10 +73,24 @@ def seen(
     *exit_codes: int | None,
     started: bool = True,
     stopped: bool = False,
+    limited: bool = False,
+    handed: tuple[bool, ...] | None = None,
 ) -> Observation:
     """One allocation's evidence: its squeue state (``None`` once purged), markers, and one exit
-    code per slot (a single unfinished slot by default)."""
-    return Observation(slurm_state, started, stopped, exit_codes or (None,))
+    code per slot (a single unfinished slot by default). A started allocation started at ``NOW``;
+    steps return 10 minutes later, after the pre-limit signal (5 minutes) when ``limited``, and a
+    stop comes 20 minutes later."""
+    codes = exit_codes or (None,)
+    return Observation(
+        slurm_state,
+        NOW if started else None,
+        NOW + timedelta(minutes=20) if stopped else None,
+        NOW + timedelta(minutes=5) if limited else None,
+        tuple(
+            None if code is None else StepEnd(code, NOW + timedelta(minutes=10)) for code in codes
+        ),
+        handed or (True,) * len(codes),
+    )
 
 
 def evidence(
@@ -105,11 +119,12 @@ SLURM_STATES = st.sampled_from([None, None, "PENDING", "RUNNING", "COMPLETED", "
 
 @st.composite
 def observations_of(draw: st.DrawFn, task_count: int) -> Observation:
-    return Observation(
+    return seen(
         draw(SLURM_STATES),
-        draw(st.booleans()),
-        draw(st.booleans()),
-        tuple(draw(st.none() | st.integers(0, 255)) for _ in range(task_count)),
+        *(draw(st.none() | st.integers(0, 255)) for _ in range(task_count)),
+        started=draw(st.booleans()),
+        stopped=draw(st.booleans()),
+        limited=draw(st.booleans()),
     )
 
 

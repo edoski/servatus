@@ -55,7 +55,7 @@ from ._state import (
     record_outcome,
     seal,
 )
-from ._status import ResultState, Status, classify_results, project
+from ._status import ResultState, Status, classify_results, current, project
 from ._store import Store
 
 ResultProbe = Callable[[Sequence[Task]], Collection[str]]
@@ -239,7 +239,8 @@ class Campaign:
         """The last ``max_bytes`` (1 B to 1 MiB, checked before any contact) of an allocation
         log, or of one Task's step log.
 
-        ``task`` alone reads that Task's step log in its current accepted allocation.
+        ``task`` alone reads that Task's step log in its current allocation; in a chain, finding
+        it observes the chain's later links.
         """
         if task is None and allocation is None:
             raise ConfigurationError("read_log needs a task, an allocation, or both")
@@ -519,7 +520,12 @@ class Campaign:
             name = attempt.allocation_id
             if attempt.job is not None:
                 observations[name] = observe(
-                    name, attempt.job, len(attempt.task_keys), rows[name], markers[name]
+                    name,
+                    attempt.job,
+                    len(attempt.task_keys),
+                    rows[name],
+                    markers[name],
+                    gated=attempt.link.index > 1,
                 )
             elif (row := queue_row(name, rows[name], None)) is not None:
                 strays[name] = row.job
@@ -532,9 +538,12 @@ class Campaign:
     def _current(self, state: State, key: str) -> Attempt:
         if (past := history(state).get(key)) is None:
             raise NotFound(f"unknown Task: {key!r}")
-        if not past.accepted:
+        chained = [attempt.allocation_id for attempt, _ in past.accepted if attempt.link.index > 1]
+        observed = self._observe(state, chained) if chained else Observed({}, {})
+        found = current(past, observed)
+        if found is None:
             raise NotFound(f"Task {key!r} has no accepted allocation")
-        return past.accepted[-1][0]
+        return found[0]
 
     def _verified(self, plan: Plan) -> Plan:
         """Rebuild ``plan`` the way a saved plan is loaded; refuse it unless it is exactly what

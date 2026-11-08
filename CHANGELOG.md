@@ -13,6 +13,24 @@ All notable changes to Servatus are recorded here. The format follows
   the `budget` the chain was planned with). A plain allocation is link 1 of 1. The invariant
   requires every later link to follow the accepted previous link of its chain with the same Tasks.
   Schema 8 is rejected; there is no migration.
+- `status --json` prints `servatus.status/3`. Each Task gains `run_time` (`{"total", "complete"}`,
+  `null` offline) and `link`, and `detail` is one of `never started`, `time limit`, `yielded`, or
+  `budget spent`. Each Attempt gains `link`, and its `observation` replaces `started`, `stopped`,
+  and `exit_codes` with `started_at`, `stopped_at`, `limit_at`, `ends` (`{"exit_code", "at"}` or
+  `null` per slot), and `handed`. `Observation.execution` returns the execution, the exit code,
+  and a `StopReason`.
+- A step that exits 75 reads as `STOPPED (yielded)` with exit code 75 in every campaign, not
+  `FAILED`. `Retry.FAILED` selects both, as before.
+- Run markers are listed with `find -printf '%T@ %p\n'`, which needs GNU find on the login host.
+  `servatus doctor` gains a `find -printf` check.
+
+### Added
+
+- Run-time accounting: `status` shows each Task's `RUN TIME`, summed over every allocation that ran
+  it from run-marker mtimes, and a `LINK` column. `RunTime`, `StepEnd`, `StopReason`, and `Link` are
+  public.
+- `FakeScheduler` stamps file mtimes from a clock (`clock=`, or an internal one moved by
+  `advance`), reports them through `find -printf`, and exposes `mtime(path)` and `now()`.
 
 ## [0.13.0] - 2026-11-06
 

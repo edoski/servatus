@@ -159,9 +159,10 @@ def test_human_workflow_from_creation_to_status(cli: Cli[str]) -> None:
     cli.fake.finish_step(1000, 1, exit_code=3)
     code, out, _ = cli("status", "state")
     assert code == 0
-    assert re.search(r"^KEY  RESULT      EXECUTION  EXIT  ALLOCATION$", out, re.M)
-    assert re.search(r"^one  UNOBSERVED  RUNNING    -     [0-9a-f]{24}$", out, re.M)
-    assert re.search(r"^two  UNOBSERVED  FAILED     3     [0-9a-f]{24}$", out, re.M)
+    assert re.search(r"^KEY  RESULT      EXECUTION  EXIT  RUN TIME   LINK  ALLOCATION$", out, re.M)
+    id_ = r"[0-9a-f]{24}$"
+    assert re.search(rf"^one  UNOBSERVED  RUNNING    -     ~00:00:00  -     {id_}", out, re.M)
+    assert re.search(rf"^two  UNOBSERVED  FAILED     3     00:00:00   -     {id_}", out, re.M)
     assert "counts: tasks 2, unobserved 2, running 1, failed 1" in out
     assert "next: servatus plan state --retry-failed --output PLAN.json" in out
     cli.fake.finish(1000)
@@ -185,7 +186,7 @@ def test_machine_output_for_every_data_command(cli: Cli[str]) -> None:
     assert receipt["job"] == 1000
     assert receipt["task_keys"] == ["one", "two"]
     status = cli.json("status", "state")
-    assert status["format"] == "servatus.status/2" and status["counts"]["queued"] == 2
+    assert status["format"] == "servatus.status/3" and status["counts"]["queued"] == 2
     assert status["warnings"] == [] and status["tasks"][0]["exit_code"] is None
     cancelled = cli.json("cancel", "state", "--task", "one")
     assert cancelled == {
@@ -209,7 +210,7 @@ def test_machine_output_for_every_data_command(cli: Cli[str]) -> None:
         "tasks_per_allocation": 4,
         "verdict": "pass",
     }
-    assert [check["verdict"] for check in checks] == ["pass"] * 7
+    assert [check["verdict"] for check in checks] == ["pass"] * 8
     assert checks[0] == {"name": "slurm version", "verdict": "pass", "detail": "slurm 23.11.4"}
 
 
@@ -433,9 +434,10 @@ def test_status_explains_outcomes_warnings_and_next_steps(cli: Cli[str]) -> None
         cli.fake.purge(job)
     code, out, _ = cli("status", "state")
     assert code == 0
-    assert re.search(r"^a\s+UNOBSERVED  FAILED\s+3\s+[0-9a-f]{24}$", out, re.M)
-    assert re.search(r"^b\s+UNOBSERVED  STOPPED \(never started\)  -\s+[0-9a-f]{24}$", out, re.M)
-    assert re.search(r"^c\s+UNOBSERVED  LOST\s+-\s+[0-9a-f]{24}$", out, re.M)
+    assert re.search(r"^a\s+UNOBSERVED  FAILED\s+3\s+00:00:00\s+-\s+[0-9a-f]{24}$", out, re.M)
+    never = r"^b\s+UNOBSERVED  STOPPED \(never started\)  -\s+00:00:00\s+-\s+[0-9a-f]{24}$"
+    assert re.search(never, out, re.M)
+    assert re.search(r"^c\s+UNOBSERVED  LOST\s+-\s+~00:10:00\s+-\s+[0-9a-f]{24}$", out, re.M)
     assert "counts: tasks 3, unobserved 3, failed 1, stopped 1, lost 1" in out
     assert "quiescent: yes; results ready: no" in out
     assert "next: servatus plan state --retry-failed --output PLAN.json" in out

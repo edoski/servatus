@@ -360,7 +360,7 @@ def busy(state: State, observed: Observed, key: str) -> bool:
 
 def current(state: State, observed: Observed, key: str) -> Execution:
     latest = history(state, key, AcceptanceState.ACCEPTED)[-1]
-    execution, _ = observed.attempts[latest.allocation_id].execution(latest.task_keys.index(key))
+    execution, _, _ = observed.attempts[latest.allocation_id].execution(latest.task_keys.index(key))
     return execution
 
 

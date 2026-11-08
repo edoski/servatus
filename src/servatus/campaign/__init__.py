@@ -11,7 +11,7 @@ data.
 from ._campaign import Campaign, Connect, ResultProbe
 from ._config import Apptainer, Profile, Resources, Target, Task
 from ._doctor import Check, Diagnosis, Verdict, diagnose
-from ._evidence import Execution, Observation
+from ._evidence import Execution, Observation, StepEnd, StopReason
 from ._plan import Decision, Plan, PlannedAllocation, capacity
 from ._policy import Hold, Retry
 from ._remote import Completed, Transport, connect
@@ -27,7 +27,7 @@ from ._results import (
     to_document,
 )
 from ._state import AcceptanceState, Link
-from ._status import AttemptStatus, ResultState, Status, TaskStatus
+from ._status import AttemptStatus, ResultState, RunTime, Status, TaskStatus
 
 __all__ = [
     "AcceptanceState",
@@ -53,8 +53,11 @@ __all__ = [
     "ResultProbe",
     "ResultState",
     "Retry",
+    "RunTime",
     "ShapeCheck",
     "Status",
+    "StepEnd",
+    "StopReason",
     "SubmitResult",
     "Target",
     "Task",
