@@ -156,8 +156,7 @@ def stray_warning(allocation_id: str, job: int) -> str:
 def current(past: TaskHistory, observed: Observed) -> tuple[Attempt, int] | None:
     """The Task's current allocation and its slot there: the latest accepted Attempt that was
     handed the Task. Link 1 of a chain always is; a later link is once its observation shows the
-    handoff. Without observations, the latest accepted link 1. Status, retry selection, and
-    ``read_log`` all follow this one rule."""
+    handoff. Without observations, the latest accepted link 1."""
     found: tuple[Attempt, int] | None = None
     for attempt, slot in past.accepted:
         observation = observed.attempts.get(attempt.allocation_id)

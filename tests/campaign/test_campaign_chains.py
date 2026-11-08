@@ -78,9 +78,6 @@ def purge_all(world: World) -> None:
         world.fake.purge(job.job)
 
 
-# --- planning --------------------------------------------------------------------------------
-
-
 def test_a_budget_plans_full_links_and_a_shorter_last_link(world: World) -> None:
     campaign = world.create(jobs(2))
     plan = campaign.plan(chain_profile(), continuation=BUDGET)
@@ -266,9 +263,6 @@ def test_a_tampered_continuation_breaks_the_digest(world: World) -> None:
         campaign.load_plan(json.dumps(document).encode())
 
 
-# --- submission ------------------------------------------------------------------------------
-
-
 def test_links_are_submitted_in_order_each_depending_on_every_earlier_link(
     world: World,
 ) -> None:
@@ -365,9 +359,6 @@ def test_validate_checks_later_links_with_kill_on_invalid_dep(world: World) -> N
     assert ["--kill-on-invalid-dep=yes" in call for call in tested] == [False, True, True]
     assert not any(word.startswith("--dependency") for call in tested for word in call)
     assert world.fake.jobs == ()
-
-
-# --- progression -----------------------------------------------------------------------------
 
 
 def test_a_time_limit_hands_the_task_to_the_next_link_and_exit_0_ends_the_chain(
@@ -495,9 +486,6 @@ def test_logs_follow_the_task_to_its_current_link(world: World) -> None:
     assert campaign.read_log(task="task-0").content == b"link 2"
 
 
-# --- cancellation ----------------------------------------------------------------------------
-
-
 def test_cancel_stops_a_chain_newest_link_first(world: World) -> None:
     campaign, plan = submitted(world)
     world.fake.start(1000)
@@ -514,9 +502,6 @@ def test_cancelling_one_link_cuts_the_chain_there(world: World) -> None:
     receipts = campaign.cancel(allocations=[plan.allocations[2].allocation_id])
     assert [receipt.job for receipt in receipts] == [1003, 1002]
     assert states(world) == ["PENDING", "PENDING", "CANCELLED", "CANCELLED"]
-
-
-# --- extension -------------------------------------------------------------------------------
 
 
 def finished(world: World, probe: Probe | None = None) -> Campaign:

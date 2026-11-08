@@ -106,9 +106,6 @@ sys.exit(7 if mode == "fail" else 0)
 """
 
 
-# A chain step: it records its SERVATUS_ environment, then exits at once (``exit=N``), exits N on
-# the pre-limit signal (``usr1=N``; ``usr1=die`` dies of it like an app that never handles it), or
-# only counts the signal and waits to be stopped (``hold``).
 CHAIN_WORKER = """#!{python}
 import json, os, signal, sys, time
 out, mode = sys.argv[1], sys.argv[2]
@@ -125,6 +122,8 @@ def usr1(*_):
 def term(*_):
     open(out + ".stopped", "w").close()
     os._exit(143)
+if mode != "hold" and not mode.startswith(("exit=", "usr1=")):
+    sys.exit("unknown chain worker mode " + mode)
 signal.signal(signal.SIGUSR1, usr1)
 signal.signal(signal.SIGTERM, term)
 open(out + ".started", "w").close()

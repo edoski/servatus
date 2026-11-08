@@ -15,7 +15,7 @@ from ..errors import ConfigurationError, EvidenceConflict, Unavailable
 from ._config import Target
 from ._evidence import Marker, QueueRow, parse_markers, parse_queue, parse_receipt
 from ._remote import MAX_STREAM_BYTES, Completed, Transport, diagnostic
-from ._script import job_name
+from ._script import MAX_ARGS, job_name
 
 MAX_QUERY_NAMES = 100
 TAIL = "/usr/bin/tail"
@@ -25,12 +25,7 @@ SQUEUE_OPTIONS = ("--me", "--all", "--states=all", "--noheader")
 SQUEUE_FORMAT = "--format=%i|%j|%T"
 MARKER_SUFFIXES = (".start", ".stop", ".limit", ".end", ".go")
 MARKER_FORMAT = "%T@ %p\n"
-# Each name pattern costs three find arguments; seven keep one listing, -printf included, within
-# the 32-argument bound.
-MAX_NAME_PATTERNS = 7
-# Generous per-marker line length beyond log_root: the mtime, "/", 24 hex digits, and the longest
-# suffix.
-_MARKER_LINE_BYTES = 96
+_MARKER_LINE_BYTES = len("0000000000.0000000000 /") + 24 + len(".4294967295.4294967295.255.end")
 
 
 class CommandFailed(Unavailable):
@@ -65,6 +60,10 @@ def find_argv(log_root: PurePosixPath, patterns: Sequence[str]) -> tuple[str, ..
         "-printf",
         MARKER_FORMAT,
     )
+
+
+MAX_NAME_PATTERNS = (MAX_ARGS - len(find_argv(PurePosixPath("/"), ("*",)))) // 3 + 1
+"""How many name patterns one listing holds within ``check_command``'s argument bound."""
 
 
 def marker_patterns(

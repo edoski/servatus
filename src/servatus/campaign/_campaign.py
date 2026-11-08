@@ -26,7 +26,7 @@ from ..errors import (
     SubmissionInterrupted,
     Unavailable,
 )
-from ._config import MAX_LINKS, Continuation, Profile, Target, Task, task_keys
+from ._config import Continuation, Profile, Target, Task, task_keys
 from ._evidence import Marker, Observation, Observed, QueueRow, evidenced_job, observe, queue_row
 from ._plan import (
     Decision,
@@ -372,7 +372,7 @@ class Campaign:
                 item.memory_mib,
                 item.gpus,
                 item.time_limit,
-                *scheduler.test_only((*item.argv, *_LATER_LINK[:later]), item.script),
+                *scheduler.test_only((*item.argv, *(_LATER_LINK if later else ())), item.script),
             )
             for (_, _, later, _), item in shapes.items()
         )
@@ -505,7 +505,8 @@ class Campaign:
             item
             for item in state.attempts
             if item.acceptance is not AcceptanceState.UNRESOLVED
-            and item.link.index >= first.get(item.link.chain, MAX_LINKS + 1)
+            and item.link.chain in first
+            and item.link.index >= first[item.link.chain]
         ]
         rows, _ = self._evidence(chosen)
         cancelled: list[Receipt] = []

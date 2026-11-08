@@ -8,7 +8,8 @@ it to the allocation identity and slot. The script records its run in empty mark
 ``log_root`` (see ``_evidence``): a start marker before any step, one end marker per returned step,
 and a stop marker when it is interrupted.
 
-A chain link (``Chained``) after the first launches a slot only once its handoff marker exists.
+A chain link (``Chained``) after the first launches a slot only once its handoff marker exists
+and holds a plain decimal; anything else counts as no handoff.
 A link that hands some slot on to the next link gets the pre-limit signal in its batch shell
 (``--signal=B:USR1@N``): a trap writes a limit marker and relays the signal to the steps, and each
 slot that ``continues`` writes the next link's handoff marker after its step returned. That link
@@ -125,8 +126,7 @@ class Chained:
 
     @property
     def hands_off(self) -> bool:
-        """Whether some slot continues in the next link. This one flag selects the batch-shell
-        signal, the limit trap, and the handoff epilogue."""
+        """Whether some slot continues in the next link."""
         return any(self.index < count for count in self.counts)
 
 
@@ -228,11 +228,8 @@ _EPILOGUE = (
     'exit "$status"',
     "",
 )
-# A link that hands off. Its slot subshells trap the interrupt themselves and decide after their
-# step returned, so no handoff is written before a step ended. A trap interrupts `wait` with a
-# made-up status (128 + N, or 1 in ksh), so `reap` waits again until the status repeats or the
-# shell no longer knows the child (127). The link exits 0 only when every slot proved it wrote no
-# handoff, which lets Slurm delete the rest of the chain.
+# A trap interrupts `wait` with a made-up status (128 + N, or 1 in ksh), so `reap` waits again
+# until the status repeats or the shell no longer knows the child (127).
 _RELAY = (
     "pids=",
     "continued=0",
@@ -268,7 +265,7 @@ _RELAY = (
 _REAP = ("reap", 'exit "$continued"', "")
 # Each handoff name is looked up exactly once, by the one link that may run it, on a node that
 # never looked it up before, after the previous link ended; so the lookup cannot hit a cached
-# negative entry and needs no wait or poll. Content that is not a plain decimal fails closed.
+# negative entry and needs no wait or poll.
 _GATE = (
     "handed() {",
     "  previous=",
