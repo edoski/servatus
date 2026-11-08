@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import signal
 import subprocess
 import sys
@@ -43,6 +44,7 @@ SHELLS = [
 # The stub interpreter itself injects these on macOS (PEP 538 locale coercion, CoreFoundation).
 INTERPRETER_NOISE = ("__CF_USER_TEXT_ENCODING", "LC_CTYPE")
 CLIENT_ENV = {"PATH": "/usr/bin:/bin"}
+RELAY_NOISE = re.compile(r"run_pending_traps:|^User defined signal 1$")
 BUDGET = timedelta(hours=30)
 SPENT = timedelta(seconds=5400)
 
@@ -203,12 +205,12 @@ class Lease:
         return os.readlink(path) if path.is_symlink() else None
 
     def stderr(self) -> str:
-        # bash, unlike dash or ksh, reports a subshell that the relayed SIGUSR1 reached between fork
-        # and its own trap (macOS /bin/sh is bash 3.2). The subshell dies as it would in any shell.
+        # The relayed SIGUSR1 can reach a subshell the lease forked an instant before, ahead of the
+        # subshell's own trap. It dies, which the lease tolerates, and bash and dash say so.
         return "".join(
             line
             for line in self.errors.read_text().splitlines(keepends=True)
-            if "run_pending_traps:" not in line
+            if not RELAY_NOISE.search(line)
         )
 
     def started(self, key: str) -> bool:
