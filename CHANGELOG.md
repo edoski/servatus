@@ -4,6 +4,12 @@ All notable changes to Servatus are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/) (before 1.0, minor versions may break compatibility).
 
+## [0.14.1] - 2026-11-08
+
+The same package as 0.14.0, which never reached PyPI: its release check failed on three
+shell-runtime tests that assumed a fast host. Those tests now hold on slow macOS runners. No code
+under `src/` changed.
+
 ## [0.14.0] - 2026-11-08
 
 A long Task can now continue across allocations under a lifetime run-time budget, with no
@@ -393,7 +399,8 @@ A clean break: no compatibility aliases and no migration of earlier campaign sta
 
 Versions before 0.12.0 had no changelog. See the git history for their changes.
 
-[Unreleased]: https://github.com/edoski/servatus/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/edoski/servatus/compare/v0.14.1...HEAD
+[0.14.1]: https://github.com/edoski/servatus/releases/tag/v0.14.1
 [0.14.0]: https://github.com/edoski/servatus/releases/tag/v0.14.0
 [0.13.0]: https://github.com/edoski/servatus/releases/tag/v0.13.0
 [0.12.1]: https://github.com/edoski/servatus/releases/tag/v0.12.1
