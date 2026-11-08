@@ -157,16 +157,31 @@ def test_a_step_takes_the_lease_row_and_limit_and_its_own_start_and_end() -> Non
 
 
 @pytest.mark.parametrize(
-    ("requested", "held", "expected"),
-    [(5, 20, 5), (20, 5, 5), (None, 5, 5), (5, None, 5), (None, None, None)],
+    ("requested", "held", "ended", "expected"),
+    [
+        (5, 20, True, 5),
+        (20, 5, True, 5),
+        (5, 20, False, 20),
+        (20, 5, False, 5),
+        (None, 5, False, 5),
+        (5, None, False, 5),
+        (None, None, False, None),
+    ],
 )
-def test_a_step_stopped_at_the_earlier_of_its_stop_request_and_the_lease_stop(
-    requested: float | None, held: float | None, expected: float | None
+def test_a_step_stopped_at_its_stop_request_or_the_lease_stop_that_ended_it(
+    requested: float | None, held: float | None, ended: bool, expected: float | None
 ) -> None:
-    own = () if requested is None else (stop(requested),)
+    own = (start(), *(() if requested is None else (stop(requested),)))
+    own += (end(143, 30),) if ended else ()
     lease = HELD if held is None else (*HELD, stop(held))
     stopped = step("RUNNING", own, lease).stopped_at
     assert stopped == (None if expected is None else AT + at(expected))
+
+
+def test_a_step_the_lease_ended_during_its_grace_ran_until_the_lease_stopped() -> None:
+    observation = step(None, (start(1), stop(5)), (*HELD, stop(9)))
+    assert observation.run_time(0, AT + at(60), BOUND) == (at(8), True)
+    assert observation.execution(0) == (Execution.STOPPED, None, None)
 
 
 @pytest.mark.parametrize(

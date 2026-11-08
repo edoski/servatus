@@ -176,8 +176,9 @@ class Observation:
 
     A ``step`` is observed through its lease: the lease's ``squeue`` state and limit marker, its
     own start marker (written inside the step once Slurm started it), its own end marker, and
-    the earlier of its stop request and the lease's stop marker. Its one slot is ``handed``
-    unless its order was withdrawn.
+    when it stopped: the earlier of its stop request and the lease's stop marker, or, when it
+    recorded no end, the lease's stop marker, which ended it. Its one slot is ``handed`` unless
+    its order was withdrawn.
     """
 
     slurm_state: str | None
@@ -470,10 +471,13 @@ def observe_step(
     if withdrawn is not None and (started is not None or end is not None):
         raise EvidenceConflict(f"step {step_id} was withdrawn, yet it ran")
     stops = [at for at in (requested, held.stopped_at) if at is not None]
+    stopped = min(stops, default=None)
+    if end is None and held.stopped_at is not None:
+        stopped = held.stopped_at
     return Observation(
         held.slurm_state,
         started,
-        min(stops, default=None),
+        stopped,
         held.limit_at,
         (end,),
         (withdrawn is None,),
