@@ -27,20 +27,21 @@ It drives small sweeps through the ``servatus`` CLI over SSH, one Task per alloc
 - Link 2 of each chain (direct launcher) and, with ``--image-partition``, the Apptainer step
   under ``--cleanenv`` must learn a positive ``SERVATUS_JOB_END_TIME`` from Slurm's
   ``SLURM_JOB_END_TIME``.
-- Leases: ``plan --hold 2 --max-links 2`` holds two 1-CPU slots on 10-minute links with a
-  90-second pre-limit signal. In link 1, ``servatus start`` runs ``a`` (exits 0) and ``b`` (traps
-  ``SIGUSR1``), so ``c`` waits for room and starts only after ``a`` ended, reading QUEUED meanwhile
-  and counting run time only once it began. ``d`` asks for both slots while ``b`` holds one, so once
-  the lease took its order it waits, and ``cancel --task d`` must end it unstarted. ``cancel --task
-  b`` must stop ``b`` through ``SIGUSR1`` while the lease runs on. ``--retry a`` must run ``a``
-  again in the same lease. After link 1's pre-limit signal, ``start`` must place ``e`` in link 2,
-  which must start once link 1 ended; ``cancel --allocation`` then ends the chain. With
-  ``--gpu-partition``, a one-slot GPU lease runs ``nvidia-smi -L`` as a step, which must list
-  exactly one GPU. This proves what the test suite can only emulate: orders reaching the compute
-  node (it reports how long the lease took to claim one and to stop a step), a no-replace symbolic
-  link as the claim on the shared filesystem, ``test -O`` in the node's ``/bin/sh``,
-  ``srun --exact`` waiting inside the allocation, ``SIGUSR1`` and ``SIGTERM`` on a step's ``srun``
-  (running and waiting), the held allocation outliving its steps, and lease links chaining.
+- Leases: ``plan --hold 2 --max-links 2`` holds two 1-CPU slots on 10-minute links with a 90-second
+  pre-limit signal. In link 1, ``servatus start`` orders ``a`` (exits 0), ``b`` (traps ``SIGUSR1``)
+  and ``c`` (exits 0) at once. Slurm picks which two start; the third must wait until one of them
+  ended (the check reports how long Slurm took to hand over the slot), reading QUEUED meanwhile and
+  counting run time only once it began. ``d`` asks for both slots while ``b`` holds one, so once the
+  lease took its order it waits, and ``cancel --task d`` must end it unstarted. ``cancel --task b``
+  must stop ``b`` through ``SIGUSR1`` while the lease runs on. ``--retry a`` must run ``a`` again in
+  the same lease. After link 1's pre-limit signal, ``start`` must place ``e`` in link 2, which must
+  start once link 1 ended; ``cancel --allocation`` then ends the chain. With ``--gpu-partition``, a
+  one-slot GPU lease runs ``nvidia-smi -L`` as a step, which must list exactly one GPU. This proves
+  what the test suite can only emulate: orders reaching the compute node (it reports how long the
+  lease took to claim one and to stop a step), a no-replace symbolic link as the claim on the shared
+  filesystem, ``test -O`` in the node's ``/bin/sh``, ``srun --exact`` waiting inside the allocation,
+  ``SIGUSR1`` and ``SIGTERM`` on a step's ``srun`` (running and waiting), the held allocation
+  outliving its steps, and lease links chaining.
 
 Everything it writes on the cluster lives in a new ``WORK_DIR/run-<timestamp>`` directory. It
 submits at most sixteen small jobs, at most three running at a time, and cancels whatever it
@@ -522,27 +523,26 @@ def lease_check(
             raise SystemExit("the lease never took the order of a")
         time.sleep(1)
     pickup = round(time.monotonic() - ordered)
-    waiting = wait_for(
+    ran = wait_for(
         root,
-        "a and b to run while c waits for room",
+        "a and c to succeed while b runs",
         deadline,
         lambda d: (
-            executions(d)["a"] in ("RUNNING", "SUCCEEDED") and executions(d)["b"] == "RUNNING"
+            executions(d)["a"] == executions(d)["c"] == "SUCCEEDED"
+            and executions(d)["b"] == "RUNNING"
         ),
         "lease",
     )
-    if executions(waiting)["a"] == "RUNNING":
-        assert executions(waiting)["c"] == "QUEUED", executions(waiting)
-    ran = wait_for(
-        root,
-        "a and c to succeed",
-        deadline,
-        lambda d: executions(d)["a"] == executions(d)["c"] == "SUCCEEDED",
-        "lease",
-    )
-    a_end = attempts(ran)[steps["a"]]["observation"]["ends"][0]["at"]
-    c_start = attempts(ran)[steps["c"]]["observation"]["started_at"]
-    assert c_start >= a_end, f"c started at {c_start}, before a ended at {a_end}"
+    observed = {key: attempts(ran)[steps[key]]["observation"] for key in LEASE_TASKS}
+    starts = {key: datetime.fromisoformat(item["started_at"]) for key, item in observed.items()}
+    last = max(starts, key=starts.__getitem__)
+    ends = [
+        datetime.fromisoformat(item["ends"][0]["at"])
+        for key, item in observed.items()
+        if key != last and item["ends"][0] is not None
+    ]
+    assert ends and starts[last] >= min(ends), f"three steps ran in two slots: {observed}"
+    handover = round((starts[last] - min(ends)).total_seconds())
 
     servatus(root, "ensure", "lease", tasks_file(root, "wide.jsonl", {"d": "exit 0"}))
     wide = start(root, "lease", "wide.jsonl", first, "--slots", "2")
@@ -605,6 +605,7 @@ def lease_check(
     assert seconds(c["run_time"]["total"]) < 30, c
     return {
         "order_pickup_seconds": pickup,
+        "slot_handover_seconds": handover,
         "stop_seconds": stop_seconds,
         "a_run_time": seconds(a["run_time"]["total"]),
         "c_run_time": seconds(c["run_time"]["total"]),
