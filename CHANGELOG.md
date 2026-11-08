@@ -393,7 +393,8 @@ A clean break: no compatibility aliases and no migration of earlier campaign sta
 
 Versions before 0.12.0 had no changelog. See the git history for their changes.
 
-[Unreleased]: https://github.com/edoski/servatus/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/edoski/servatus/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/edoski/servatus/releases/tag/v0.14.0
 [0.13.0]: https://github.com/edoski/servatus/releases/tag/v0.13.0
 [0.12.1]: https://github.com/edoski/servatus/releases/tag/v0.12.1
 [0.12.0]: https://github.com/edoski/servatus/releases/tag/v0.12.0
