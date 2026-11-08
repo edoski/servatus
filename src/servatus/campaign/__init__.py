@@ -6,7 +6,8 @@ Start with ``Campaign.create``, ``Campaign.open``, or ``Campaign.ensure``. A ``P
 across a chain of allocations under a lifetime run-time budget. ``connect``, ``Transport``, and
 ``Completed`` are the scheduler transport seam (see ``servatus.testing.FakeScheduler``);
 ``diagnose`` checks that a profile's cluster has what Servatus needs, and ``to_document`` turns
-results into JSON-compatible data.
+results into JSON-compatible data. ``Campaign.hold`` plans a lease, a held allocation whose Tasks
+start later as steps (``Campaign.plan(lease=...)``); ``Kind`` names what an Attempt holds.
 """
 
 from ._campaign import Campaign, Connect, ResultProbe
@@ -36,7 +37,7 @@ from ._results import (
     WaitingAllocation,
     to_document,
 )
-from ._state import AcceptanceState, Link
+from ._state import AcceptanceState, Kind, Link
 from ._status import AttemptStatus, ResultState, RunTime, Status, TaskStatus
 
 __all__ = [
@@ -55,6 +56,7 @@ __all__ = [
     "Execution",
     "Extension",
     "Hold",
+    "Kind",
     "Link",
     "LogSnapshot",
     "Observation",

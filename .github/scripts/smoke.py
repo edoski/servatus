@@ -80,7 +80,7 @@ def check_cli(root: Path) -> None:
     )
     run(executable, "create", "state", "tasks.jsonl", cwd=root)
     document = json.loads(run(executable, "status", "state", "--offline", "--json", cwd=root))
-    assert document["format"] == "servatus.status/3", document
+    assert document["format"] == "servatus.status/4", document
     assert [task["key"] for task in document["tasks"]] == ["alpha", "beta"], document
 
 
@@ -137,6 +137,21 @@ def check_campaign(root: Path) -> None:
         fake.purge(job)
     (task,) = chain.status().tasks
     assert task.execution == "SUCCEEDED" and task.link is not None and task.link.index == 2
+
+    leased = Campaign.create(root / "lease", [], appendable=True, connect=fake)
+    lease = leased.submit(leased.hold(chained, slots=2)).receipts[0]
+    fake.start(lease.job)
+    leased.append([Task("step", ["/bin/true"])])
+    (step,) = (
+        receipt.allocation_id
+        for receipt in leased.submit(leased.plan(lease=lease.allocation_id)).receipts
+    )
+    assert fake.poll(lease.job) == (step,)
+    fake.begin_step(step)
+    assert [task.execution for task in leased.status().tasks] == ["RUNNING"]
+    fake.end_step(step, 0)
+    (done,) = leased.status().tasks
+    assert done.execution == "SUCCEEDED" and done.current_allocation_id == step, done
 
 
 def check_publication(root: Path) -> None:

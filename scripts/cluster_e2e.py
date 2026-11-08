@@ -27,9 +27,25 @@ It drives small sweeps through the ``servatus`` CLI over SSH, one Task per alloc
 - Link 2 of each chain (direct launcher) and, with ``--image-partition``, the Apptainer step
   under ``--cleanenv`` must learn a positive ``SERVATUS_JOB_END_TIME`` from Slurm's
   ``SLURM_JOB_END_TIME``.
+- Leases: ``plan --hold 2 --max-links 2`` holds two 1-CPU slots on 15-minute links with a 90-second
+  pre-limit signal. In link 1, ``servatus start`` orders ``a`` (exits 0), ``b`` (traps ``SIGUSR1``)
+  and ``c`` (exits 0) at once. Slurm picks which two start; the third must wait until one of them
+  ended (the check reports how long Slurm took to hand over the slot), reading QUEUED meanwhile and
+  counting run time only once it began. ``hog`` then takes the other slot beside ``b``, so ``d``
+  waits once the lease took its order, and ``cancel --task d`` must end it unstarted;
+  ``cancel --task hog`` frees the slot again. ``cancel --task b`` must stop ``b`` through
+  ``SIGUSR1`` while the lease runs on. ``--retry a`` must run ``a`` again in the same lease. After
+  link 1's pre-limit signal, ``start`` must place ``e`` in link 2, which must start once link 1
+  ended; ``cancel --allocation`` then ends the chain. With ``--gpu-partition``, a one-slot GPU lease
+  runs ``nvidia-smi -L`` as a step, which must list exactly one GPU. This proves what the test suite
+  can only emulate: orders reaching the compute node (it reports how long the lease took to claim
+  one and to stop a step), a no-replace symbolic link as the claim on the shared filesystem,
+  ``test -O`` in the node's ``/bin/sh``, ``srun --exact`` waiting inside the allocation, ``SIGUSR1``
+  and ``SIGTERM`` on a step's ``srun`` (running and waiting), the held allocation outliving its
+  steps, and lease links chaining.
 
 Everything it writes on the cluster lives in a new ``WORK_DIR/run-<timestamp>`` directory. It
-submits at most thirteen small jobs, at most three running at a time, and cancels whatever it
+submits at most sixteen small jobs, at most three running at a time, and cancels whatever it
 leaves behind. It prints one JSON summary line last.
 """
 
@@ -65,6 +81,15 @@ CHAIN_TASKS = {
     "die": f'{REPORT}; if [ "$SERVATUS_LINK" = 1 ]; then sleep 600; fi; exit 0',
 }
 DIED_OF_USR1 = 138
+STEP_REPORT = (
+    'echo "$SERVATUS_TASK_KEY $SERVATUS_ALLOCATION_ID $SERVATUS_JOB_ID $SERVATUS_JOB_END_TIME"'
+)
+LEASE_TASKS = {
+    "a": f"{STEP_REPORT}; sleep 30; exit 0",
+    "b": f'{STEP_REPORT}; trap "echo got USR1; exit 75" USR1; sleep 600 & wait $!',
+    "c": f"{STEP_REPORT}; sleep 5; exit 0",
+}
+HOG_TASK = 'trap "exit 75" USR1; sleep 600 & wait $!'
 # glibc, not Alpine's musl: --nv binds the host's nvidia-smi, which needs a glibc loader.
 IMAGE_SOURCE = "docker://debian:12-slim"
 PULL_JOB = "servatus-e2e-pull"
@@ -165,6 +190,13 @@ def configuration(arguments: argparse.Namespace, run: PurePosixPath, image: bool
         "\n[profiles.chain.resources]\n"
         'time_limit = "00:03:00"\n'
         'signal_before_end = "00:01:30"\n'
+        "\n[profiles.lease.target]\n"
+        f"partitions = [{json.dumps(arguments.partition)}]\n"
+        "max_tasks_per_allocation = 2\n"
+        "max_cpus_per_allocation = 2\n"
+        "\n[profiles.lease.resources]\n"
+        'time_limit = "00:15:00"\n'
+        'signal_before_end = "00:01:30"\n'
     )
     if arguments.gpu_partition is not None:
         document += (
@@ -175,6 +207,14 @@ def configuration(arguments: argparse.Namespace, run: PurePosixPath, image: bool
             "\n[profiles.gpu.resources]\n"
             "gpus = 1\n"
             "memory_mib = 1024\n"
+            "\n[profiles.lease-gpu.target]\n"
+            f"partitions = [{json.dumps(arguments.gpu_partition)}]\n"
+            f"gpu_gres = {json.dumps(arguments.gpu_gres)}\n"
+            "max_gpus_per_allocation = 1\n"
+            "\n[profiles.lease-gpu.resources]\n"
+            "gpus = 1\n"
+            "memory_mib = 1024\n"
+            'signal_before_end = "00:01:30"\n'
         )
     if image:
         document += (
@@ -402,6 +442,207 @@ def chain_check(root: Path, deadline: float) -> dict[str, Any]:
     return summary
 
 
+def tasks_file(root: Path, name: str, tasks: dict[str, str]) -> str:
+    (root / name).write_text(
+        "".join(
+            json.dumps({"key": key, "args": ["/bin/sh", "-c", command]}) + "\n"
+            for key, command in tasks.items()
+        )
+    )
+    return name
+
+
+def hold(root: Path, state: str, profile: str, *options: str) -> list[str]:
+    """Plan, validate, and submit a lease; its link ids, also recorded for the cleanup."""
+    plan = f"{state}.lease.json"
+    servatus(root, "plan", state, "--profile", profile, *options, "--output", plan)
+    servatus(root, "validate", state, plan)
+    submitted = json.loads(servatus(root, "submit", state, plan, "--json").stdout)
+    links = [receipt["allocation_id"] for receipt in submitted["receipts"]]
+    with (root / "leases.txt").open("a") as record:
+        record.write("".join(f"{state} {link}\n" for link in links))
+    log(f"submitted lease {links} as jobs {[r['job'] for r in submitted['receipts']]}")
+    return links
+
+
+def start(root: Path, state: str, name: str, lease: str, *options: str) -> dict[str, str]:
+    """``servatus start``; each started Task's step id."""
+    started = json.loads(
+        servatus(root, "start", state, name, "--lease", lease, *options, "--json").stdout
+    )
+    return {receipt["task_keys"][0]: receipt["allocation_id"] for receipt in started["receipts"]}
+
+
+def attempts(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {attempt["allocation_id"]: attempt for attempt in document["attempts"]}
+
+
+def slurm_state(document: dict[str, Any], allocation_id: str) -> str | None:
+    observation = attempts(document)[allocation_id]["observation"]
+    return None if observation is None else observation["slurm_state"]
+
+
+def lease_step_log(root: Path, state: str, step: str, deadline: float) -> str:
+    output = root / f"{state}-{step}.log"
+    while True:
+        read = servatus(
+            root, "logs", state, "--allocation", step, "--output", str(output), check=False
+        )
+        if read.returncode == 0:
+            return output.read_text()
+        if time.monotonic() > deadline:
+            raise SystemExit(f"cannot read the log of step {step}:\n{read.stderr}")
+        time.sleep(POLL_SECONDS)
+
+
+def claimed(arguments: argparse.Namespace, run: PurePosixPath, lease: str, step: str) -> str:
+    """Where the claim on a step's order points, as the login node sees it ("" before any)."""
+    claim = run / "logs" / f"{lease}.d" / f"{step}.claim"
+    command = f"readlink {shlex.quote(str(claim))} || :"
+    completed = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", arguments.host, command],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return completed.stdout.strip()
+
+
+def lease_check(
+    arguments: argparse.Namespace, root: Path, run: PurePosixPath, deadline: float
+) -> dict[str, Any]:
+    """A chain of two 2-slot leases: steps that run, wait for room, are stopped running and
+    waiting, rerun in the same lease, and start in link 2 after link 1's pre-limit signal."""
+    diagnose(root, "lease")
+    servatus(root, "ensure", "lease", tasks_file(root, "lease.jsonl", LEASE_TASKS))
+    first, second = hold(root, "lease", "lease", "--hold", "2", "--max-links", "2")
+    wait_for(root, "link 1 to run", deadline, lambda d: slurm_state(d, first) == "RUNNING", "lease")
+    ordered = time.monotonic()
+    steps = start(root, "lease", "lease.jsonl", first)
+    assert sorted(steps) == sorted(LEASE_TASKS), steps
+    while claimed(arguments, run, first, steps["a"]) != "taken":
+        if time.monotonic() > deadline:
+            raise SystemExit("the lease never took the order of a")
+        time.sleep(1)
+    pickup = round(time.monotonic() - ordered)
+    ran = wait_for(
+        root,
+        "a and c to succeed while b runs",
+        deadline,
+        lambda d: (
+            executions(d)["a"] == executions(d)["c"] == "SUCCEEDED"
+            and executions(d)["b"] == "RUNNING"
+        ),
+        "lease",
+    )
+    observed = {key: attempts(ran)[steps[key]]["observation"] for key in LEASE_TASKS}
+    starts = {key: datetime.fromisoformat(item["started_at"]) for key, item in observed.items()}
+    last = max(starts, key=starts.__getitem__)
+    ends = [
+        datetime.fromisoformat(item["ends"][0]["at"])
+        for key, item in observed.items()
+        if key != last and item["ends"][0] is not None
+    ]
+    assert ends and starts[last] >= min(ends), f"three steps ran in two slots: {observed}"
+    handover = round((starts[last] - min(ends)).total_seconds())
+
+    servatus(root, "ensure", "lease", tasks_file(root, "hog.jsonl", {"hog": HOG_TASK}))
+    hog = start(root, "lease", "hog.jsonl", first)
+    wait_for(
+        root,
+        "hog to run beside b",
+        deadline,
+        lambda d: executions(d)["hog"] == executions(d)["b"] == "RUNNING",
+        "lease",
+    )
+    servatus(root, "ensure", "lease", tasks_file(root, "waiting.jsonl", {"d": "exit 0"}))
+    waiting = start(root, "lease", "waiting.jsonl", first)
+    while claimed(arguments, run, first, waiting["d"]) != "taken":
+        if time.monotonic() > deadline:
+            raise SystemExit("the lease never took the order of d")
+        time.sleep(1)
+    servatus(root, "cancel", "lease", "--task", "d")
+    unstarted = wait_for(
+        root, "d to end unstarted", deadline, lambda d: executions(d)["d"] == "STOPPED", "lease"
+    )
+    d = next(task for task in unstarted["tasks"] if task["key"] == "d")
+    busy = (executions(unstarted)["b"], executions(unstarted)["hog"])
+    assert (d["detail"], busy) == ("never started", ("RUNNING", "RUNNING")), unstarted
+    servatus(root, "cancel", "lease", "--task", "hog")
+    wait_for(root, "hog to stop", deadline, lambda d: executions(d)["hog"] == "STOPPED", "lease")
+
+    stopping = time.monotonic()
+    cancelled = json.loads(servatus(root, "cancel", "lease", "--task", "b", "--json").stdout)
+    assert [item["allocation_id"] for item in cancelled["cancelled"]] == [steps["b"]], cancelled
+    stopped = wait_for(
+        root, "b to stop", deadline, lambda d: executions(d)["b"] == "STOPPED", "lease"
+    )
+    stop_seconds = round(time.monotonic() - stopping)
+    b = next(task for task in stopped["tasks"] if task["key"] == "b")
+    assert b["exit_code"] == 75, b
+    report = lease_step_log(root, "lease", steps["b"], deadline)
+    key, step, job, end_time = report.splitlines()[0].split()
+    assert (key, step) == ("b", steps["b"]) and int(job) > 0 and int(end_time) > 0, report
+    assert "got USR1" in report, report
+    assert slurm_state(stopped, first) == "RUNNING", "the lease ended with its step"
+
+    again = start(root, "lease", "lease.jsonl", first, "--retry", "a")
+    assert list(again) == ["a"], again
+    rerun = wait_for(
+        root, "a to succeed again", deadline, lambda d: executions(d)["a"] == "SUCCEEDED", "lease"
+    )
+    assert attempts(rerun)[again["a"]]["within"] == first, attempts(rerun)[again["a"]]
+    wait_for(
+        root,
+        "link 1's pre-limit signal",
+        deadline,
+        lambda d: attempts(d)[first]["observation"]["limit_at"] is not None,
+        "lease",
+    )
+    servatus(root, "ensure", "lease", tasks_file(root, "late.jsonl", {"e": "exit 0"}))
+    late = start(root, "lease", "late.jsonl", first)
+    linked = wait_for(
+        root,
+        "e to succeed in link 2",
+        deadline,
+        lambda d: executions(d)["e"] == "SUCCEEDED",
+        "lease",
+    )
+    assert attempts(linked)[late["e"]]["within"] == second, attempts(linked)[late["e"]]
+    cancelled = json.loads(
+        servatus(root, "cancel", "lease", "--allocation", first, "--json").stdout
+    )
+    assert [item["allocation_id"] for item in cancelled["cancelled"]] == [second], cancelled
+    final = wait_for(root, "Slurm to purge the leases", deadline, lambda d: d["quiescent"], "lease")
+    a = next(task for task in final["tasks"] if task["key"] == "a")
+    c = next(task for task in final["tasks"] if task["key"] == "c")
+    assert seconds(c["run_time"]["total"]) < 30, c
+    return {
+        "order_pickup_seconds": pickup,
+        "slot_handover_seconds": handover,
+        "stop_seconds": stop_seconds,
+        "a_run_time": seconds(a["run_time"]["total"]),
+        "c_run_time": seconds(c["run_time"]["total"]),
+        "steps": {**steps, **hog, **waiting, **late},
+        "links": [first, second],
+    }
+
+
+def lease_gpu_check(root: Path, deadline: float) -> dict[str, Any]:
+    """A one-slot GPU lease whose step sees exactly one GPU."""
+    diagnose(root, "lease-gpu")
+    tasks = {"smi": "/usr/bin/nvidia-smi -L"}
+    servatus(root, "ensure", "lease-gpu", tasks_file(root, "lease-gpu.jsonl", tasks))
+    (lease,) = hold(root, "lease-gpu", "lease-gpu", "--hold", "1")
+    step = start(root, "lease-gpu", "lease-gpu.jsonl", lease)["smi"]
+    wait_for(
+        root, "the GPU step", deadline, lambda d: executions(d)["smi"] == "SUCCEEDED", "lease-gpu"
+    )
+    gpus = one_gpu(lease_step_log(root, "lease-gpu", step, deadline))
+    servatus(root, "cancel", "lease-gpu", "--allocation", lease)
+    return {"lease": lease, "step": step, "gpus": gpus}
+
+
 def sweep(arguments: argparse.Namespace, root: Path, run: PurePosixPath) -> dict[str, Any]:
     started = time.monotonic()
     deadline = started + arguments.timeout
@@ -465,6 +706,9 @@ def sweep(arguments: argparse.Namespace, root: Path, run: PurePosixPath) -> dict
         if image_gpu:
             summary["apptainer_gpu"] = image_gpu_check(root, deadline)
     summary["chains"] = chain_check(root, deadline)
+    summary["leases"] = lease_check(arguments, root, run, deadline)
+    if arguments.gpu_partition is not None:
+        summary["lease_gpu"] = lease_gpu_check(root, deadline)
     summary["seconds"] = round(time.monotonic() - started)
     return summary
 
@@ -487,6 +731,12 @@ def cancel_leftovers(arguments: argparse.Namespace, root: Path) -> None:
                 cancelled = servatus(root, "cancel", state, "--task", key, check=False)
                 if cancelled.returncode != 0:
                     log(f"could not cancel {key}: {cancelled.stderr.strip()}")
+    leases = root / "leases.txt"
+    for line in leases.read_text().splitlines() if leases.exists() else ():
+        state, link = line.split()
+        cancelled = servatus(root, "cancel", state, "--allocation", link, check=False)
+        if cancelled.returncode != 0:
+            log(f"could not cancel lease {link}: {cancelled.stderr.strip()}")
 
 
 def main() -> None:
@@ -501,7 +751,7 @@ def main() -> None:
     parser.add_argument("--gpu-gres", default="gpu", help="count-free GRES for --gpu-partition")
     parser.add_argument("--image-partition", help="also pull an image and run a Task in it here")
     parser.add_argument("--apptainer", default="/usr/bin/apptainer")
-    parser.add_argument("--timeout", type=int, default=2700, help="seconds for the whole sweep")
+    parser.add_argument("--timeout", type=int, default=3600, help="seconds for the whole sweep")
     arguments = parser.parse_args()
     work_dir = PurePosixPath(arguments.work_dir)
     if not work_dir.is_absolute():

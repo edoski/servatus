@@ -357,10 +357,123 @@ pre-limit signal reads as a time limit, and the chain continues.
 | `plan` output | A `continuation` line; per Task its run time, budget left, link count, and `extends SUCCEEDED` or `extends VALID`; each allocation's `link j/K`. |
 | `plan` holds | `SPENT`: the Task's run time leaves no room under the budget. |
 | `status` | `RUN TIME` (`/ budget` in a budgeted chain) and `LINK` (`3/5`, `-` for one allocation); details `time limit`, `yielded`, `budget spent`, `never started`. |
-| `status --json` | `servatus.status/3`: each Task's `run_time` and `link`, each Attempt's `link` and timed `observation`. |
-| Saved plans | `servatus.plan/3`: the Decision gains `continuation`, `spent` (each selected Task's measured run time), and `extensions`. |
+| `status --json` | `servatus.status/4`: each Task's `run_time` and `link`, each Attempt's `link` and timed `observation`. |
+| Saved plans | `servatus.plan/4`: the Decision gains `continuation`, `spent` (each selected Task's measured run time), and `extensions`. |
 | Library | `Campaign.plan(profile, continuation=Continuation(budget="3-00:00:00"))`; `Plan.extensions`; `Link`, `RunTime`, `StopReason`, `Extension`, `YIELD_EXIT`, `MAX_LINKS`. |
 | Exit codes | Unchanged. |
+
+## Leases: hold an allocation, start Tasks in it
+
+On a cluster that limits how many jobs you may run, every cancel and resubmit gives your GPUs back
+to the queue. A **lease** holds one allocation for its whole time limit, and you start Tasks in it
+whenever you like. Each Task runs as its own exact `srun` step inside the lease, with the same
+environment, logs, run markers, and status as any Campaign Task. Stopping a Task ends its step,
+not the lease, so the GPUs stay yours.
+
+A lease belongs to a Campaign, and its Tasks are the Campaign's Tasks. Keys are immutable, so new or
+changed work is a new key in an appendable Campaign.
+
+```toml
+# SERVATUS.toml: a lease holds `--hold N` slots, each a copy of the profile's per-Task resources,
+# and each step uses exactly one slot. For a step that needs 2 GPUs, use a profile with gpus = 2.
+[profiles.l40s.resources]
+cpus = 104
+memory_mib = 196608
+gpus = 1
+time_limit = "3-00:00:00"
+signal_before_end = "00:10:00"   # required: the lease tells its steps it is ending
+```
+
+```sh
+servatus ensure gpu tasks.jsonl                          # an appendable Campaign
+servatus plan gpu --profile l40s --hold 2 --output lease.json
+#   lease: 2 slots of 104 CPUs, 196608 MiB, 1 GPUs, 3-00:00:00
+#     3f9c0e2a7b1d4c5e6f708192  208 CPUs, 393216 MiB, 2 GPUs, 3-00:00:00
+servatus submit gpu lease.json                           # one sbatch
+#   submitted lease 3f9c0e2a7b1d4c5e6f708192: job 41234
+
+servatus start gpu train.jsonl --lease 3f9c0e2a7b1d4c5e6f708192
+#   submitted allocation 5b2e7c90d41f3a6b8e2c1d07: job 41234 (train-a)
+
+servatus status gpu
+#   KEY      RESULT      EXECUTION  EXIT  RUN TIME   LINK  ALLOCATION
+#   train-a  UNOBSERVED  RUNNING    -     ~01:02:13  -     5b2e7c90d41f3a6b8e2c1d07 (lease 3f9c0e2a7b1d4c5e6f708192)
+#   eval-1   UNOBSERVED  QUEUED     -     00:00:00   -     8d01f4c2e9a7b6d5c3e2f1a0 (lease 3f9c0e2a7b1d4c5e6f708192)
+#   lease 3f9c0e2a7b1d4c5e6f708192: job 41234 RUNNING, 2 slots
+
+servatus cancel gpu --task train-a                       # stops the step; the lease stays
+servatus start gpu train.jsonl --lease 3f9c0e2a7b1d4c5e6f708192 --retry train-a   # once STOPPED
+servatus logs gpu --task train-a --output train-a.log
+servatus cancel gpu --allocation 3f9c0e2a7b1d4c5e6f708192   # ends the lease and every step in it
+```
+
+`start` registers the file's new Tasks, refusing a changed Task under an existing key as `ensure`
+does, plans exactly the file's keys into the lease, and submits them. A key that already ran is held
+(`SUBMITTED`, or `ACTIVE` while its step still runs) unless you name it with `--retry KEY` or select
+it with `--retry-failed`. To review first, use `plan --lease ID --output PLAN.json` and `submit`.
+
+How it behaves:
+
+- **Slots.** `--hold N` asks Slurm for N times the profile's per-Task resources, as an allocation of
+  N Tasks would, so `capacity` and every ceiling apply. Every step uses exactly one slot; a run
+  that needs more resources needs a lease of a larger profile. Steps of several slots are not
+  possible: the lease is one task per slot, and Slurm refuses a step whose per-task CPUs exceed the
+  job's (`Job step's --cpus-per-task value exceeds that of job (2 > 1). Job step may never run.`)
+  instead of letting it wait.
+- **Waiting for a slot.** A step started while every slot is busy waits inside the lease and reads
+  `QUEUED`. Slurm, not Servatus, chooses which waiting step starts when a slot frees, so it need
+  not be the first one you started. It can start up to about two minutes after the slot frees,
+  because `srun` backs off between its retries.
+- **Starting.** `start` and `submit` write one order per Task into the lease's directory on the
+  cluster's filesystem, and the lease looks for new orders every 5 seconds. On NFS a new order can
+  take up to about a minute to become visible on the compute node. Orders written while the lease is
+  still queued start when it starts.
+- **Status.** A step reads `QUEUED` until it begins, `RUNNING`, then `SUCCEEDED`, `FAILED`, or
+  `STOPPED` from its own end marker as soon as that is visible. A Task can be started again in the
+  same lease the moment its step ended. `RUN TIME` counts from the moment the step really began, not
+  from when it was ordered.
+- **Stopping.** `cancel --task KEY` withdraws an order the lease has not taken yet, at once, and the
+  Task reads `STOPPED (never started)`. Otherwise the lease stops the step: a running step gets
+  `SIGUSR1`, the same signal it gets before a time limit, then `SIGTERM` (which `srun` turns into
+  `SIGKILL`) after `signal_before_end`; a step still waiting for room ends without starting. It reads
+  `STOPPED`, or `SUCCEEDED` if your application exits 0 on the signal, and can be started again from
+  then on.
+- **The end of the lease.** At `signal_before_end` before the limit, the lease takes no more orders
+  and relays `SIGUSR1` to every step. A step that then exits nonzero, or is stopped at the limit,
+  reads `STOPPED (time limit)`. Orders it never took stay `QUEUED`, holding their Tasks, until you
+  `cancel` them or Slurm forgets the lease; then start them in the next link.
+- **Longer than one limit.** `plan --hold N --max-links K` queues K leases, each starting when the
+  one before it ended. `--lease` accepts any of their ids and starts steps in the current one: the
+  first that Slurm lists, has not ended, and has not had its pre-limit signal. A step runs in the
+  link it was started in; start it again in the next link (`--retry KEY` or `--retry-failed`). For
+  one run longer than a limit, use [budgeted continuation](#budgeted-continuation) instead.
+- **The step interface is the Campaign's.** Each step gets `SERVATUS_TASK_KEY`,
+  `SERVATUS_ALLOCATION_ID` (the step's id), `SERVATUS_SLOT=0`, `SERVATUS_JOB_ID` and
+  `SERVATUS_JOB_END_TIME` (the lease's job and its deadline), `SERVATUS_RUN_TIME` (measured when
+  planned), `SERVATUS_LINK=1`, `SERVATUS_LINKS=1`, and `SERVATUS_BUDGET` with `--budget`, under
+  which a Task whose run time leaves no room is held `SPENT`.
+- **Recovery.** An interrupted `start` or `submit` leaves its steps unresolved; `reconcile`
+  resolves each at once. A step the lease already took is accepted, and any other is withdrawn and
+  recorded as not submitted, so start it again.
+
+Python:
+
+```python
+from servatus import Campaign, Profile, Task
+
+campaign = Campaign.ensure("gpu", tasks)
+held = campaign.hold(Profile.load("SERVATUS.toml", name="l40s"), slots=2)  # --hold 2
+lease = campaign.submit(held).receipts[0].allocation_id
+
+campaign.append([Task("eval-7", ["python", "eval.py"], stdin=b'{"ckpt": 7}')])
+campaign.submit(campaign.plan(lease=lease, only=["eval-7"]))
+campaign.cancel(tasks=["eval-7"])
+```
+
+The lease runs a POSIX `sh` batch script that never waits for a step and needs no Python on the
+compute node. [ADR 0009](https://github.com/edoski/servatus/blob/main/docs/adr/0009-leases.md)
+explains the protocol: the claim that lets exactly one of the lease and `cancel` decide each order,
+the step's own start marker, and the stop and limit signals.
 
 ## Recovery playbook
 
@@ -768,14 +881,15 @@ memory_mib = 98304
 `STATE` is the campaign directory. `plan` and `doctor` read `./SERVATUS.toml` unless
 `--config PATH` is given. Output is human-readable, with every non-printable character escaped
 (except `--show-scripts`); every command except `logs` accepts `--json` for exact machine output.
-`status --json` prints a `servatus.status/3` document (`tasks`, `attempts`, `counts`, `quiescent`,
+`status --json` prints a `servatus.status/4` document (`tasks`, `attempts`, `counts`, `quiescent`,
 `results_ready`, `warnings`). `plan --json` prints the saved plan document plus `retry`,
 `extensions`, `allocations`, `warnings`, `saved`, and `totals` (`{"cpu_hours", "gpu_hours",
 "memory_gib_hours"}`, `Plan.totals`). Each Task carries `run_time` (`{"total", "complete"}`, or `null`
 offline), `detail` (why a `STOPPED` Task stopped: `never started`, `time limit`, `yielded`, or
 `budget spent`), and `link`; each Attempt's `observation` carries the mtimes of its start, stop,
-and limit markers, each slot's end (`{"exit_code", "at"}` or `null`), and which slots it was
-handed. Saved plans are `servatus.plan/3` documents. Receipts, submit and
+and limit markers, each slot's end (`{"exit_code", "at"}` or `null`), which slots it was handed,
+and whether it observes a `step`. Each Attempt also carries `slots` and `within`: a lease has
+`slots`, a step `within`. Saved plans are `servatus.plan/4` documents. Receipts, submit and
 reconcile results, shape checks, and planned allocations are encoded with
 `servatus.campaign.to_document`; a receipt is `{"allocation_id", "job", "task_keys"}` with an
 integer job number.
@@ -790,12 +904,15 @@ integer job number.
 | `  --retry KEY`, `--retry-failed` | Retry named Tasks (`LOST` ones included), or every Task whose latest work failed or stopped. |
 | `  --only KEY`, `--tasks-per-allocation N`, `--show-scripts` | Restrict the plan; lower packing; print batch scripts (sensitive). |
 | `  --budget DURATION`, `--max-links K` | Continue each Task through a chain of links until its lifetime budget is spent ([budgeted continuation](#budgeted-continuation)). |
+| `  --hold N` | Plan a lease of N slots of the profile's per-Task resources, or K leases with `--max-links K` ([leases](#leases-hold-an-allocation-start-tasks-in-it)). |
+| `  --lease ID` | Plan the selected Tasks as steps of one slot each in the lease's current link; no `--profile` or `--config`. |
+| `start STATE TASKS.jsonl --lease ID` | Register the file's new Tasks and start its keys as steps in the lease; takes `--retry`, `--retry-failed`, `--budget`. Exit 3 if interrupted. |
 | `validate STATE PLAN` | `sbatch --test-only` once per distinct allocation shape; exit 1 if any is rejected. |
 | `submit STATE PLAN` | Submit the reviewed plan. Exit 3 if interrupted. |
 | `status STATE [--offline]` | Task and allocation status; `--offline` skips Slurm. |
 | `logs STATE [--task KEY] [--allocation ID] [--bytes N] [--output FILE]` | Bounded log tail; writes 0600; refuses a terminal. |
 | `reconcile STATE` | Resolve every unresolved allocation from Slurm evidence; exit 75 while some still wait. |
-| `cancel STATE [--task KEY]... [--allocation ID]...` | `scancel` matching allocations that Slurm lists as queued or running, newest first; a chain link brings its later links. |
+| `cancel STATE [--task KEY]... [--allocation ID]...` | `scancel` matching allocations that Slurm lists as queued or running, newest first; a chain link brings its later links. A step stops inside its lease; a lease ends with every step in it. |
 | `doctor [--profile NAME]` | Check what the profile needs from its cluster, read-only; see below. Exit 1 if a check fails, 75 if one went unanswered. |
 
 `doctor` submits nothing and writes nothing. It refuses a profile that does not fit its ceilings,
@@ -821,10 +938,12 @@ the allocation log, and both that Task's step log in that allocation; `--bytes` 
 
 - Intent is durable before each `sbatch`. An uncertain submission blocks its Tasks until it is
   resolved, and is recorded as never submitted only after Slurm and the run markers show nothing
-  for 15 minutes; nothing is retried without an explicit decision.
+  for 15 minutes, or, for a step in a lease, once the client's claim on its order won; nothing is
+  retried without an explicit decision.
 - Submission executes exactly the reviewed plan, or refuses it as stale or tampered.
 - A Task never runs in two allocations at once. A chain's later link runs a Task only on a handoff
-  its predecessor writes after the Task's step returned.
+  its predecessor writes after the Task's step returned. A lease starts a step only after its claim
+  on the step's order won, the same claim `cancel` and `reconcile` contend for.
 - Campaign state is owner-only, validated on every read, atomically replaced, and synced.
 - Scheduler evidence is bounded, identity-checked, and read from each Attempt's original target.
   No Slurm accounting is needed, and a missing marker counts only after Slurm forgets the job.

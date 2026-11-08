@@ -27,9 +27,9 @@ from ..errors import ConfigurationError
 from . import _codec
 from ._config import task_keys
 from ._evidence import Execution, Observation, Observed, StopReason
-from ._state import AcceptanceState, Attempt, Link, State, TaskHistory, history
+from ._state import AcceptanceState, Attempt, Kind, Link, State, TaskHistory, history
 
-STATUS_FORMAT = "servatus.status/3"
+STATUS_FORMAT = "servatus.status/4"
 _SECOND = timedelta(seconds=1)
 
 
@@ -72,6 +72,9 @@ class TaskStatus:
 
 @dataclass(frozen=True, slots=True)
 class AttemptStatus:
+    """One Attempt: an allocation, a lease of ``slots``, or a step using one slot of the lease
+    it runs ``within`` (``kind``)."""
+
     allocation_id: str
     link: Link
     task_keys: tuple[str, ...]
@@ -81,6 +84,12 @@ class AttemptStatus:
     job: int | None
     intent_at: datetime
     observation: Observation | None
+    slots: int | None
+    within: str | None
+
+    @property
+    def kind(self) -> Kind:
+        return Kind.of(self.slots, self.within)
 
 
 _EXECUTIONS = (
@@ -126,7 +135,7 @@ class Status:
         return counts
 
     def to_json(self) -> bytes:
-        """Canonical JSON tagged ``{"format": "servatus.status/3"}``, including ``counts``.
+        """Canonical JSON tagged ``{"format": "servatus.status/4"}``, including ``counts``.
 
         Scheduler text and labels may be private; treat the document as private diagnostics.
         """
@@ -203,6 +212,8 @@ def project(
             observation=(
                 None if attempt.job is None else observed.attempts.get(attempt.allocation_id)
             ),
+            slots=attempt.slots,
+            within=attempt.within,
         )
         attempts.append(projected)
         if attempt.acceptance is AcceptanceState.ACCEPTED:

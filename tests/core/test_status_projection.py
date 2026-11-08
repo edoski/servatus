@@ -268,7 +268,7 @@ def test_json_is_versioned_canonical_and_round_trips() -> None:
     status = view(state, observations, {"task-0": ResultState.MISSING}, strays={stray: 77})
     data = status.to_json()
     value = json.loads(data)
-    assert value["format"] == STATUS_FORMAT == "servatus.status/3"
+    assert value["format"] == STATUS_FORMAT == "servatus.status/4"
     assert data == json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     assert value["counts"] == dict(status.counts())
     assert value["observed_at"] == "2030-01-01T00:00:00+00:00"
@@ -296,8 +296,10 @@ def test_json_is_versioned_canonical_and_round_trips() -> None:
         "limit_at": None,
         "ends": [{"exit_code": 1, "at": "2030-01-01T00:10:00+00:00"}, None],
         "handed": [True, True],
+        "step": False,
     }
     assert attempt["intent_at"] == "2030-01-01T00:00:00+00:00"
+    assert (attempt["slots"], attempt["within"]) == (None, None)
     assert value["attempts"][1]["observation"] is None
     assert value["attempts"][2]["allocation_id"] == pending
     assert value["attempts"][2]["acceptance"] == "UNRESOLVED"

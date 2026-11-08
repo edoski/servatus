@@ -17,7 +17,7 @@ from ..errors import ConfigurationError, Conflict, CorruptState, NotFound
 from . import _codec
 from ._config import MAX_LINKS, MINUTE, Profile, Task
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 class _Invalid(ValueError):
@@ -27,6 +27,23 @@ class _Invalid(ValueError):
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise _Invalid(message)
+
+
+class Kind(StrEnum):
+    """What an Attempt holds. An ``allocation`` runs its Tasks as one Slurm job. A ``lease`` is a
+    Slurm job that holds ``slots`` copies of its Profile's per-Task Resources and runs no Task of
+    its own. A ``step`` runs one Task in one slot of the lease it is ``within``, as an ``srun``
+    step of the lease's job."""
+
+    ALLOCATION = "allocation"
+    LEASE = "lease"
+    STEP = "step"
+
+    @staticmethod
+    def of(slots: int | None, within: str | None) -> Kind:
+        if within is not None:
+            return Kind.STEP
+        return Kind.ALLOCATION if slots is None else Kind.LEASE
 
 
 class AcceptanceState(StrEnum):
@@ -73,7 +90,9 @@ class Link:
 class Attempt:
     """One allocation's durable record: intent before scheduler contact, then one outcome.
 
-    The outcome is its revision plus the accepted ``job``, or ``None`` for not submitted.
+    The outcome is its revision plus the accepted ``job``, or ``None`` for not submitted. A lease
+    has no Tasks and holds ``slots``; a step has one Task and the lease it runs ``within``, whose
+    job is its job, and uses one of the lease's slots (``kind``).
     """
 
     allocation_id: str
@@ -84,6 +103,8 @@ class Attempt:
     intent_at: datetime
     job: int | None = None
     outcome_revision: int | None = None
+    slots: int | None = None
+    within: str | None = None
 
     def __post_init__(self) -> None:
         _require(_codec.is_hex(self.allocation_id, 24), "invalid allocation identity")
@@ -93,8 +114,17 @@ class Attempt:
             "link 1 must name its own chain",
         )
         _require(self.intent_at.utcoffset() == timedelta(0), "intent time must be UTC")
-        keys = self.task_keys
-        _require(bool(keys) and len(set(keys)) == len(keys), "invalid attempt task references")
+        keys, slots = self.task_keys, self.slots
+        _require(len(set(keys)) == len(keys), "invalid attempt task references")
+        _require(slots is None or (type(slots) is int and slots >= 1), "invalid slot count")
+        _require(self.within is None or _codec.is_hex(self.within, 24), "invalid lease identity")
+        _require(slots is None or self.within is None, "a step uses one slot of its lease")
+        kind = self.kind
+        _require(
+            len(keys) == 1 if kind is Kind.STEP else bool(keys) == (kind is Kind.ALLOCATION),
+            f"invalid {kind} task references",
+        )
+        _require(kind is not Kind.STEP or self.link.count == 1, "a step is one link")
         if self.outcome_revision is None:
             _require(self.job is None, "unresolved intent has a job")
         else:
@@ -102,6 +132,10 @@ class Attempt:
         _require(
             self.job is None or (type(self.job) is int and self.job >= 1), "invalid job number"
         )
+
+    @property
+    def kind(self) -> Kind:
+        return Kind.of(self.slots, self.within)
 
     @property
     def acceptance(self) -> AcceptanceState:
@@ -198,6 +232,7 @@ def _check(state: State) -> None:
 
     identities: set[str] = set()
     links: dict[tuple[str, int], Attempt] = {}
+    leases: dict[str, Attempt] = {}
     busy_until: dict[str, float] = {}
     last_intent = 0
     for attempt in state.attempts:
@@ -212,11 +247,16 @@ def _check(state: State) -> None:
                 and previous.link.count == link.count
                 and previous.link.budget == link.budget
                 and previous.task_keys == keys
+                and previous.slots == attempt.slots
                 and previous.job is not None
                 and cast(int, previous.outcome_revision) < intent,
                 "a link must follow the accepted previous link of its chain",
             )
         links[link.chain, link.index] = attempt
+        if attempt.within is not None:
+            _check_step(attempt, leases.get(attempt.within))
+        if attempt.kind is Kind.LEASE:
+            leases[attempt.allocation_id] = attempt
         _require(intent > last_intent, "invalid intent revision")
         last_intent = intent
         event(intent)
@@ -234,6 +274,20 @@ def _check(state: State) -> None:
         for name in keys:
             busy_until[name] = max(busy_until.get(name, 0), until)
     _require(revision == max(events, default=0), "revision does not match recorded mutations")
+
+
+def _check_step(step: Attempt, lease: Attempt | None) -> None:
+    """A step runs in an earlier lease accepted before its intent, on the lease's Profile; once
+    accepted, its job is the lease's job."""
+    _require(
+        lease is not None
+        and lease.job is not None
+        and cast(int, lease.outcome_revision) < step.intent_revision,
+        "a step must run in a lease accepted before its intent",
+    )
+    lease = cast(Attempt, lease)
+    _require(step.profile == lease.profile, "a step must use its lease's Profile")
+    _require(step.job is None or step.job == lease.job, "a step's job must be its lease's job")
 
 
 # --- Pure transitions ------------------------------------------------------------------------
@@ -298,9 +352,12 @@ def record_intent(
     task_keys: tuple[str, ...],
     profile: Profile,
     at: datetime,
+    slots: int | None = None,
+    within: str | None = None,
 ) -> State:
-    """Record intent for one allocation. A link after the first must follow the accepted
-    previous link of its chain, with the same Tasks; otherwise ``Conflict``."""
+    """Record intent for one allocation, lease, or step (``Kind``). A link after the first must
+    follow the accepted previous link of its chain, with the same Tasks; a step must fit an
+    accepted lease; otherwise ``Conflict``."""
     with _rejected():
         attempt = Attempt(
             allocation_id=allocation_id,
@@ -309,6 +366,8 @@ def record_intent(
             profile=profile,
             intent_revision=state.revision + 1,
             intent_at=at,
+            slots=slots,
+            within=within,
         )
     return _changed(state, revision=attempt.intent_revision, attempts=state.attempts + (attempt,))
 
@@ -339,7 +398,7 @@ def record_outcome(state: State, allocation_id: str, job: int | None) -> State:
     return _changed(state, revision=revision, attempts=attempts)
 
 
-# --- Document (schema 9) ---------------------------------------------------------------------
+# --- Document (schema 10) ---------------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -352,6 +411,8 @@ class _AttemptDocument:
     intent_at: datetime
     job: int | None
     outcome_revision: int | None
+    slots: int | None
+    within: str | None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

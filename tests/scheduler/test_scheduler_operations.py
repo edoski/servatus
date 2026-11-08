@@ -44,6 +44,9 @@ FIND = (
     "*.limit",
     "-o",
     "-name",
+    "*.void",
+    "-o",
+    "-name",
     "*.end",
     "-o",
     "-name",
@@ -173,8 +176,8 @@ def test_markers_split_the_listing_by_leading_hex_digit_only_when_large() -> Non
     extra = {f"a{allocation(index)[1:]}": 1 for index in range(20, 26)}
     found = scheduler(large).markers({first: 20_000, second: 20_000, third: 1} | extra)
     assert [call[9:-3:3] for call in large.calls] == [
-        ("3*.start", "3*.stop", "3*.limit", "3*.end", "3*.go"),
-        ("a*.start", "a*.stop", "a*.limit", "a*.end", "a*.go"),
+        ("3*.start", "3*.stop", "3*.limit", "3*.void", "3*.end", "3*.go"),
+        ("a*.start", "a*.stop", "a*.limit", "a*.void", "a*.end", "a*.go"),
     ]
     assert all(call[:8] == FIND[:8] and call[-3:] == (")", *PRINTF) for call in large.calls)
     assert {name: found[name] for name in (first, second, third)} == {

@@ -28,8 +28,8 @@ uv run --isolated --no-project --with dist/servatus-*.whl \
 The last step installs the built wheel into a throwaway environment and checks the wheel contents
 (`py.typed`, no tests), the public names, that `servatus` is imported from the installed wheel,
 the console script and `--version`, an offline CLI campaign, a `FakeScheduler` plan, validate,
-submit, and retry round-trip, and publication. It takes the wheel path as its only argument. Clear
-`dist/` first if it holds older wheels. Coverage settings (`source`, branch coverage, the 97% floor)
+submit, and retry round-trip, a budgeted chain, a lease that runs one step, and publication. It
+takes the wheel path as its only argument. Clear `dist/` first if it holds older wheels. Coverage settings (`source`, branch coverage, the 97% floor)
 live in `pyproject.toml`.
 
 ## Test layout
@@ -47,8 +47,10 @@ live in `pyproject.toml`.
 `tests/` is on the import path, so tests import helpers as `from support.builders import target`.
 
 `scripts/cluster_e2e.py` is the live check against a real cluster: direct and Apptainer launchers,
-CPU and one GPU, and two budgeted chains on 3-minute links. CI and pytest never run it. Run it
-before a release, and after any change to a Slurm command, a batch script, or a run marker.
+CPU and one GPU, two budgeted chains on 3-minute links, and a chain of two leases whose steps run,
+wait for room, stop, and rerun. CI and pytest never run it. Run it
+before a release, and after any change to a Slurm command, a batch script, an order, or a run
+marker.
 
 ## Rules
 

@@ -152,7 +152,7 @@ def _intent(state: State, **changes: Any) -> State:
     ("changes", "message"),
     [
         ({"allocation_id": "NOT-HEX"}, "invalid allocation identity"),
-        ({"task_keys": ()}, "invalid attempt task references"),
+        ({"task_keys": ()}, "invalid allocation task references"),
         ({"task_keys": ("task-0", "task-0")}, "invalid attempt task references"),
         ({"task_keys": ("foreign",)}, "invalid attempt task references"),
         ({"task_keys": ("task-1", "task-0")}, "not in roster order"),
@@ -263,7 +263,7 @@ def test_documents_round_trip_canonically() -> None:
     assert data.endswith(b"\n") and data == reencode(json.loads(data))
     assert decode(data) == state
     raw = json.loads(data)
-    assert raw["schema_version"] == SCHEMA_VERSION == 9
+    assert raw["schema_version"] == SCHEMA_VERSION == 10
     assert raw["tasks"][3] == {
         "task": {"key": "task-3", "args": ["x"], "stdin": "", "env": {"A": "1"}},
         "revision": 3,
@@ -285,6 +285,8 @@ def test_documents_round_trip_canonically() -> None:
         "intent_at",
         "job",
         "outcome_revision",
+        "slots",
+        "within",
     }
     assert [attempt.acceptance for attempt in state.attempts] == [
         AcceptanceState.ACCEPTED,
@@ -351,7 +353,7 @@ EDITS: list[tuple[str, Callable[[dict[str, Any]], None]]] = [
     ("unresolved intent has a job", lambda r: r["attempts"][3].update(job=1)),
     ("invalid outcome revision", lambda r: r["attempts"][0].update(outcome_revision=1)),
     ("invalid job number", lambda r: r["attempts"][0].update(job=0)),
-    ("unsupported campaign schema; expected 9", lambda r: r.update(schema_version=8)),
+    ("unsupported campaign schema; expected 10", lambda r: r.update(schema_version=9)),
     ("link 1 must name its own chain", lambda r: r["attempts"][0]["link"].update(chain="a" * 24)),
     ("invalid link position", lambda r: r["attempts"][0]["link"].update(index=2)),
     ("invalid link budget", lambda r: r["attempts"][0]["link"].update(budget="00:00:30")),
@@ -392,12 +394,12 @@ def test_every_defect_is_corrupt_state_with_its_reason(
         decode(_edit(edit))
 
 
-def test_a_schema_8_document_is_corrupt_state() -> None:
+def test_a_schema_9_document_is_corrupt_state() -> None:
     raw = json.loads(encode(history()))
-    raw["schema_version"] = 8
+    raw["schema_version"] = 9
     for attempt in raw["attempts"]:
-        del attempt["link"]
-    with pytest.raises(CorruptState, match="unsupported campaign schema; expected 9"):
+        del attempt["slots"], attempt["within"]
+    with pytest.raises(CorruptState, match="unsupported campaign schema; expected 10"):
         decode(reencode(raw))
 
 

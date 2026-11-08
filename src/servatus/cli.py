@@ -21,9 +21,11 @@ from . import __version__
 from .campaign import (
     MAX_LINKS,
     AcceptanceState,
+    AttemptStatus,
     Campaign,
     Connect,
     Continuation,
+    Execution,
     Plan,
     Profile,
     Receipt,
@@ -152,6 +154,8 @@ def _shape(item: Any) -> str:
 
 
 def _receipt_line(receipt: Receipt) -> str:
+    if not receipt.task_keys:
+        return f"lease {receipt.allocation_id}: job {receipt.job}"
     return f"allocation {receipt.allocation_id}: job {receipt.job} ({_keys(receipt.task_keys)})"
 
 
@@ -254,18 +258,28 @@ def _print_plan(plan: Plan, scripts: bool, saved: Path | None) -> None:
     print(f"digest: {plan.digest}")
     for line in _continuation(plan):
         print(line)
-    allocations = _plural(len(plan.allocations), "allocation")
-    print(f"selected: {_plural(len(decision.selected), 'Task')} in {allocations}")
-    for item in plan.allocations:
-        place = "" if item.link.count == 1 else f", link {item.link.index}/{item.link.count}"
-        tasks = _plural(len(item.task_keys), "Task")
-        print(f"  {item.allocation_id}  {tasks}, {_shape(item)}{place}")
-        print(f"    {_keys(item.task_keys)}")
-    totals = plan.totals
-    gpu = f", {totals.gpu_hours} GPU-hours" if totals.gpu_hours else ""
-    print(
-        f"requests at most {totals.cpu_hours} CPU-hours{gpu}, {totals.memory_gib_hours} GiB-hours"
-    )
+    if decision.slots is not None:
+        print(f"lease: {_plural(decision.slots, 'slot')} of {_shape(decision.profile.resources)}")
+        for item in plan.allocations:
+            place = "" if item.link.count == 1 else f", link {item.link.index}/{item.link.count}"
+            print(f"  {item.allocation_id}  {_shape(item)}{place}")
+    else:
+        noun = "allocation"
+        if decision.within is not None:
+            noun = "step"
+            print(f"in lease {decision.within}: one slot per step")
+        allocations = _plural(len(plan.allocations), noun)
+        print(f"selected: {_plural(len(decision.selected), 'Task')} in {allocations}")
+        for item in plan.allocations:
+            place = "" if item.link.count == 1 else f", link {item.link.index}/{item.link.count}"
+            tasks = _plural(len(item.task_keys), "Task")
+            print(f"  {item.allocation_id}  {tasks}, {_shape(item)}{place}")
+            print(f"    {_keys(item.task_keys)}")
+    if decision.within is None:
+        totals = plan.totals
+        gpu = f", {totals.gpu_hours} GPU-hours" if totals.gpu_hours else ""
+        hours = f"{totals.cpu_hours} CPU-hours{gpu}, {totals.memory_gib_hours} GiB-hours"
+        print(f"requests at most {hours}")
     if plan.retry:
         print(f"retry: {_keys(plan.retry)}")
     print(f"held: {_plural(len(decision.held), 'Task')}")
@@ -280,7 +294,8 @@ def _print_plan(plan: Plan, scripts: bool, saved: Path | None) -> None:
     if scripts:
         for item in plan.allocations:
             print(f"--- allocation {item.allocation_id} (sensitive) ---")
-            print(shlex.join(item.argv))
+            if item.argv:
+                print(shlex.join(item.argv))
             print(item.script.decode("utf-8", "replace"))
     if saved is None:
         print("not saved; pass --output PLAN.json to save it")
@@ -288,16 +303,43 @@ def _print_plan(plan: Plan, scripts: bool, saved: Path | None) -> None:
         print(f"saved: {_safe(saved)}")
 
 
+def _profile(arguments: argparse.Namespace) -> Profile:
+    return Profile.load(arguments.config or Path("SERVATUS.toml"), name=arguments.profile)
+
+
+def _refuse(arguments: argparse.Namespace, mode: str, *names: str) -> None:
+    for name in names:
+        if getattr(arguments, name.removeprefix("--").replace("-", "_")) not in (None, False, []):
+            raise ConfigurationError(f"{mode} takes no {name}")
+
+
+def _selection(arguments: argparse.Namespace) -> Retry | tuple[str, ...]:
+    return Retry.FAILED if arguments.retry_failed else tuple(arguments.retry)
+
+
 def _plan(arguments: argparse.Namespace) -> int:
     campaign = _open(arguments)
-    profile = Profile.load(arguments.config, name=arguments.profile)
-    plan = campaign.plan(
-        profile,
-        retry=Retry.FAILED if arguments.retry_failed else tuple(arguments.retry),
-        only=tuple(arguments.only) if arguments.only else None,
-        tasks_per_allocation=arguments.tasks_per_allocation,
-        continuation=Continuation(budget=arguments.budget, max_links=arguments.max_links),
-    )
+    continuation = Continuation(budget=arguments.budget, max_links=arguments.max_links)
+    if arguments.hold is not None:
+        _refuse(arguments, "--hold", "--lease", "--retry", "--retry-failed", "--only")
+        _refuse(arguments, "--hold", "--tasks-per-allocation", "--budget")
+        plan = campaign.hold(_profile(arguments), slots=arguments.hold, continuation=continuation)
+    elif arguments.lease is not None:
+        _refuse(arguments, "--lease", "--config", "--profile", "--tasks-per-allocation")
+        plan = campaign.plan(
+            lease=arguments.lease,
+            retry=_selection(arguments),
+            only=tuple(arguments.only) if arguments.only else None,
+            continuation=continuation,
+        )
+    else:
+        plan = campaign.plan(
+            _profile(arguments),
+            retry=_selection(arguments),
+            only=tuple(arguments.only) if arguments.only else None,
+            tasks_per_allocation=arguments.tasks_per_allocation,
+            continuation=continuation,
+        )
     saved = cast(Path | None, arguments.output)
     if saved is not None:
         plan.save(saved)
@@ -323,13 +365,16 @@ def _validate(arguments: argparse.Namespace) -> int:
     if arguments.json:
         _emit({"checks": [to_document(check) for check in checks]})
     else:
+        unit = "Task" if plan.decision.slots is None else "slot"
         for check in checks:
             verdict = "accepted" if check.accepted else "REJECTED"
-            print(f"{_plural(check.task_count, 'Task')} ({_shape(check)}): {verdict}")
+            print(f"{_plural(check.task_count, unit)} ({_shape(check)}): {verdict}")
             for line in f"{check.scheduler_stdout}\n{check.scheduler_stderr}".split("\n"):
                 if line.strip():
                     print(f"  {_safe(line)}")
-        if not checks:
+        if plan.decision.within is not None:
+            print("nothing to validate: steps start inside their lease, not through sbatch")
+        elif not checks:
             print("nothing to validate: the plan has no allocations")
     return 0 if all(check.accepted for check in checks) else EXIT_ERROR
 
@@ -356,8 +401,7 @@ def _print_result(result: SubmitResult, arguments: argparse.Namespace) -> None:
         print("nothing to submit: the plan has no allocations")
 
 
-def _submit(arguments: argparse.Namespace) -> int:
-    campaign, plan = _load_plan(arguments)
+def _submitted(campaign: Campaign, plan: Plan, arguments: argparse.Namespace) -> int:
     try:
         result = campaign.submit(plan)
     except SubmissionInterrupted as error:
@@ -365,6 +409,28 @@ def _submit(arguments: argparse.Namespace) -> int:
         raise
     _print_result(result, arguments)
     return 0
+
+
+def _submit(arguments: argparse.Namespace) -> int:
+    campaign, plan = _load_plan(arguments)
+    return _submitted(campaign, plan, arguments)
+
+
+def _start(arguments: argparse.Namespace) -> int:
+    tasks = _read_tasks(arguments.tasks)
+    _open(arguments)  # a lease belongs to an existing campaign, which ensure would create
+    campaign = Campaign.ensure(arguments.state, tasks, connect=arguments.connect)
+    plan = campaign.plan(
+        lease=arguments.lease,
+        retry=_selection(arguments),
+        only=tuple(task.key for task in tasks),
+        continuation=Continuation(budget=arguments.budget),
+    )
+    if not arguments.json:
+        for key, hold in plan.decision.held.items():
+            if key in {task.key for task in tasks}:
+                print(f"held {_safe(key)}: {hold.value}")
+    return _submitted(campaign, plan, arguments)
 
 
 # --- Status and logs -------------------------------------------------------------------------
@@ -394,6 +460,7 @@ def _print_status(status: Status, path: Path) -> None:
     observed = "observed" if status.scheduler_observed else "not observed (--offline)"
     print(f"campaign {status.campaign_id}: revision {status.revision}, {kind}")
     print(f"at {status.observed_at.isoformat(timespec='seconds')}; scheduler {observed}")
+    attempts = {attempt.allocation_id: attempt for attempt in status.attempts}
     rows = [("KEY", "RESULT", "EXECUTION", "EXIT", "RUN TIME", "LINK", "ALLOCATION")]
     for task in status.tasks:
         execution = task.execution.value
@@ -401,6 +468,9 @@ def _print_status(status: Status, path: Path) -> None:
             execution = f"{execution} ({task.detail.value})"
         exit_code = "-" if task.exit_code is None else str(task.exit_code)
         allocation = task.current_allocation_id or "-"
+        if task.current_allocation_id is not None:
+            within = attempts[task.current_allocation_id].within
+            allocation += "" if within is None else f" (lease {within})"
         rows.append(
             (
                 _safe(task.key),
@@ -421,6 +491,9 @@ def _print_status(status: Status, path: Path) -> None:
         f"{name} {value}" for name, value in counts.items() if value or name == "tasks"
     )
     print(f"counts: {shown}")
+    for attempt in status.attempts:
+        if (line := _lease_line(attempt)) is not None:
+            print(line)
     quiescent = "yes" if status.quiescent else "no"
     print(f"quiescent: {quiescent}; results ready: {'yes' if status.results_ready else 'no'}")
     for warning in status.warnings:
@@ -428,12 +501,24 @@ def _print_status(status: Status, path: Path) -> None:
     hints: list[str] = []
     if any(attempt.acceptance is AcceptanceState.UNRESOLVED for attempt in status.attempts):
         hints.append(f"servatus reconcile {state}")
-    spent = [task for task in status.tasks if task.detail is StopReason.BUDGET_SPENT]
-    if counts["failed"] + counts["stopped"] > len(spent):
+    leases: set[str] = set()
+    elsewhere = False
+    for task in status.tasks:
+        ended = task.execution in (Execution.FAILED, Execution.STOPPED)
+        if not ended or task.detail is StopReason.BUDGET_SPENT:
+            continue
+        within = attempts[cast(str, task.current_allocation_id)].within
+        if within is None:
+            elsewhere = True
+        else:
+            leases.add(within)
+    if elsewhere:
         hints.append(f"servatus plan {state} --retry-failed --output PLAN.json")
+    for lease in sorted(leases):
+        hints.append(f"servatus plan {state} --lease {lease} --retry-failed --output PLAN.json")
     if counts["lost"]:
         hints.append(f"servatus plan {state} --retry KEY --output PLAN.json  (LOST Tasks)")
-    if spent:
+    if any(task.detail is StopReason.BUDGET_SPENT for task in status.tasks):
         larger = f"servatus plan {state} --retry KEY --budget LARGER --output PLAN.json"
         hints.append(f"{larger}  (to extend a spent budget)")
     if counts["not_submitted"]:
@@ -442,6 +527,20 @@ def _print_status(status: Status, path: Path) -> None:
         hints.append(f"servatus status {state}")
     for hint in hints:
         print(f"next: {hint}")
+
+
+def _lease_line(attempt: AttemptStatus) -> str | None:
+    """One line per lease Slurm still lists: its job, state, slots, and link."""
+    observation = attempt.observation
+    if attempt.slots is None or observation is None:
+        return None
+    if observation.slurm_state is None:
+        return None
+    link = attempt.link
+    place = "" if link.count == 1 else f", link {link.index}/{link.count}"
+    shown = _safe(observation.slurm_state)
+    slots = _plural(attempt.slots, "slot")
+    return f"lease {attempt.allocation_id}: job {attempt.job} {shown}, {slots}{place}"
 
 
 def _status(arguments: argparse.Namespace) -> int:
@@ -525,7 +624,7 @@ _DOCTOR_EXIT = {
 
 
 def _doctor(arguments: argparse.Namespace) -> int:
-    profile = Profile.load(arguments.config, name=arguments.profile)
+    profile = _profile(arguments)
     diagnosis = diagnose(profile, connect=arguments.connect)
     if arguments.json:
         document = cast(dict[str, object], to_document(diagnosis))
@@ -570,8 +669,18 @@ def _parser() -> argparse.ArgumentParser:
         sub.add_argument(name, action="store_true", help=text)
 
     def profile_options(sub: argparse.ArgumentParser) -> None:
-        sub.add_argument("--config", type=Path, default=Path("SERVATUS.toml"), metavar="PATH")
+        text = "configuration file (default: SERVATUS.toml)"
+        sub.add_argument("--config", type=Path, metavar="PATH", help=text)
         sub.add_argument("--profile", metavar="NAME")
+
+    def retry_options(sub: argparse.ArgumentParser) -> None:
+        retry = sub.add_mutually_exclusive_group()
+        retry.add_argument("--retry", **_KEYS)
+        retry.add_argument("--retry-failed", action="store_true", help="retry failed or stopped")
+
+    def lease_options(sub: argparse.ArgumentParser, *, required: bool) -> None:
+        text = "start the Tasks as steps in this lease (any of its links)"
+        sub.add_argument("--lease", required=required, metavar="ID", help=text)
 
     text = "create a campaign; sealed unless --appendable"
     flag(command("create", _create, text, "state", "tasks"), "--appendable", "allow appending")
@@ -582,10 +691,11 @@ def _parser() -> argparse.ArgumentParser:
     plan = command("plan", _plan, "show selected, held, and deferred Tasks; save the plan", "state")
     plan.add_argument("--output", type=Path, metavar="PLAN.json", help="save the plan (0600)")
     profile_options(plan)
-    retry = plan.add_mutually_exclusive_group()
-    retry.add_argument("--retry", **_KEYS)
-    retry.add_argument("--retry-failed", action="store_true", help="retry failed or stopped")
+    retry_options(plan)
     plan.add_argument("--only", **_KEYS)
+    text = "plan a lease that holds N slots of the profile's per-Task resources"
+    plan.add_argument("--hold", type=int, metavar="N", help=text)
+    lease_options(plan, required=False)
     plan.add_argument("--tasks-per-allocation", type=int, metavar="N")
     text = "lifetime run-time budget per Task, [D-]HH:MM:SS; continue Tasks until it is spent"
     plan.add_argument("--budget", metavar="DURATION", help=text)
@@ -595,6 +705,11 @@ def _parser() -> argparse.ArgumentParser:
     text = "ask sbatch --test-only once per allocation shape"
     command("validate", _validate, text, "state", "plan")
     command("submit", _submit, "submit a reviewed plan", "state", "plan")
+    text = "register the file's Tasks and start them as steps in a lease"
+    start = command("start", _start, text, "state", "tasks")
+    lease_options(start, required=True)
+    retry_options(start)
+    start.add_argument("--budget", metavar="DURATION", help="lifetime run-time budget per Task")
     status = command("status", _status, "show Task and allocation status", "state")
     flag(status, "--offline", "do not contact Slurm")
     logs = command("logs", _logs, "write a bounded raw log tail (sensitive)", "state")

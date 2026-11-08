@@ -29,6 +29,18 @@ and a slot of a link that hands off writes the next link's handoff marker exactl
     fake.interrupt(link1, "TIMEOUT")  # each running slot hands off to link 2
     fake.start(link2)                 # runs the handed slots
 
+A lease is a job whose batch script serves orders. Steps are ordered into its order directory by
+``submit`` and withdrawn by ``cancel`` and ``reconcile`` through the same claim the lease takes,
+and controls act as the lease's batch script and Slurm's step scheduler would::
+
+    fake.start(lease)                 # the lease starts; it takes no order yet
+    fake.poll(lease)                  # it claims each new order; each step waits for room
+    fake.begin_step(step)             # Slurm found room: the step writes its start marker
+    fake.end_step(step, 0)            # the step returned: its end marker
+    fake.honor_stops(lease)           # every step asked to stop ends (143 by default)
+    fake.signal_limit(lease)          # the limit marker; the lease takes no more orders
+    fake.interrupt(lease, "TIMEOUT")  # its stop marker; unfinished steps record nothing
+
 Controls and ``count`` name commands by basename (``"sbatch"``, ``"squeue"``, ``"find"``, ...),
 except the ``sbatch --version`` connectivity check that precedes every submission, which is
 ``"ping"``: so ``fail_next("sbatch")`` affects the next real submission, and ``fail_next("ping")``
@@ -50,7 +62,15 @@ from typing import cast
 
 from .campaign._config import Resources, Target
 from .campaign._remote import MAX_STREAM_BYTES, Completed, Transport
-from .campaign._scheduler import SQUEUE_FORMAT, SQUEUE_OPTIONS, TAIL, WRITABLE_DIRECTORY, find_argv
+from .campaign._scheduler import (
+    ORDER,
+    SQUEUE_FORMAT,
+    SQUEUE_OPTIONS,
+    TAIL,
+    WITHDRAW,
+    WRITABLE_DIRECTORY,
+    find_argv,
+)
 from .campaign._script import check_command, continues, dependency_options, sbatch_argv
 from .errors import ConfigurationError, Unavailable
 
@@ -86,13 +106,14 @@ class FakeJob:
 class _Link:
     """What the fake reads from a rendered batch script: the slots it launches, the handoff
     prefixes of this link (``own``, set on gated links) and the next one, the slots that hand
-    off, and on link 1 each slot's run time before the chain."""
+    off, on link 1 each slot's run time before the chain, and a lease's order directory."""
 
     slots: tuple[int, ...]
     own: str | None = None
     next: str | None = None
     hands_off: frozenset[int] = frozenset()
     previous: Mapping[int, int] = field(default_factory=dict[int, int])
+    orders: str | None = None
 
     @classmethod
     def read(cls, script: bytes) -> _Link:
@@ -104,7 +125,7 @@ class _Link:
         for line in script.split(b"\n"):
             if (found := _PREVIOUS.fullmatch(line)) is not None:
                 pending = int(found.group(1))
-            elif line.startswith((b"own=", b"next=")):
+            elif line.startswith((b"own=", b"next=", b"orders=")):
                 name, _, value = line.decode().partition("=")
                 prefixes[name] = shlex.split(value)[0]
             elif line.endswith(b"&") and (found := _SLOT.search(line)) is not None:
@@ -115,7 +136,12 @@ class _Link:
                 if f'"$next.{slot}.go"'.encode() in line:
                     hands_off.add(slot)
         return cls(
-            tuple(slots), prefixes.get("own"), prefixes.get("next"), frozenset(hands_off), previous
+            tuple(slots),
+            prefixes.get("own"),
+            prefixes.get("next"),
+            frozenset(hands_off),
+            previous,
+            prefixes.get("orders"),
         )
 
 
@@ -138,6 +164,16 @@ class _Job:
     ended: dict[int, int] = field(default_factory=dict[int, int])
     launched: dict[int, int] = field(default_factory=dict[int, int])
     handed_off: set[int] = field(default_factory=set[int])
+    taken: dict[str, int | None] = field(default_factory=dict[str, int | None])
+
+    @property
+    def lease(self) -> bool:
+        return self.link.orders is not None
+
+    @property
+    def step_prefix(self) -> str:
+        """``<log_root>/`` of this job's steps' markers."""
+        return f"{posixpath.dirname(self.marker)}/"
 
     @property
     def started(self) -> bool:
@@ -258,7 +294,7 @@ class FakeScheduler:
             "scancel": self._scancel,
             "scontrol": self._scontrol,
             "find": self._find_files,
-            "sh": self._writable_directory,
+            "sh": self._shell,
             "tail": self._tail,
         }
         if command not in handlers:
@@ -318,6 +354,8 @@ class FakeScheduler:
         found.state = _RUNNING
         found.started_at = self.now()
         self._write(f"{found.marker}.start")
+        if found.lease:
+            return
         own = found.link.own
         for slot in found.link.slots:
             if own is None:
@@ -346,6 +384,8 @@ class FakeScheduler:
         chain link that hands off does only when no slot handed off, else ``FAILED``."""
         found = self._find(job)
         code = _exit_code(exit_code)
+        if found.lease:
+            raise ConfigurationError(f"lease {found.job} ends only when Slurm interrupts it")
         if found.state == _PENDING:
             self.start(job)
         if found.state == _COMPLETED and not found.launched:
@@ -369,6 +409,58 @@ class FakeScheduler:
         if found.relay and not found.limited:
             self._write(f"{found.marker}.limit")
         found.limited = True
+
+    def poll(self, job: int) -> tuple[str, ...]:
+        """A running lease looks at its order directory, as its batch script does every few
+        seconds: it claims each order it has not taken, unless the client's claim won, and
+        starts its step, which waits for room until ``begin_step``. After the pre-limit signal
+        it takes nothing. Returns the steps it started, in name order."""
+        found = self._find(job)
+        if not found.lease or found.state != _RUNNING:
+            raise ConfigurationError(f"job {found.job} is not a running lease")
+        if found.limited:
+            return ()
+        directory = cast(str, found.link.orders)
+        taken: list[str] = []
+        for path in sorted(self._files):
+            step = posixpath.basename(path).removesuffix(".run")
+            if posixpath.dirname(path) != directory or not path.endswith(".run"):
+                continue
+            claim = f"{directory}/{step}.claim"
+            if claim not in self._files:
+                self._write(claim, b"taken")
+            if self._files[claim] == b"taken" and step not in found.taken:
+                found.taken[step] = None
+                taken.append(step)
+        return tuple(taken)
+
+    def begin_step(self, step: str) -> None:
+        """Slurm found room for a step its lease started: the step writes its start marker."""
+        found = self._lease_of(step)
+        if f"{found.step_prefix}{step}.{found.job}.start" in self._files:
+            raise ConfigurationError(f"step {step} already began")
+        self._write(f"{found.step_prefix}{step}.{found.job}.start")
+
+    def end_step(self, step: str, exit_code: int = 0) -> None:
+        """A step returns, begun or still waiting for room: its end marker appears."""
+        found = self._lease_of(step)
+        code = _exit_code(exit_code)
+        found.taken[step] = code
+        self._write(f"{found.step_prefix}{step}.{found.job}.0.{code}.end")
+
+    def honor_stops(self, job: int, exit_code: int = 143) -> tuple[str, ...]:
+        """The lease acts on every stop request: each step it took that has not ended and has a
+        stop marker returns ``exit_code`` (143 by default, as after SIGTERM), a running one
+        after SIGUSR1, one still waiting for room without starting. Returns those steps."""
+        found = self._find(job)
+        stopped = tuple(
+            step
+            for step, code in found.taken.items()
+            if code is None and f"{found.step_prefix}{step}.{found.job}.stop" in self._files
+        )
+        for step in stopped:
+            self.end_step(step, exit_code)
+        return stopped
 
     def interrupt(self, job: int, state: str = "CANCELLED") -> None:
         """Slurm interrupts the job (cancel, time limit, preemption). A started batch script
@@ -475,6 +567,12 @@ class FakeScheduler:
                 if job.state == _PENDING and job.kill_invalid and _COMPLETED in ended:
                     job.state = "CANCELLED"
                     changed = True
+
+    def _lease_of(self, step: str) -> _Job:
+        for job in self._jobs:
+            if step in job.taken and job.taken[step] is None and job.state == _RUNNING:
+                return job
+        raise ConfigurationError(f"no running lease runs step {step}")
 
     def _find(self, job: int) -> _Job:
         for candidate in reversed(self._jobs):
@@ -585,10 +683,27 @@ class FakeScheduler:
             raise AssertionError(f"FakeScheduler does not understand {argv!r}")
         return Completed(0, _SLURM_CONFIG, b"")
 
-    def _writable_directory(self, argv: tuple[str, ...], _stdin: bytes) -> Completed:
-        if argv[:-1] != WRITABLE_DIRECTORY:
+    def _shell(self, argv: tuple[str, ...], stdin: bytes) -> Completed:
+        """The fixed shell programs: the writable-directory check, and writing or withdrawing a
+        lease's order."""
+        if argv[:-1] == WRITABLE_DIRECTORY:
+            return Completed(0, b"", b"")
+        if argv[:-2] == ORDER:
+            directory, step = argv[-2:]
+            self._write(f"{directory}/{step}.run", stdin)
+            return Completed(0, b"", b"")
+        if argv[:-4] != WITHDRAW:
             raise AssertionError(f"FakeScheduler does not understand {argv!r}")
-        return Completed(0, b"", b"")
+        directory, step, void, stop = argv[-4:]
+        if stop and stop not in self._files:
+            self._write(stop)
+        claim = f"{directory}/{step}.claim"
+        if claim not in self._files:
+            self._write(claim, b"withdrawn")
+        if self._files[claim] != b"withdrawn":
+            return Completed(0, b"taken\n", b"")
+        self._write(void)
+        return Completed(0, b"withdrawn\n", b"")
 
     def _find_files(self, argv: tuple[str, ...], _stdin: bytes) -> Completed:
         root, patterns = (argv[2], argv[9:-3:3]) if len(argv) > 12 else ("", ())

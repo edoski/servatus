@@ -3,7 +3,7 @@
 
 Valid histories come from the real transitions. Each document is mutated (numbers nudged, list
 items swapped/dropped/duplicated, keys removed or added, values transplanted between fields of the
-same name) and re-serialized canonically. ``reference`` restates the schema-9 rules directly and
+same name) and re-serialized canonically. ``reference`` restates the schema-10 rules directly and
 quadratically, in the style of the 0.11 decoder; only Profile decoding reuses the codec.
 """
 
@@ -57,6 +57,8 @@ ATTEMPT = {
     "intent_at",
     "job",
     "outcome_revision",
+    "slots",
+    "within",
 }
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 PROFILES = (
@@ -165,7 +167,7 @@ def reference(doc: Any) -> bool:
 
 def check(doc: Any) -> None:
     need(is_dict(doc) and set(doc) == TOP)
-    need(is_int(doc["schema_version"]) and doc["schema_version"] == 9)
+    need(is_int(doc["schema_version"]) and doc["schema_version"] == 10)
     need(is_hex(doc["campaign_id"], 32))
     revision, sealed = doc["revision"], doc["sealed_revision"]
     need(is_int(revision) and revision >= 0)
@@ -228,9 +230,29 @@ def check(doc: Any) -> None:
         need(is_int(intent) and 1 <= intent <= revision and intent not in events)
         need(not prior or intent > prior[-1]["intent_revision"])
         events.add(intent)
-        keys = raw["task_keys"]
+        keys, slots, within = raw["task_keys"], raw["slots"], raw["within"]
         need(is_strings(keys))
-        need(bool(keys) and len(set(keys)) == len(keys))
+        need(len(set(keys)) == len(keys))
+        need(slots is None or (is_int(slots) and slots >= 1))
+        need(within is None or is_hex(within, 24))
+        if within is not None:
+            need(len(keys) == 1 and slots is None and count == 1)
+            need(
+                any(
+                    other["allocation_id"] == within
+                    and other["slots"] is not None
+                    and other["within"] is None
+                    and other["job"] is not None
+                    and other["outcome_revision"] < intent
+                    and other["profile"] == raw["profile"]
+                    and raw["job"] in (None, other["job"])
+                    for other in prior
+                )
+            )
+        elif slots is not None:
+            need(keys == [])
+        else:
+            need(bool(keys))
         need(all(key in introduced and introduced[key] < intent for key in keys))
         need([key for key in order if key in keys] == keys)
         need(
@@ -248,6 +270,7 @@ def check(doc: Any) -> None:
                     and other["link"]["count"] == count
                     and other["link"]["budget"] == link["budget"]
                     and other["task_keys"] == keys
+                    and other["slots"] == slots
                     and other["job"] is not None
                     and other["outcome_revision"] < intent
                     for other in prior
@@ -278,7 +301,9 @@ def histories(draw: st.DrawFn) -> State:
     extra = 0
     for _ in range(draw(st.integers(0, 10))):
         operation = draw(
-            st.sampled_from(["append", "seal", "intent", "intent", "outcome", "next link"])
+            st.sampled_from(
+                ["append", "seal", "intent", "intent", "outcome", "next link", "lease", "step"]
+            )
         )
         unresolved = [a for a in state.attempts if a.outcome_revision is None]
         if operation == "append" and not state.sealed:
@@ -300,6 +325,24 @@ def histories(draw: st.DrawFn) -> State:
             budget = draw(st.sampled_from([None, timedelta(hours=30)]))
             link = Link(identity, 1, count, budget)
             state, _ = intend(state, keys, profile_value=chosen_profile, link=link)
+        elif operation == "lease":
+            identity = f"{len(state.attempts) + 1:024x}"
+            link = Link(identity, 1, draw(st.sampled_from([1, 2])))
+            slots = draw(st.integers(1, 3))
+            state, _ = intend(state, (), profile_value=PROFILES[0], link=link, slots=slots)
+        elif operation == "step":
+            free = [task.key for task in state.tasks if task.key not in unresolved_keys(state)]
+            leases = [a for a in state.attempts if a.slots is not None and a.within is None]
+            leases = [a for a in leases if a.job is not None]
+            if not free or not leases:
+                continue
+            lease = draw(st.sampled_from(leases))
+            state, _ = intend(
+                state,
+                (draw(st.sampled_from(free)),),
+                profile_value=lease.profile,
+                within=lease.allocation_id,
+            )
         elif operation == "next link":
             busy = unresolved_keys(state)
             taken = {(a.link.chain, a.link.index) for a in state.attempts}
@@ -315,10 +358,18 @@ def histories(draw: st.DrawFn) -> State:
                 previous = draw(st.sampled_from(ready))
                 old = previous.link
                 link = Link(old.chain, old.index + 1, old.count, old.budget)
-                state, _ = intend(state, previous.task_keys, link=link)
+                state, _ = intend(
+                    state,
+                    previous.task_keys,
+                    profile_value=previous.profile,
+                    link=link,
+                    slots=previous.slots,
+                )
         elif operation == "outcome" and unresolved:
             attempt = draw(st.sampled_from(unresolved))
             job = draw(st.sampled_from([None, 7, 8]))
+            if attempt.within is not None and job is not None:
+                job = state.attempt(attempt.within).job
             state = record_outcome(state, attempt.allocation_id, job)
     return state
 
@@ -474,6 +525,11 @@ def test_mutation_corpus_exercises_both_verdicts() -> None:
     state, chain = intend(state, ["task-4"], link=Link(f"{5:024x}", 1, 3, timedelta(hours=2)))
     state = record_outcome(state, chain, 43)
     state, _ = intend(state, ["task-4"], link=Link(chain, 2, 3, timedelta(hours=2)))
+    state, lease = intend(state, (), link=Link(f"{7:024x}", 1, 2), slots=2)
+    state = record_outcome(state, lease, 44)
+    state, step = intend(state, ["task-2"], within=lease)
+    state = record_outcome(state, step, 44)
+    state, _ = intend(state, (), link=Link(lease, 2, 2), slots=2)
     base = json.loads(encode(state))
     accepted = rejected = 0
     for _ in range(4000):

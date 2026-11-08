@@ -20,6 +20,7 @@ from ..errors import (
     Busy,
     ConfigurationError,
     Conflict,
+    EvidenceConflict,
     NotFound,
     PlanRefused,
     StalePlan,
@@ -27,7 +28,17 @@ from ..errors import (
     Unavailable,
 )
 from ._config import Continuation, Profile, Target, Task, task_keys
-from ._evidence import Marker, Observation, Observed, QueueRow, evidenced_job, observe, queue_row
+from ._evidence import (
+    Marker,
+    Observation,
+    Observed,
+    QueueRow,
+    Void,
+    evidenced_job,
+    observe,
+    observe_step,
+    queue_row,
+)
 from ._plan import (
     Decision,
     Plan,
@@ -38,7 +49,7 @@ from ._plan import (
     decode_decision,
     link_profile,
 )
-from ._policy import Request, Retry, decide, scope
+from ._policy import Hold, Request, Retry, decide, scope
 from ._remote import Transport
 from ._remote import connect as connect_target
 from ._results import (
@@ -56,6 +67,7 @@ from ._script import dependency_options, log_path
 from ._state import (
     AcceptanceState,
     Attempt,
+    Kind,
     State,
     append,
     chain_jobs,
@@ -95,7 +107,11 @@ def _receipt(attempt: Attempt) -> Receipt:
 
 
 def _outcomes(state: State, outcomes: Sequence[tuple[str, int | None]]) -> State:
-    return reduce(lambda current, item: record_outcome(current, *item), outcomes, state)
+    """``state`` with each outcome recorded for the Attempts still unresolved: a concurrent
+    submission may have resolved one since."""
+    unresolved = AcceptanceState.UNRESOLVED
+    pending = [item for item in outcomes if state.attempt(item[0]).acceptance is unresolved]
+    return reduce(lambda current, item: record_outcome(current, *item), pending, state)
 
 
 def _merge(state: State, tasks: tuple[Task, ...]) -> State:
@@ -117,6 +133,25 @@ def _budgeted(
         key for key, ran in spent.items() if not continuation.link_limits(profile.resources, ran)
     )
     return replace(request, exhausted=exhausted)
+
+
+def _unique(attempts: Iterable[Attempt]) -> list[Attempt]:
+    return list({attempt.allocation_id: attempt for attempt in attempts}.values())
+
+
+def _withins(steps: Iterable[Attempt]) -> list[str]:
+    return list(dict.fromkeys(cast(str, item.within) for item in steps))
+
+
+def _size(item: PlannedAllocation) -> int:
+    """Tasks per allocation, or a lease's slots."""
+    return len(item.task_keys) if item.slots is None else item.slots
+
+
+def _serving(observation: Observation) -> bool:
+    """Whether a lease takes new orders: Slurm lists it, it has not ended, and its pre-limit
+    signal has not arrived."""
+    return not observation.ended and observation.limit_at is None
 
 
 def _interrupted(
@@ -275,7 +310,7 @@ class Campaign:
         else:
             attempt = state.attempt(allocation)
         job = _receipt(attempt).job
-        slot = None
+        slot = 0 if attempt.kind is Kind.STEP else None
         if task is not None:
             if task not in attempt.task_keys:
                 raise NotFound(f"Task {task!r} is not in allocation {attempt.allocation_id}")
@@ -287,10 +322,46 @@ class Campaign:
 
     # --- Planning -----------------------------------------------------------------------------
 
+    def hold(
+        self, profile: Profile, *, slots: int | None = None, continuation: Continuation = _PLAIN
+    ) -> Plan:
+        """A plan of one lease: ``slots`` (default: as many as fit) copies of the profile's
+        per-Task Resources, held for its whole time limit, selecting no Task. ``continuation``
+        may set ``max_links`` to queue that many leases, each starting when the one before it
+        ended; a budget is refused. Needs ``signal_before_end``. Observes nothing."""
+        if not isinstance(profile, Profile):
+            raise ConfigurationError("profile must be a Profile")
+        if not isinstance(continuation, Continuation):
+            raise ConfigurationError("continuation must be a Continuation")
+        if continuation.budget is not None:
+            raise ConfigurationError("a lease takes no budget; its steps may")
+        if profile.resources.signal_before_end is None:
+            raise ConfigurationError("a lease needs resources.signal_before_end")
+        size = capacity(profile.target, profile.resources, slots)
+        continuation.check(profile.resources)
+        state = self._store.read()
+        decision = Decision(
+            campaign_id=state.campaign_id,
+            revision=state.revision,
+            nonce=secrets.token_hex(16),
+            profile=profile,
+            selected=(),
+            held={task.key: Hold.NOT_REQUESTED for task in state.tasks},
+            deferred=(),
+            tasks_per_allocation=1,
+            probe_required=False,
+            continuation=continuation,
+            spent={},
+            extensions={},
+            slots=size,
+        )
+        return build_plan(state, decision)
+
     def plan(
         self,
-        profile: Profile,
+        profile: Profile | None = None,
         *,
+        lease: str | None = None,
         retry: Collection[str] | Retry = (),
         only: Collection[str] | None = None,
         tasks_per_allocation: int | None = None,
@@ -302,20 +373,38 @@ class Campaign:
         Only Tasks never accepted, or requested for retry, are probed; scheduler evidence is
         gathered only for the accepted Attempts of retry candidates. An active continuation
         measures each candidate's run time from that evidence and records it in the Decision.
+
+        With ``lease`` instead of a profile (the id of any link of a lease of this campaign),
+        each selected Task starts as a step using one slot of the lease's current link: the first
+        one Slurm lists that has not ended or reached its pre-limit signal (``Conflict`` when there
+        is none). Steps use the lease's Profile, always learn their run time, and are never
+        deferred; ``continuation`` may carry a budget but not ``max_links``.
         """
-        if not isinstance(profile, Profile):
-            raise ConfigurationError("profile must be a Profile")
         if not isinstance(continuation, Continuation):
             raise ConfigurationError("continuation must be a Continuation")
+        if lease is None:
+            if not isinstance(profile, Profile):
+                raise ConfigurationError("profile must be a Profile")
+        elif profile is not None or tasks_per_allocation is not None:
+            raise ConfigurationError("a step plan takes its Profile from its lease, one Task each")
+        elif continuation.max_links is not None:
+            raise ConfigurationError("steps do not continue across links; plan without max_links")
         request = Request.parse(retry, only)
         if request.retry is Retry.INCOMPLETE and self._probe is None:
             raise ConfigurationError("Retry.INCOMPLETE needs a result probe")
-        cap = capacity(profile.target, profile.resources, tasks_per_allocation)
-        continuation.check(profile.resources)
         state = self._store.read()
+        within, cap = None, 1
+        if lease is not None:
+            held = self._lease_link(state, lease)
+            within, profile = held.allocation_id, held.profile
+        profile = cast(Profile, profile)
+        if within is None:
+            cap = capacity(profile.target, profile.resources, tasks_per_allocation)
+        continuation.check(profile.resources)
         observed, results = self._consult(state, request)
         self._unchanged(state)
-        spent = self._spent(state, observed) if continuation.active else {}
+        measured = continuation.active or within is not None
+        spent = self._spent(state, observed) if measured else {}
         request = _budgeted(request, continuation, profile, spent)
         selection = decide(state, observed, results, request)
 
@@ -325,7 +414,10 @@ class Campaign:
                 for key in group
             )
 
-        selected, deferred = batch(selection.selected, profile.target, cap, links)
+        if within is None:
+            selected, deferred = batch(selection.selected, profile.target, cap, links)
+        else:
+            selected, deferred = selection.selected, ()
         decision = Decision(
             campaign_id=state.campaign_id,
             revision=state.revision,
@@ -337,10 +429,11 @@ class Campaign:
             tasks_per_allocation=cap,
             probe_required=self._probe is not None,
             continuation=continuation,
-            spent={key: spent.get(key, _ZERO) for key in selected} if continuation.active else {},
+            spent={key: spent.get(key, _ZERO) for key in selected} if measured else {},
             extensions={
                 key: reason for key, reason in selection.extensions.items() if key in selected
             },
+            within=within,
         )
         return build_plan(state, decision)
 
@@ -356,19 +449,20 @@ class Campaign:
         """Ask ``sbatch --test-only`` once per distinct allocation shape. Records nothing.
 
         A shape of a later chain link also carries ``--kill-on-invalid-dep=yes``; its
-        dependency needs job numbers that exist only at submission."""
+        dependency needs job numbers that exist only at submission. A step plan submits no Slurm
+        job, so it has nothing to validate."""
         plan = self._verified(plan)
-        if not plan.allocations:
+        if not plan.allocations or plan.decision.kind is Kind.STEP:
             return ()
         scheduler = self._scheduler(plan.decision.profile.target)
         shapes: dict[tuple[int, timedelta, bool, bool], PlannedAllocation] = {}
         for item in plan.allocations:
             later = item.link.index > 1
             relay = any(word.startswith("--signal=B:") for word in item.argv)
-            shapes.setdefault((len(item.task_keys), item.time_limit, later, relay), item)
+            shapes.setdefault((_size(item), item.time_limit, later, relay), item)
         return tuple(
             ShapeCheck(
-                len(item.task_keys),
+                _size(item),
                 item.cpus,
                 item.memory_mib,
                 item.gpus,
@@ -386,7 +480,8 @@ class Campaign:
         The plan is rebuilt and compared first, the scheduler is pinged, and every planned Task
         must still be eligible, with the run time it was planned with; all of that happens before
         any intent. Links go in order, every chain's link 1 first, and each later link depends on
-        the jobs of the links before it. A stop after that raises ``SubmissionInterrupted`` whose
+        the jobs of the links before it. A step is ordered into its lease instead of submitted,
+        and its job is the lease's. A stop after that raises ``SubmissionInterrupted`` whose
         ``result`` lists receipts, unresolved allocations, and unattempted allocations.
         """
         plan = self._verified(plan)
@@ -414,8 +509,12 @@ class Campaign:
                 stop = "the next intent was not recorded"
                 raise _interrupted(stop, error, receipts, (), plan.allocations[index:]) from error
             try:
-                after = dependency_options(chain_jobs(claimed, item.link))
-                job = scheduler.submit((*item.argv, *after), item.script)
+                if item.within is None:
+                    after = dependency_options(chain_jobs(claimed, item.link))
+                    job = scheduler.submit((*item.argv, *after), item.script)
+                else:
+                    scheduler.order(item.within, item.allocation_id, item.script)
+                    job = cast(int, claimed.attempt(item.within).job)
             except Exception as error:
                 stop = "scheduler acceptance is unresolved"
                 raise _interrupted(stop, error, receipts, unresolved, later) from error
@@ -437,16 +536,28 @@ class Campaign:
 
         A queue row, else a run marker, records acceptance of its job. Without either, an
         allocation whose intent is at least ``NOT_SUBMITTED_AFTER`` old is recorded as not
-        submitted; a younger one stays unresolved and is reported as ``waiting``.
+        submitted; a younger one stays unresolved and is reported as ``waiting``. A step resolves
+        at once: the client claims its order, so it was not submitted when that claim won, and
+        accepted when its lease had taken it.
         """
         now = self._time()
         state = self._store.read()
         unresolved = [
             item for item in state.attempts if item.acceptance is AcceptanceState.UNRESOLVED
         ]
+        steps = [item for item in unresolved if item.within is not None]
+        unresolved = [item for item in unresolved if item.within is None]
         rows, markers = self._evidence(unresolved, unresolved)
         outcomes: list[tuple[str, int | None]] = []
         waiting: list[WaitingAllocation] = []
+        for attempt in steps:
+            lease = state.attempt(cast(str, attempt.within))
+            job = cast(int, lease.job)
+            scheduler = self._scheduler(attempt.profile.target)
+            withdrawn = scheduler.withdraw(
+                lease.allocation_id, attempt.allocation_id, job, stop=False
+            )
+            outcomes.append((attempt.allocation_id, None if withdrawn else job))
         for attempt in unresolved:
             name = attempt.allocation_id
             job = evidenced_job(name, rows[name], markers[name])
@@ -477,7 +588,9 @@ class Campaign:
         submitted. A chosen chain link brings every later link of its chain. Allocations are
         cancelled newest first, so no later link becomes eligible while an earlier one stops; after
         a failed ``scancel``, no earlier link of that chain is tried, and an unresolved link of a
-        chosen chain is a ``Conflict``.
+        chosen chain is a ``Conflict``. Cancelling a lease ends every step in it. A step that has
+        not ended is stopped inside its lease, which runs on: its order is withdrawn when the lease
+        has not taken it yet, and otherwise the lease stops the step.
         Returns a receipt (with the job Slurm listed) for each allocation that was asked to stop;
         packed allocations stop all their Tasks.
         """
@@ -512,7 +625,9 @@ class Campaign:
         for item in chained:
             if item.acceptance is AcceptanceState.UNRESOLVED:
                 raise Conflict(f"allocation {item.allocation_id} is unresolved; reconcile it first")
-        rows, _ = self._evidence(chained)
+        steps = [item.allocation_id for item in chained if item.within is not None]
+        rows, _ = self._evidence([item for item in chained if item.within is None])
+        observed = self._observe(state, steps).attempts
         cancelled: list[Receipt] = []
         failed: list[str] = []
         broken: set[str] = set()
@@ -522,6 +637,19 @@ class Campaign:
                 # An earlier link stopped after its pre-limit signal would hand off to the link
                 # that is still queued.
                 skipped.append(attempt.allocation_id)
+                continue
+            if attempt.within is not None:
+                observation = observed.get(attempt.allocation_id)
+                if observation is None or not observation.live or observation.ended:
+                    continue
+                job = cast(int, attempt.job)
+                scheduler = self._scheduler(attempt.profile.target)
+                try:
+                    scheduler.withdraw(attempt.within, attempt.allocation_id, job, stop=True)
+                except Unavailable as error:
+                    failed.append(f"{attempt.allocation_id} ({error})")
+                else:
+                    cancelled.append(Receipt(attempt.allocation_id, job, attempt.task_keys))
                 continue
             row = queue_row(attempt.allocation_id, rows[attempt.allocation_id], attempt.job)
             if row is None or row.settling:
@@ -583,20 +711,39 @@ class Campaign:
 
     def _observe(self, state: State, allocation_ids: Iterable[str]) -> Observed:
         """Observe the accepted and not-submitted Attempts among ``allocation_ids``: accepted
-        ones from their queue rows and run markers, not-submitted ones from their queue rows."""
+        ones from their queue rows and run markers, not-submitted ones from their queue rows.
+        A step is observed through its lease's queue row and markers plus its own markers; a
+        not-submitted step that left any marker but its void is an ``EvidenceConflict``."""
         wanted = set(allocation_ids)
         chosen = [
             item
             for item in state.attempts
             if item.allocation_id in wanted and item.acceptance is not AcceptanceState.UNRESOLVED
         ]
-        accepted = [item for item in chosen if item.acceptance is _ACCEPTED]
-        rows, markers = self._evidence(chosen, accepted)
+        steps = [item for item in chosen if item.within is not None]
+        leases = {item.allocation_id: item for item in map(state.attempt, _withins(steps))}
+        jobs = [item for item in chosen if item.within is None]
+        accepted = [item for item in jobs if item.acceptance is _ACCEPTED]
+        queued = _unique((*jobs, *leases.values()))
+        rows, markers = self._evidence(queued, _unique((*accepted, *steps, *leases.values())))
         observations: dict[str, Observation] = {}
         strays: dict[str, int] = {}
         for attempt in chosen:
             name = attempt.allocation_id
-            if attempt.job is not None:
+            if attempt.within is not None:
+                lease = leases[attempt.within]
+                if attempt.job is not None:
+                    observations[name] = observe_step(
+                        name,
+                        lease.allocation_id,
+                        attempt.job,
+                        rows[lease.allocation_id],
+                        markers[name],
+                        markers[lease.allocation_id],
+                    )
+                elif any(not isinstance(marker, Void) for marker in markers[name]):
+                    raise EvidenceConflict(f"step {name} was recorded as not submitted, yet it ran")
+            elif attempt.job is not None:
                 observations[name] = observe(
                     name,
                     attempt.job,
@@ -608,6 +755,24 @@ class Campaign:
             elif (row := queue_row(name, rows[name], None)) is not None:
                 strays[name] = row.job
         return Observed(observations, strays)
+
+    def _lease_link(self, state: State, lease_id: str) -> Attempt:
+        """The link of the chain of lease ``lease_id`` that new steps start in: the first
+        accepted one that takes orders."""
+        named = state.attempt(lease_id)
+        if named.kind is not Kind.LEASE:
+            raise ConfigurationError(f"allocation {lease_id} is not a lease")
+        chain = [
+            item
+            for item in state.attempts
+            if item.link.chain == named.link.chain and item.acceptance is _ACCEPTED
+        ]
+        observed = self._observe(state, (item.allocation_id for item in chain)).attempts
+        for item in chain:
+            if _serving(observed[item.allocation_id]):
+                return item
+        stop = "has no queued or running link before its pre-limit signal"
+        raise Conflict(f"lease {lease_id} {stop}")
 
     def _unchanged(self, state: State) -> None:
         if self._store.read().revision != state.revision:
@@ -647,8 +812,13 @@ class Campaign:
         request = Request(frozenset(key for key in keys if past[key].accepted), frozenset(keys))
         observed, results = self._consult(state, request)
         continuation, profile = decision.continuation, decision.profile
-        spent = self._spent(state, observed) if continuation.active else {}
-        if continuation.active and {key: spent.get(key) for key in keys} != decision.spent:
+        if decision.within is not None:
+            lease = self._observe(state, (decision.within,)).attempts[decision.within]
+            if not _serving(lease):
+                stop = f"lease {decision.within} ended or reached its pre-limit signal; plan again"
+                raise StalePlan(stop)
+        spent = self._spent(state, observed) if decision.measured else {}
+        if decision.measured and {key: spent.get(key) for key in keys} != decision.spent:
             raise StalePlan("a planned Task's measured run time changed after planning; plan again")
         request = _budgeted(request, continuation, profile, spent)
         try:
@@ -683,6 +853,8 @@ class Campaign:
                 task_keys=item.task_keys,
                 profile=profile,
                 at=self._time(),
+                slots=item.slots,
+                within=item.within,
             )
 
         return self._store.update(claim)

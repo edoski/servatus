@@ -10,37 +10,47 @@ A long Task can now continue across allocations under a lifetime run-time budget
 controller running while it does: `plan --budget` queues a chain of allocations at submission, and
 each link hands its Tasks on to the next through a marker it writes after their steps returned (see
 [ADR 0008](https://github.com/edoski/servatus/blob/main/docs/adr/0008-chains.md)). `status` shows
-every Task's run time, summed over its allocations from run-marker mtimes. Plans without a budget
-render the batch scripts and `sbatch` requests 0.13 did, plus `SERVATUS_JOB_END_TIME` in every
-step.
+every Task's run time, summed over its allocations from run-marker mtimes. A **lease** holds one
+allocation, GPUs included, for its whole time limit, and Tasks start, stop, and are watched inside
+it from the operator's machine as steps: `plan --hold N` and `submit` make one, `start` starts the
+Tasks of a file in it, and `cancel`, `status`, `logs`, and `reconcile` work as for any Attempt (see
+[ADR 0009](https://github.com/edoski/servatus/blob/main/docs/adr/0009-leases.md)). Plans without a
+budget or a lease render the batch scripts and `sbatch` requests 0.13 did, plus
+`SERVATUS_JOB_END_TIME` in every step.
 
 **Upgrading from 0.13.** Schema 8 campaign state and `servatus.plan/2` plan files are rejected, so
 finish or abandon 0.13 campaigns with 0.13 first, then create new campaigns and plans. Published
 results and Workspaces are unaffected, so a Task rerun in a new campaign still resumes its private
-work. Read `servatus.status/3` from `status --json` (timed observations, `run_time`, `link`), expect
-exit 75 to read as `STOPPED (yielded)`, make sure the login host has GNU `find` (run
-`servatus doctor`), and add `signal_before_end` to a profile before planning with `--budget`.
+work. Read `servatus.status/4` from `status --json` (timed observations, `run_time`, `link`, and
+each Attempt's `slots` and `within`), expect exit 75 to read as `STOPPED (yielded)`, make sure the
+login host has GNU `find` (run `servatus doctor`), and add `signal_before_end` to a profile before
+planning with `--budget` or holding a lease. `plan` and `doctor` still read `./SERVATUS.toml` unless
+`--config` is given.
 
 ### Breaking
 
-- Campaign state uses schema 9: every Attempt records its `link`, its place in a chain of
+- Campaign state uses schema 10: every Attempt records its `link`, its place in a chain of
   allocations (`chain`, the allocation id of link 1, its 1-based `index`, the chain's `count`, and
-  the `budget` the chain was planned with). A plain allocation is link 1 of 1. The invariant
-  requires every later link to follow the accepted previous link of its chain with the same Tasks.
-  Schema 8 is rejected; there is no migration.
-- `status --json` prints `servatus.status/3`. Each Task gains `run_time` (`{"total", "complete"}`,
+  the `budget` the chain was planned with), and its `slots` and `within`, which make it a lease (its
+  slot count) or a step (its lease). A plain allocation is link 1 of 1. The invariant requires every
+  later link to follow the accepted previous link of its chain with the same Tasks and slots, and a
+  step to run in a lease accepted before it, on the lease's Profile and job. Schema 8 is rejected;
+  there is no migration.
+- `status --json` prints `servatus.status/4`. Each Task gains `run_time` (`{"total", "complete"}`,
   `null` offline) and `link`, and `detail` is one of `never started`, `time limit`, `yielded`, or
-  `budget spent`. Each Attempt gains `link`, and its `observation` replaces `started`, `stopped`,
-  and `exit_codes` with `started_at`, `stopped_at`, `limit_at`, `ends` (`{"exit_code", "at"}` or
-  `null` per slot), and `handed`. `Observation.execution` returns the execution, the exit code,
-  and a `StopReason`.
+  `budget spent`. Each Attempt gains `link`, `slots`, and `within`, and its `observation` replaces
+  `started`, `stopped`, and `exit_codes` with `started_at`, `stopped_at`, `limit_at`, `ends`
+  (`{"exit_code", "at"}` or `null` per slot), `handed`, and `step`. `Observation.execution`
+  returns the execution, the exit code, and a `StopReason`.
 - A step that exits 75 reads as `STOPPED (yielded)` with exit code 75 in every campaign, not
   `FAILED`. `Retry.FAILED` selects both, as before.
 - Run markers are listed with `find -printf '%T@ %p\n'`, which needs GNU find on the login host.
   `servatus doctor` gains a `find -printf` check.
-- Saved plans are `servatus.plan/3`: the Decision gains `continuation`, `spent` (each selected
-  Task's measured run time, with a continuation), and `extensions`. `PlannedAllocation` gains
-  `link`, and its `argv` of a later link lacks the dependency that `submit` adds.
+- Saved plans are `servatus.plan/4`: the Decision gains `continuation`, `spent` (each selected
+  Task's measured run time, with a continuation or for steps), `extensions`, `slots`, and
+  `within`. `PlannedAllocation` gains `link`, `slots`, and `within`, and its `argv` of a later link
+  lacks the dependency that `submit` adds.
+- `Campaign.plan`'s `profile` is optional, so a step plan can take its Profile from its lease.
 - `cancel` stops allocations newest first, and cancelling a chain link also cancels every later
   link of its chain.
 - `logs --task`, status, and `--retry-failed` follow a Task's current allocation: its latest
@@ -75,6 +85,25 @@ exit 75 to read as `STOPPED (yielded)`, make sure the login host has GNU `find` 
 - `plan` prints the most a plan requests, `requests at most N CPU-hours, N GPU-hours, N GiB-hours`
   over every allocation and chain link at its time limit (GPU-hours only when nonzero). `plan
   --json` carries it as `totals`, and the library as `Plan.totals`, a public `Totals`.
+- Leases: `plan --hold N [--max-links K]` (`Campaign.hold(profile, slots=N)`) plans one lease of N
+  slots of the profile's per-Task resources, or a chain of K, and `submit` sends it as one job that
+  gets the pre-limit signal in its batch shell. `plan --lease ID` (`Campaign.plan(lease=ID)`) plans
+  each selected Task as a step of exactly one slot in the lease's current link (Slurm refuses a step
+  whose per-task CPUs exceed the lease's, so a larger run needs a lease of a larger profile), and
+  `submit` writes its order into the lease's owner-only order directory instead of calling `sbatch`.
+  `servatus start STATE TASKS.jsonl --lease ID` registers the file's new Tasks and starts its keys
+  in one command. The lease's POSIX `sh` batch script starts each step only after its no-replace
+  claim on the order won, the same claim `cancel` and `reconcile` contend for; the step writes its
+  own start marker once Slurm gave it room, so a waiting step reads `QUEUED` and accrues no run
+  time. Slurm chooses which waiting step starts when a slot frees, and `srun`'s retry backoff can
+  delay that start by up to about two minutes. `cancel --task KEY` withdraws a step the lease has
+  not taken, or has the lease stop it with `SIGUSR1`, then `SIGTERM` after `signal_before_end`;
+  after the pre-limit signal the lease takes no more orders. A step stops being live as soon as it
+  ended or was withdrawn, so its Task can be started again in the same lease. `reconcile` resolves
+  an unresolved step at once. A new run marker, `<step>.<job>.void`, records a withdrawn step. Steps
+  get the Campaign's step environment, `SERVATUS_JOB_END_TIME` included, and request nothing in
+  `Plan.totals`. `Kind` is public, and `FakeScheduler` emulates leases with `poll`, `begin_step`,
+  `end_step`, and `honor_stops`.
 
 ## [0.13.0] - 2026-11-06
 
