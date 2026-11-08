@@ -228,6 +228,76 @@ class Resources:
         object.__setattr__(self, "signal_before_end", signal)
 
 
+# --- Continuation ----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class Continuation:
+    """How far one plan continues its Tasks across allocations, called links of a chain.
+
+    ``budget`` is each selected Task's lifetime run-time budget, across every allocation it ever
+    had and will have, rounded up to whole minutes. ``max_links`` caps how many links one chain
+    of the plan queues (1 to ``MAX_LINKS``). ``Continuation()`` is a plain plan: one allocation
+    per Task and no budget.
+    """
+
+    budget: timedelta | None
+    max_links: int | None
+
+    def __init__(
+        self, *, budget: str | timedelta | None = None, max_links: int | None = None
+    ) -> None:
+        if max_links is not None and (
+            type(max_links) is not int or not 1 <= max_links <= MAX_LINKS
+        ):
+            raise ConfigurationError(f"max_links must be an integer from 1 to {MAX_LINKS}")
+        limit = None if budget is None else whole_minutes(duration(budget, "budget"))
+        object.__setattr__(self, "budget", limit)
+        object.__setattr__(self, "max_links", max_links)
+
+    @property
+    def active(self) -> bool:
+        """Whether the plan builds chains: steps learn their link and run time."""
+        return self.budget is not None or self.max_links is not None
+
+    def link_limits(
+        self, resources: Resources, spent: timedelta = timedelta(0)
+    ) -> tuple[timedelta, ...]:
+        """The time limit of each link that continues a Task which has already run ``spent``.
+
+        Without a budget, ``max_links`` (default 1) full ``time_limit`` links. With one, full
+        links and then one shorter link holding the rest of the budget, rounded down to whole
+        minutes so the budget is never exceeded. A rest within a minute of ``signal_before_end``
+        is dropped: that link would be signalled as it starts. At most ``max_links``, or
+        ``MAX_LINKS``, links; none once the budget is spent.
+        """
+        full = resources.time_limit
+        if self.budget is None:
+            return (full,) * (self.max_links or 1)
+        count, rest = divmod(max(self.budget - spent, timedelta(0)), full)
+        rest -= rest % MINUTE
+        limits = (full,) * count + ((rest,) if rest > self.reserve(resources) else ())
+        return limits[: self.max_links or MAX_LINKS]
+
+    @staticmethod
+    def reserve(resources: Resources) -> timedelta:
+        """The shortest useful last link: a minute beyond ``signal_before_end``."""
+        return (resources.signal_before_end or timedelta(0)) + MINUTE
+
+    def check(self, resources: Resources) -> None:
+        """Refuse a continuation these Resources cannot serve: several links, or a budget, need
+        ``signal_before_end``, and a budget must buy at least one link."""
+        chained = self.budget is not None or (self.max_links or 1) > 1
+        _require(
+            not chained or resources.signal_before_end is not None,
+            "continuing Tasks across allocations needs resources.signal_before_end",
+        )
+        _require(
+            self.budget is None or bool(self.link_limits(resources)),
+            "budget must exceed signal_before_end by more than one minute",
+        )
+
+
 # --- Target ----------------------------------------------------------------------------------
 
 

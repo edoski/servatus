@@ -17,6 +17,18 @@ and inject failures::
 Every file carries an mtime from the fake's clock (``clock``, or an internal one that ``advance``
 moves), which ``find -printf`` reports, so run time is measured as on a real cluster.
 
+Chains behave as Slurm and their batch scripts would. A job submitted with
+``--dependency=afternotok:...`` starts only once every job it names ended without exit 0, and with
+``--kill-on-invalid-dep=yes`` Slurm deletes it, unstarted, once any of them exits 0. A later link
+runs only the slots whose handoff markers exist. ``signal_limit`` delivers the pre-limit signal,
+and a slot of a link that hands off writes the next link's handoff marker exactly when
+``servatus.campaign._script.continues`` says, as the rendered shell does::
+
+    fake.start(link1)
+    fake.signal_limit(link1)          # the limit marker; the steps get SIGUSR1
+    fake.interrupt(link1, "TIMEOUT")  # each running slot hands off to link 2
+    fake.start(link2)                 # runs the handed slots
+
 Controls and ``count`` name commands by basename (``"sbatch"``, ``"squeue"``, ``"find"``, ...),
 except the ``sbatch --version`` connectivity check that precedes every submission, which is
 ``"ping"``: so ``fail_next("sbatch")`` affects the next real submission, and ``fail_next("ping")``
@@ -28,22 +40,29 @@ from __future__ import annotations
 
 import fnmatch
 import posixpath
+import re
+import shlex
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
+from typing import cast
 
 from .campaign._config import Resources, Target
 from .campaign._remote import MAX_STREAM_BYTES, Completed, Transport
 from .campaign._scheduler import SQUEUE_FORMAT, SQUEUE_OPTIONS, TAIL, WRITABLE_DIRECTORY, find_argv
-from .campaign._script import check_command, sbatch_argv
+from .campaign._script import check_command, continues, dependency_options, sbatch_argv
 from .errors import ConfigurationError, Unavailable
 
 __all__ = ["FakeJob", "FakeScheduler"]
 
 _RUNNING = "RUNNING"
 _PENDING = "PENDING"
+_COMPLETED = "COMPLETED"
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_SLOT = re.compile(rb"--job-name=servatus-[0-9a-f]{24}-([0-9]+) ")
+_PREVIOUS = re.compile(rb"previous=([0-9]+)")
+_HANDED = re.compile(rb"(?:0|[1-9][0-9]{0,8})\n")
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +79,44 @@ class FakeJob:
     task_count: int
     state: str
     in_queue: bool
+    dependencies: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _Link:
+    """What the fake reads from a rendered batch script: the slots it launches, the handoff
+    prefixes of this link (``own``, set on gated links) and the next one, the slots that hand
+    off, and on link 1 each slot's run time before the chain."""
+
+    slots: tuple[int, ...]
+    own: str | None = None
+    next: str | None = None
+    hands_off: frozenset[int] = frozenset()
+    previous: Mapping[int, int] = field(default_factory=dict[int, int])
+
+    @classmethod
+    def read(cls, script: bytes) -> _Link:
+        slots: list[int] = []
+        previous: dict[int, int] = {}
+        hands_off: set[int] = set()
+        prefixes: dict[str, str] = {}
+        pending: int | None = None
+        for line in script.split(b"\n"):
+            if (found := _PREVIOUS.fullmatch(line)) is not None:
+                pending = int(found.group(1))
+            elif line.startswith((b"own=", b"next=")):
+                name, _, value = line.decode().partition("=")
+                prefixes[name] = shlex.split(value)[0]
+            elif line.endswith(b"&") and (found := _SLOT.search(line)) is not None:
+                slot = int(found.group(1))
+                slots.append(slot)
+                if pending is not None:
+                    previous[slot] = pending
+                if f'"$next.{slot}.go"'.encode() in line:
+                    hands_off.add(slot)
+        return cls(
+            tuple(slots), prefixes.get("own"), prefixes.get("next"), frozenset(hands_off), previous
+        )
 
 
 @dataclass(slots=True)
@@ -70,13 +127,25 @@ class _Job:
     script: bytes
     task_count: int
     marker: str
+    link: _Link
+    relay: bool = False
+    after: tuple[int, ...] = ()
+    kill_invalid: bool = False
     state: str = _PENDING
     in_queue: bool = True
+    started_at: datetime | None = None
+    limited: bool = False
     ended: dict[int, int] = field(default_factory=dict[int, int])
+    launched: dict[int, int] = field(default_factory=dict[int, int])
+    handed_off: set[int] = field(default_factory=set[int])
 
     @property
     def started(self) -> bool:
-        return self.state != _PENDING
+        return self.started_at is not None
+
+    @property
+    def live(self) -> bool:
+        return self.state in (_PENDING, _RUNNING)
 
 
 def _key(argv: Sequence[str]) -> str:
@@ -105,7 +174,7 @@ def _sbatch_options() -> frozenset[str]:
     resources = Resources(
         cpus=1, memory_mib=1, time_limit="00:02:00", gpus=1, signal_before_end="00:00:30"
     )
-    argv = sbatch_argv(target, resources, 1, "0" * 24)
+    argv = (*sbatch_argv(target, resources, 1, "0" * 24), *dependency_options((1,)))
     return frozenset(word.partition("=")[0] for word in argv[1:]) | {"--test-only"}
 
 
@@ -238,48 +307,82 @@ class FakeScheduler:
     # --- Controls ----------------------------------------------------------------------------
 
     def start(self, job: int) -> None:
-        """The job starts running: its batch script writes the start marker."""
+        """The job starts running: its batch script writes the start marker and launches its
+        slots, a later chain link only those whose handoff marker exists. A link with no slot to
+        launch exits 0 at once. A job whose dependencies are not satisfied cannot start."""
         found = self._find(job)
         if found.state != _PENDING:
             raise ConfigurationError(f"job {found.job} is not pending")
+        if not self._eligible(found):
+            raise ConfigurationError(f"job {found.job} waits for its dependencies")
         found.state = _RUNNING
+        found.started_at = self.now()
         self._write(f"{found.marker}.start")
+        own = found.link.own
+        for slot in found.link.slots:
+            if own is None:
+                found.launched[slot] = found.link.previous.get(slot, 0)
+            elif _HANDED.fullmatch(self._files.get(f"{own}.{slot}.go", b"")):
+                found.launched[slot] = int(self._files[f"{own}.{slot}.go"])
+        if not found.launched:
+            found.state = _COMPLETED
+            self._settle()
 
     def finish_step(self, job: int, slot: int, exit_code: int = 0) -> None:
-        """One Task step of a running job returns: its slot's end marker appears."""
+        """One Task step of a running job returns: its slot's end marker appears, and in a link
+        that hands off, the next link's handoff marker when the slot continues."""
         found = self._find(job)
         code = _exit_code(exit_code)
-        if found.state != _RUNNING or not 0 <= slot < found.task_count or slot in found.ended:
+        if found.state != _RUNNING or slot not in found.launched or slot in found.ended:
             raise ConfigurationError(f"job {found.job} has no running step in slot {slot}")
         found.ended[slot] = code
         self._write(f"{found.marker}.{slot}.{code}.end")
+        if found.relay and continues(code, interrupted=False, limited=found.limited):
+            self._hand_off(found, slot)
 
     def finish(self, job: int, exit_code: int = 0) -> None:
         """Every remaining step returns ``exit_code`` (a pending job starts first). The job
-        settles as ``COMPLETED`` when every step returned 0, else ``FAILED``, and stays in
-        ``squeue`` until ``purge``."""
+        settles and stays in ``squeue`` until ``purge``: ``COMPLETED`` when it exits 0, which a
+        chain link that hands off does only when no slot handed off, else ``FAILED``."""
         found = self._find(job)
         code = _exit_code(exit_code)
         if found.state == _PENDING:
             self.start(job)
+        if found.state == _COMPLETED and not found.launched:
+            return
         if found.state != _RUNNING:
             raise ConfigurationError(f"job {found.job} is not running")
-        for slot in range(found.task_count):
+        for slot in found.launched:
             if slot not in found.ended:
                 self.finish_step(job, slot, code)
-        found.state = "COMPLETED" if not any(found.ended.values()) else "FAILED"
+        failed = found.handed_off if found.relay else any(found.ended.values())
+        found.state = "FAILED" if failed else _COMPLETED
+        self._settle()
+
+    def signal_limit(self, job: int) -> None:
+        """Slurm sends the pre-limit signal (``signal_before_end`` before the limit). A chain
+        link that hands off gets it in its batch shell, which writes the limit marker and relays
+        it; any other job's steps get it from Slurm directly. Every step learns of it."""
+        found = self._find(job)
+        if found.state != _RUNNING:
+            raise ConfigurationError(f"job {found.job} is not running")
+        if found.relay and not found.limited:
+            self._write(f"{found.marker}.limit")
+        found.limited = True
 
     def interrupt(self, job: int, state: str = "CANCELLED") -> None:
         """Slurm interrupts the job (cancel, time limit, preemption). A started batch script
-        writes its stop marker and its unfinished steps record nothing."""
+        writes its stop marker and its unfinished steps record nothing; in a link that hands
+        off, each one continues after the pre-limit signal."""
         self._interrupt(self._find(job), state)
 
     def lose(self, job: int, state: str = "NODE_FAIL") -> None:
         """The batch shell vanishes without writing anything (SIGKILL, node failure)."""
         found = self._find(job)
-        if found.state not in (_PENDING, _RUNNING):
+        if not found.live:
             raise ConfigurationError(f"job {found.job} already ended")
         found.state = state
+        self._settle()
 
     def purge(self, job: int) -> None:
         """Slurm forgets the job (after ``MinJobAge``); ``squeue`` no longer lists it."""
@@ -333,11 +436,45 @@ class FakeScheduler:
         self._mtimes[path] = moment
 
     def _interrupt(self, found: _Job, state: str) -> None:
-        if found.state not in (_PENDING, _RUNNING):
+        if not found.live:
             raise ConfigurationError(f"job {found.job} already ended")
-        if found.started:
+        if found.state == _RUNNING:
             self._write(f"{found.marker}.stop")
+            for slot in found.launched:
+                stopped = slot not in found.ended
+                if (
+                    stopped
+                    and found.relay
+                    and continues(None, interrupted=True, limited=found.limited)
+                ):
+                    self._hand_off(found, slot)
         found.state = state
+        self._settle()
+
+    def _hand_off(self, found: _Job, slot: int) -> None:
+        """The slot writes the next link's handoff marker: its run time so far, in seconds."""
+        if slot not in found.link.hands_off or found.link.next is None:
+            return
+        elapsed = (self.now() - cast(datetime, found.started_at)) // timedelta(seconds=1)
+        self._write(f"{found.link.next}.{slot}.go", f"{found.launched[slot] + elapsed}\n".encode())
+        found.handed_off.add(slot)
+
+    def _eligible(self, found: _Job) -> bool:
+        """``afternotok``: every job it follows ended, none of them with exit 0."""
+        states = [self._find(job).state for job in found.after]
+        return all(state not in (_PENDING, _RUNNING, _COMPLETED) for state in states)
+
+    def _settle(self) -> None:
+        """``--kill-on-invalid-dep=yes``: Slurm deletes each pending job that follows a job that
+        exited 0, before it ever starts."""
+        changed = True
+        while changed:
+            changed = False
+            for job in self._jobs:
+                ended = (self._find(after).state for after in job.after)
+                if job.state == _PENDING and job.kill_invalid and _COMPLETED in ended:
+                    job.state = "CANCELLED"
+                    changed = True
 
     def _find(self, job: int) -> _Job:
         for candidate in reversed(self._jobs):
@@ -348,7 +485,14 @@ class FakeScheduler:
     @staticmethod
     def _snapshot(job: _Job) -> FakeJob:
         return FakeJob(
-            job.job, job.name, job.argv, job.script, job.task_count, job.state, job.in_queue
+            job.job,
+            job.name,
+            job.argv,
+            job.script,
+            job.task_count,
+            job.state,
+            job.in_queue,
+            job.after,
         )
 
     @staticmethod
@@ -373,6 +517,20 @@ class FakeScheduler:
         if options["--export"] != "NIL" or not stdin.startswith(b"#!/bin/sh\n"):
             raise AssertionError("Servatus batch requests use --export=NIL and a /bin/sh script")
         task_count = int(options["--ntasks"] or "0")
+        if options.get("--kill-on-invalid-dep", "yes") != "yes":
+            raise AssertionError(f"FakeScheduler does not understand {argv!r}")
+        dependency = options.get("--dependency")
+        after: tuple[int, ...] = ()
+        if dependency is not None:
+            kind, _, jobs = dependency.partition(":")
+            if kind != "afternotok" or not jobs:
+                raise AssertionError(f"FakeScheduler does not understand {argv!r}")
+            after = tuple(int(job) for job in jobs.split(":"))
+            if not all(
+                any(item.job == job and item.in_queue for item in self._jobs) for job in after
+            ):
+                reason = b"sbatch: error: Batch job submission failed: Job dependency problem\n"
+                return Completed(1, b"", reason)
         if "--test-only" in options:
             message = (
                 f"sbatch: Job {self._next_job_id} to start at 2030-01-01T00:00:00 using "
@@ -388,6 +546,10 @@ class FakeScheduler:
             stdin,
             task_count,
             f"{log_root}/{name.removeprefix('servatus-')}.{self._next_job_id}",
+            _Link.read(stdin),
+            relay=(options.get("--signal") or "").startswith("B:"),
+            after=after,
+            kill_invalid="--kill-on-invalid-dep" in options,
         )
         self._jobs.append(job)
         self._next_job_id += 1
@@ -413,7 +575,7 @@ class FakeScheduler:
             raise AssertionError(f"FakeScheduler does not understand {argv!r}")
         name = argv[2].removeprefix("--name=")
         for job in self._jobs:
-            if job.in_queue and job.name == name and job.state in (_PENDING, _RUNNING):
+            if job.in_queue and job.name == name and job.live:
                 self._interrupt(job, "CANCELLED")
         return Completed(0, b"", b"")
 

@@ -9,7 +9,7 @@ from hypothesis import strategies as st
 from support.builders import profile
 
 from servatus.campaign._evidence import Execution, Observation, Observed
-from servatus.campaign._policy import Hold, Request, Retry, Selection, decide, scope
+from servatus.campaign._policy import Extension, Hold, Request, Retry, Selection, decide, scope
 from servatus.campaign._state import AcceptanceState, Attempt, Link, State, record_intent
 from servatus.campaign._status import ResultState
 from servatus.errors import PlanRefused
@@ -447,3 +447,33 @@ def test_bulk_selectors_never_raise(
 ) -> None:
     state, observed, results = scenario
     decide(state, observed, results, Request.parse(retry, only))
+
+
+@settings(max_examples=1000, deadline=None)
+@given(
+    scenarios(every_accepted_observed=True),
+    st.sampled_from(list(Retry)) | st.lists(st.sampled_from(KEYS), unique=True).map(tuple),
+    st.sets(st.sampled_from(KEYS)),
+)
+def test_a_budget_never_reruns_spent_work_and_only_named_keys_extend(
+    scenario: tuple[State, Observed, dict[str, ResultState]],
+    retry: tuple[str, ...] | Retry,
+    exhausted: set[str],
+) -> None:
+    state, observed, results = scenario
+    request = Request.parse(retry)
+    budgeted = Request(request.retry, request.only, frozenset(exhausted))
+    try:
+        selection = decide(state, observed, results, budgeted)
+    except PlanRefused as refusal:
+        assert not isinstance(retry, Retry) and refusal.keys
+        return
+    for key in selection.selected:
+        if history(state, key, AcceptanceState.ACCEPTED):
+            assert key not in exhausted
+    assert set(selection.extensions) <= set(selection.selected)
+    assert isinstance(retry, Retry) <= (not selection.extensions)
+    for key, reason in selection.extensions.items():
+        valid = results.get(key) is ResultState.VALID
+        assert reason is (Extension.VALID if valid else Extension.SUCCEEDED)
+    assert all(hold is not Hold.SPENT or key in exhausted for key, hold in selection.held.items())

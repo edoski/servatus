@@ -207,15 +207,130 @@ are valid. Unselected Tasks are **held**
 | `SUBMITTED` | The Task has accepted work and was not requested for retry. Slurm is not consulted. | `status`; to rerun, `--retry KEY` or `--retry-failed`. |
 | `ACTIVE` | Slurm still lists earlier work of the Task: queued, running, or finished but not yet purged. | Wait a few minutes, or `cancel`. |
 | `UNRESOLVED` | An intent has no recorded outcome. | `servatus reconcile STATE`. |
+| `SPENT` | Under `--budget`, the Task's run time leaves no room for one more link. | Nothing, or extend it with a larger budget. |
 | `NOT_REQUESTED` | Excluded by `--only`. | Nothing. |
 
-`--retry-failed` selects Tasks whose latest accepted work is `FAILED` or `STOPPED`. It never selects
+`--retry-failed` selects Tasks whose current work is `FAILED` or `STOPPED`. It never selects
 `LOST` work: the job vanished without recording an outcome, and during a network partition its
 step may even still run. Rerun a `LOST` Task by naming it, `--retry KEY`; naming it is your
 acknowledgement. Explicit `--retry` keys are strict: an unknown key, a valid result, a Task never
 accepted, or a Task whose earlier work Slurm still lists refuses the whole plan (`PlanRefused`,
 listing every key). Eligible Tasks beyond the target's `max_allocations_per_submit` are
 **deferred** to the next plan.
+
+## Budgeted continuation
+
+A long training Task can resume from its own checkpoint. Give its plan a lifetime run-time budget,
+and Servatus queues enough allocations, called **links**, to spend it. Each link continues where
+the previous one stopped, and nothing needs to run on your machine while the chain progresses.
+
+```toml
+[profiles.l40s.resources]
+time_limit = "16:00:00"
+signal_before_end = "00:10:00"   # required for continuation
+```
+
+```sh
+servatus plan state --profile l40s --budget 3-00:00:00 --output plan.json
+#   continuation: lifetime budget 3-00:00:00 per Task
+#     az-small  run time 00:00:00, budget left 3-00:00:00, 5 links
+#   selected: 1 Task in 5 allocations
+#     9a1c5d0e7b3f2a8c4d6e1b09  1 Task, 32 CPUs, 64000 MiB, 1 GPUs, 16:00:00, link 1/5
+#     ...                       1 Task, 32 CPUs, 64000 MiB, 1 GPUs, 08:00:00, link 5/5
+servatus submit state plan.json   # queues all five links now; close the laptop
+servatus status state             # RUN TIME 1-09:12:03 / 3-00:00:00, LINK 3/5
+```
+
+The budget is a lifetime total per Task: full `time_limit` links, then one shorter link with the
+rest rounded down to whole minutes, so a Task's links never add up to more than its budget. A rest
+within a minute of `signal_before_end` is dropped with a warning. Tasks packed together with
+different run times share a chain sized for the neediest; the plan warns, and each Task still
+learns its own budget. `--max-links K` caps a chain at K links (1 to 32;
+alone, it plans K full links). Each link starts only after every earlier link of its chain has
+ended, and Slurm deletes the rest of a chain, before it allocates anything, once a link hands
+nothing on.
+
+### The application protocol
+
+At `signal_before_end` before each link's limit, every step gets `SIGUSR1`.
+
+| Your step | Status | Chain |
+| --- | --- | --- |
+| exits 0 | `SUCCEEDED` | ends for this Task |
+| exits 75 at any time | `STOPPED (yielded)`, exit 75 | continues |
+| gets `SIGUSR1`, then exits nonzero or is stopped at the limit | `STOPPED (time limit)` | continues |
+| exits nonzero before `SIGUSR1` | `FAILED` | ends; `--retry-failed` reruns it |
+| is cancelled or preempted | `STOPPED` | ends |
+| does any of the continuing rows on its last planned link | `STOPPED (budget spent)` | ends |
+
+So an application that never handles `SIGUSR1` still continues: it dies of the signal (exit 138),
+which counts as stopped at the limit. Every chain step also receives these reserved variables:
+
+| Variable | Meaning |
+| --- | --- |
+| `SERVATUS_BUDGET` | The Task's lifetime run-time budget in seconds. Unset without `--budget`. |
+| `SERVATUS_RUN_TIME` | Seconds the Task ran before this allocation, across every allocation it ever had, measured. |
+| `SERVATUS_LINK`, `SERVATUS_LINKS` | This link's 1-based position and the Task's planned number of links. `LINK == LINKS` means this is its last link. |
+
+An application that counts its own budget takes `SERVATUS_BUDGET` as its total, and
+`SERVATUS_RUN_TIME` plus its own elapsed time (or its own checkpointed counter) as what it used. It
+exits 0 once the budget is spent, and a resumed run whose budget is already spent exits 0 at once:
+
+```python
+import os, signal, sys, time
+
+started = time.monotonic()
+budget = int(os.environ.get("SERVATUS_BUDGET", config.budget_seconds))
+used_before = int(os.environ.get("SERVATUS_RUN_TIME", 0))
+last = os.environ.get("SERVATUS_LINK") == os.environ.get("SERVATUS_LINKS")
+
+
+def on_usr1(*_):
+    save(state)
+    spent = used_before + time.monotonic() - started >= budget
+    sys.exit(0 if spent or last else 75)
+
+
+signal.signal(signal.SIGUSR1, on_usr1)
+```
+
+### Extending a Task
+
+A budget is a total, not an increment, so planning the same budget again selects nothing: the Task
+is held `SPENT`. To give a finished Task more time, name it with a larger budget:
+
+```sh
+servatus plan state --retry az-small --budget 1-12:00:00 --output extend.json
+#     az-small  run time 1-00:00:41, budget left 11:59:19, 1 link, extends SUCCEEDED
+```
+
+`--retry KEY --budget D` is the only way to extend a Task. It accepts a `SUCCEEDED` Task, and one
+whose probe reports `VALID`, when its run time leaves room under `D`; the plan names each as an
+extension. Without `--budget`, a `VALID` Task is refused as before. `--retry-failed --budget D`
+selects `FAILED` and `STOPPED` Tasks with room left and holds the rest `SPENT`. The step resumes
+from its own checkpoint; Servatus never touches its outputs, so an application that publishes an
+immutable destination at the old budget must publish the extended result elsewhere.
+
+### Cancelling a chain
+
+`servatus cancel state --task KEY` cancels every queued or running link of the Task, newest first,
+so no later link becomes eligible in between. `--allocation ID` on a link cancels it and every
+later link of its chain. Cancel through Servatus: a raw `scancel` of a running link after its
+pre-limit signal reads as a time limit, and the chain continues.
+
+### What changes in the CLI and JSON
+
+| Surface | Change |
+| --- | --- |
+| `plan --budget DURATION` | Lifetime run-time budget per selected Task (`[D-]HH:MM:SS`, rounded up to whole minutes). Needs `signal_before_end`. |
+| `plan --max-links K` | At most K links per chain, 1 to 32. Without `--budget`, K full links. |
+| `plan` output | A `continuation` line; per Task its run time, budget left, link count, and `extends SUCCEEDED` or `extends VALID`; each allocation's `link j/K`. |
+| `plan` holds | `SPENT`: the Task's run time leaves no room under the budget. |
+| `status` | `RUN TIME` (`/ budget` in a budgeted chain) and `LINK` (`3/5`, `-` for one allocation); details `time limit`, `yielded`, `budget spent`, `never started`. |
+| `status --json` | `servatus.status/3`: each Task's `run_time` and `link`, each Attempt's `link` and timed `observation`. |
+| Saved plans | `servatus.plan/3`: the Decision gains `continuation`, `spent` (each selected Task's measured run time), and `extensions`. |
+| Library | `Campaign.plan(profile, continuation=Continuation(budget="3-00:00:00"))`; `Plan.extensions`; `Link`, `RunTime`, `StopReason`, `Extension`, `YIELD_EXIT`, `MAX_LINKS`. |
+| Exit codes | Unchanged. |
 
 ## Recovery playbook
 
@@ -628,7 +743,7 @@ memory_mib = 98304
 offline), `detail` (why a `STOPPED` Task stopped: `never started`, `time limit`, `yielded`, or
 `budget spent`), and `link`; each Attempt's `observation` carries the mtimes of its start, stop,
 and limit markers, each slot's end (`{"exit_code", "at"}` or `null`), and which slots it was
-handed. Saved plans are `servatus.plan/2` documents. Receipts, submit and
+handed. Saved plans are `servatus.plan/3` documents. Receipts, submit and
 reconcile results, shape checks, and planned allocations are encoded with
 `servatus.campaign.to_document`; a receipt is `{"allocation_id", "job", "task_keys"}` with an
 integer job number.
@@ -642,12 +757,13 @@ integer job number.
 | `plan STATE [--profile NAME] [--output FILE]` | Show selected, held, and deferred Tasks; `--output` saves the plan (0600, never overwrites). |
 | `  --retry KEY`, `--retry-failed` | Retry named Tasks (`LOST` ones included), or every Task whose latest work failed or stopped. |
 | `  --only KEY`, `--tasks-per-allocation N`, `--show-scripts` | Restrict the plan; lower packing; print batch scripts (sensitive). |
+| `  --budget DURATION`, `--max-links K` | Continue each Task through a chain of links until its lifetime budget is spent ([budgeted continuation](#budgeted-continuation)). |
 | `validate STATE PLAN` | `sbatch --test-only` once per distinct allocation shape; exit 1 if any is rejected. |
 | `submit STATE PLAN` | Submit the reviewed plan. Exit 3 if interrupted. |
 | `status STATE [--offline]` | Task and allocation status; `--offline` skips Slurm. |
 | `logs STATE [--task KEY] [--allocation ID] [--bytes N] [--output FILE]` | Bounded log tail; writes 0600; refuses a terminal. |
 | `reconcile STATE` | Resolve every unresolved allocation from Slurm evidence; exit 75 while some still wait. |
-| `cancel STATE [--task KEY]... [--allocation ID]...` | `scancel` matching allocations that Slurm lists as queued or running. |
+| `cancel STATE [--task KEY]... [--allocation ID]...` | `scancel` matching allocations that Slurm lists as queued or running, newest first; a chain link brings its later links. |
 | `doctor [--profile NAME]` | Check what the profile needs from its cluster, read-only; see below. Exit 1 if a check fails, 75 if one went unanswered. |
 
 `doctor` submits nothing and writes nothing. It refuses a profile that does not fit its ceilings,
@@ -675,6 +791,8 @@ the allocation log, and both that Task's step log in that allocation; `--bytes` 
   resolved, and is recorded as never submitted only after Slurm and the run markers show nothing
   for 15 minutes; nothing is retried without an explicit decision.
 - Submission executes exactly the reviewed plan, or refuses it as stale or tampered.
+- A Task never runs in two allocations at once. A chain's later link runs a Task only on a handoff
+  its predecessor writes after the Task's step returned.
 - Campaign state is owner-only, validated on every read, atomically replaced, and synced.
 - Scheduler evidence is bounded, identity-checked, and read from each Attempt's original target.
   No Slurm accounting is needed, and a missing marker counts only after Slurm forgets the job.
@@ -693,7 +811,8 @@ your launchers, pass `servatus.testing.FakeScheduler()`, an in-memory Slurm, as 
 ## Non-goals
 
 - **No job arrays or multi-node jobs.** One Task may use several GPUs on its node (`torchrun`).
-- **No automatic retry, background polling, or scheduler plugins.** One native Slurm lane.
+- **No automatic retry, background polling, or scheduler plugins.** One native Slurm lane; a
+  budgeted chain is planned and reviewed up front.
 - **Not an experiment tracker, workflow engine, or secrets manager.** Task meaning belongs to you.
 - **No raw Slurm options, fractional GPU requests, or cross-filesystem copies.**
 

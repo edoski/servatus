@@ -24,6 +24,7 @@ from pathlib import Path
 PUBLIC_NAMES = (
     "Apptainer",
     "Campaign",
+    "Continuation",
     "Draft",
     "Profile",
     "Publication",
@@ -84,7 +85,7 @@ def check_cli(root: Path) -> None:
 
 
 def check_campaign(root: Path) -> None:
-    from servatus import Campaign, Profile, Resources, Retry, Target, Task
+    from servatus import Campaign, Continuation, Profile, Resources, Retry, Target, Task
     from servatus.testing import FakeScheduler
 
     fake = FakeScheduler()
@@ -112,6 +113,30 @@ def check_campaign(root: Path) -> None:
     fake.purge(job)
     assert campaign.status().counts()["failed"] == 2
     assert campaign.plan(profile, retry=Retry.FAILED).decision.selected == ("t0", "t1")
+
+    chained = Profile(
+        "chained",
+        target,
+        Resources(cpus=1, memory_mib=512, time_limit="00:05:00", signal_before_end="00:01:00"),
+    )
+    chain = Campaign.create(root / "chain", [Task("long", ["/bin/true"])], connect=fake)
+    plan = chain.load_plan(
+        chain.plan(chained, continuation=Continuation(budget="00:13:00")).to_json()
+    )
+    assert [item.time_limit.seconds for item in plan.allocations] == [300, 300, 180], plan
+    assert all(check.accepted for check in chain.validate(plan))
+    first, second, third = (receipt.job for receipt in chain.submit(plan).receipts)
+    assert fake.job(third).dependencies == (first, second), fake.job(third)
+    fake.start(first)
+    fake.signal_limit(first)
+    fake.interrupt(first, "TIMEOUT")
+    fake.start(second)
+    fake.finish(second)
+    assert fake.job(third).state == "CANCELLED", fake.job(third)
+    for job in (first, second, third):
+        fake.purge(job)
+    (task,) = chain.status().tasks
+    assert task.execution == "SUCCEEDED" and task.link is not None and task.link.index == 2
 
 
 def check_publication(root: Path) -> None:

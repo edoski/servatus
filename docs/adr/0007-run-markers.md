@@ -1,6 +1,7 @@
 # ADR 0007: Observe work from the queue and run markers, not Slurm accounting
 
-Status: accepted (0.13); amended after 0.13 to read markers with their mtimes
+Status: accepted (0.13); amended after 0.13 to read markers with their mtimes, and by
+[ADR 0008](0008-chains.md) for chain links
 
 Supersedes the Evidence section of ADR 0003 and the recovery, duplicate-risk, and status rules of
 ADR 0005.
@@ -9,7 +10,9 @@ ADR 0005.
 > its mtime, and a Task's run time is the span between its markers' mtimes, summed over its
 > allocations. The file server stamps every mtime, so run time never mixes clocks. `servatus
 > doctor` checks that `find -printf` works, and name patterns drop from eight to seven to leave
-> room for it. A step that exits 75 reads as `STOPPED (yielded)`.
+> room for it. A step that exits 75 reads as `STOPPED (yielded)`. [ADR 0008](0008-chains.md) adds
+> `<allocation>.<job>.limit` and `<allocation>.<slot>.go`, and a second batch-script shape for
+> chain links that hand off.
 
 ## Context
 

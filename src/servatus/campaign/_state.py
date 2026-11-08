@@ -313,6 +313,17 @@ def record_intent(
     return _changed(state, revision=attempt.intent_revision, attempts=state.attempts + (attempt,))
 
 
+def chain_jobs(state: State, link: Link) -> tuple[int, ...]:
+    """The jobs of the links before ``link`` in its chain, in order. The invariant guarantees
+    that each was accepted before ``link``'s intent."""
+    jobs = {
+        attempt.link.index: attempt.job
+        for attempt in state.attempts
+        if attempt.link.chain == link.chain and attempt.link.index < link.index
+    }
+    return tuple(cast(int, jobs[index]) for index in range(1, link.index))
+
+
 def record_outcome(state: State, allocation_id: str, job: int | None) -> State:
     """Record acceptance of ``job`` or non-submission (``None``) at the next revision. Identical
     repeats are idempotent; a conflicting outcome raises ``Conflict``."""

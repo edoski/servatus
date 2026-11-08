@@ -18,15 +18,18 @@ from typing import Any, cast
 
 from . import __version__
 from .campaign import (
+    MAX_LINKS,
     AcceptanceState,
     Campaign,
     Connect,
+    Continuation,
     Plan,
     Profile,
     Receipt,
     ReconcileResult,
     Retry,
     Status,
+    StopReason,
     SubmitResult,
     Task,
     TaskStatus,
@@ -208,11 +211,36 @@ def _plan_document(plan: Plan, scripts: bool, saved: Path | None) -> dict[str, o
         allocations.append(entry)
     document.update(
         retry=list(plan.retry),
+        extensions=list(plan.extensions),
         allocations=allocations,
         warnings=list(plan.warnings),
         saved=None if saved is None else str(saved),
     )
     return document
+
+
+def _continuation(plan: Plan) -> list[str]:
+    """The plan's continuation and each selected Task's run time, for human output."""
+    decision = plan.decision
+    continuation = decision.continuation
+    if not continuation.active:
+        return []
+    budget = continuation.budget
+    links = continuation.max_links
+    shown = "no budget" if budget is None else f"lifetime budget {to_document(budget)} per Task"
+    lines = [f"continuation: {shown}" + ("" if links is None else f", at most {links} links")]
+    resources = decision.profile.resources
+    for key in decision.selected:
+        ran = decision.spent[key]
+        count = len(continuation.link_limits(resources, ran))
+        line = f"  {_safe(key)}  run time {to_document(ran)}"
+        if budget is not None:
+            line += f", budget left {to_document(budget - ran)}"
+        line += f", {_plural(count, 'link')}"
+        if key in decision.extensions:
+            line += f", extends {decision.extensions[key].value}"
+        lines.append(line)
+    return lines
 
 
 def _print_plan(plan: Plan, scripts: bool, saved: Path | None) -> None:
@@ -222,10 +250,14 @@ def _print_plan(plan: Plan, scripts: bool, saved: Path | None) -> None:
         f"profile {_safe(decision.profile.label)})"
     )
     print(f"digest: {plan.digest}")
+    for line in _continuation(plan):
+        print(line)
     allocations = _plural(len(plan.allocations), "allocation")
     print(f"selected: {_plural(len(decision.selected), 'Task')} in {allocations}")
     for item in plan.allocations:
-        print(f"  {item.allocation_id}  {_plural(len(item.task_keys), 'Task')}, {_shape(item)}")
+        place = "" if item.link.count == 1 else f", link {item.link.index}/{item.link.count}"
+        tasks = _plural(len(item.task_keys), "Task")
+        print(f"  {item.allocation_id}  {tasks}, {_shape(item)}{place}")
         print(f"    {_keys(item.task_keys)}")
     if plan.retry:
         print(f"retry: {_keys(plan.retry)}")
@@ -257,6 +289,7 @@ def _plan(arguments: argparse.Namespace) -> int:
         retry=Retry.FAILED if arguments.retry_failed else tuple(arguments.retry),
         only=tuple(arguments.only) if arguments.only else None,
         tasks_per_allocation=arguments.tasks_per_allocation,
+        continuation=Continuation(budget=arguments.budget, max_links=arguments.max_links),
     )
     saved = cast(Path | None, arguments.output)
     if saved is not None:
@@ -392,6 +425,9 @@ def _print_status(status: Status, path: Path) -> None:
         hints.append(f"servatus plan {state} --retry-failed --output PLAN.json")
     if counts["lost"]:
         hints.append(f"servatus plan {state} --retry KEY --output PLAN.json  (LOST Tasks)")
+    if any(task.detail is StopReason.BUDGET_SPENT for task in status.tasks):
+        larger = f"servatus plan {state} --retry KEY --budget LARGER --output PLAN.json"
+        hints.append(f"{larger}  (to extend a spent budget)")
     if counts["not_submitted"]:
         hints.append(f"servatus plan {state} --output PLAN.json")
     if not status.scheduler_observed and status.attempts:
@@ -543,6 +579,10 @@ def _parser() -> argparse.ArgumentParser:
     retry.add_argument("--retry-failed", action="store_true", help="retry failed or stopped")
     plan.add_argument("--only", **_KEYS)
     plan.add_argument("--tasks-per-allocation", type=int, metavar="N")
+    text = "lifetime run-time budget per Task, [D-]HH:MM:SS; continue Tasks until it is spent"
+    plan.add_argument("--budget", metavar="DURATION", help=text)
+    text = f"queue at most K links per chain (1 to {MAX_LINKS}); alone, K full links"
+    plan.add_argument("--max-links", type=int, metavar="K", help=text)
     flag(plan, "--show-scripts", "print batch scripts (sensitive)")
     text = "ask sbatch --test-only once per allocation shape"
     command("validate", _validate, text, "state", "plan")

@@ -7,10 +7,12 @@
 - [0005: Keep one Campaign execution authority](0005-campaign-engine.md)
 - [0006: Make a clean break in 0.12](0006-clean-break-0.12.md)
 - [0007: Observe work from the queue and run markers](0007-run-markers.md)
+- [0008: Continue Tasks through chains queued at submission](0008-chains.md)
 
 ADR 0002 defines the publication transaction and Workspace lifecycle; ADR 0004 extends it to
 concurrent children. ADR 0003 defines the transport, launchers, batch script, and scheduler
 evidence, and records the scope of prior production acceptance. ADR 0005 defines Campaign state,
 planning, submission, and status. ADR 0006 records what the 0.12 clean break changed and why. ADR
 0007 replaces Slurm accounting with `squeue` and run markers in 0.13, superseding the evidence parts
-of ADRs 0003 and 0005.
+of ADRs 0003 and 0005. ADR 0008 adds budgeted continuation through chains of allocations and run
+time from marker mtimes.

@@ -12,8 +12,9 @@ this order:
    scheduler state is not consulted (the work may still be queued, running, or long finished),
    so plans without retries do not depend on (or observe) scheduler evidence.
 6. Slurm still lists a job of any accepted (or not-submitted) allocation of the Task, settling
-   ones included: ``ACTIVE``.
-7. Otherwise the retry selector decides from the Task's current execution (``_status.current``:
+   ones included (a chain's pending links too): ``ACTIVE``.
+7. Under a budget, a Task whose run time leaves no room for one more link: ``SPENT``.
+8. Otherwise the retry selector decides from the Task's current execution (``_status.current``:
    the latest accepted Attempt that was handed the Task).
 
 Resubmission is always explicit, in one of two forms:
@@ -26,6 +27,10 @@ Resubmission is always explicit, in one of two forms:
   current execution is ``FAILED`` or ``STOPPED``, never ``LOST``. ``Retry.INCOMPLETE`` selects
   Tasks whose current execution is terminal and whose result was observed MISSING; it needs a
   probe. Every other Task stays ``SUBMITTED``.
+
+Under a budget, an explicit key may also extend finished work: a Task whose probe reports VALID,
+or whose current execution SUCCEEDED, is selected as an ``Extension`` instead of refused. A named
+key whose budget is already spent refuses the plan.
 """
 
 from __future__ import annotations
@@ -48,14 +53,24 @@ class Hold(StrEnum):
 
     ``VALID``: the probe reports a valid result. ``UNRESOLVED``: an intent has no recorded
     outcome. ``ACTIVE``: Slurm still lists earlier work. ``SUBMITTED``: the Task has accepted
-    work and was not selected for retry. ``NOT_REQUESTED``: excluded by ``only``.
+    work and was not selected for retry. ``SPENT``: the Task's run time leaves no room under the
+    plan's budget. ``NOT_REQUESTED``: excluded by ``only``.
     """
 
     VALID = "VALID"
     UNRESOLVED = "UNRESOLVED"
     ACTIVE = "ACTIVE"
     SUBMITTED = "SUBMITTED"
+    SPENT = "SPENT"
     NOT_REQUESTED = "NOT_REQUESTED"
+
+
+class Extension(StrEnum):
+    """Why an explicitly retried Task under a budget extends finished work: its current
+    execution ``SUCCEEDED``, or its probe reports ``VALID``."""
+
+    SUCCEEDED = "SUCCEEDED"
+    VALID = "VALID"
 
 
 class Retry(Enum):
@@ -72,15 +87,18 @@ class _Refusal(Enum):
     VALID = "valid results cannot be retried"
     UNACCEPTED = "retry needs an earlier accepted attempt"
     LIVE = "Slurm still lists earlier work; wait for it or cancel it"
+    SPENT = "the budget is already spent; plan a larger budget"
 
 
 @dataclass(frozen=True, slots=True)
 class Request:
-    """One plan request, parsed once: explicit retry keys or a bulk selector, and an optional
-    ``only`` scope."""
+    """One plan request, parsed once: explicit retry keys or a bulk selector, an optional
+    ``only`` scope, and under a budget the Tasks whose budget is ``exhausted`` (``None``: no
+    budget)."""
 
     retry: frozenset[str] | Retry = frozenset()
     only: frozenset[str] | None = None
+    exhausted: frozenset[str] | None = None
 
     @classmethod
     def parse(
@@ -100,10 +118,12 @@ class Request:
 
 @dataclass(frozen=True, slots=True)
 class Selection:
-    """Selected Task keys in roster order and the reason for every other Task."""
+    """Selected Task keys in roster order, the reason for every other Task, and the selected
+    Tasks that extend finished work."""
 
     selected: tuple[str, ...]
     held: Mapping[str, Hold]
+    extensions: Mapping[str, Extension] = MappingProxyType({})
 
 
 def scope(state: State, request: Request) -> tuple[tuple[Task, ...], tuple[str, ...]]:
@@ -140,14 +160,17 @@ def decide(
     refused[_Refusal.UNKNOWN] = sorted((named | (request.only or frozenset())) - past.keys())
     selected: list[str] = []
     held: dict[str, Hold] = {}
+    extensions: dict[str, Extension] = {}
     for key, own in past.items():
         if request.only is not None and key not in request.only:
-            outcome: Hold | _Refusal | None = Hold.NOT_REQUESTED
+            outcome: Hold | _Refusal | Extension | None = Hold.NOT_REQUESTED
         else:
             result = results.get(key, ResultState.UNOBSERVED)
-            outcome = _judge(own, observed, result, request.retry, named=key in named)
-        if outcome is None:
+            outcome = _judge(own, observed, result, request, key, named=key in named)
+        if outcome is None or isinstance(outcome, Extension):
             selected.append(key)
+            if outcome is not None:
+                extensions[key] = outcome
         elif isinstance(outcome, Hold):
             held[key] = outcome
         else:
@@ -160,19 +183,23 @@ def decide(
         ]
         keys = tuple(dict.fromkeys(key for keys in refused.values() for key in keys))
         raise PlanRefused("plan refused; " + "; ".join(reasons), keys=keys)
-    return Selection(tuple(selected), MappingProxyType(held))
+    return Selection(tuple(selected), MappingProxyType(held), MappingProxyType(extensions))
 
 
 def _judge(
     past: TaskHistory,
     observed: Observed,
     result: ResultState,
-    retry: frozenset[str] | Retry,
+    request: Request,
+    key: str,
     *,
     named: bool,
-) -> Hold | _Refusal | None:
-    """One requested Task: its hold reason, a refusal (named keys only), or None to select it."""
-    if result is ResultState.VALID:
+) -> Hold | _Refusal | Extension | None:
+    """One requested Task: its hold reason, a refusal (named keys only), or None (or the
+    ``Extension`` it is) to select it."""
+    retry, exhausted = request.retry, request.exhausted
+    extends = named and exhausted is not None
+    if result is ResultState.VALID and not extends:
         return _Refusal.VALID if named else Hold.VALID
     if past.unresolved is not None:
         return Hold.UNRESOLVED
@@ -185,10 +212,16 @@ def _judge(
         return Hold.SUBMITTED
     if stray or any(observed.attempts[attempt.allocation_id].live for attempt, _ in past.accepted):
         return _Refusal.LIVE if named else Hold.ACTIVE
-    if named:
+    if exhausted is not None and key in exhausted:
+        return _Refusal.SPENT if named else Hold.SPENT
+    if named and not extends:
         return None
     attempt, slot = cast(tuple[Attempt, int], current(past, observed))
     execution, _, _ = observed.attempts[attempt.allocation_id].execution(slot)
+    if named:
+        if result is ResultState.VALID:
+            return Extension.VALID
+        return Extension.SUCCEEDED if execution is Execution.SUCCEEDED else None
     if retry is Retry.FAILED:
         chosen = execution in (Execution.FAILED, Execution.STOPPED)
     else:

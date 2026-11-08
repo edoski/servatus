@@ -326,8 +326,10 @@ def test_saved_plans_are_compact_private_and_round_trip_without_observation(worl
     plan = campaign.plan(cpu_profile())
     data = plan.to_json()
     document = json.loads(data)
-    assert document["format"] == "servatus.plan/2" and document["digest"] == plan.digest
+    assert document["format"] == "servatus.plan/3" and document["digest"] == plan.digest
     assert document["selected"] == list(keys(0, 1, 2)) and document["probe_required"] is True
+    assert document["continuation"] == {"budget": None, "max_links": None}
+    assert document["spent"] == {} and document["extensions"] == {}
     assert all(secret not in data for secret in (b"secret-", b"train.py", b"SEED"))
     destination = world.root / "plan.json"
     plan.save(destination)
@@ -386,7 +388,9 @@ def test_saved_plans_out_of_roster_order_or_over_the_batch_bound_are_refused(
         campaign.load_plan(json.dumps(document).encode())
 
 
-@pytest.mark.parametrize("data", [b"", b"[]", b"{", b'{"format": "servatus.plan/2"}'])
+@pytest.mark.parametrize(
+    "data", [b"", b"[]", b"{", b'{"format": "servatus.plan/3"}', b'{"format": "servatus.plan/2"}']
+)
 def test_malformed_plan_documents_are_refused(world: World, data: bytes) -> None:
     campaign = world.create(jobs(1))
     with pytest.raises(ConfigurationError, match="invalid plan document"):

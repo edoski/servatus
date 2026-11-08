@@ -13,7 +13,13 @@ from servatus.campaign._config import Target
 from servatus.campaign._evidence import Execution, Observation, evidenced_job, observe
 from servatus.campaign._remote import Completed
 from servatus.campaign._scheduler import Scheduler, find_argv
-from servatus.campaign._script import log_path, render_batch, sbatch_argv
+from servatus.campaign._script import (
+    Chained,
+    dependency_options,
+    log_path,
+    render_batch,
+    sbatch_argv,
+)
 from servatus.errors import ConfigurationError, EvidenceConflict, Unavailable
 from servatus.testing import FakeJob, FakeScheduler
 
@@ -412,3 +418,124 @@ def test_controls_reject_impossible_transitions() -> None:
         fake.lose(job)
     with pytest.raises(ConfigurationError, match="job_id"):
         fake.set_next_job_id(0)
+
+
+# --- chains ----------------------------------------------------------------------------------
+
+SIGNALLED = resources(gpus=0, time_limit="01:00:00", signal_before_end="00:10:00")
+
+
+def chain_link(
+    harness: Harness, index: int, count: int, after: tuple[int, ...] = (), slots: int = 1
+) -> int:
+    """Submit link ``index`` of a ``count``-link chain of ``allocation(n)`` identities."""
+    chain = Chained(
+        index,
+        None,
+        (count,) * slots,
+        (timedelta(seconds=30),) * slots,
+        allocation(index + 1) if index < count else None,
+    )
+    argv = sbatch_argv(harness.target, SIGNALLED, slots, allocation(index), chain)
+    script = render_batch(harness.target, SIGNALLED, tasks(slots), allocation(index), chain)
+    return harness.scheduler.submit((*argv, *dependency_options(after)), script)
+
+
+def handoff(harness: Harness, index: int, slot: int = 0) -> str:
+    return f"{harness.root}/{allocation(index)}.{slot}.go"
+
+
+def test_a_chain_link_waits_for_its_dependencies_and_slurm_prunes_it() -> None:
+    harness = Harness()
+    first = chain_link(harness, 1, 3)
+    second = chain_link(harness, 2, 3, (first,))
+    third = chain_link(harness, 3, 3, (first, second))
+    assert [job.dependencies for job in harness.fake.jobs] == [(), (first,), (first, second)]
+    with pytest.raises(ConfigurationError, match=f"job {second} waits for its dependencies"):
+        harness.fake.start(second)
+    harness.fake.start(first)
+    harness.fake.advance(minutes=50)
+    harness.fake.signal_limit(first)
+    assert harness.marker(allocation(1), first, "limit") in harness.fake.files
+    harness.fake.advance(minutes=10)
+    harness.fake.interrupt(first, "TIMEOUT")
+    assert harness.fake.files[handoff(harness, 2)] == b"3630\n"
+    harness.fake.start(second)
+    harness.fake.advance(minutes=1)
+    harness.fake.finish(second)
+    assert [job.state for job in harness.fake.jobs] == ["TIMEOUT", "COMPLETED", "CANCELLED"]
+    assert handoff(harness, 3) not in harness.fake.files
+    assert harness.marker(allocation(3), third, "start") not in harness.fake.files
+
+
+def test_a_link_runs_only_handed_slots_and_exits_0_with_none() -> None:
+    harness = Harness()
+    first = chain_link(harness, 1, 3, slots=2)
+    second = chain_link(harness, 2, 3, (first,), slots=2)
+    third = chain_link(harness, 3, 3, (first, second), slots=2)
+    harness.fake.start(first)
+    harness.fake.finish_step(first, 0, 75)
+    harness.fake.finish_step(first, 1, 0)
+    harness.fake.finish(first)
+    assert harness.fake.job(first).state == "FAILED"
+    harness.fake.write_file(handoff(harness, 2, 1), b"012\n")
+    harness.fake.start(second)
+    with pytest.raises(ConfigurationError, match="no running step in slot 1"):
+        harness.fake.finish_step(second, 1)
+    harness.fake.finish(second, exit_code=1)
+    assert harness.fake.job(second).state == "COMPLETED"
+    assert harness.fake.job(third).state == "CANCELLED"
+
+
+def test_a_link_with_nothing_handed_completes_as_it_starts() -> None:
+    harness = Harness()
+    first = chain_link(harness, 1, 2)
+    second = chain_link(harness, 2, 2, (first,))
+    harness.fake.start(first)
+    harness.fake.interrupt(first)
+    harness.fake.start(second)
+    assert harness.fake.job(second).state == "COMPLETED"
+    harness.fake.finish(second)
+    assert harness.fake.job(second).state == "COMPLETED"
+
+
+def test_the_pre_limit_signal_reaches_a_plain_job_without_a_limit_marker() -> None:
+    harness = Harness()
+    job = harness.submit(allocation(1))
+    with pytest.raises(ConfigurationError, match="is not running"):
+        harness.fake.signal_limit(job)
+    harness.fake.start(job)
+    harness.fake.signal_limit(job)
+    harness.fake.interrupt(job, "TIMEOUT")
+    assert harness.markers() == {harness.marker(allocation(1), job, s) for s in ("start", "stop")}
+    assert not any(path.endswith(".go") for path in harness.fake.files)
+    with pytest.raises(ConfigurationError, match="is not running"):
+        harness.fake.finish(job)
+
+
+def test_a_dependency_on_a_job_slurm_forgot_is_refused() -> None:
+    harness = Harness()
+    first = chain_link(harness, 1, 2)
+    harness.fake.finish(first)
+    harness.fake.purge(first)
+    with pytest.raises(Unavailable, match="Job dependency problem"):
+        chain_link(harness, 2, 2, (first,))
+    with pytest.raises(Unavailable, match="Job dependency problem"):
+        chain_link(harness, 2, 2, (77,))
+    assert len(harness.fake.jobs) == 1
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ("--dependency=afterok:1000", "--kill-on-invalid-dep=yes"),
+        ("--dependency=afternotok:", "--kill-on-invalid-dep=yes"),
+        ("--dependency=afternotok:1000", "--kill-on-invalid-dep=no"),
+    ],
+)
+def test_dependency_drift_is_an_assertion_error(options: tuple[str, ...]) -> None:
+    harness = Harness()
+    harness.submit(allocation(1))
+    argv, script = harness.request(allocation(2))
+    with pytest.raises(AssertionError, match="does not understand"):
+        harness.fake.run((*argv, *options), stdin=script)
