@@ -107,7 +107,11 @@ def _receipt(attempt: Attempt) -> Receipt:
 
 
 def _outcomes(state: State, outcomes: Sequence[tuple[str, int | None]]) -> State:
-    return reduce(lambda current, item: record_outcome(current, *item), outcomes, state)
+    """``state`` with each outcome recorded for the Attempts still unresolved: a concurrent
+    submission may have resolved one since."""
+    unresolved = AcceptanceState.UNRESOLVED
+    pending = [item for item in outcomes if state.attempt(item[0]).acceptance is unresolved]
+    return reduce(lambda current, item: record_outcome(current, *item), pending, state)
 
 
 def _merge(state: State, tasks: tuple[Task, ...]) -> State:

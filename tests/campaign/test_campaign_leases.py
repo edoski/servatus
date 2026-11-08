@@ -29,7 +29,8 @@ from servatus.campaign import (
     TaskStatus,
 )
 from servatus.campaign._scheduler import ORDER
-from servatus.campaign._state import Kind
+from servatus.campaign._state import Kind, record_outcome
+from servatus.campaign._store import Store
 from servatus.errors import (
     ConfigurationError,
     Conflict,
@@ -465,6 +466,20 @@ def test_an_order_that_never_arrived_is_not_submitted_at_once(world: World) -> N
     assert world.fake.poll(1000) == ()
     assert task(campaign).execution is AcceptanceState.NOT_SUBMITTED
     assert campaign.plan(lease=lease).decision.selected == ("task-0",)
+
+
+def test_reconcile_keeps_an_outcome_a_concurrent_submit_recorded(world: World) -> None:
+    campaign, lease, step = interrupted_order(world, "lose_next_reply")
+
+    def submitted(_: tuple[str, ...]) -> None:
+        Store.open(world.path).update(lambda state: record_outcome(state, step, 1000))
+
+    world.wire.on("sh", submitted)
+    result = campaign.reconcile()
+    assert result.receipts == (Receipt(step, 1000, ("task-0",)),)
+    assert marker(step, "void") in world.fake.files
+    assert outcome(campaign) == (Execution.STOPPED, None, StopReason.NEVER_STARTED)
+    assert campaign.plan(lease=lease, retry=["task-0"]).decision.selected == ("task-0",)
 
 
 def test_an_order_taken_before_its_reply_was_lost_is_accepted(world: World) -> None:
