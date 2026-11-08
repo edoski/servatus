@@ -24,8 +24,9 @@ It drives small sweeps through the ``servatus`` CLI over SSH, one Task per alloc
   signal to the step (``yield`` logs it), ``afternotok`` with ``--kill-on-invalid-dep=yes``
   pruning the chain, the exact-name handoff lookup across nodes, and ``date`` on compute nodes
   (link 2 learns a positive ``SERVATUS_RUN_TIME``).
-- Every chain step, and the Apptainer step under ``--cleanenv``, must learn a positive
-  ``SERVATUS_JOB_END_TIME`` from Slurm's ``SLURM_JOB_END_TIME``.
+- Link 2 of each chain (direct launcher) and, with ``--image-partition``, the Apptainer step
+  under ``--cleanenv`` must learn a positive ``SERVATUS_JOB_END_TIME`` from Slurm's
+  ``SLURM_JOB_END_TIME``.
 
 Everything it writes on the cluster lives in a new ``WORK_DIR/run-<timestamp>`` directory. It
 submits at most thirteen small jobs, at most three running at a time, and cancels whatever it

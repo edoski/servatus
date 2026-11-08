@@ -40,8 +40,8 @@ another number is an `EvidenceConflict`.
 **Outcomes come from the job itself.** The batch script writes empty marker files to `log_root`,
 which the login node already reads for logs, named so they are found without a job number:
 
-- `<allocation>.<job>.start`, created right after the script reads `SLURM_JOB_ID` and installs its
-  trap. If it cannot be created, no step starts, so no start marker means no Task ran.
+- `<allocation>.<job>.start`, created right after the script reads `SLURM_JOB_ID` and
+  `SLURM_JOB_END_TIME` and installs its trap. If it cannot be created, no step starts, so no start marker means no Task ran.
 - `<allocation>.<job>.<slot>.<exit code>.end`, created by that slot's own subshell as soon as its
   step returns, so a slot that ends early is recorded whatever its siblings do.
 - `<allocation>.<job>.stop`, created by the HUP/INT/TERM trap before it terminates the steps.
