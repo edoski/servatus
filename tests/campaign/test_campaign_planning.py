@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import stat
-from dataclasses import replace
+from dataclasses import astuple, replace
 from datetime import timedelta
 from typing import Any
 
@@ -81,6 +81,7 @@ def test_gpu_allocations_request_gres_per_allocation_and_per_step(world: World) 
     assert (item.cpus, item.memory_mib, item.gpus) == (128, 262144, 4)
     assert "--gres=gpu:a100:4" in item.argv and "--nodes=1" in item.argv
     assert item.script.count(b"--gres=gpu:a100:1") == 4
+    assert astuple(plan.totals) == (9216.0, 288.0, 18432.0)
 
 
 def test_batch_cap_defers_eligible_tasks_and_keeps_retry_intent(world: World) -> None:

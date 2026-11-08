@@ -72,6 +72,9 @@ exit 75 to read as `STOPPED (yielded)`, make sure the login host has GNU `find` 
 - Every step learns its job's deadline as `SERVATUS_JOB_END_TIME` (UNIX seconds), passed from
   Slurm's `SLURM_JOB_END_TIME`, which Slurm 23.02 and later set in every batch job. Like
   `SLURM_JOB_ID`, the batch script requires it and exits before any run marker without it.
+- `plan` prints the most a plan requests, `requests at most N CPU-hours, N GPU-hours, N GiB-hours`
+  over every allocation and chain link at its time limit (GPU-hours only when nonzero). `plan
+  --json` carries it as `totals`, and the library as `Plan.totals`.
 
 ## [0.13.0] - 2026-11-06
 
