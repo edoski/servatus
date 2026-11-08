@@ -429,7 +429,7 @@ def sweep(arguments: argparse.Namespace, root: Path, run: PurePosixPath) -> dict
     assert outcome == expected, outcome
     long_attempt = next(item for item in final["attempts"] if item["job"] == jobs["long"])
     observation = long_attempt["observation"]
-    assert observation["started"] and observation["stopped"], long_attempt
+    assert observation["started_at"] and observation["stopped_at"], long_attempt
 
     retry = json.loads(servatus(root, "plan", "state", "--retry-failed", "--json").stdout)
     assert retry["selected"] == ["fail", "long"], retry
