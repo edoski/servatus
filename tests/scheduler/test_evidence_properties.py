@@ -22,6 +22,7 @@ from servatus.campaign._evidence import (
     StepEnd,
     Stop,
     StopReason,
+    Void,
     observe,
     parse_markers,
     parse_queue,
@@ -148,7 +149,7 @@ def marker_name(allocation_id: str, marker: Marker) -> str:
         return f"{allocation_id}.{marker.slot}.go"
     if isinstance(marker, End):
         return f"{allocation_id}.{marker.job}.{marker.slot}.{marker.exit_code}.end"
-    kind = {Start: "start", Stop: "stop", Limit: "limit"}[type(marker)]
+    kind = {Start: "start", Stop: "stop", Limit: "limit", Void: "void"}[type(marker)]
     return f"{allocation_id}.{marker.job}.{kind}"
 
 
