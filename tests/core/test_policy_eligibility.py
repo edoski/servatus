@@ -472,8 +472,13 @@ def test_a_budget_never_reruns_spent_work_and_only_named_keys_extend(
         if history(state, key, AcceptanceState.ACCEPTED):
             assert key not in exhausted
     assert set(selection.extensions) <= set(selection.selected)
-    assert isinstance(retry, Retry) <= (not selection.extensions)
     for key, reason in selection.extensions.items():
-        valid = results.get(key) is ResultState.VALID
-        assert reason is (Extension.VALID if valid else Extension.SUCCEEDED)
+        if reason is Extension.VALID:
+            assert not isinstance(retry, Retry) and key in retry
+            assert results.get(key) is ResultState.VALID
+        else:
+            assert current(state, observed, key) is Execution.SUCCEEDED
+    for key in selection.selected:
+        if history(state, key, AcceptanceState.ACCEPTED) and key not in selection.extensions:
+            assert current(state, observed, key) is not Execution.SUCCEEDED
     assert all(hold is not Hold.SPENT or key in exhausted for key, hold in selection.held.items())

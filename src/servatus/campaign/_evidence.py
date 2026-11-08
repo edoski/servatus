@@ -133,8 +133,9 @@ class StopReason(StrEnum):
     """Why a ``STOPPED`` Task stopped, when the evidence says.
 
     ``TIME_LIMIT``: the step was stopped by, or exited nonzero after, the pre-limit signal of a
-    link that hands off. ``YIELDED``: the step exited 75. ``BUDGET_SPENT``: either of those on
-    the last link of a budgeted chain. ``NEVER_STARTED``: the allocation never ran the Task.
+    link that hands off. ``YIELDED``: the step exited 75. ``BUDGET_SPENT``: the step exited 75 on
+    the last link of a budgeted chain, which gets the signal as a plain allocation does.
+    ``NEVER_STARTED``: the allocation never ran the Task.
     """
 
     TIME_LIMIT = "time limit"

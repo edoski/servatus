@@ -256,7 +256,7 @@ def _task_status(
         else:
             execution, exit_code, detail = observation.execution(slot)
             last = owner.link.budget is not None and owner.link.index == owner.link.count
-            if last and detail in (StopReason.TIME_LIMIT, StopReason.YIELDED):
+            if last and detail is StopReason.YIELDED:
                 detail = StopReason.BUDGET_SPENT
     elif owner is None:
         execution = AcceptanceState.NOT_SUBMITTED

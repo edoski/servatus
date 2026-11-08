@@ -479,12 +479,21 @@ def test_a_link_runs_only_handed_slots_and_exits_0_with_none() -> None:
     harness.fake.finish(first)
     assert harness.fake.job(first).state == "FAILED"
     harness.fake.write_file(handoff(harness, 2, 1), b"012\n")
+    harness.fake.write_file(handoff(harness, 2), b" 7\t\nignored")
     harness.fake.start(second)
     with pytest.raises(ConfigurationError, match="no running step in slot 1"):
         harness.fake.finish_step(second, 1)
     harness.fake.finish(second, exit_code=1)
     assert harness.fake.job(second).state == "COMPLETED"
     assert harness.fake.job(third).state == "CANCELLED"
+
+
+def test_a_link_submitted_after_an_earlier_link_exited_0_is_deleted() -> None:
+    harness = Harness()
+    first = chain_link(harness, 1, 2)
+    harness.fake.finish(first)
+    second = chain_link(harness, 2, 2, (first,))
+    assert harness.fake.job(second).state == "CANCELLED"
 
 
 def test_a_link_with_nothing_handed_completes_as_it_starts() -> None:

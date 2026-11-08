@@ -51,8 +51,9 @@ Servatus uses a small generic vocabulary. Names in `code` are the public Python 
   exit after the pre-limit signal). Its content is the Task's run time so far in seconds, for the
   next step. A later link runs only the slots handed to it.
 - **Budget:** a Task's lifetime run-time limit across all its allocations, given by
-  `plan --budget` (`Continuation`). The chain spends it in full `time_limit` links and one shorter
-  last link, never more. A step learns it as `SERVATUS_BUDGET`, with `SERVATUS_RUN_TIME`,
+  `plan --budget` (`Continuation`). A Task's own links are full `time_limit` links and one shorter
+  last link that never add up to more; Tasks packed with different run times share links sized
+  for the neediest, and the plan warns. A step learns it as `SERVATUS_BUDGET`, with `SERVATUS_RUN_TIME`,
   `SERVATUS_LINK`, and `SERVATUS_LINKS`; exit 75 (`YIELD_EXIT`) asks to continue.
 - **Continuation (`Continuation`):** how far one plan continues its Tasks: an optional `budget`
   and an optional `max_links` (at most `MAX_LINKS`, 32). `Continuation()` is a plain plan.

@@ -261,10 +261,13 @@ At `signal_before_end` before each link's limit, every step gets `SIGUSR1`.
 | gets `SIGUSR1`, then exits nonzero or is stopped at the limit | `STOPPED (time limit)` | continues |
 | exits nonzero before `SIGUSR1` | `FAILED` | ends; `--retry-failed` reruns it |
 | is cancelled or preempted | `STOPPED` | ends |
-| does any of the continuing rows on its last planned link | `STOPPED (budget spent)` | ends |
+| exits 75 on its last planned link | `STOPPED (budget spent)` | ends |
 
 So an application that never handles `SIGUSR1` still continues: it dies of the signal (exit 138),
-which counts as stopped at the limit. Every chain step also receives these reserved variables:
+which counts as stopped at the limit. The chain's last link gets the signal as a plain allocation
+does, so there a nonzero exit after `SIGUSR1` reads `FAILED` and a stop at the limit reads
+`STOPPED`. On the last link, exit 0 when done, or 75 to read `budget spent`. Every chain step also
+receives these reserved variables:
 
 | Variable | Meaning |
 | --- | --- |

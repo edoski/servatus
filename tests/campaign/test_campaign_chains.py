@@ -166,7 +166,7 @@ def test_packed_tasks_with_different_histories_continue_for_their_own_links(
     assert plan.extensions == ("task-0",)
     assert plan.decision.extensions == {"task-0": Extension.SUCCEEDED}
     assert len(plan.allocations) == 4
-    assert "different numbers of links (task-0 3, task-1 4)" in plan.warnings[0]
+    assert "different links (task-0 02:40:00 in 3, task-1 03:30:00 in 4)" in plan.warnings[0]
     third, fourth = plan.allocations[2].script, plan.allocations[3].script
     assert b'"$next.0.go"' not in third and b'"$next.1.go"' in third
     assert b"if handed 0;" not in fourth and b"if handed 1;" in fourth
@@ -250,6 +250,20 @@ def test_inconsistent_chain_decisions_are_refused(
     document = json.loads(plan.to_json()) | {"spent": {"task-0": "01:00:00"}} | changes
     with pytest.raises(ConfigurationError, match=message):
         campaign.load_plan(json.dumps(document).encode())
+
+
+def test_tasks_packed_with_different_last_links_are_a_warning(world: World) -> None:
+    campaign = world.create(jobs(2))
+    campaign.submit(campaign.plan(chain_profile(), only=["task-0"]))
+    world.fake.start(1000)
+    world.clock.advance(minutes=30)
+    world.fake.finish(1000, exit_code=1)
+    world.fake.purge(1000)
+    budget = Continuation(budget="03:00:00")
+    plan = campaign.plan(chain_profile(), retry=["task-0"], continuation=budget)
+    assert [item.time_limit for item in plan.allocations] == [HOUR] * 3
+    (warning,) = plan.warnings
+    assert "different links (task-0 02:30:00 in 3, task-1 03:00:00 in 3)" in warning
 
 
 def test_a_tampered_continuation_breaks_the_digest(world: World) -> None:
@@ -497,6 +511,32 @@ def test_cancel_stops_a_chain_newest_link_first(world: World) -> None:
     assert states(world) == ["CANCELLED"] * 4
 
 
+def test_a_failed_cancel_leaves_the_earlier_links_of_its_chain_alone(world: World) -> None:
+    campaign, plan = submitted(world)
+    world.fake.start(1000)
+    world.wire.on("scancel", lambda _argv: None)
+    world.wire.on("scancel", lambda _argv: Completed(1, b"", b"scancel: error\n"))
+    with pytest.raises(Unavailable, match="not attempted: ") as raised:
+        campaign.cancel(tasks=["task-0"])
+    first, second = plan.allocations[0].allocation_id, plan.allocations[1].allocation_id
+    assert raised.value.args[0].endswith(f"not attempted: {second}, {first}")
+    assert states(world) == ["RUNNING", "PENDING", "PENDING", "CANCELLED"]
+
+
+def test_cancelling_a_chain_with_an_unresolved_link_needs_reconcile_first(world: World) -> None:
+    campaign = world.create(jobs(1))
+    plan = campaign.plan(chain_profile(), continuation=Continuation(max_links=2))
+    world.wire.on("sbatch", lambda _argv: None)
+    world.wire.on("sbatch", lambda _argv: world.fake.lose_next_reply("sbatch"))
+    with pytest.raises(SubmissionInterrupted):
+        campaign.submit(plan)
+    unresolved = plan.allocations[1].allocation_id
+    with pytest.raises(Exception, match=f"allocation {unresolved} is unresolved"):
+        campaign.cancel(tasks=["task-0"])
+    campaign.reconcile()
+    assert len(campaign.cancel(tasks=["task-0"])) == 2
+
+
 def test_cancelling_one_link_cuts_the_chain_there(world: World) -> None:
     campaign, plan = submitted(world)
     receipts = campaign.cancel(allocations=[plan.allocations[2].allocation_id])
@@ -534,6 +574,32 @@ def test_a_larger_budget_extends_a_succeeded_task_once(world: World) -> None:
     assert held.decision.held == {"task-0": Hold.SPENT}
     with pytest.raises(PlanRefused, match="budget is already spent"):
         campaign.plan(chain_profile(), retry=["task-0"], continuation=extend)
+
+
+def test_a_bulk_retry_of_incomplete_work_under_a_budget_extends_and_submits(world: World) -> None:
+    probe = Probe()
+    campaign = finished(world, probe)
+    plan = campaign.plan(chain_profile(), retry=Retry.INCOMPLETE, continuation=BUDGET)
+    assert plan.decision.extensions == {"task-0": Extension.SUCCEEDED}
+    assert len(campaign.submit(plan).receipts) == 3
+
+
+def test_the_last_link_reads_a_signal_death_as_a_failure_like_a_plain_allocation(
+    world: World,
+) -> None:
+    campaign, _ = submitted(world)
+    for job in (1000, 1001, 1002):
+        world.fake.start(job)
+        time_limit(world, job)
+    world.fake.start(1003)
+    world.clock.advance(minutes=20)
+    world.fake.signal_limit(1003)
+    world.fake.finish(1003, exit_code=138)
+    assert "limit" not in "".join(path for path in world.fake.files if "1003" in path)
+    purge_all(world)
+    (task,) = campaign.status().tasks
+    assert (task.execution, task.exit_code, task.detail) == (Execution.FAILED, 138, None)
+    assert task.run_time == RunTime(timedelta(hours=3, minutes=20), True)
 
 
 def test_a_retry_of_failed_work_under_a_budget_holds_spent_tasks(world: World) -> None:

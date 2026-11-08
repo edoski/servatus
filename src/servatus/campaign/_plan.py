@@ -256,14 +256,16 @@ def _budget_notes(decision: Decision) -> list[str]:
             left = continuation.budget - decision.spent.get(key, _ZERO) - sum(own, _ZERO)
             if left >= MINUTE:
                 (unreachable if len(own) == cap else dropped).append(key)
-        if len({len(own) for own in chain.limits}) > 1:
-            counts = ", ".join(
-                f"{key} {len(own)}" for key, own in zip(chain.keys, chain.limits, strict=True)
+        if len(set(chain.limits)) > 1:
+            shown = ", ".join(
+                f"{key} {format_duration(sum(own, _ZERO))} in {len(own)}"
+                for key, own in zip(chain.keys, chain.limits, strict=True)
             )
             notes.append(
-                f"Tasks packed together need different numbers of links ({counts}); later links "
-                "hold resources for the Tasks that ended; plan with --tasks-per-allocation 1 "
-                "to avoid it"
+                f"Tasks packed together need different links ({shown}); a Task runs to its "
+                "link's limit, which a needier Task may have set, unless it stops itself at "
+                "SERVATUS_BUDGET, and later links hold resources for Tasks that ended; plan with "
+                "--tasks-per-allocation 1 to avoid it"
             )
     if unreachable:
         notes.insert(

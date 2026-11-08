@@ -361,10 +361,11 @@ class Campaign:
         if not plan.allocations:
             return ()
         scheduler = self._scheduler(plan.decision.profile.target)
-        shapes: dict[tuple[int, timedelta, bool, str], PlannedAllocation] = {}
+        shapes: dict[tuple[int, timedelta, bool, bool], PlannedAllocation] = {}
         for item in plan.allocations:
             later = item.link.index > 1
-            shapes.setdefault((len(item.task_keys), item.time_limit, later, item.argv[-1]), item)
+            relay = any(word.startswith("--signal=B:") for word in item.argv)
+            shapes.setdefault((len(item.task_keys), item.time_limit, later, relay), item)
         return tuple(
             ShapeCheck(
                 len(item.task_keys),
@@ -474,7 +475,9 @@ class Campaign:
 
         ``tasks`` selects every allocation of each Task that was accepted or recorded as not
         submitted. A chosen chain link brings every later link of its chain. Allocations are
-        cancelled newest first, so no later link becomes eligible while an earlier one stops.
+        cancelled newest first, so no later link becomes eligible while an earlier one stops; after
+        a failed ``scancel``, no earlier link of that chain is tried, and an unresolved link of a
+        chosen chain is a ``Conflict``.
         Returns a receipt (with the job Slurm listed) for each allocation that was asked to stop;
         packed allocations stop all their Tasks.
         """
@@ -501,17 +504,25 @@ class Campaign:
         first: dict[str, int] = {}
         for item in chosen:
             first.setdefault(item.link.chain, item.link.index)
-        chosen = [
+        chained = [
             item
             for item in state.attempts
-            if item.acceptance is not AcceptanceState.UNRESOLVED
-            and item.link.chain in first
-            and item.link.index >= first[item.link.chain]
+            if item.link.chain in first and item.link.index >= first[item.link.chain]
         ]
-        rows, _ = self._evidence(chosen)
+        for item in chained:
+            if item.acceptance is AcceptanceState.UNRESOLVED:
+                raise Conflict(f"allocation {item.allocation_id} is unresolved; reconcile it first")
+        rows, _ = self._evidence(chained)
         cancelled: list[Receipt] = []
         failed: list[str] = []
-        for attempt in reversed(chosen):
+        broken: set[str] = set()
+        skipped: list[str] = []
+        for attempt in reversed(chained):
+            if attempt.link.chain in broken:
+                # An earlier link stopped after its pre-limit signal would hand off to the link
+                # that is still queued.
+                skipped.append(attempt.allocation_id)
+                continue
             row = queue_row(attempt.allocation_id, rows[attempt.allocation_id], attempt.job)
             if row is None or row.settling:
                 continue
@@ -519,11 +530,15 @@ class Campaign:
                 self._scheduler(attempt.profile.target).cancel(attempt.allocation_id)
             except Unavailable as error:
                 failed.append(f"{attempt.allocation_id} ({error})")
+                broken.add(attempt.link.chain)
             else:
                 cancelled.append(Receipt(attempt.allocation_id, row.job, attempt.task_keys))
         if failed:
             done = ", ".join(item.allocation_id for item in cancelled) or "none"
-            raise Unavailable(f"cancel failed for {'; '.join(failed)}; cancelled: {done}")
+            message = f"cancel failed for {'; '.join(failed)}; cancelled: {done}"
+            if skipped:
+                message += f"; not attempted: {', '.join(skipped)}"
+            raise Unavailable(message)
         return tuple(cancelled)
 
     # --- Internals ----------------------------------------------------------------------------

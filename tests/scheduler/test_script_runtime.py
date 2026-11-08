@@ -562,6 +562,16 @@ def test_a_gated_link_launches_exactly_the_handed_slots(tmp_path: Path, shell: s
 
 
 @pytest.mark.parametrize("shell", SHELLS)
+def test_a_handoff_is_read_like_one_line_of_shell_input(tmp_path: Path, shell: str) -> None:
+    runtime = Runtime(tmp_path, container=False)
+    runtime.handoff(0, ALLOCATION).write_text(" 7200\t\nmore\n")
+    chain = Chained(2, BUDGET, (2,), (timedelta(0),))
+    result = runtime.run(shell, runtime.script((runtime.link("a", "exit=0"),), chain=chain))
+    assert result.returncode == 0, result.stderr
+    assert json.loads((runtime.out / "a.json").read_text())["SERVATUS_RUN_TIME"] == "7200"
+
+
+@pytest.mark.parametrize("shell", SHELLS)
 def test_a_link_with_nothing_handed_exits_0_without_running_a_step(
     tmp_path: Path, shell: str
 ) -> None:

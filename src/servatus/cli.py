@@ -421,11 +421,12 @@ def _print_status(status: Status, path: Path) -> None:
     hints: list[str] = []
     if any(attempt.acceptance is AcceptanceState.UNRESOLVED for attempt in status.attempts):
         hints.append(f"servatus reconcile {state}")
-    if counts["failed"] + counts["stopped"]:
+    spent = [task for task in status.tasks if task.detail is StopReason.BUDGET_SPENT]
+    if counts["failed"] + counts["stopped"] > len(spent):
         hints.append(f"servatus plan {state} --retry-failed --output PLAN.json")
     if counts["lost"]:
         hints.append(f"servatus plan {state} --retry KEY --output PLAN.json  (LOST Tasks)")
-    if any(task.detail is StopReason.BUDGET_SPENT for task in status.tasks):
+    if spent:
         larger = f"servatus plan {state} --retry KEY --budget LARGER --output PLAN.json"
         hints.append(f"{larger}  (to extend a spent budget)")
     if counts["not_submitted"]:

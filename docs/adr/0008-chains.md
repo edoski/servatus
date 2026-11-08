@@ -94,8 +94,10 @@ left. A named key whose budget is spent refuses the plan.
 the Task: link 1 always, a later link once its handoff marker appeared, unless the marker's mtime
 is later than that link's start (a predecessor cut off from Slurm finished after its successor
 started, which then skipped the slot). Status, `Retry` selection, and `logs --task` all follow
-it. Status labels a `STOPPED` Task `time limit`, `yielded`, `budget spent` (either of those on
-the last link of a budgeted chain), or `never started`; there is no new execution state.
+it. Status labels a `STOPPED` Task `time limit`, `yielded`, `budget spent` (exit 75 on the last
+link of a budgeted chain), or `never started`; there is no new execution state. The last link gets
+the signal as a plain allocation does, so there a nonzero exit after `SIGUSR1` reads `FAILED`, as
+in 0.13.
 
 **Cancellation follows the chain.** `cancel --task` stops every queued or running link of the
 Task, newest first, so no later link becomes eligible while an earlier one stops.

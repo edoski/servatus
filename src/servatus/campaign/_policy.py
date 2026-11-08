@@ -28,9 +28,9 @@ Resubmission is always explicit, in one of two forms:
   Tasks whose current execution is terminal and whose result was observed MISSING; it needs a
   probe. Every other Task stays ``SUBMITTED``.
 
-Under a budget, an explicit key may also extend finished work: a Task whose probe reports VALID,
-or whose current execution SUCCEEDED, is selected as an ``Extension`` instead of refused. A named
-key whose budget is already spent refuses the plan.
+Under a budget, a selected Task whose current execution SUCCEEDED, or (named explicitly) whose
+probe reports VALID instead of being refused, extends finished work: it is selected as an
+``Extension``. A named key whose budget is already spent refuses the plan.
 """
 
 from __future__ import annotations
@@ -66,8 +66,8 @@ class Hold(StrEnum):
 
 
 class Extension(StrEnum):
-    """Why an explicitly retried Task under a budget extends finished work: its current
-    execution ``SUCCEEDED``, or its probe reports ``VALID``."""
+    """Why a Task selected under a budget extends finished work: its current execution
+    ``SUCCEEDED``, or its probe reports ``VALID`` (explicit keys only)."""
 
     SUCCEEDED = "SUCCEEDED"
     VALID = "VALID"
@@ -218,12 +218,13 @@ def _judge(
         return None
     attempt, slot = cast(tuple[Attempt, int], current(past, observed))
     execution, _, _ = observed.attempts[attempt.allocation_id].execution(slot)
-    if named:
-        if result is ResultState.VALID:
-            return Extension.VALID
-        return Extension.SUCCEEDED if execution is Execution.SUCCEEDED else None
-    if retry is Retry.FAILED:
+    if named and result is ResultState.VALID:
+        return Extension.VALID
+    if retry is Retry.FAILED and not named:
         chosen = execution in (Execution.FAILED, Execution.STOPPED)
     else:
-        chosen = execution.terminal and result is ResultState.MISSING
-    return None if chosen else Hold.SUBMITTED
+        chosen = named or (execution.terminal and result is ResultState.MISSING)
+    if not chosen:
+        return Hold.SUBMITTED
+    budgeted = exhausted is not None
+    return Extension.SUCCEEDED if budgeted and execution is Execution.SUCCEEDED else None

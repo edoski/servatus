@@ -62,7 +62,7 @@ _COMPLETED = "COMPLETED"
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _SLOT = re.compile(rb"--job-name=servatus-[0-9a-f]{24}-([0-9]+) ")
 _PREVIOUS = re.compile(rb"previous=([0-9]+)")
-_HANDED = re.compile(rb"(?:0|[1-9][0-9]{0,8})\n")
+_HANDED = re.compile(rb"[ \t]*(0|[1-9][0-9]{0,8})[ \t]*\n")
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,8 +322,8 @@ class FakeScheduler:
         for slot in found.link.slots:
             if own is None:
                 found.launched[slot] = found.link.previous.get(slot, 0)
-            elif _HANDED.fullmatch(self._files.get(f"{own}.{slot}.go", b"")):
-                found.launched[slot] = int(self._files[f"{own}.{slot}.go"])
+            elif handed := _HANDED.match(self._files.get(f"{own}.{slot}.go", b"")):
+                found.launched[slot] = int(handed.group(1))
         if not found.launched:
             found.state = _COMPLETED
             self._settle()
@@ -553,6 +553,7 @@ class FakeScheduler:
         )
         self._jobs.append(job)
         self._next_job_id += 1
+        self._settle()
         return Completed(0, f"{job.job}\n".encode(), b"")
 
     def _squeue(self, argv: tuple[str, ...], _stdin: bytes) -> Completed:

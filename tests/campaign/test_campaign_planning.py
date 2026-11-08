@@ -405,6 +405,14 @@ def test_a_saved_plan_goes_stale_when_the_campaign_changes(world: World) -> None
         campaign.load_plan(data)
 
 
+def test_validate_groups_shapes_without_a_signal_or_site_options(world: World) -> None:
+    campaign = world.create(jobs(8))
+    bare = cpu_profile(account=None, max_tasks_per_allocation=1)
+    plan = campaign.plan(bare)
+    assert len(plan.allocations) == 8
+    assert [check.task_count for check in campaign.validate(plan)] == [1]
+
+
 def test_validate_checks_each_distinct_shape_without_recording(world: World) -> None:
     campaign = world.create(jobs(5))
     plan = campaign.plan(cpu_profile())
