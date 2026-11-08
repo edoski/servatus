@@ -39,9 +39,11 @@ def intend(
     *,
     profile_value: Profile | None = None,
     link: Link | None = None,
+    slots: int | None = None,
+    within: str | None = None,
 ) -> tuple[State, str]:
     """Record intent for ``keys``, as link 1 of 1 unless ``link`` says otherwise; the identity
-    numbers the Attempt."""
+    numbers the Attempt. ``slots`` alone makes a lease; with ``within``, a step in that lease."""
     identity = allocation_id(len(state.attempts) + 1)
     changed = record_intent(
         state,
@@ -50,6 +52,8 @@ def intend(
         task_keys=tuple(keys),
         profile=profile_value or profile(),
         at=NOW + timedelta(minutes=len(state.attempts)),
+        slots=slots,
+        within=within,
     )
     return changed, identity
 
@@ -61,10 +65,18 @@ def submit(
     accepted: bool = True,
     profile_value: Profile | None = None,
     link: Link | None = None,
+    slots: int | None = None,
+    within: str | None = None,
+    job: int | None = None,
 ) -> tuple[State, str]:
-    """Intent plus outcome: job ``100 + attempt count`` when accepted, else non-submission."""
-    changed, identity = intend(state, keys, profile_value=profile_value, link=link)
-    job = len(changed.attempts) + 100 if accepted else None
+    """Intent plus outcome: ``job`` (default ``100 + attempt count``) when accepted, else
+    non-submission."""
+    changed, identity = intend(
+        state, keys, profile_value=profile_value, link=link, slots=slots, within=within
+    )
+    if job is None:
+        job = len(changed.attempts) + 100
+    job = job if accepted else None
     return record_outcome(changed, identity, job), identity
 
 
