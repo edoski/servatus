@@ -4,7 +4,7 @@ All notable changes to Servatus are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/) (before 1.0, minor versions may break compatibility).
 
-## [Unreleased]
+## [0.14.0] - 2026-11-08
 
 A long Task can now continue across allocations under a lifetime run-time budget, with no
 controller running while it does: `plan --budget` queues a chain of allocations at submission, and
