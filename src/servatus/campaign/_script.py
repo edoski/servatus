@@ -524,7 +524,9 @@ _RUN = (
 )
 # The lease takes an order at most once, never after its pre-limit signal, and never one whose
 # claim the client won. Its loop never waits for a step, and it never exits on its own, so the
-# next link of a chain of leases always becomes eligible when this one ends.
+# next link of a chain of leases always becomes eligible when this one ends. Its idle sleep
+# ignores the relayed pre-limit signal, which would otherwise kill it and make some shells log
+# the death.
 _SERVE = (
     "seen=",
     "while :; do",
@@ -543,7 +545,7 @@ _SERVE = (
     '      seen="$seen $id"',
     "    fi",
     "  done",
-    f"  sleep {POLL_SECONDS} &",
+    f"  ( trap '' USR1; exec sleep {POLL_SECONDS} ) &",
     '  wait "$!" || :',
     "done",
     "",
