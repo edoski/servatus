@@ -230,12 +230,13 @@ listing every key). Eligible Tasks beyond the target's `max_allocations_per_subm
 **deferred** to the next plan.
 
 To rerun failed work with more resources, plan it with a bigger profile. `status --json` shows each
-Task's `exit_code`, so you can pick the Tasks that ran out of memory (137: the kernel's
-out-of-memory killer ends a step with `SIGKILL`) and name only those:
+Task's `exit_code`, so you can name only some Tasks. Exit 137 means the step's process was killed
+with `SIGKILL`, most often by the out-of-memory killer; its step log (`servatus logs`) confirms it.
+A Task whose child process ran out of memory may exit 1 instead.
 
 ```sh
 servatus plan state --retry-failed --profile bigger --output retry.json   # every failed or stopped Task
-servatus status state --json | jq -r '.tasks[] | select(.exit_code == 137) | .key'
+servatus status state --json | jq -r '.tasks[] | select(.exit_code == 137) | .key'   # killed, exit 137
 servatus plan state --retry lr-1e-3 --retry lr-3e-4 --profile bigger --output retry.json
 ```
 
