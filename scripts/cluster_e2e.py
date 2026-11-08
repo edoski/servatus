@@ -27,21 +27,22 @@ It drives small sweeps through the ``servatus`` CLI over SSH, one Task per alloc
 - Link 2 of each chain (direct launcher) and, with ``--image-partition``, the Apptainer step
   under ``--cleanenv`` must learn a positive ``SERVATUS_JOB_END_TIME`` from Slurm's
   ``SLURM_JOB_END_TIME``.
-- Leases: ``plan --hold 2 --max-links 2`` holds two 1-CPU slots on 10-minute links with a 90-second
+- Leases: ``plan --hold 2 --max-links 2`` holds two 1-CPU slots on 15-minute links with a 90-second
   pre-limit signal. In link 1, ``servatus start`` orders ``a`` (exits 0), ``b`` (traps ``SIGUSR1``)
   and ``c`` (exits 0) at once. Slurm picks which two start; the third must wait until one of them
   ended (the check reports how long Slurm took to hand over the slot), reading QUEUED meanwhile and
-  counting run time only once it began. ``d`` asks for both slots while ``b`` holds one, so once the
-  lease took its order it waits, and ``cancel --task d`` must end it unstarted. ``cancel --task b``
-  must stop ``b`` through ``SIGUSR1`` while the lease runs on. ``--retry a`` must run ``a`` again in
-  the same lease. After link 1's pre-limit signal, ``start`` must place ``e`` in link 2, which must
-  start once link 1 ended; ``cancel --allocation`` then ends the chain. With ``--gpu-partition``, a
-  one-slot GPU lease runs ``nvidia-smi -L`` as a step, which must list exactly one GPU. This proves
-  what the test suite can only emulate: orders reaching the compute node (it reports how long the
-  lease took to claim one and to stop a step), a no-replace symbolic link as the claim on the shared
-  filesystem, ``test -O`` in the node's ``/bin/sh``, ``srun --exact`` waiting inside the allocation,
-  ``SIGUSR1`` and ``SIGTERM`` on a step's ``srun`` (running and waiting), the held allocation
-  outliving its steps, and lease links chaining.
+  counting run time only once it began. ``hog`` then takes the other slot beside ``b``, so ``d``
+  waits once the lease took its order, and ``cancel --task d`` must end it unstarted;
+  ``cancel --task hog`` frees the slot again. ``cancel --task b`` must stop ``b`` through
+  ``SIGUSR1`` while the lease runs on. ``--retry a`` must run ``a`` again in the same lease. After
+  link 1's pre-limit signal, ``start`` must place ``e`` in link 2, which must start once link 1
+  ended; ``cancel --allocation`` then ends the chain. With ``--gpu-partition``, a one-slot GPU lease
+  runs ``nvidia-smi -L`` as a step, which must list exactly one GPU. This proves what the test suite
+  can only emulate: orders reaching the compute node (it reports how long the lease took to claim
+  one and to stop a step), a no-replace symbolic link as the claim on the shared filesystem,
+  ``test -O`` in the node's ``/bin/sh``, ``srun --exact`` waiting inside the allocation, ``SIGUSR1``
+  and ``SIGTERM`` on a step's ``srun`` (running and waiting), the held allocation outliving its
+  steps, and lease links chaining.
 
 Everything it writes on the cluster lives in a new ``WORK_DIR/run-<timestamp>`` directory. It
 submits at most sixteen small jobs, at most three running at a time, and cancels whatever it
@@ -88,6 +89,7 @@ LEASE_TASKS = {
     "b": f'{STEP_REPORT}; trap "echo got USR1; exit 75" USR1; sleep 600 & wait $!',
     "c": f"{STEP_REPORT}; sleep 5; exit 0",
 }
+HOG_TASK = 'trap "exit 75" USR1; sleep 600 & wait $!'
 # glibc, not Alpine's musl: --nv binds the host's nvidia-smi, which needs a glibc loader.
 IMAGE_SOURCE = "docker://debian:12-slim"
 PULL_JOB = "servatus-e2e-pull"
@@ -193,7 +195,7 @@ def configuration(arguments: argparse.Namespace, run: PurePosixPath, image: bool
         "max_tasks_per_allocation = 2\n"
         "max_cpus_per_allocation = 2\n"
         "\n[profiles.lease.resources]\n"
-        'time_limit = "00:10:00"\n'
+        'time_limit = "00:15:00"\n'
         'signal_before_end = "00:01:30"\n'
     )
     if arguments.gpu_partition is not None:
@@ -544,9 +546,18 @@ def lease_check(
     assert ends and starts[last] >= min(ends), f"three steps ran in two slots: {observed}"
     handover = round((starts[last] - min(ends)).total_seconds())
 
-    servatus(root, "ensure", "lease", tasks_file(root, "wide.jsonl", {"d": "exit 0"}))
-    wide = start(root, "lease", "wide.jsonl", first, "--slots", "2")
-    while claimed(arguments, run, first, wide["d"]) != "taken":
+    servatus(root, "ensure", "lease", tasks_file(root, "hog.jsonl", {"hog": HOG_TASK}))
+    hog = start(root, "lease", "hog.jsonl", first)
+    wait_for(
+        root,
+        "hog to run beside b",
+        deadline,
+        lambda d: executions(d)["hog"] == executions(d)["b"] == "RUNNING",
+        "lease",
+    )
+    servatus(root, "ensure", "lease", tasks_file(root, "waiting.jsonl", {"d": "exit 0"}))
+    waiting = start(root, "lease", "waiting.jsonl", first)
+    while claimed(arguments, run, first, waiting["d"]) != "taken":
         if time.monotonic() > deadline:
             raise SystemExit("the lease never took the order of d")
         time.sleep(1)
@@ -555,7 +566,10 @@ def lease_check(
         root, "d to end unstarted", deadline, lambda d: executions(d)["d"] == "STOPPED", "lease"
     )
     d = next(task for task in unstarted["tasks"] if task["key"] == "d")
-    assert (d["detail"], executions(unstarted)["b"]) == ("never started", "RUNNING"), unstarted
+    busy = (executions(unstarted)["b"], executions(unstarted)["hog"])
+    assert (d["detail"], busy) == ("never started", ("RUNNING", "RUNNING")), unstarted
+    servatus(root, "cancel", "lease", "--task", "hog")
+    wait_for(root, "hog to stop", deadline, lambda d: executions(d)["hog"] == "STOPPED", "lease")
 
     stopping = time.monotonic()
     cancelled = json.loads(servatus(root, "cancel", "lease", "--task", "b", "--json").stdout)
@@ -609,7 +623,7 @@ def lease_check(
         "stop_seconds": stop_seconds,
         "a_run_time": seconds(a["run_time"]["total"]),
         "c_run_time": seconds(c["run_time"]["total"]),
-        "steps": {**steps, **wide, **late},
+        "steps": {**steps, **hog, **waiting, **late},
         "links": [first, second],
     }
 
