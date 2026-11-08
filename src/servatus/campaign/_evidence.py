@@ -107,6 +107,15 @@ class Limit:
 
 
 @dataclass(frozen=True, slots=True)
+class Void:
+    """``<step>.<job>.void``: the client withdrew a step's order before its lease took it, so
+    the step never runs. Written only after the client's claim on the order won."""
+
+    job: int
+    at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class End:
     """``<allocation>.<job>.<slot>.<exit code>.end``: that slot's step returned."""
 
@@ -126,7 +135,7 @@ class Handoff:
     at: datetime
 
 
-Marker = Start | Stop | Limit | End | Handoff
+Marker = Start | Stop | Limit | Void | End | Handoff
 
 
 class StopReason(StrEnum):
@@ -135,7 +144,8 @@ class StopReason(StrEnum):
     ``TIME_LIMIT``: the step was stopped by, or exited nonzero after, the pre-limit signal of a
     link that hands off. ``YIELDED``: the step exited 75. ``BUDGET_SPENT``: the step exited 75 on
     the last link of a budgeted chain, which gets the signal as a plain allocation does.
-    ``NEVER_STARTED``: the allocation never ran the Task.
+    ``NEVER_STARTED``: the allocation never ran the Task, or a step was withdrawn or stopped
+    before it began.
     """
 
     TIME_LIMIT = "time limit"
@@ -162,7 +172,13 @@ class Observation:
     (``None`` once purged), the mtimes of its start, stop, and limit markers, each slot's
     ``StepEnd`` (``None`` until its step returned), and whether each slot was ``handed`` to this
     allocation. Link 1 has every slot. A later link has a slot once its handoff marker appeared,
-    unless it appeared only after this link started (a predecessor cut off from Slurm)."""
+    unless it appeared only after this link started (a predecessor cut off from Slurm).
+
+    A ``step`` is observed through its lease: the lease's ``squeue`` state and limit marker, its
+    own start marker (written inside the step once Slurm started it), its own end marker, and
+    the earlier of its stop request and the lease's stop marker. Its one slot is ``handed``
+    unless its order was withdrawn.
+    """
 
     slurm_state: str | None
     started_at: datetime | None
@@ -170,16 +186,26 @@ class Observation:
     limit_at: datetime | None
     ends: tuple[StepEnd | None, ...]
     handed: tuple[bool, ...]
+    step: bool = False
 
     @property
     def live(self) -> bool:
-        """Slurm still lists the job, settling included; retry waits until it is purged."""
+        """Slurm still lists the job, settling included; retry waits until it is purged. A step
+        stops being live as soon as it ended or was withdrawn, while its lease runs on."""
+        if self.step:
+            return self.slurm_state is not None and self.handed[0] and self.ends[0] is None
         return self.slurm_state is not None
+
+    @property
+    def ended(self) -> bool:
+        """Slurm no longer lists the job, or lists it as ended and settling."""
+        return self.slurm_state is None or self.slurm_state in _ENDED
 
     def execution(self, slot: int) -> tuple[Execution, int | None, StopReason | None]:
         """The Task in ``slot``, its exit code (steps that returned), and why it stopped."""
         state, end = self.slurm_state, self.ends[slot]
-        if state is not None and _queued(state):
+        withdrawn = self.step and not self.handed[slot]
+        if state is not None and _queued(state) and not withdrawn:
             return Execution.QUEUED, None, None
         if not self.handed[slot]:
             return Execution.STOPPED, None, StopReason.NEVER_STARTED
@@ -191,9 +217,15 @@ class Observation:
                 return Execution.STOPPED, code, StopReason.YIELDED
             if self.limit_at is not None and self.limit_at <= end.at:
                 return Execution.STOPPED, code, StopReason.TIME_LIMIT
+            if self.step and self.stopped_at is not None and self.stopped_at <= end.at:
+                reason = StopReason.NEVER_STARTED if self.started_at is None else None
+                return Execution.STOPPED, code, reason
             return Execution.FAILED, code, None
         if state is not None:
-            return (Execution.ENDING if state in _ENDED else Execution.RUNNING), None, None
+            if state in _ENDED:
+                return Execution.ENDING, None, None
+            waiting = self.step and self.started_at is None
+            return (Execution.QUEUED if waiting else Execution.RUNNING), None, None
         if self.started_at is None:
             return Execution.STOPPED, None, StopReason.NEVER_STARTED
         if self.stopped_at is not None:
@@ -204,12 +236,15 @@ class Observation:
     def run_time(self, slot: int, now: datetime, bound: timedelta) -> tuple[timedelta, bool]:
         """How long ``slot`` ran in this allocation, at most ``bound`` (its time limit), and
         whether that is exact: a step still running counts until ``now``, and a LOST one counts
-        ``bound``, both inexact. A slot never handed or never started ran for no time."""
+        ``bound``, both inexact. A slot never handed or never started ran for no time. A step
+        asked to stop runs on until its end marker, so it counts until ``now`` meanwhile."""
         started = self.started_at
         if not self.handed[slot] or started is None:
             return timedelta(0), True
         end = self.ends[slot]
         stopped = end.at if end is not None else self.stopped_at
+        if self.step and end is None and self.live:
+            stopped = None
         if stopped is not None:
             return _clamp(stopped - started, bound), True
         if self.live:
@@ -233,7 +268,7 @@ _DECIMAL = re.compile(rb"[1-9][0-9]*\Z")
 _RECEIPT = re.compile(rb"([1-9][0-9]*)\n?\Z")
 _EXIT_CODE = r"(?:[0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])"
 _MARKER = re.compile(
-    rf"(?:([1-9][0-9]*)\.(?:(start|stop|limit)|(0|[1-9][0-9]*)\.({_EXIT_CODE})\.end)"
+    rf"(?:([1-9][0-9]*)\.(?:(start|stop|limit|void)|(0|[1-9][0-9]*)\.({_EXIT_CODE})\.end)"
     r"|(0|[1-9][0-9]*)\.go)\Z"
 )
 _TIMED = re.compile(rb"([0-9]{1,12})(?:\.([0-9]{1,10}))? (.+)")
@@ -327,6 +362,8 @@ def parse_markers(
             marker = Stop(int(job), at)
         elif kind == "limit":
             marker = Limit(int(job), at)
+        elif kind == "void":
+            marker = Void(int(job), at)
         else:
             marker = End(int(job), int(slot), int(code), at)
         markers[allocation_id].append(marker)
@@ -387,6 +424,8 @@ def observe(
             stopped = marker.at
         elif isinstance(marker, Limit):
             limited = marker.at
+        elif isinstance(marker, Void):
+            raise EvidenceConflict(f"allocation {allocation_id}: unexpected void marker")
         elif marker.slot >= task_count or ends[marker.slot] is not None:
             raise EvidenceConflict(
                 f"allocation {allocation_id}: unexpected end marker for slot {marker.slot}"
@@ -398,6 +437,47 @@ def observe(
     )
     return Observation(
         None if row is None else row.state, started, stopped, limited, tuple(ends), handed
+    )
+
+
+def observe_step(
+    step_id: str,
+    lease_id: str,
+    job: int,
+    rows: Sequence[QueueRow],
+    own: Iterable[Marker],
+    lease: Iterable[Marker],
+) -> Observation:
+    """One accepted step's ``Observation`` from its lease's queue rows and markers and its own
+    markers. Evidence of another job, a slot other than 0, a limit or handoff marker of the
+    step, or a withdrawn step that started or ended is an ``EvidenceConflict`` naming it."""
+    held = observe(lease_id, job, 0, rows, lease)
+    started = requested = withdrawn = None
+    end: StepEnd | None = None
+    for marker in own:
+        if isinstance(marker, (Handoff, Limit)) or marker.job != job:
+            raise EvidenceConflict(f"step {step_id}: a run marker does not belong to job {job}")
+        if isinstance(marker, Start):
+            started = marker.at
+        elif isinstance(marker, Stop):
+            requested = marker.at
+        elif isinstance(marker, Void):
+            withdrawn = marker.at
+        elif marker.slot != 0 or end is not None:
+            raise EvidenceConflict(f"step {step_id}: unexpected end marker for slot {marker.slot}")
+        else:
+            end = StepEnd(marker.exit_code, marker.at)
+    if withdrawn is not None and (started is not None or end is not None):
+        raise EvidenceConflict(f"step {step_id} was withdrawn, yet it ran")
+    stops = [at for at in (requested, held.stopped_at) if at is not None]
+    return Observation(
+        held.slurm_state,
+        started,
+        min(stops, default=None),
+        held.limit_at,
+        (end,),
+        (withdrawn is None,),
+        step=True,
     )
 
 

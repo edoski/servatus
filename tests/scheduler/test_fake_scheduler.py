@@ -436,7 +436,7 @@ def chain_link(
         (timedelta(seconds=30),) * slots,
         allocation(index + 1) if index < count else None,
     )
-    argv = sbatch_argv(harness.target, SIGNALLED, slots, allocation(index), chain)
+    argv = sbatch_argv(harness.target, SIGNALLED, slots, allocation(index), relay=chain.hands_off)
     script = render_batch(harness.target, SIGNALLED, tasks(slots), allocation(index), chain)
     return harness.scheduler.submit((*argv, *dependency_options(after)), script)
 

@@ -159,11 +159,14 @@ def sbatch_argv(
     resources: Resources,
     task_count: int,
     allocation_id: str,
-    chain: Chained | None = None,
+    *,
+    relay: bool = False,
 ) -> tuple[str, ...]:
-    """The complete ``sbatch`` request for one single-node allocation of ``task_count`` Tasks.
+    """The complete ``sbatch`` request for one single-node allocation of ``task_count`` Tasks
+    (a lease: its slots).
 
-    A chain link that hands off asks for the pre-limit signal in its batch shell (``B:``)."""
+    A ``relay`` (a chain link that hands off, or a lease) asks for the pre-limit signal in its
+    batch shell (``B:``)."""
     identity = job_name(allocation_id)
     output = log_path(target.log_root, allocation_id, "%j")
     argv = [
@@ -192,8 +195,7 @@ def sbatch_argv(
         argv.append(f"--gres={target.gpu_gres}:{task_count * resources.gpus}")
     if resources.signal_before_end is not None:
         seconds = resources.signal_before_end // timedelta(seconds=1)
-        relay = "B:" if chain is not None and chain.hands_off else ""
-        argv.append(f"--signal={relay}USR1@{seconds}")
+        argv.append(f"--signal={'B:' if relay else ''}USR1@{seconds}")
     return tuple(argv)
 
 
@@ -210,7 +212,7 @@ _PRELUDE = (
 # marker, so a step the trap interrupts is recorded as stopped, not as a failure of its own.
 # `command :` keeps a failed marker write (quota, ESTALE) from exiting the shell and orphaning the
 # steps.
-_TRAP = (
+_INTERRUPT = (
     "pids=",
     "interrupt() {",
     "  trap '' HUP INT TERM",
@@ -220,7 +222,16 @@ _TRAP = (
     "  exit 1",
     "}",
     "trap interrupt HUP INT TERM",
-    ': > "$marker.start" || exit 1',
+)
+_START = ': > "$marker.start" || exit 1'
+_TRAP = (*_INTERRUPT, _START)
+# The pre-limit signal: record it, then relay it to the process group, where `srun` forwards it
+# to each step.
+_LIMIT = (
+    "  trap '' USR1",
+    '  command : > "$marker.limit"',
+    "  kill -s USR1 0 2>/dev/null || :",
+    "}",
 )
 _EPILOGUE = (
     "status=0",
@@ -253,13 +264,10 @@ _RELAY = (
     '  exit "$continued"',
     "}",
     "limit() {",
-    "  trap '' USR1",
-    '  command : > "$marker.limit"',
-    "  kill -s USR1 0 2>/dev/null || :",
-    "}",
+    *_LIMIT,
     "trap interrupt HUP INT TERM",
     "trap limit USR1",
-    ': > "$marker.start" || exit 1',
+    _START,
     "started=$(date +%s)",
 )
 _REAP = ("reap", 'exit "$continued"', "")
@@ -274,6 +282,7 @@ _GATE = (
     "}",
 )
 _HANDOFF = 'printf \'%s\\n\' "$((previous + $(date +%s) - started))" > "$next.{slot}.go"'
+_STARTED = 'command : > "$1" || exit 1; shift; exec "$@"'
 # Step-local GPU visibility exists only inside the step; read it there and fail when absent.
 _GPU_VISIBILITY = '"${CUDA_VISIBLE_DEVICES:?Slurm did not set step GPU visibility}"'
 
@@ -366,8 +375,11 @@ def _step(
     allocation_id: str,
     slot: int,
     chain: Chained | None,
+    started: str | None = None,
 ) -> str:
-    """``printf STDIN | [ENV] srun ... COMMAND`` for one slot."""
+    """``printf STDIN | [ENV] srun ... COMMAND`` for one slot. With ``started``, the shell word
+    of a start marker, the step creates that marker itself before the command runs, and fails
+    without running it when it cannot."""
     srun = str(target.slurm_bin / "srun")
     path = log_path(target.log_root, allocation_id, "%j", slot)
     step = [
@@ -387,6 +399,8 @@ def _step(
     if resources.gpus:
         step.append(f"--gres={target.gpu_gres}:{resources.gpus}")
     prefix, command = _launch(target, resources, task, allocation_id, slot, chain)
+    if started is not None:
+        command = f"{shlex.join((_SHELL, '-c', _STARTED, 'servatus-start'))} {started} {command}"
     words = f"{prefix} {shlex.join(step)} {command}".lstrip()
     return f"printf {printf_literal(task.stdin)} | {words}"
 
@@ -451,7 +465,139 @@ def render_batch(
             lines.append(f"previous={chain.spent[slot] // timedelta(seconds=1)}")
         lines.extend((launch, 'pids="$pids $!"'))
     lines.extend(_REAP if relay else _EPILOGUE)
-    script = "\n".join(lines).encode("utf-8")
+    return _bounded("\n".join(lines).encode("utf-8"), target)
+
+
+# --- Leases ----------------------------------------------------------------------------------
+
+POLL_SECONDS = 5
+"""How often a lease looks for new orders."""
+
+
+def order_directory(log_root: PurePosixPath, lease_id: str) -> PurePosixPath:
+    """``<log_root>/<lease>.d``, owner-only: the client writes each step's order there as
+    ``<step>.run``, and the client and the lease contend for ``<step>.claim``."""
+    return log_root / f"{lease_id}.d"
+
+
+# A step starts only once the lease's own claim on its order won: a symbolic link created
+# without replacing, which the client's withdrawal contends for under the same name. The
+# `readlink` makes a retransmitted creation whose first reply was lost still count as won.
+_TAKE = (
+    "taken() {",
+    '  ln -s taken "$orders/$1.claim" 2>/dev/null ||',
+    '    [ "$(readlink "$orders/$1.claim" 2>/dev/null)" = taken ]',
+    "}",
+)
+# One step: it sources its order (its run time and `launch`), waits for its `srun` whatever
+# signal arrives, and records its end. A stop request gets the pre-limit treatment: SIGUSR1,
+# which srun forwards as-is, then after `grace` SIGTERM, which srun turns into SIGKILL; a step
+# still waiting for room never started, so its srun gets SIGTERM at once. The watcher ignores
+# USR1 and the step's shell catches it, so the relayed pre-limit signal kills neither, while
+# srun, started from a shell that catches it, keeps forwarding it.
+_RUN = (
+    "run() {",
+    "  trap : USR1",
+    '  m=$log/$1."$job_id"',
+    '  . "$orders/$1.run"',
+    "  launch",
+    "  step=$!",
+    "  (",
+    "    trap '' USR1",
+    f'    until [ -e "$m.stop" ]; do sleep {POLL_SECONDS}; done',
+    '    if [ -e "$m.start" ]; then',
+    '      kill -s USR1 "$step" 2>/dev/null || exit 0',
+    '      sleep "$grace"',
+    "    fi",
+    '    kill -s TERM "$step" 2>/dev/null',
+    "  ) &",
+    "  watch=$!",
+    '  wait "$step"',
+    "  code=$?",
+    '  while wait "$step" 2>/dev/null; again=$?; [ "$again" -ne 127 ] && [ "$again" -ne "$code" ]',
+    "  do code=$again; done",
+    '  kill "$watch" 2>/dev/null',
+    '  command : > "$m.0.$code.end"',
+    "}",
+)
+# The lease takes an order at most once, never after its pre-limit signal, and never one whose
+# claim the client won. Its loop never waits for a step, and it never exits on its own, so the
+# next link of a chain of leases always becomes eligible when this one ends.
+_SERVE = (
+    "seen=",
+    "while :; do",
+    '  for order in "$orders"/*.run; do',
+    '    [ "$limited" = 0 ] || break',
+    "    id=${order##*/}",
+    "    id=${id%.run}",
+    "    case $id in ????????????????????????) ;; *) continue ;; esac",
+    "    case $id in *[!0-9a-f]*) continue ;; esac",
+    '    case $seen in *" $id"*) continue ;; esac',
+    '    if taken "$id"; then',
+    '      seen="$seen $id"',
+    '      run "$id" &',
+    '      pids="$pids $!"',
+    '    elif [ -h "$orders/$id.claim" ]; then',
+    '      seen="$seen $id"',
+    "    fi",
+    "  done",
+    f"  sleep {POLL_SECONDS} &",
+    '  wait "$!" || :',
+    "done",
+    "",
+)
+
+
+def render_lease(target: Target, resources: Resources, lease_id: str) -> bytes:
+    """The ``#!/bin/sh`` batch script of one lease: it records its start like any allocation,
+    makes its owner-only order directory, then serves orders until Slurm ends it. Interrupted,
+    it records its stop and terminates every step, as an allocation does; at the pre-limit
+    signal it records the limit, relays the signal to its steps, and takes no more orders."""
+    if resources.signal_before_end is None:
+        raise ConfigurationError("a lease needs resources.signal_before_end")
+    prefix = target.log_root / lease_id
+    orders = shlex.quote(str(order_directory(target.log_root, lease_id)))
+    lines = [
+        *_PRELUDE,
+        f'marker={shlex.quote(str(prefix))}."$job_id"',
+        f"log={shlex.quote(str(target.log_root))}",
+        f"orders={orders}",
+        f"grace={resources.signal_before_end // timedelta(seconds=1)}",
+        "limited=0",
+        *_INTERRUPT,
+        "limit() {",
+        "  limited=1",
+        *_LIMIT,
+        "trap limit USR1",
+        _START,
+        'mkdir -p "$orders" 2>/dev/null',
+        '[ -d "$orders" ] && [ ! -h "$orders" ] && [ -O "$orders" ] || exit 1',
+        *_TAKE,
+        *_RUN,
+        *_SERVE,
+    ]
+    return _bounded("\n".join(lines).encode("utf-8"), target)
+
+
+def render_order(
+    target: Target, resources: Resources, task: Task, step_id: str, chain: Chained
+) -> bytes:
+    """One step's order, which its lease sources: the run time the step reports
+    (``previous``) and ``launch``, the Campaign's exact ``srun`` step of ``task`` with
+    ``resources`` (the slots it uses), its environment from link 1 of 1 ``chain``, and a start
+    marker the step writes itself, so a step waiting for room is not yet running."""
+    step = _step(target, resources, task, step_id, 0, chain, '"$m.start"')
+    lines = (
+        f"previous={chain.spent[0] // timedelta(seconds=1)}",
+        "launch() {",
+        f"{step} &",
+        "}",
+        "",
+    )
+    return _bounded("\n".join(lines).encode("utf-8"), target)
+
+
+def _bounded(script: bytes, target: Target) -> bytes:
     if len(script) > target.max_script_bytes:
         raise ConfigurationError(
             f"rendered batch script ({len(script)} bytes) exceeds target max_script_bytes "

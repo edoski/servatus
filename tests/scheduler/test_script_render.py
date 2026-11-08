@@ -323,7 +323,8 @@ def test_one_flag_selects_the_batch_shell_signal_and_the_relay() -> None:
         (chained(2, (3, 2)), True),
     ]:
         assert chain is None or chain.hands_off == relayed
-        signal = sbatch_argv(target(), SIGNALLED, 2, ALLOCATION, chain)[-1]
+        relay = chain is not None and chain.hands_off
+        signal = sbatch_argv(target(), SIGNALLED, 2, ALLOCATION, relay=relay)[-1]
         assert signal == ("--signal=B:USR1@600" if relayed else "--signal=USR1@600")
         script = link(chain)
         assert ("trap limit USR1" in script) == relayed

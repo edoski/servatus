@@ -177,7 +177,7 @@ def test_machine_output_for_every_data_command(cli: Cli[str]) -> None:
     created = cli.json("create", "state", "tasks.jsonl")
     assert created["tasks"] == 2 and created["sealed"] is True
     plan = cli.json("plan", "state", "--output", "plan.json")
-    assert plan["format"] == "servatus.plan/3" and plan["selected"] == ["one", "two"]
+    assert plan["format"] == "servatus.plan/4" and plan["selected"] == ["one", "two"]
     assert plan["saved"] == "plan.json" and plan["warnings"] == [] and plan["extensions"] == []
     allocation = plan["allocations"][0]
     assert "script" not in allocation and allocation["cpus"] == 4
@@ -195,7 +195,7 @@ def test_machine_output_for_every_data_command(cli: Cli[str]) -> None:
     assert receipt["job"] == 1000
     assert receipt["task_keys"] == ["one", "two"]
     status = cli.json("status", "state")
-    assert status["format"] == "servatus.status/3" and status["counts"]["queued"] == 2
+    assert status["format"] == "servatus.status/4" and status["counts"]["queued"] == 2
     assert status["warnings"] == [] and status["tasks"][0]["exit_code"] is None
     cancelled = cli.json("cancel", "state", "--task", "one")
     assert cancelled == {

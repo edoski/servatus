@@ -2,10 +2,12 @@
 
 A ``Decision`` is everything an operator reviews: which Tasks a plan submits, why every other
 Task is held or deferred, the Profile it uses, and how far it continues them (``Continuation``,
-with each selected Task's measured run time). ``build_plan`` derives the rest (chains of
-allocations, their identities, batch scripts, ``sbatch`` argv, and the digest) from a Decision and
-the current Campaign state, so a saved plan stays compact (no Task arguments or stdin) and a
-submitted plan can always be rebuilt and compared with what was reviewed.
+with each selected Task's measured run time). A Decision of ``slots`` alone holds a lease of that
+many slots; one with ``within`` starts its Tasks as steps of ``slots`` each in that lease.
+``build_plan`` derives the rest (chains of allocations or leases, steps, their identities, batch
+scripts and orders, ``sbatch`` argv, and the digest) from a Decision and the current Campaign
+state, so a saved plan stays compact (no Task arguments or stdin) and a submitted plan can always
+be rebuilt and compared with what was reviewed.
 """
 
 from __future__ import annotations
@@ -24,10 +26,18 @@ from . import _codec
 from ._codec import format_duration
 from ._config import MAX_LINKS, MINUTE, Continuation, Profile, Resources, Target, Task
 from ._policy import Extension, Hold
-from ._script import Chained, check_command, dependency_options, render_batch, sbatch_argv
-from ._state import Link, State, history
+from ._script import (
+    Chained,
+    check_command,
+    dependency_options,
+    render_batch,
+    render_lease,
+    render_order,
+    sbatch_argv,
+)
+from ._state import Kind, Link, State, history
 
-PLAN_FORMAT = "servatus.plan/3"
+PLAN_FORMAT = "servatus.plan/4"
 _ZERO = timedelta(0)
 # The longest job number Slurm prints, to bound a link's dependency option at planning.
 _LONGEST_JOB = 4_294_967_295
@@ -43,6 +53,12 @@ class Decision:
     the same Campaign state. ``continuation`` says how far the plan continues its Tasks;
     ``spent`` is each selected Task's run time, measured at planning, when it is active; and
     ``extensions`` names the selected Tasks that extend finished work under a budget.
+
+    ``slots`` and ``within`` say what the plan submits (``kind``): with neither, allocations of
+    up to ``tasks_per_allocation`` Tasks; with ``slots`` alone, a lease holding that many copies
+    of the Profile's Resources and selecting no Task; with both, one step per selected Task in the
+    lease ``within``, each using ``slots`` of it. A lease or step plan has one Task per
+    allocation.
     """
 
     campaign_id: str
@@ -57,17 +73,31 @@ class Decision:
     continuation: Continuation
     spent: Mapping[str, timedelta]
     extensions: Mapping[str, Extension]
+    slots: int | None = None
+    within: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("held", "spent", "extensions"):
             object.__setattr__(self, name, MappingProxyType(dict(getattr(self, name))))
+
+    @property
+    def kind(self) -> Kind:
+        return Kind.of(self.slots, self.within)
+
+    @property
+    def measured(self) -> bool:
+        """Whether ``spent`` records each selected Task's run time: under a continuation, and
+        for steps, which always report it."""
+        return self.continuation.active or self.within is not None
 
 
 @dataclass(frozen=True, slots=True)
 class PlannedAllocation:
     """One single-node allocation: its place in its chain, its Tasks, total request, this link's
     time limit, and exact ``sbatch`` input. A later link's ``argv`` lacks the dependency on the
-    earlier links' jobs, which submission adds once they are known."""
+    earlier links' jobs, which submission adds once they are known. A lease has no Tasks and
+    holds ``slots``; a step's ``script`` is its order for the lease ``within``, and its ``argv``
+    is empty."""
 
     allocation_id: str
     link: Link
@@ -78,6 +108,8 @@ class PlannedAllocation:
     time_limit: timedelta
     script: bytes = field(repr=False)
     argv: tuple[str, ...] = field(repr=False)
+    slots: int | None = None
+    within: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,10 +140,12 @@ class Plan:
                 f"{len(deferred)} eligible Tasks are deferred by max_allocations_per_submit; "
                 "plan again after submitting"
             )
+        if self.decision.kind is not Kind.ALLOCATION:
+            return tuple(notes)
         return (*notes, *_budget_notes(self.decision))
 
     def to_json(self) -> bytes:
-        """Canonical JSON: ``{"format": "servatus.plan/3"}``, the Decision, and the digest."""
+        """Canonical JSON: ``{"format": "servatus.plan/4"}``, the Decision, and the digest."""
         document = cast(dict[str, object], _codec.dump(self.decision))
         document["format"] = PLAN_FORMAT
         document["digest"] = self.digest
@@ -283,6 +317,19 @@ def _budget_notes(decision: Decision) -> list[str]:
     return notes
 
 
+def slot_resources(resources: Resources, slots: int) -> Resources:
+    """What a step using ``slots`` of a lease of ``resources`` asks for."""
+    if slots == 1:
+        return resources
+    return Resources(
+        cpus=slots * resources.cpus,
+        memory_mib=slots * resources.memory_mib,
+        time_limit=resources.time_limit,
+        gpus=slots * resources.gpus,
+        signal_before_end=resources.signal_before_end,
+    )
+
+
 def link_profile(profile: Profile, time_limit: timedelta) -> Profile:
     """``profile`` with one link's time limit."""
     resources = profile.resources
@@ -318,42 +365,85 @@ def _check(state: State, decision: Decision) -> None:
             raise ConfigurationError("plan Task keys are not in roster order")
     continuation = decision.continuation
     continuation.check(decision.profile.resources)
-    measured: set[str] = set(decision.selected) if continuation.active else set()
+    measured: set[str] = set(decision.selected) if decision.measured else set()
     if set(decision.spent) != measured:
         raise ConfigurationError("plan run times do not match its selected Tasks")
     if not set(decision.extensions) <= set(decision.selected) or (
         decision.extensions and continuation.budget is None
     ):
         raise ConfigurationError("plan extensions must be selected Tasks under a budget")
+    kind = decision.kind
+    if kind is Kind.ALLOCATION:
+        return
+    if decision.tasks_per_allocation != 1 or type(decision.slots) is not int or decision.slots < 1:
+        raise ConfigurationError("a lease or step plan needs a slot count and one Task each")
+    if kind is Kind.LEASE:
+        if decision.selected or decision.deferred or continuation.budget is not None:
+            raise ConfigurationError("a lease plan selects no Task and takes no budget")
+        return
+    lease = next((item for item in state.attempts if item.allocation_id == decision.within), None)
+    if (
+        lease is None
+        or lease.kind is not Kind.LEASE
+        or lease.job is None
+        or lease.profile != decision.profile
+        or decision.slots > cast(int, lease.slots)
+    ):
+        raise ConfigurationError("a step plan must fit an accepted lease of the campaign")
+    if decision.deferred or continuation.max_links is not None:
+        raise ConfigurationError("steps are one link each and never deferred")
 
 
 def build_plan(state: State, decision: Decision) -> Plan:
-    """Derive chains, allocations, scripts, argv, and the digest from ``decision`` against
-    ``state``.
+    """Derive allocations, scripts, argv, and the digest from ``decision`` against ``state``.
 
     Each packed group of selected Tasks is one chain with as many links as its neediest Task;
-    a plain plan's chains have one link. ``StalePlan`` when the decision was made for another
-    campaign or revision; ``ConfigurationError`` when it is inconsistent or a rendered request
-    breaks a bound.
+    a plain plan's chains have one link. A lease plan is one chain of ``max_links`` (default 1)
+    leases; a step plan is one step per selected Task. ``StalePlan`` when the decision was made
+    for another campaign or revision; ``ConfigurationError`` when it is inconsistent or a
+    rendered request breaks a bound.
     """
     _check(state, decision)
     held = decision.held
     decision = replace(
         decision, held={task.key: held[task.key] for task in state.tasks if task.key in held}
     )
-    profile, continuation = decision.profile, decision.continuation
-    target = profile.target
-    capacity(target, profile.resources, decision.tasks_per_allocation)
+    kind = decision.kind
+    profile = decision.profile
+    size = decision.slots if kind is Kind.LEASE else decision.tasks_per_allocation
+    capacity(profile.target, profile.resources, size)
     document = _codec.dump(decision)
     by_key = {task.key: task for task in state.tasks}
+    if kind is Kind.LEASE:
+        allocations = _leases(decision, document)
+    elif kind is Kind.STEP:
+        allocations = _steps(decision, document, by_key)
+    else:
+        allocations = _allocations(decision, document, by_key)
+    limit = profile.target.max_allocations_per_submit
+    if limit is not None and kind is not Kind.STEP and len(allocations) > limit:
+        raise ConfigurationError("plan exceeds the target's max_allocations_per_submit")
+    scripts = [hashlib.sha256(item.script).hexdigest() for item in allocations]
+    digest = _codec.digest({"decision": document, "scripts": scripts})
+    past = history(state)
+    retry = tuple(key for key in decision.selected + decision.deferred if past[key].accepted)
+    return Plan(decision, tuple(allocations), digest, retry)
+
+
+def _identity(document: object, index: int, link: int) -> str:
+    return _codec.digest({"decision": document, "index": index, "link": link})[:24]
+
+
+def _allocations(
+    decision: Decision, document: object, by_key: Mapping[str, Task]
+) -> list[PlannedAllocation]:
+    profile, continuation = decision.profile, decision.continuation
+    target = profile.target
     chains = _chains(decision)
     if any(not own for chain in chains for own in chain.limits):
         raise ConfigurationError("the plan selects a Task whose budget is already spent")
     ids = [
-        [
-            _codec.digest({"decision": document, "index": index, "link": link})[:24]
-            for link in range(1, chain.count + 1)
-        ]
+        [_identity(document, index, link) for link in range(1, chain.count + 1)]
         for index, chain in enumerate(chains)
     ]
     allocations: list[PlannedAllocation] = []
@@ -374,7 +464,8 @@ def build_plan(state: State, decision: Decision) -> Plan:
                 )
             group: tuple[Task, ...] = tuple(by_key[key] for key in chain.keys)
             script = render_batch(target, resources, group, allocation_id, chained)
-            argv = sbatch_argv(target, resources, len(group), allocation_id, chained)
+            relay = chained is not None and chained.hands_off
+            argv = sbatch_argv(target, resources, len(group), allocation_id, relay=relay)
             check_command((*argv, *dependency_options((_LONGEST_JOB,) * (link - 1)), "--test-only"))
             allocations.append(
                 PlannedAllocation(
@@ -389,11 +480,61 @@ def build_plan(state: State, decision: Decision) -> Plan:
                     argv=argv,
                 )
             )
-    limit = target.max_allocations_per_submit
-    if limit is not None and len(allocations) > limit:
-        raise ConfigurationError("plan exceeds the target's max_allocations_per_submit")
-    scripts = [hashlib.sha256(item.script).hexdigest() for item in allocations]
-    digest = _codec.digest({"decision": document, "scripts": scripts})
-    past = history(state)
-    retry = tuple(key for key in decision.selected + decision.deferred if past[key].accepted)
-    return Plan(decision, tuple(allocations), digest, retry)
+    return allocations
+
+
+def _leases(decision: Decision, document: object) -> list[PlannedAllocation]:
+    """One chain of leases: each link holds the same slots for the full time limit and always
+    asks for the pre-limit signal in its batch shell."""
+    profile, slots = decision.profile, cast(int, decision.slots)
+    target, resources = profile.target, profile.resources
+    count = decision.continuation.max_links or 1
+    ids = [_identity(document, 0, link) for link in range(1, count + 1)]
+    leases: list[PlannedAllocation] = []
+    for link, allocation_id in enumerate(ids, start=1):
+        argv = sbatch_argv(target, resources, slots, allocation_id, relay=True)
+        check_command((*argv, *dependency_options((_LONGEST_JOB,) * (link - 1)), "--test-only"))
+        leases.append(
+            PlannedAllocation(
+                allocation_id=allocation_id,
+                link=Link(ids[0], link, count),
+                task_keys=(),
+                cpus=slots * resources.cpus,
+                memory_mib=slots * resources.memory_mib,
+                gpus=slots * resources.gpus,
+                time_limit=resources.time_limit,
+                script=render_lease(target, resources, allocation_id),
+                argv=argv,
+                slots=slots,
+            )
+        )
+    return leases
+
+
+def _steps(
+    decision: Decision, document: object, by_key: Mapping[str, Task]
+) -> list[PlannedAllocation]:
+    """One step per selected Task, link 1 of 1 of its own chain, rendered as an order."""
+    profile, continuation = decision.profile, decision.continuation
+    slots = cast(int, decision.slots)
+    resources = slot_resources(profile.resources, slots)
+    steps: list[PlannedAllocation] = []
+    for index, key in enumerate(decision.selected):
+        step_id = _identity(document, index, 1)
+        chain = Chained(1, continuation.budget, (1,), (decision.spent[key],))
+        steps.append(
+            PlannedAllocation(
+                allocation_id=step_id,
+                link=Link(step_id, 1, 1, continuation.budget),
+                task_keys=(key,),
+                cpus=resources.cpus,
+                memory_mib=resources.memory_mib,
+                gpus=resources.gpus,
+                time_limit=resources.time_limit,
+                script=render_order(profile.target, resources, by_key[key], step_id, chain),
+                argv=(),
+                slots=slots,
+                within=decision.within,
+            )
+        )
+    return steps

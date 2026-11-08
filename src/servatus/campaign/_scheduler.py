@@ -1,5 +1,5 @@
 """Slurm operations over one ``Transport``: submit, test, read the queue and run markers, tail,
-and cancel.
+cancel, and write or withdraw a lease's orders.
 
 Every method issues fixed, absolute argument vectors and parses replies with the pure functions in
 ``_evidence``. Command failures raise ``Unavailable``; untrustworthy replies raise
@@ -15,7 +15,7 @@ from ..errors import ConfigurationError, EvidenceConflict, Unavailable
 from ._config import Target
 from ._evidence import Marker, QueueRow, parse_markers, parse_queue, parse_receipt
 from ._remote import MAX_STREAM_BYTES, Completed, Transport, diagnostic
-from ._script import MAX_ARGS, job_name
+from ._script import MAX_ARGS, job_name, order_directory
 
 MAX_QUERY_NAMES = 100
 TAIL = "/usr/bin/tail"
@@ -23,8 +23,30 @@ FIND = "/usr/bin/find"
 WRITABLE_DIRECTORY = ("/bin/sh", "-c", 'test -d "$1" && test -w "$1"', "servatus")
 SQUEUE_OPTIONS = ("--me", "--all", "--states=all", "--noheader")
 SQUEUE_FORMAT = "--format=%i|%j|%T"
-MARKER_SUFFIXES = (".start", ".stop", ".limit", ".end", ".go")
+MARKER_SUFFIXES = (".start", ".stop", ".limit", ".void", ".end", ".go")
 MARKER_FORMAT = "%T@ %p\n"
+# The order directory must be this user's own, so nobody else can plant or read an order.
+_ORDERS = (
+    'umask 077; d=$1; mkdir -p -- "$d" 2>/dev/null; '
+    '[ -d "$d" ] && [ ! -h "$d" ] && [ -O "$d" ] || exit 1; '
+)
+ORDER = (
+    "/bin/sh",
+    "-c",
+    _ORDERS + 'cat > "$d/.$2.part" && mv -f -- "$d/.$2.part" "$d/$2.run"',
+    "servatus-order",
+)
+# The claim is a symbolic link created without replacing; the lease takes an order under the
+# same name, so exactly one side wins, and `readlink` tells either side which.
+WITHDRAW = (
+    "/bin/sh",
+    "-c",
+    _ORDERS + '[ -z "$4" ] || [ -e "$4" ] || command : > "$4" || exit 1; '
+    'ln -s withdrawn "$d/$2.claim" 2>/dev/null; '
+    'case $(readlink "$d/$2.claim" 2>/dev/null) in '
+    'withdrawn) command : > "$3" && echo withdrawn ;; taken) echo taken ;; *) exit 1 ;; esac',
+    "servatus-withdraw",
+)
 _MARKER_LINE_BYTES = len("0000000000.0000000000 /") + 24 + len(".4294967295.4294967295.255.end")
 
 
@@ -201,3 +223,29 @@ class Scheduler:
         hit, and a job that already ended is not an error."""
         argv = (self._command("scancel"), "--me", f"--name={job_name(allocation_id)}")
         _require_ok(self._transport.run(argv), "scancel", quiet=False)
+
+    def order(self, lease_id: str, step_id: str, script: bytes) -> None:
+        """Write one step's order into its lease's order directory, atomically. ``Unavailable``
+        leaves it unknown whether the order exists."""
+        directory = order_directory(self._target.log_root, lease_id)
+        argv = (*ORDER, str(directory), step_id)
+        _require_ok(self._transport.run(argv, stdin=script), f"ordering step {step_id}")
+
+    def withdraw(self, lease_id: str, step_id: str, job: int, *, stop: bool) -> bool:
+        """Claim a step's order for the client: ``True`` when the client's claim won, now or
+        earlier, so the step never runs (its void marker records that); ``False`` when the lease
+        took the order first. With ``stop``, first ask the lease to stop the step (its stop
+        marker), which matters only when the lease took it."""
+        log_root = self._target.log_root
+        marker = log_root / f"{step_id}.{job}"
+        argv = (
+            *WITHDRAW,
+            str(order_directory(log_root, lease_id)),
+            step_id,
+            f"{marker}.void",
+            f"{marker}.stop" if stop else "",
+        )
+        completed = _require_ok(self._transport.run(argv), f"withdrawing step {step_id}")
+        if completed.stdout not in (b"withdrawn\n", b"taken\n"):
+            raise CommandFailed(f"withdrawing step {step_id} printed an unexpected reply")
+        return completed.stdout == b"withdrawn\n"
